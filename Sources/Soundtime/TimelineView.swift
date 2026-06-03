@@ -54,6 +54,10 @@ final class TimelineView: MTKView {
         true
     }
 
+    override var mouseDownCanMoveWindow: Bool {
+        false
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         window?.makeFirstResponder(self)
