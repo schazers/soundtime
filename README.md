@@ -19,6 +19,7 @@ This repository currently contains the native app shell:
 - Spacebar playback for decoded WAV files with a moving playhead
 - Click-drag timeline selection with selected duration in the header
 - Delete/Backspace removes the selected range non-destructively
+- Command-Z restores the previous edit timeline
 
 ## Run
 
