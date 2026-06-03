@@ -3,8 +3,11 @@ import MetalKit
 final class TimelineView: MTKView {
     var onAudioFileDropped: ((URL) -> Void)?
     var onTogglePlayback: (() -> Void)?
+    var onSelectionChanged: ((TimelineSelection?) -> Void)?
 
     private var timelineRenderer: TimelineRenderer?
+    private var isSelectionEnabled = false
+    private var selectionAnchorProgress: Float?
     private let supportedAudioExtensions: Set<String> = [
         "aif",
         "aiff",
@@ -40,11 +43,22 @@ final class TimelineView: MTKView {
     }
 
     func displayWaveform(_ waveformOverview: WaveformOverview?) {
+        isSelectionEnabled = waveformOverview != nil
         timelineRenderer?.displayWaveform(waveformOverview)
+
+        if waveformOverview == nil {
+            selectionAnchorProgress = nil
+            displaySelection(nil)
+            onSelectionChanged?(nil)
+        }
     }
 
     func displayPlayheadProgress(_ progress: Float) {
         timelineRenderer?.displayPlayheadProgress(progress)
+    }
+
+    func displaySelection(_ selection: TimelineSelection?) {
+        timelineRenderer?.displaySelection(selection)
     }
 
     private func configure() {
@@ -115,6 +129,43 @@ final class TimelineView: MTKView {
         super.keyDown(with: event)
     }
 
+    override func mouseDown(with event: NSEvent) {
+        guard isSelectionEnabled else {
+            super.mouseDown(with: event)
+            return
+        }
+
+        window?.makeFirstResponder(self)
+        let progress = progress(for: event)
+        selectionAnchorProgress = progress
+        updateSelection(from: progress, to: progress)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard
+            isSelectionEnabled,
+            let selectionAnchorProgress
+        else {
+            super.mouseDragged(with: event)
+            return
+        }
+
+        updateSelection(from: selectionAnchorProgress, to: progress(for: event))
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard
+            isSelectionEnabled,
+            let selectionAnchorProgress
+        else {
+            super.mouseUp(with: event)
+            return
+        }
+
+        updateSelection(from: selectionAnchorProgress, to: progress(for: event))
+        self.selectionAnchorProgress = nil
+    }
+
     private func firstSupportedAudioURL(from pasteboard: NSPasteboard) -> URL? {
         let options: [NSPasteboard.ReadingOptionKey: Any] = [
             .urlReadingFileURLsOnly: true,
@@ -134,5 +185,25 @@ final class TimelineView: MTKView {
     private func setDropHighlightVisible(_ isVisible: Bool) {
         layer?.borderColor = isVisible ? NSColor.systemTeal.cgColor : NSColor.clear.cgColor
         layer?.borderWidth = isVisible ? 2 : 0
+    }
+
+    private func progress(for event: NSEvent) -> Float {
+        let point = convert(event.locationInWindow, from: nil)
+        guard bounds.width > 0 else {
+            return 0
+        }
+
+        return min(max(Float(point.x / bounds.width), 0), 1)
+    }
+
+    private func updateSelection(from startProgress: Float, to endProgress: Float) {
+        let selection = TimelineSelection(
+            startProgress: startProgress,
+            endProgress: endProgress
+        )
+        let visibleSelection = selection.durationProgress > 0.001 ? selection : nil
+
+        displaySelection(visibleSelection)
+        onSelectionChanged?(visibleSelection)
     }
 }

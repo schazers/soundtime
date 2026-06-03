@@ -19,6 +19,7 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
     private let pipelineState: MTLRenderPipelineState
     private var waveformOverview: WaveformOverview?
     private var playheadProgress: Float = 0
+    private var selection: TimelineSelection?
 
     init(device: MTLDevice, pixelFormat: MTLPixelFormat) throws {
         guard let commandQueue = device.makeCommandQueue() else {
@@ -37,6 +38,13 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         descriptor.vertexFunction = vertexFunction
         descriptor.fragmentFunction = fragmentFunction
         descriptor.colorAttachments[0].pixelFormat = pixelFormat
+        descriptor.colorAttachments[0].isBlendingEnabled = true
+        descriptor.colorAttachments[0].rgbBlendOperation = .add
+        descriptor.colorAttachments[0].alphaBlendOperation = .add
+        descriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        descriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+        descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        descriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
 
         self.device = device
         self.commandQueue = commandQueue
@@ -55,6 +63,10 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         playheadProgress = min(max(progress, 0), 1)
     }
 
+    func displaySelection(_ selection: TimelineSelection?) {
+        self.selection = selection
+    }
+
     func draw(in view: MTKView) {
         guard
             let renderPassDescriptor = view.currentRenderPassDescriptor,
@@ -68,6 +80,7 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         let drawableSize = view.drawableSize
         let backingScale = backingScale(for: view)
         let gridVertices = makeGridVertices(drawableSize: drawableSize, backingScale: backingScale)
+        let selectionVertices = makeSelectionVertices(drawableSize: drawableSize)
         let waveformVertices = makeWaveformVertices(
             drawableSize: drawableSize,
             backingScale: backingScale
@@ -76,6 +89,7 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
 
         encoder.setRenderPipelineState(pipelineState)
         draw(vertices: gridVertices, primitiveType: .line, encoder: encoder)
+        draw(vertices: selectionVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: waveformVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: playheadVertices, primitiveType: .triangle, encoder: encoder)
         encoder.endEncoding()
@@ -146,6 +160,40 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
             from: SIMD2<Float>(0, centerY),
             to: SIMD2<Float>(width, centerY),
             color: centerColor,
+            drawableSize: SIMD2<Float>(width, height)
+        )
+
+        return vertices
+    }
+
+    private func makeSelectionVertices(drawableSize: CGSize) -> [TimelineVertex] {
+        guard
+            let selection,
+            waveformOverview != nil,
+            selection.durationProgress > 0.001
+        else {
+            return []
+        }
+
+        let width = Float(drawableSize.width)
+        let height = Float(drawableSize.height)
+        guard width > 0, height > 0 else {
+            return []
+        }
+
+        let left = selection.startProgress * width
+        let right = selection.endProgress * width
+        let color = SIMD4<Float>(0.0, 0.84, 0.78, 0.22)
+        var vertices: [TimelineVertex] = []
+        vertices.reserveCapacity(6)
+
+        appendRectangle(
+            to: &vertices,
+            left: left,
+            right: right,
+            top: 0,
+            bottom: height,
+            color: color,
             drawableSize: SIMD2<Float>(width, height)
         )
 

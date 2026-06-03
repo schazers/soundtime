@@ -17,6 +17,7 @@ This repository currently contains the native app shell:
 - WAV PCM decode into an in-memory floating-point buffer
 - Full-file waveform overview rendered through Metal
 - Spacebar playback for decoded WAV files with a moving playhead
+- Click-drag timeline selection with selected duration in the header
 
 ## Run
 

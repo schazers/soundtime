@@ -5,6 +5,8 @@ final class WorkspaceView: NSView {
     private var selectedAudioFile: AudioFileMetadata?
     private var decodedAudioBuffer: DecodedAudioBuffer?
     private var loadedAudioSummary: String?
+    private var selectedTimelineRange: TimelineSelection?
+    private var currentPlaybackStatus = "idle"
     private var playbackTimer: Timer?
     private let playbackController = AudioPlaybackController()
 
@@ -48,6 +50,9 @@ final class WorkspaceView: NSView {
         timelineSurface.onTogglePlayback = { [weak self] in
             self?.togglePlayback()
         }
+        timelineSurface.onSelectionChanged = { [weak self] selection in
+            self?.updateSelection(selection)
+        }
 
         addSubview(titleLabel)
         addSubview(metadataLabel)
@@ -74,10 +79,13 @@ final class WorkspaceView: NSView {
         selectedAudioFile = nil
         decodedAudioBuffer = nil
         loadedAudioSummary = nil
+        selectedTimelineRange = nil
+        currentPlaybackStatus = "idle"
         playbackTimer?.invalidate()
         playbackTimer = nil
         playbackController.clear()
         timelineSurface.displayWaveform(nil)
+        timelineSurface.displaySelection(nil)
         timelineSurface.displayPlayheadProgress(0)
         metadataLabel.stringValue = "\(url.lastPathComponent) - loading..."
 
@@ -96,7 +104,10 @@ final class WorkspaceView: NSView {
                 case .unsupported:
                     self.decodedAudioBuffer = nil
                     self.loadedAudioSummary = nil
+                    self.selectedTimelineRange = nil
+                    self.currentPlaybackStatus = "idle"
                     self.playbackController.clear()
+                    self.timelineSurface.displaySelection(nil)
                     self.timelineSurface.displayPlayheadProgress(0)
                     self.metadataLabel.stringValue = "\(result.metadata.formattedSummary) - WAV decode not available yet"
                 case let .decoded(decodedAudioBuffer, waveformOverview):
@@ -105,11 +116,16 @@ final class WorkspaceView: NSView {
                     self.timelineSurface.displayWaveform(waveformOverview)
                     self.timelineSurface.displayPlayheadProgress(0)
                     self.loadedAudioSummary = "\(result.metadata.displayName) - \(decodedAudioBuffer.formattedSummary)"
+                    self.selectedTimelineRange = nil
+                    self.currentPlaybackStatus = "press Space to play"
                     self.updateStatus("press Space to play")
                 case let .failed(message):
                     self.decodedAudioBuffer = nil
                     self.loadedAudioSummary = nil
+                    self.selectedTimelineRange = nil
+                    self.currentPlaybackStatus = "idle"
                     self.playbackController.clear()
+                    self.timelineSurface.displaySelection(nil)
                     self.timelineSurface.displayPlayheadProgress(0)
                     self.timelineSurface.displayWaveform(nil)
                     self.metadataLabel.stringValue = "\(result.metadata.formattedSummary) - WAV decode failed: \(message)"
@@ -122,7 +138,10 @@ final class WorkspaceView: NSView {
                 self.selectedAudioFile = nil
                 self.decodedAudioBuffer = nil
                 self.loadedAudioSummary = nil
+                self.selectedTimelineRange = nil
+                self.currentPlaybackStatus = "idle"
                 self.playbackController.clear()
+                self.timelineSurface.displaySelection(nil)
                 self.timelineSurface.displayPlayheadProgress(0)
                 self.timelineSurface.displayWaveform(nil)
                 self.metadataLabel.stringValue = "\(url.lastPathComponent) - could not load audio"
@@ -182,12 +201,41 @@ final class WorkspaceView: NSView {
         }
     }
 
+    private func updateSelection(_ selection: TimelineSelection?) {
+        selectedTimelineRange = selection
+        updateStatus(currentPlaybackStatus)
+    }
+
     private func updateStatus(_ status: String) {
+        currentPlaybackStatus = status
         guard let loadedAudioSummary else {
             metadataLabel.stringValue = status
             return
         }
 
-        metadataLabel.stringValue = "\(loadedAudioSummary) - \(status)"
+        if
+            let selectedTimelineRange,
+            let decodedAudioBuffer,
+            selectedTimelineRange.durationProgress > 0
+        {
+            let selectedDuration = selectedTimelineRange.duration(in: decodedAudioBuffer.duration)
+            metadataLabel.stringValue = "\(loadedAudioSummary) - \(status) - selected \(formatDuration(selectedDuration))"
+        } else {
+            metadataLabel.stringValue = "\(loadedAudioSummary) - \(status)"
+        }
+    }
+
+    private func formatDuration(_ duration: TimeInterval) -> String {
+        if duration < 1 {
+            return String(format: "%.0f ms", duration * 1_000)
+        }
+
+        if duration < 60 {
+            return String(format: "%.2f sec", duration)
+        }
+
+        let minutes = Int(duration) / 60
+        let seconds = Int(duration) % 60
+        return String(format: "%d:%02d", minutes, seconds)
     }
 }
