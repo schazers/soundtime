@@ -33,16 +33,37 @@ enum WAVAudioDecoder {
         }
     }
 
-    private struct WAVFormat {
-        let formatTag: UInt16
-        let channelCount: Int
-        let sampleRate: Double
-        let blockAlign: Int
-        let bitsPerSample: Int
-    }
-
     static func canDecode(_ url: URL) -> Bool {
         ["wav", "wave"].contains(url.pathExtension.lowercased())
+    }
+
+    static func inspect(url: URL) throws -> WAVFileInfo {
+        guard canDecode(url) else {
+            throw DecodeError.unsupportedFileType
+        }
+
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        return try inspect(in: data, url: url)
+    }
+
+    static func buildSparsePreview(
+        url: URL,
+        targetBinCount: Int = 512,
+        samplesPerBin: Int = 8
+    ) throws -> (WAVFileInfo, WaveformOverview) {
+        guard canDecode(url) else {
+            throw DecodeError.unsupportedFileType
+        }
+
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        let fileInfo = try inspect(in: data, url: url)
+        let waveformOverview = try buildSparsePreview(
+            in: data,
+            fileInfo: fileInfo,
+            targetBinCount: targetBinCount,
+            samplesPerBin: samplesPerBin
+        )
+        return (fileInfo, waveformOverview)
     }
 
     static func decode(url: URL) throws -> DecodedAudioBuffer {
@@ -51,6 +72,11 @@ enum WAVAudioDecoder {
         }
 
         let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        let fileInfo = try inspect(in: data, url: url)
+        return try decodeSamples(in: data, fileInfo: fileInfo)
+    }
+
+    private static func inspect(in data: Data, url: URL) throws -> WAVFileInfo {
         guard
             data.count >= 12,
             try readFourCC(in: data, at: 0) == "RIFF",
@@ -67,11 +93,10 @@ enum WAVAudioDecoder {
             throw DecodeError.missingDataChunk
         }
 
-        let format = try parseFormat(in: data, chunk: formatChunk)
-        return try decodeSamples(
+        return try parseFileInfo(
             in: data,
-            chunk: dataChunk,
-            format: format,
+            formatChunk: formatChunk,
+            dataChunk: dataChunk,
             url: url
         )
     }
@@ -97,58 +122,114 @@ enum WAVAudioDecoder {
         return chunks
     }
 
-    private static func parseFormat(in data: Data, chunk: Range<Int>) throws -> WAVFormat {
-        guard chunk.count >= 16 else {
+    private static func parseFileInfo(
+        in data: Data,
+        formatChunk: Range<Int>,
+        dataChunk: Range<Int>,
+        url: URL
+    ) throws -> WAVFileInfo {
+        guard formatChunk.count >= 16 else {
             throw DecodeError.invalidFormat
         }
 
-        var formatTag = try readUInt16LE(in: data, at: chunk.lowerBound)
-        let channelCount = Int(try readUInt16LE(in: data, at: chunk.lowerBound + 2))
-        let sampleRate = Double(try readUInt32LE(in: data, at: chunk.lowerBound + 4))
-        let blockAlign = Int(try readUInt16LE(in: data, at: chunk.lowerBound + 12))
-        let bitsPerSample = Int(try readUInt16LE(in: data, at: chunk.lowerBound + 14))
+        var formatTag = try readUInt16LE(in: data, at: formatChunk.lowerBound)
+        let channelCount = Int(try readUInt16LE(in: data, at: formatChunk.lowerBound + 2))
+        let sampleRate = Double(try readUInt32LE(in: data, at: formatChunk.lowerBound + 4))
+        let blockAlign = Int(try readUInt16LE(in: data, at: formatChunk.lowerBound + 12))
+        let bitsPerSample = Int(try readUInt16LE(in: data, at: formatChunk.lowerBound + 14))
 
         if formatTag == 0xFFFE {
-            guard chunk.count >= 40 else {
+            guard formatChunk.count >= 40 else {
                 throw DecodeError.invalidFormat
             }
 
-            formatTag = try readUInt16LE(in: data, at: chunk.lowerBound + 24)
+            formatTag = try readUInt16LE(in: data, at: formatChunk.lowerBound + 24)
         }
 
         guard channelCount > 0, sampleRate > 0, blockAlign > 0, bitsPerSample > 0 else {
             throw DecodeError.invalidFormat
         }
 
-        return WAVFormat(
+        return WAVFileInfo(
+            url: url,
             formatTag: formatTag,
             channelCount: channelCount,
             sampleRate: sampleRate,
             blockAlign: blockAlign,
-            bitsPerSample: bitsPerSample
+            bitsPerSample: bitsPerSample,
+            dataRange: dataChunk
         )
     }
 
-    private static func decodeSamples(
+    private static func buildSparsePreview(
         in data: Data,
-        chunk: Range<Int>,
-        format: WAVFormat,
-        url: URL
-    ) throws -> DecodedAudioBuffer {
-        guard format.formatTag == 1 || format.formatTag == 3 else {
-            throw DecodeError.unsupportedFormat(format.formatTag)
-        }
-        guard format.bitsPerSample % 8 == 0 else {
-            throw DecodeError.unsupportedBitDepth(format.bitsPerSample)
+        fileInfo: WAVFileInfo,
+        targetBinCount: Int,
+        samplesPerBin: Int
+    ) throws -> WaveformOverview {
+        try validateDecodable(fileInfo)
+
+        guard fileInfo.frameCount > 0 else {
+            return WaveformOverview(duration: fileInfo.duration, bins: [])
         }
 
-        let bytesPerSample = format.bitsPerSample / 8
-        guard format.blockAlign >= bytesPerSample * format.channelCount else {
-            throw DecodeError.invalidFormat
+        let binCount = min(max(targetBinCount, 1), fileInfo.frameCount)
+        let sampledFrameCount = max(samplesPerBin, 1)
+        var bins: [WaveformOverview.Bin] = []
+        bins.reserveCapacity(binCount)
+
+        for binIndex in 0..<binCount {
+            let startFrame = binIndex * fileInfo.frameCount / binCount
+            let endFrame = max((binIndex + 1) * fileInfo.frameCount / binCount, startFrame + 1)
+            let frameSpan = endFrame - startFrame
+            let binSampleCount = min(sampledFrameCount, frameSpan)
+            var minimumSample: Float = 1
+            var maximumSample: Float = -1
+
+            for sampleIndex in 0..<binSampleCount {
+                let frameOffset: Int
+                if binSampleCount == 1 {
+                    frameOffset = frameSpan / 2
+                } else {
+                    frameOffset = sampleIndex * (frameSpan - 1) / (binSampleCount - 1)
+                }
+
+                let frameIndex = startFrame + frameOffset
+                let frameByteOffset = fileInfo.dataRange.lowerBound + frameIndex * fileInfo.blockAlign
+
+                for channelIndex in 0..<fileInfo.channelCount {
+                    let sampleOffset = frameByteOffset + channelIndex * bytesPerSample(for: fileInfo)
+                    let sample = try decodeSample(
+                        in: data,
+                        at: sampleOffset,
+                        formatTag: fileInfo.formatTag,
+                        bitsPerSample: fileInfo.bitsPerSample
+                    )
+                    minimumSample = min(minimumSample, sample)
+                    maximumSample = max(maximumSample, sample)
+                }
+            }
+
+            if minimumSample > maximumSample {
+                minimumSample = 0
+                maximumSample = 0
+            }
+
+            bins.append(WaveformOverview.Bin(
+                minimumSample: minimumSample,
+                maximumSample: maximumSample
+            ))
         }
 
-        let frameCount = chunk.count / format.blockAlign
-        var samplesByChannel = (0..<format.channelCount).map { _ in
+        return WaveformOverview(duration: fileInfo.duration, bins: bins)
+    }
+
+    private static func decodeSamples(in data: Data, fileInfo: WAVFileInfo) throws -> DecodedAudioBuffer {
+        try validateDecodable(fileInfo)
+
+        let bytesPerSample = bytesPerSample(for: fileInfo)
+        let frameCount = fileInfo.frameCount
+        var samplesByChannel = (0..<fileInfo.channelCount).map { _ in
             [Float]()
         }
 
@@ -157,27 +238,43 @@ enum WAVAudioDecoder {
         }
 
         for frameIndex in 0..<frameCount {
-            let frameOffset = chunk.lowerBound + frameIndex * format.blockAlign
+            let frameOffset = fileInfo.dataRange.lowerBound + frameIndex * fileInfo.blockAlign
 
-            for channelIndex in 0..<format.channelCount {
+            for channelIndex in 0..<fileInfo.channelCount {
                 let sampleOffset = frameOffset + channelIndex * bytesPerSample
                 let sample = try decodeSample(
                     in: data,
                     at: sampleOffset,
-                    formatTag: format.formatTag,
-                    bitsPerSample: format.bitsPerSample
+                    formatTag: fileInfo.formatTag,
+                    bitsPerSample: fileInfo.bitsPerSample
                 )
                 samplesByChannel[channelIndex].append(sample)
             }
         }
 
         return DecodedAudioBuffer(
-            url: url,
-            sampleRate: format.sampleRate,
-            channelCount: format.channelCount,
+            url: fileInfo.url,
+            sampleRate: fileInfo.sampleRate,
+            channelCount: fileInfo.channelCount,
             frameCount: frameCount,
             samplesByChannel: samplesByChannel
         )
+    }
+
+    private static func validateDecodable(_ fileInfo: WAVFileInfo) throws {
+        guard fileInfo.formatTag == 1 || fileInfo.formatTag == 3 else {
+            throw DecodeError.unsupportedFormat(fileInfo.formatTag)
+        }
+        guard fileInfo.bitsPerSample % 8 == 0 else {
+            throw DecodeError.unsupportedBitDepth(fileInfo.bitsPerSample)
+        }
+        guard fileInfo.blockAlign >= bytesPerSample(for: fileInfo) * fileInfo.channelCount else {
+            throw DecodeError.invalidFormat
+        }
+    }
+
+    private static func bytesPerSample(for fileInfo: WAVFileInfo) -> Int {
+        fileInfo.bitsPerSample / 8
     }
 
     private static func decodeSample(

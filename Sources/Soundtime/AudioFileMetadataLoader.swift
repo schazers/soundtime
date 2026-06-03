@@ -2,6 +2,15 @@ import AVFoundation
 import Foundation
 
 enum AudioFileMetadataLoader {
+    static func loadQuickMetadata(for url: URL, duration: TimeInterval?) throws -> AudioFileMetadata {
+        AudioFileMetadata(
+            url: url,
+            displayName: displayName(for: url),
+            duration: duration,
+            fileSize: try loadFileSizeSynchronously(for: url)
+        )
+    }
+
     static func loadMetadata(for url: URL) async throws -> AudioFileMetadata {
         async let duration = loadDuration(for: url)
         async let fileSize = loadFileSize(for: url)
@@ -27,6 +36,10 @@ enum AudioFileMetadataLoader {
     }
 
     private static func loadFileSize(for url: URL) async throws -> Int64? {
+        try loadFileSizeSynchronously(for: url)
+    }
+
+    private static func loadFileSizeSynchronously(for url: URL) throws -> Int64? {
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         return attributes[.size] as? Int64
     }

@@ -3,6 +3,29 @@ import Foundation
 
 @MainActor
 final class AudioPlaybackController {
+    private enum PlaybackSource {
+        case decoded(DecodedAudioBuffer)
+        case file(AVAudioFile)
+
+        var frameCount: Int {
+            switch self {
+            case let .decoded(decodedAudioBuffer):
+                decodedAudioBuffer.frameCount
+            case let .file(audioFile):
+                Int(audioFile.length)
+            }
+        }
+
+        var sampleRate: Double {
+            switch self {
+            case let .decoded(decodedAudioBuffer):
+                decodedAudioBuffer.sampleRate
+            case let .file(audioFile):
+                audioFile.processingFormat.sampleRate
+            }
+        }
+    }
+
     struct Snapshot {
         let frameIndex: Int
         let frameCount: Int
@@ -40,7 +63,7 @@ final class AudioPlaybackController {
 
     private let engine = AVAudioEngine()
     private let playerNode = AVAudioPlayerNode()
-    private var decodedAudioBuffer: DecodedAudioBuffer?
+    private var playbackSource: PlaybackSource?
     private var scheduledPlaybackBuffer: AVAudioPCMBuffer?
     private var scheduledStartFrame = 0
     private var pausedFrame = 0
@@ -50,13 +73,17 @@ final class AudioPlaybackController {
         isPlayerRunning
     }
 
+    var hasSource: Bool {
+        playbackSource != nil
+    }
+
     init() {
         engine.attach(playerNode)
     }
 
     func load(_ decodedAudioBuffer: DecodedAudioBuffer) throws {
         stopEnginePlayback()
-        self.decodedAudioBuffer = decodedAudioBuffer
+        playbackSource = .decoded(decodedAudioBuffer)
         scheduledStartFrame = 0
         pausedFrame = 0
 
@@ -65,9 +92,20 @@ final class AudioPlaybackController {
         engine.connect(playerNode, to: engine.mainMixerNode, format: format)
     }
 
+    func loadFile(at url: URL) throws {
+        stopEnginePlayback()
+        let audioFile = try AVAudioFile(forReading: url)
+        playbackSource = .file(audioFile)
+        scheduledStartFrame = 0
+        pausedFrame = 0
+
+        engine.disconnectNodeOutput(playerNode)
+        engine.connect(playerNode, to: engine.mainMixerNode, format: audioFile.processingFormat)
+    }
+
     func clear() {
         stopEnginePlayback()
-        decodedAudioBuffer = nil
+        playbackSource = nil
         scheduledStartFrame = 0
         pausedFrame = 0
     }
@@ -84,23 +122,40 @@ final class AudioPlaybackController {
     }
 
     func play() throws {
-        guard let decodedAudioBuffer else {
+        guard let playbackSource else {
             throw PlaybackError.noAudioLoaded
         }
 
-        if pausedFrame >= decodedAudioBuffer.frameCount {
+        let sourceFrameCount = playbackSource.frameCount
+        if pausedFrame >= sourceFrameCount {
             pausedFrame = 0
         }
 
-        let playbackBuffer = try makePlaybackBuffer(
-            from: decodedAudioBuffer,
-            startingAt: pausedFrame
-        )
-
         scheduledStartFrame = pausedFrame
-        scheduledPlaybackBuffer = playbackBuffer
         playerNode.stop()
-        playerNode.scheduleBuffer(playbackBuffer, at: nil)
+
+        switch playbackSource {
+        case let .decoded(decodedAudioBuffer):
+            let playbackBuffer = try makePlaybackBuffer(
+                from: decodedAudioBuffer,
+                startingAt: pausedFrame
+            )
+            scheduledPlaybackBuffer = playbackBuffer
+            playerNode.scheduleBuffer(playbackBuffer, at: nil)
+        case let .file(audioFile):
+            let remainingFrameCount = sourceFrameCount - pausedFrame
+            guard remainingFrameCount > 0 else {
+                throw PlaybackError.invalidFormat
+            }
+
+            scheduledPlaybackBuffer = nil
+            playerNode.scheduleSegment(
+                audioFile,
+                startingFrame: AVAudioFramePosition(pausedFrame),
+                frameCount: AVAudioFrameCount(remainingFrameCount),
+                at: nil
+            )
+        }
 
         if !engine.isRunning {
             try engine.start()
@@ -117,16 +172,17 @@ final class AudioPlaybackController {
     }
 
     func seek(toProgress progress: Float) throws {
-        guard let decodedAudioBuffer else {
+        guard let playbackSource else {
             throw PlaybackError.noAudioLoaded
         }
 
+        let sourceFrameCount = playbackSource.frameCount
         let clampedProgress = min(max(progress, 0), 1)
         let targetFrame = min(
-            max(Int((clampedProgress * Float(decodedAudioBuffer.frameCount)).rounded(.down)), 0),
-            decodedAudioBuffer.frameCount
+            max(Int((clampedProgress * Float(sourceFrameCount)).rounded(.down)), 0),
+            sourceFrameCount
         )
-        let shouldResumePlayback = isPlayerRunning && targetFrame < decodedAudioBuffer.frameCount
+        let shouldResumePlayback = isPlayerRunning && targetFrame < sourceFrameCount
 
         playerNode.stop()
         scheduledPlaybackBuffer = nil
@@ -140,24 +196,25 @@ final class AudioPlaybackController {
     }
 
     func snapshot() -> Snapshot {
-        guard let decodedAudioBuffer else {
+        guard let playbackSource else {
             return Snapshot(frameIndex: 0, frameCount: 0, isPlaying: false)
         }
 
+        let sourceFrameCount = playbackSource.frameCount
         let frameIndex = currentFrame()
-        if isPlayerRunning, frameIndex >= decodedAudioBuffer.frameCount {
+        if isPlayerRunning, frameIndex >= sourceFrameCount {
             finishAtEnd()
         }
 
         return Snapshot(
-            frameIndex: min(frameIndex, decodedAudioBuffer.frameCount),
-            frameCount: decodedAudioBuffer.frameCount,
+            frameIndex: min(frameIndex, sourceFrameCount),
+            frameCount: sourceFrameCount,
             isPlaying: isPlayerRunning
         )
     }
 
     private func currentFrame() -> Int {
-        guard let decodedAudioBuffer else {
+        guard let playbackSource else {
             return 0
         }
         guard isPlayerRunning else {
@@ -171,13 +228,13 @@ final class AudioPlaybackController {
         }
 
         let elapsedFrames = max(Int(playerTime.sampleTime), 0)
-        return min(scheduledStartFrame + elapsedFrames, decodedAudioBuffer.frameCount)
+        return min(scheduledStartFrame + elapsedFrames, playbackSource.frameCount)
     }
 
     private func finishAtEnd() {
         playerNode.stop()
         scheduledPlaybackBuffer = nil
-        pausedFrame = decodedAudioBuffer?.frameCount ?? 0
+        pausedFrame = playbackSource?.frameCount ?? 0
         isPlayerRunning = false
     }
 

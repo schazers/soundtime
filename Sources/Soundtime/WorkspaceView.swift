@@ -10,6 +10,8 @@ final class WorkspaceView: NSView {
     private var loadedAudioSummary: String?
     private var selectedTimelineRange: TimelineSelection?
     private var currentPlayheadFrame = 0
+    private var displayedFrameCount = 0
+    private var displayedSampleRate: Double = 0
     private var currentPlaybackStatus = "idle"
     private var playbackTimer: Timer?
     private let playbackController = AudioPlaybackController()
@@ -130,6 +132,8 @@ final class WorkspaceView: NSView {
         loadedAudioSummary = nil
         selectedTimelineRange = nil
         currentPlayheadFrame = 0
+        displayedFrameCount = 0
+        displayedSampleRate = 0
         currentPlaybackStatus = "idle"
         playbackTimer?.invalidate()
         playbackTimer = nil
@@ -139,6 +143,11 @@ final class WorkspaceView: NSView {
         timelineSurface.displayPlayheadProgress(0)
         updateTimeReadout()
         metadataLabel.stringValue = "\(url.lastPathComponent) - loading..."
+
+        if WAVAudioDecoder.canDecode(url) {
+            loadDroppedWAVFile(at: url, importID: importID)
+            return
+        }
 
         Task { [weak self, importID, url] in
             do {
@@ -159,6 +168,8 @@ final class WorkspaceView: NSView {
                     self.loadedAudioSummary = nil
                     self.selectedTimelineRange = nil
                     self.currentPlayheadFrame = 0
+                    self.displayedFrameCount = 0
+                    self.displayedSampleRate = 0
                     self.currentPlaybackStatus = "idle"
                     self.playbackController.clear()
                     self.timelineSurface.displaySelection(nil)
@@ -170,6 +181,8 @@ final class WorkspaceView: NSView {
                     self.audioTimeline = AudioEditTimeline(sourceBuffer: decodedAudioBuffer)
                     self.editUndoStack.removeAll()
                     self.currentPlayheadFrame = 0
+                    self.displayedFrameCount = decodedAudioBuffer.frameCount
+                    self.displayedSampleRate = decodedAudioBuffer.sampleRate
                     try self.playbackController.load(decodedAudioBuffer)
                     self.timelineSurface.displayWaveform(waveformOverview)
                     self.timelineSurface.displayPlayheadProgress(0)
@@ -184,6 +197,8 @@ final class WorkspaceView: NSView {
                     self.loadedAudioSummary = nil
                     self.selectedTimelineRange = nil
                     self.currentPlayheadFrame = 0
+                    self.displayedFrameCount = 0
+                    self.displayedSampleRate = 0
                     self.currentPlaybackStatus = "idle"
                     self.playbackController.clear()
                     self.timelineSurface.displaySelection(nil)
@@ -204,6 +219,8 @@ final class WorkspaceView: NSView {
                 self.loadedAudioSummary = nil
                 self.selectedTimelineRange = nil
                 self.currentPlayheadFrame = 0
+                self.displayedFrameCount = 0
+                self.displayedSampleRate = 0
                 self.currentPlaybackStatus = "idle"
                 self.playbackController.clear()
                 self.timelineSurface.displaySelection(nil)
@@ -212,6 +229,102 @@ final class WorkspaceView: NSView {
                 self.updateTimeReadout()
                 self.metadataLabel.stringValue = "\(url.lastPathComponent) - could not load audio"
             }
+        }
+    }
+
+    private func loadDroppedWAVFile(at url: URL, importID: UUID) {
+        Task { [weak self, importID, url] in
+            do {
+                let previewResult = try await AudioImportPipeline.loadWAVPreview(at: url)
+
+                guard let self, self.activeImportID == importID else {
+                    return
+                }
+
+                self.applyPreview(previewResult)
+                await self.finishDecodingWAV(at: url, importID: importID)
+            } catch {
+                guard let self, self.activeImportID == importID else {
+                    return
+                }
+
+                self.selectedAudioFile = nil
+                self.decodedAudioBuffer = nil
+                self.audioTimeline = nil
+                self.editUndoStack.removeAll()
+                self.loadedAudioSummary = nil
+                self.selectedTimelineRange = nil
+                self.currentPlayheadFrame = 0
+                self.displayedFrameCount = 0
+                self.displayedSampleRate = 0
+                self.currentPlaybackStatus = "idle"
+                self.playbackController.clear()
+                self.timelineSurface.displaySelection(nil)
+                self.timelineSurface.displayPlayheadProgress(0)
+                self.timelineSurface.displayWaveform(nil)
+                self.updateTimeReadout()
+                self.metadataLabel.stringValue = "\(url.lastPathComponent) - WAV preview failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func applyPreview(_ previewResult: WAVPreviewImportResult) {
+        selectedAudioFile = previewResult.metadata
+        decodedAudioBuffer = nil
+        audioTimeline = nil
+        editUndoStack.removeAll()
+        selectedTimelineRange = nil
+        currentPlayheadFrame = 0
+        displayedFrameCount = previewResult.fileInfo.frameCount
+        displayedSampleRate = previewResult.fileInfo.sampleRate
+        window?.title = "Soundtime - \(previewResult.metadata.displayName)"
+        loadedAudioSummary = "\(previewResult.metadata.displayName) - \(previewResult.fileInfo.formattedSummary)"
+
+        timelineSurface.displayWaveform(previewResult.waveformOverview)
+        timelineSurface.displaySelection(nil)
+        timelineSurface.displayPlayheadProgress(0)
+
+        do {
+            try playbackController.loadFile(at: previewResult.metadata.url)
+            currentPlaybackStatus = "press Space to play - finishing edit decode"
+        } catch {
+            playbackController.clear()
+            currentPlaybackStatus = "preview ready - playback failed: \(error.localizedDescription)"
+        }
+
+        updateStatus(currentPlaybackStatus)
+    }
+
+    private func finishDecodingWAV(at url: URL, importID: UUID) async {
+        do {
+            let (decodedAudioBuffer, waveformOverview) = try await AudioImportPipeline.loadDecodedWAV(at: url)
+
+            guard activeImportID == importID else {
+                return
+            }
+
+            self.decodedAudioBuffer = decodedAudioBuffer
+            audioTimeline = AudioEditTimeline(sourceBuffer: decodedAudioBuffer)
+            editUndoStack.removeAll()
+            displayedFrameCount = decodedAudioBuffer.frameCount
+            displayedSampleRate = decodedAudioBuffer.sampleRate
+
+            if !playbackController.hasSource {
+                try? playbackController.load(decodedAudioBuffer)
+            }
+
+            timelineSurface.displayWaveform(waveformOverview)
+            timelineSurface.displayPlayheadProgress(playbackController.snapshot().progress)
+            updateLoadedAudioSummary(for: decodedAudioBuffer)
+            currentPlaybackStatus = playbackController.isPlaying ? "playing" : "press Space to play"
+            updateStatus(currentPlaybackStatus)
+        } catch {
+            guard activeImportID == importID else {
+                return
+            }
+
+            currentPlaybackStatus = "preview ready - edit decode failed: \(error.localizedDescription)"
+            updateStatus(currentPlaybackStatus)
         }
     }
 
@@ -266,7 +379,7 @@ final class WorkspaceView: NSView {
     }
 
     private func togglePlayback() {
-        guard let decodedAudioBuffer, decodedAudioBuffer.frameCount > 0 else {
+        guard playbackController.hasSource else {
             return
         }
 
@@ -288,7 +401,7 @@ final class WorkspaceView: NSView {
     }
 
     private func seek(to progress: Float) {
-        guard let decodedAudioBuffer, decodedAudioBuffer.frameCount > 0 else {
+        guard playbackController.hasSource else {
             return
         }
 
@@ -421,10 +534,10 @@ final class WorkspaceView: NSView {
 
         if
             let selectedTimelineRange,
-            let decodedAudioBuffer,
+            displayedDuration > 0,
             selectedTimelineRange.durationProgress > 0
         {
-            let selectedDuration = selectedTimelineRange.duration(in: decodedAudioBuffer.duration)
+            let selectedDuration = selectedTimelineRange.duration(in: displayedDuration)
             metadataLabel.stringValue = "\(loadedAudioSummary) - \(status) - selected \(formatDuration(selectedDuration))"
         } else {
             metadataLabel.stringValue = "\(loadedAudioSummary) - \(status)"
@@ -468,6 +581,8 @@ final class WorkspaceView: NSView {
 
         let renderedBuffer = audioTimeline.render()
         decodedAudioBuffer = renderedBuffer
+        displayedFrameCount = renderedBuffer.frameCount
+        displayedSampleRate = renderedBuffer.sampleRate
         timelineSurface.displaySelection(nil)
         timelineSurface.displayPlayheadProgress(0)
         playbackController.clear()
@@ -487,20 +602,28 @@ final class WorkspaceView: NSView {
     }
 
     private func updateTimeReadout() {
-        guard let decodedAudioBuffer, decodedAudioBuffer.frameCount > 0 else {
+        guard displayedFrameCount > 0, displayedSampleRate > 0 else {
             timeReadoutLabel.stringValue = "00:00.000 / 00:00.000"
             return
         }
 
         if let selectedTimelineRange, selectedTimelineRange.durationProgress > 0 {
-            let selectionStart = TimeInterval(selectedTimelineRange.startProgress) * decodedAudioBuffer.duration
-            let selectionEnd = TimeInterval(selectedTimelineRange.endProgress) * decodedAudioBuffer.duration
+            let selectionStart = TimeInterval(selectedTimelineRange.startProgress) * displayedDuration
+            let selectionEnd = TimeInterval(selectedTimelineRange.endProgress) * displayedDuration
             timeReadoutLabel.stringValue = "sel \(formatClockTime(selectionStart))-\(formatClockTime(selectionEnd))"
             return
         }
 
-        let playheadTime = Double(min(currentPlayheadFrame, decodedAudioBuffer.frameCount)) / decodedAudioBuffer.sampleRate
-        timeReadoutLabel.stringValue = "\(formatClockTime(playheadTime)) / \(formatClockTime(decodedAudioBuffer.duration))"
+        let playheadTime = Double(min(currentPlayheadFrame, displayedFrameCount)) / displayedSampleRate
+        timeReadoutLabel.stringValue = "\(formatClockTime(playheadTime)) / \(formatClockTime(displayedDuration))"
+    }
+
+    private var displayedDuration: TimeInterval {
+        guard displayedFrameCount > 0, displayedSampleRate > 0 else {
+            return 0
+        }
+
+        return Double(displayedFrameCount) / displayedSampleRate
     }
 
     private func formatClockTime(_ duration: TimeInterval) -> String {
