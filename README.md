@@ -21,6 +21,7 @@ This repository currently contains the native app shell:
 - Delete/Backspace removes the selected range non-destructively
 - Command-Z restores the previous edit timeline
 - Click the waveform to seek the playhead
+- Command-E exports the current edited timeline as WAV
 
 ## Run
 

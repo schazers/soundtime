@@ -5,6 +5,7 @@ final class TimelineView: MTKView {
     var onTogglePlayback: (() -> Void)?
     var onDeleteSelection: (() -> Void)?
     var onUndo: (() -> Void)?
+    var onExportRequested: (() -> Void)?
     var onSeekRequested: ((Float) -> Void)?
     var onSelectionChanged: ((TimelineSelection?) -> Void)?
 
@@ -131,6 +132,11 @@ final class TimelineView: MTKView {
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 6, event.modifierFlags.contains(.command) {
             onUndo?()
+            return
+        }
+
+        if event.keyCode == 14, event.modifierFlags.contains(.command) {
+            onExportRequested?()
             return
         }
 
