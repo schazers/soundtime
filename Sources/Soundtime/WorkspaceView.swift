@@ -63,6 +63,9 @@ final class WorkspaceView: NSView {
         timelineSurface.onUndo = { [weak self] in
             self?.undoLastEdit()
         }
+        timelineSurface.onSeekRequested = { [weak self] progress in
+            self?.seek(to: progress)
+        }
         timelineSurface.onSelectionChanged = { [weak self] selection in
             self?.updateSelection(selection)
         }
@@ -221,6 +224,28 @@ final class WorkspaceView: NSView {
         } catch {
             stopPlaybackTimer()
             updateStatus("playback failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func seek(to progress: Float) {
+        guard let decodedAudioBuffer, decodedAudioBuffer.frameCount > 0 else {
+            return
+        }
+
+        do {
+            try playbackController.seek(toProgress: progress)
+            refreshPlaybackProgress()
+
+            if playbackController.isPlaying {
+                startPlaybackTimer()
+                updateStatus("playing")
+            } else {
+                stopPlaybackTimer()
+                updateStatus("ready")
+            }
+        } catch {
+            stopPlaybackTimer()
+            updateStatus("seek failed: \(error.localizedDescription)")
         }
     }
 

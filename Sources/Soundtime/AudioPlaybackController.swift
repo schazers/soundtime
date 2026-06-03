@@ -116,6 +116,29 @@ final class AudioPlaybackController {
         isPlayerRunning = false
     }
 
+    func seek(toProgress progress: Float) throws {
+        guard let decodedAudioBuffer else {
+            throw PlaybackError.noAudioLoaded
+        }
+
+        let clampedProgress = min(max(progress, 0), 1)
+        let targetFrame = min(
+            max(Int((clampedProgress * Float(decodedAudioBuffer.frameCount)).rounded(.down)), 0),
+            decodedAudioBuffer.frameCount
+        )
+        let shouldResumePlayback = isPlayerRunning && targetFrame < decodedAudioBuffer.frameCount
+
+        playerNode.stop()
+        scheduledPlaybackBuffer = nil
+        scheduledStartFrame = targetFrame
+        pausedFrame = targetFrame
+        isPlayerRunning = false
+
+        if shouldResumePlayback {
+            try play()
+        }
+    }
+
     func snapshot() -> Snapshot {
         guard let decodedAudioBuffer else {
             return Snapshot(frameIndex: 0, frameCount: 0, isPlaying: false)
