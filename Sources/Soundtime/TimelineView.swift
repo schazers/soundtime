@@ -153,6 +153,14 @@ final class TimelineView: MTKView {
         super.keyDown(with: event)
     }
 
+    @objc func exportAudio(_ sender: Any?) {
+        onExportRequested?()
+    }
+
+    @objc func undoTimelineEdit(_ sender: Any?) {
+        onUndo?()
+    }
+
     override func mouseDown(with event: NSEvent) {
         guard isSelectionEnabled else {
             super.mouseDown(with: event)
