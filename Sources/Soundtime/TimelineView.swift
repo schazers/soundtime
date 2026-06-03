@@ -17,7 +17,9 @@ final class TimelineView: MTKView {
     }
 
     private var timelineRenderer: TimelineRenderer?
+    private let selectionOverlayLayer = CALayer()
     private var isSelectionEnabled = false
+    private var displayedSelection: TimelineSelection?
     private var selectionAnchorProgress: Float?
     private var selectionAnchorPoint: CGPoint?
     private var activeDragMode: TimelineDragMode?
@@ -93,7 +95,9 @@ final class TimelineView: MTKView {
     }
 
     func displaySelection(_ selection: TimelineSelection?) {
-        timelineRenderer?.displaySelection(selection)
+        timelineRenderer?.displaySelection(nil)
+        displayedSelection = selection
+        updateSelectionOverlay(flushImmediately: false)
     }
 
     func displayTrimPreview(_ trimRange: TimelineTrimRange?) {
@@ -116,8 +120,14 @@ final class TimelineView: MTKView {
         wantsLayer = true
         layer?.cornerRadius = 8
         layer?.masksToBounds = true
+        configureSelectionOverlay()
 
         registerForDraggedTypes([.fileURL])
+    }
+
+    override func layout() {
+        super.layout()
+        updateSelectionOverlay(flushImmediately: false)
     }
 
     override func viewDidChangeBackingProperties() {
@@ -159,6 +169,24 @@ final class TimelineView: MTKView {
 
     private func updatePreferredFrameRate() {
         preferredFramesPerSecond = window?.screen?.maximumFramesPerSecond ?? NSScreen.main?.maximumFramesPerSecond ?? 120
+    }
+
+    private func configureSelectionOverlay() {
+        selectionOverlayLayer.backgroundColor = NSColor(
+            calibratedRed: 0.0,
+            green: 0.84,
+            blue: 0.78,
+            alpha: 0.22
+        ).cgColor
+        selectionOverlayLayer.isHidden = true
+        selectionOverlayLayer.actions = [
+            "bounds": NSNull(),
+            "frame": NSNull(),
+            "hidden": NSNull(),
+            "position": NSNull(),
+        ]
+        selectionOverlayLayer.zPosition = 10
+        layer?.addSublayer(selectionOverlayLayer)
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
@@ -262,8 +290,8 @@ final class TimelineView: MTKView {
         }
 
         window?.makeFirstResponder(self)
-        let progress = progress(for: event)
-        let point = convert(event.locationInWindow, from: nil)
+        let point = currentDragPoint(for: event)
+        let progress = progress(for: point)
         if let trimDragMode = trimDragMode(for: point) {
             displayHoverProgress(nil)
             activeDragMode = trimDragMode
@@ -312,7 +340,7 @@ final class TimelineView: MTKView {
         }
 
         if isDraggingSelection {
-            updateSelection(from: selectionAnchorProgress, to: progress(for: point))
+            updateSelection(from: selectionAnchorProgress, to: progress(for: point), notifyChange: false)
         } else {
             displayHoverProgress(progress(for: point), isArmed: true)
         }
@@ -327,7 +355,7 @@ final class TimelineView: MTKView {
             return
         }
 
-        let progress = progress(for: event)
+        let progress = progress(for: currentDragPoint(for: event))
         if
             (activeDragMode == .trimStart || activeDragMode == .trimEnd),
             let activeDragMode
@@ -339,7 +367,7 @@ final class TimelineView: MTKView {
                 onTrimRequested?(trimRange)
             }
         } else if isDraggingSelection {
-            updateSelection(from: selectionAnchorProgress, to: progress)
+            updateSelection(from: selectionAnchorProgress, to: progress, notifyChange: true)
         } else {
             displaySelection(nil)
             onSelectionChanged?(nil)
@@ -384,7 +412,8 @@ final class TimelineView: MTKView {
             return convert(event.locationInWindow, from: nil)
         }
 
-        return convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        let windowPoint = window.convertPoint(fromScreen: NSEvent.mouseLocation)
+        return convert(windowPoint, from: nil)
     }
 
     private func progress(for point: CGPoint) -> Float {
@@ -413,16 +442,56 @@ final class TimelineView: MTKView {
         displayHoverProgress(progress(for: point))
     }
 
-    private func updateSelection(from startProgress: Float, to endProgress: Float) {
+    private func updateSelection(from startProgress: Float, to endProgress: Float, notifyChange: Bool) {
         let selection = TimelineSelection(
             startProgress: startProgress,
             endProgress: endProgress
         )
         let visibleSelection = selection.durationProgress > 0.001 ? selection : nil
 
-        displaySelection(visibleSelection)
-        draw()
-        onSelectionChanged?(visibleSelection)
+        displaySelection(visibleSelection, flushImmediately: true)
+        if notifyChange {
+            onSelectionChanged?(visibleSelection)
+        }
+    }
+
+    private func displaySelection(_ selection: TimelineSelection?, flushImmediately: Bool) {
+        timelineRenderer?.displaySelection(nil)
+        displayedSelection = selection
+        updateSelectionOverlay(flushImmediately: flushImmediately)
+    }
+
+    private func updateSelectionOverlay(flushImmediately: Bool) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+
+        defer {
+            CATransaction.commit()
+            if flushImmediately {
+                CATransaction.flush()
+            }
+        }
+
+        guard
+            let displayedSelection,
+            displayedSelection.durationProgress > 0.001,
+            bounds.width > 0,
+            bounds.height > 0
+        else {
+            selectionOverlayLayer.isHidden = true
+            selectionOverlayLayer.frame = .zero
+            return
+        }
+
+        let left = CGFloat(displayedSelection.startProgress) * bounds.width
+        let right = CGFloat(displayedSelection.endProgress) * bounds.width
+        selectionOverlayLayer.frame = CGRect(
+            x: left,
+            y: 0,
+            width: max(right - left, 0),
+            height: bounds.height
+        )
+        selectionOverlayLayer.isHidden = false
     }
 
     private func updateTrimPreview(for dragMode: TimelineDragMode, progress: Float) {
