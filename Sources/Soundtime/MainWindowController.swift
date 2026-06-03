@@ -1,10 +1,9 @@
 import AppKit
 
 final class MainWindowController: NSWindowController {
-    private static let fallbackContentSize = NSSize(width: 1200, height: 600)
-    private static let launchAspectRatio: CGFloat = 2
-    private static let launchScreenAreaFraction: CGFloat = 0.5
-    private static let minimumLaunchWidth: CGFloat = 1120
+    private static let fallbackContentSize = NSSize(width: 1104, height: 460)
+    private static let launchAspectRatio: CGFloat = 2.4
+    private static let launchScreenAreaFraction: CGFloat = 0.245
     private static let screenInset: CGFloat = 48
 
     convenience init() {
@@ -59,8 +58,11 @@ final class MainWindowController: NSWindowController {
             launchWidth = launchHeight * launchAspectRatio
         }
 
-        launchWidth = min(max(launchWidth, min(minimumLaunchWidth, maximumWidth)), maximumWidth)
-        launchHeight = min(launchWidth / launchAspectRatio, maximumHeight)
+        let minimumWidthForAspect = max(windowMinWidth, windowMinHeight * launchAspectRatio)
+        if launchWidth < minimumWidthForAspect, minimumWidthForAspect <= maximumWidth {
+            launchWidth = minimumWidthForAspect
+            launchHeight = launchWidth / launchAspectRatio
+        }
 
         let launchSize = NSSize(width: launchWidth, height: launchHeight)
         return NSRect(
