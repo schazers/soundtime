@@ -3,6 +3,7 @@ import MetalKit
 final class TimelineView: MTKView {
     var onAudioFileDropped: ((URL) -> Void)?
     var onTogglePlayback: (() -> Void)?
+    var onDeleteSelection: (() -> Void)?
     var onSelectionChanged: ((TimelineSelection?) -> Void)?
 
     private var timelineRenderer: TimelineRenderer?
@@ -43,10 +44,10 @@ final class TimelineView: MTKView {
     }
 
     func displayWaveform(_ waveformOverview: WaveformOverview?) {
-        isSelectionEnabled = waveformOverview != nil
+        isSelectionEnabled = waveformOverview?.isEmpty == false
         timelineRenderer?.displayWaveform(waveformOverview)
 
-        if waveformOverview == nil {
+        if !isSelectionEnabled {
             selectionAnchorProgress = nil
             displaySelection(nil)
             onSelectionChanged?(nil)
@@ -123,6 +124,11 @@ final class TimelineView: MTKView {
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 49 {
             onTogglePlayback?()
+            return
+        }
+
+        if event.keyCode == 51 || event.keyCode == 117 {
+            onDeleteSelection?()
             return
         }
 
