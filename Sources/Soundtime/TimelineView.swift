@@ -8,13 +8,23 @@ final class TimelineView: MTKView {
     var onExportRequested: (() -> Void)?
     var onSeekRequested: ((Float) -> Void)?
     var onSelectionChanged: ((TimelineSelection?) -> Void)?
+    var onTrimRequested: ((TimelineTrimRange) -> Void)?
+
+    private enum TimelineDragMode {
+        case selection
+        case trimStart
+        case trimEnd
+    }
 
     private var timelineRenderer: TimelineRenderer?
     private var isSelectionEnabled = false
     private var selectionAnchorProgress: Float?
     private var selectionAnchorPoint: CGPoint?
+    private var activeDragMode: TimelineDragMode?
     private var isDraggingSelection = false
+    private var isDraggingTrim = false
     private let selectionDragThreshold: CGFloat = 3
+    private let trimHandleHitWidth: CGFloat = 18
     private let supportedAudioExtensions: Set<String> = [
         "aif",
         "aiff",
@@ -50,13 +60,21 @@ final class TimelineView: MTKView {
     }
 
     func displayWaveform(_ waveformOverview: WaveformOverview?) {
+        let wasSelectionEnabled = isSelectionEnabled
         isSelectionEnabled = waveformOverview?.isEmpty == false
         timelineRenderer?.displayWaveform(waveformOverview)
+        displayTrimPreview(nil)
+
+        if wasSelectionEnabled != isSelectionEnabled {
+            window?.invalidateCursorRects(for: self)
+        }
 
         if !isSelectionEnabled {
             selectionAnchorProgress = nil
             selectionAnchorPoint = nil
+            activeDragMode = nil
             isDraggingSelection = false
+            isDraggingTrim = false
             displaySelection(nil)
             onSelectionChanged?(nil)
         }
@@ -68,6 +86,10 @@ final class TimelineView: MTKView {
 
     func displaySelection(_ selection: TimelineSelection?) {
         timelineRenderer?.displaySelection(selection)
+    }
+
+    func displayTrimPreview(_ trimRange: TimelineTrimRange?) {
+        timelineRenderer?.displayTrimPreview(trimRange)
     }
 
     private func configure() {
@@ -153,6 +175,28 @@ final class TimelineView: MTKView {
         super.keyDown(with: event)
     }
 
+    override func resetCursorRects() {
+        super.resetCursorRects()
+
+        guard isSelectionEnabled, bounds.width > 0, bounds.height > 0 else {
+            return
+        }
+
+        addCursorRect(
+            NSRect(x: 0, y: 0, width: trimHandleHitWidth, height: bounds.height),
+            cursor: .resizeLeftRight
+        )
+        addCursorRect(
+            NSRect(
+                x: max(bounds.width - trimHandleHitWidth, 0),
+                y: 0,
+                width: trimHandleHitWidth,
+                height: bounds.height
+            ),
+            cursor: .resizeLeftRight
+        )
+    }
+
     @objc func exportAudio(_ sender: Any?) {
         onExportRequested?()
     }
@@ -169,9 +213,23 @@ final class TimelineView: MTKView {
 
         window?.makeFirstResponder(self)
         let progress = progress(for: event)
+        let point = convert(event.locationInWindow, from: nil)
+        if let trimDragMode = trimDragMode(for: point) {
+            activeDragMode = trimDragMode
+            selectionAnchorProgress = progress
+            selectionAnchorPoint = point
+            isDraggingSelection = false
+            isDraggingTrim = false
+            displaySelection(nil)
+            onSelectionChanged?(nil)
+            return
+        }
+
+        activeDragMode = .selection
         selectionAnchorProgress = progress
-        selectionAnchorPoint = convert(event.locationInWindow, from: nil)
+        selectionAnchorPoint = point
         isDraggingSelection = false
+        isDraggingTrim = false
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -184,6 +242,17 @@ final class TimelineView: MTKView {
         }
 
         let point = convert(event.locationInWindow, from: nil)
+        if activeDragMode == .trimStart || activeDragMode == .trimEnd {
+            if !isDraggingTrim, didMovePastSelectionThreshold(to: point) {
+                isDraggingTrim = true
+            }
+
+            if isDraggingTrim, let activeDragMode {
+                updateTrimPreview(for: activeDragMode, progress: progress(for: event))
+            }
+            return
+        }
+
         if !isDraggingSelection, didMovePastSelectionThreshold(to: point) {
             isDraggingSelection = true
         }
@@ -203,7 +272,17 @@ final class TimelineView: MTKView {
         }
 
         let progress = progress(for: event)
-        if isDraggingSelection {
+        if
+            (activeDragMode == .trimStart || activeDragMode == .trimEnd),
+            let activeDragMode
+        {
+            let trimRange = trimRange(for: activeDragMode, progress: progress)
+            displayTrimPreview(nil)
+
+            if isDraggingTrim, trimRange.trimsAudio, trimRange.durationProgress > 0.001 {
+                onTrimRequested?(trimRange)
+            }
+        } else if isDraggingSelection {
             updateSelection(from: selectionAnchorProgress, to: progress)
         } else {
             displaySelection(nil)
@@ -213,7 +292,9 @@ final class TimelineView: MTKView {
 
         self.selectionAnchorProgress = nil
         selectionAnchorPoint = nil
+        activeDragMode = nil
         isDraggingSelection = false
+        isDraggingTrim = false
     }
 
     private func firstSupportedAudioURL(from pasteboard: NSPasteboard) -> URL? {
@@ -255,6 +336,37 @@ final class TimelineView: MTKView {
 
         displaySelection(visibleSelection)
         onSelectionChanged?(visibleSelection)
+    }
+
+    private func updateTrimPreview(for dragMode: TimelineDragMode, progress: Float) {
+        displayTrimPreview(trimRange(for: dragMode, progress: progress))
+    }
+
+    private func trimRange(for dragMode: TimelineDragMode, progress: Float) -> TimelineTrimRange {
+        switch dragMode {
+        case .trimStart:
+            TimelineTrimRange(startProgress: min(max(progress, 0), 0.999), endProgress: 1)
+        case .trimEnd:
+            TimelineTrimRange(startProgress: 0, endProgress: max(min(progress, 1), 0.001))
+        case .selection:
+            TimelineTrimRange(startProgress: 0, endProgress: 1)
+        }
+    }
+
+    private func trimDragMode(for point: CGPoint) -> TimelineDragMode? {
+        guard bounds.width > 0 else {
+            return nil
+        }
+
+        if point.x <= trimHandleHitWidth {
+            return .trimStart
+        }
+
+        if point.x >= bounds.width - trimHandleHitWidth {
+            return .trimEnd
+        }
+
+        return nil
     }
 
     private func didMovePastSelectionThreshold(to point: CGPoint) -> Bool {

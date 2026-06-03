@@ -87,6 +87,9 @@ final class WorkspaceView: NSView {
         timelineSurface.onSelectionChanged = { [weak self] selection in
             self?.updateSelection(selection)
         }
+        timelineSurface.onTrimRequested = { [weak self] trimRange in
+            self?.trimTimeline(to: trimRange)
+        }
 
         addSubview(titleLabel)
         addSubview(metadataLabel)
@@ -231,6 +234,26 @@ final class WorkspaceView: NSView {
         editUndoStack.append(currentTimeline)
         applyTimeline(editedTimeline)
         updateStatus("deleted \(formatDuration(deletedDuration))")
+    }
+
+    private func trimTimeline(to trimRange: TimelineTrimRange) {
+        guard
+            let currentTimeline = audioTimeline,
+            trimRange.trimsAudio
+        else {
+            return
+        }
+
+        var editedTimeline = currentTimeline
+        let originalDuration = currentTimeline.duration
+        let trimmedFrameCount = editedTimeline.trim(to: trimRange)
+        guard trimmedFrameCount > 0 else {
+            return
+        }
+
+        editUndoStack.append(currentTimeline)
+        applyTimeline(editedTimeline)
+        updateStatus("trimmed \(formatDuration(originalDuration - editedTimeline.duration))")
     }
 
     private func undoLastEdit() {
