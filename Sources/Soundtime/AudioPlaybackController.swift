@@ -45,7 +45,6 @@ final class AudioPlaybackController {
     private var scheduledStartFrame = 0
     private var pausedFrame = 0
     private var isPlayerRunning = false
-    private var playbackGeneration = 0
 
     var isPlaying: Bool {
         isPlayerRunning
@@ -98,24 +97,10 @@ final class AudioPlaybackController {
             startingAt: pausedFrame
         )
 
-        playbackGeneration += 1
-        let generation = playbackGeneration
         scheduledStartFrame = pausedFrame
         scheduledPlaybackBuffer = playbackBuffer
         playerNode.stop()
-        playerNode.scheduleBuffer(playbackBuffer, at: nil) { [weak self] in
-            Task { @MainActor in
-                guard
-                    let self,
-                    self.playbackGeneration == generation,
-                    self.isPlayerRunning
-                else {
-                    return
-                }
-
-                self.finishAtEnd()
-            }
-        }
+        playerNode.scheduleBuffer(playbackBuffer, at: nil)
 
         if !engine.isRunning {
             try engine.start()
@@ -127,7 +112,6 @@ final class AudioPlaybackController {
 
     func pause() {
         pausedFrame = currentFrame()
-        playbackGeneration += 1
         playerNode.pause()
         isPlayerRunning = false
     }
@@ -175,7 +159,6 @@ final class AudioPlaybackController {
     }
 
     private func stopEnginePlayback() {
-        playbackGeneration += 1
         playerNode.stop()
         scheduledPlaybackBuffer = nil
         isPlayerRunning = false
