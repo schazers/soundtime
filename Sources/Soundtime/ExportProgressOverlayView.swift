@@ -22,7 +22,7 @@ final class ExportProgressOverlayView: NSView {
         let label = NSTextField(labelWithString: "Exporting...")
         label.font = .systemFont(ofSize: 15, weight: .semibold)
         label.alignment = .center
-        label.textColor = .labelColor
+        label.textColor = .white
         label.translatesAutoresizingMaskIntoConstraints = false
         return label
     }()
@@ -182,7 +182,7 @@ private final class ExportProgressBarView: NSView {
         translatesAutoresizingMaskIntoConstraints = false
 
         trackLayer.backgroundColor = NSColor.controlBackgroundColor.cgColor
-        fillLayer.backgroundColor = NSColor.systemTeal.cgColor
+        fillLayer.backgroundColor = NSColor.white.cgColor
 
         layer?.addSublayer(trackLayer)
         trackLayer.addSublayer(fillLayer)
