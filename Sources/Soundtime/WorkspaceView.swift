@@ -1,10 +1,22 @@
 import AppKit
 
 final class WorkspaceView: NSView {
+    private var activeImportID = UUID()
+    private var selectedAudioFile: AudioFileMetadata?
+
     private let titleLabel: NSTextField = {
         let label = NSTextField(labelWithString: "Soundtime")
         label.font = .systemFont(ofSize: 16, weight: .semibold)
         label.textColor = NSColor.labelColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+        return label
+    }()
+
+    private let metadataLabel: NSTextField = {
+        let label = NSTextField(labelWithString: "Drop audio here")
+        label.font = .systemFont(ofSize: 13, weight: .regular)
+        label.textColor = NSColor.secondaryLabelColor
+        label.lineBreakMode = .byTruncatingMiddle
         label.translatesAutoresizingMaskIntoConstraints = false
         return label
     }()
@@ -26,18 +38,58 @@ final class WorkspaceView: NSView {
         layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
 
         timelineSurface.translatesAutoresizingMaskIntoConstraints = false
+        timelineSurface.onAudioFileDropped = { [weak self] url in
+            self?.loadDroppedAudioFile(at: url)
+        }
 
         addSubview(titleLabel)
+        addSubview(metadataLabel)
         addSubview(timelineSurface)
 
         NSLayoutConstraint.activate([
             titleLabel.topAnchor.constraint(equalTo: topAnchor, constant: 18),
             titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 22),
 
+            metadataLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
+            metadataLabel.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 14),
+            metadataLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -22),
+
             timelineSurface.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 18),
             timelineSurface.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 22),
             timelineSurface.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -22),
             timelineSurface.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -22),
         ])
+    }
+
+    private func loadDroppedAudioFile(at url: URL) {
+        let importID = UUID()
+        activeImportID = importID
+        selectedAudioFile = nil
+        metadataLabel.stringValue = "\(url.lastPathComponent) - loading..."
+
+        Task { [weak self] in
+            do {
+                let metadata = try await AudioFileMetadataLoader.loadMetadata(for: url)
+
+                await MainActor.run {
+                    guard let self, self.activeImportID == importID else {
+                        return
+                    }
+
+                    self.selectedAudioFile = metadata
+                    self.metadataLabel.stringValue = metadata.formattedSummary
+                    self.window?.title = "Soundtime - \(metadata.displayName)"
+                }
+            } catch {
+                await MainActor.run {
+                    guard let self, self.activeImportID == importID else {
+                        return
+                    }
+
+                    self.selectedAudioFile = nil
+                    self.metadataLabel.stringValue = "\(url.lastPathComponent) - could not read metadata"
+                }
+            }
+        }
     }
 }

@@ -14,6 +14,7 @@ let package = Package(
         .executableTarget(
             name: "Soundtime",
             linkerSettings: [
+                .linkedFramework("AVFoundation"),
                 .linkedFramework("Metal"),
                 .linkedFramework("MetalKit"),
             ]

@@ -13,6 +13,7 @@ This repository currently contains the native app shell:
 - Swift Package-based macOS executable
 - AppKit window titled `Soundtime`
 - Metal-backed timeline workspace with a static grid and playhead
+- Single-file audio drag and drop with lightweight filename, duration, and size metadata
 
 ## Run
 
