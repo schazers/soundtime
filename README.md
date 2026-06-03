@@ -12,7 +12,7 @@ This repository currently contains the native app shell:
 
 - Swift Package-based macOS executable
 - AppKit window titled `Soundtime`
-- Blank timeline workspace ready for the Metal renderer
+- Metal-backed timeline workspace with a static grid and playhead
 
 ## Run
 

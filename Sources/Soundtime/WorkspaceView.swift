@@ -9,7 +9,7 @@ final class WorkspaceView: NSView {
         return label
     }()
 
-    private let timelineSurface = TimelinePlaceholderView()
+    private let timelineSurface = TimelineView()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)

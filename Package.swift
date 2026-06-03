@@ -12,7 +12,11 @@ let package = Package(
     ],
     targets: [
         .executableTarget(
-            name: "Soundtime"
+            name: "Soundtime",
+            linkerSettings: [
+                .linkedFramework("Metal"),
+                .linkedFramework("MetalKit"),
+            ]
         ),
     ]
 )
