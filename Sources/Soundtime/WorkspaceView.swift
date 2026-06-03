@@ -63,7 +63,7 @@ final class WorkspaceView: NSView {
 
     private func configure() {
         wantsLayer = true
-        layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        layer?.backgroundColor = SoundtimeColors.windowBackground.cgColor
 
         timelineSurface.translatesAutoresizingMaskIntoConstraints = false
         timelineSurface.onAudioFileDropped = { [weak self] url in
@@ -98,8 +98,8 @@ final class WorkspaceView: NSView {
         addSubview(exportProgressOverlay)
 
         NSLayoutConstraint.activate([
-            titleLabel.topAnchor.constraint(equalTo: topAnchor, constant: 18),
-            titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 22),
+            titleLabel.topAnchor.constraint(equalTo: topAnchor, constant: 17),
+            titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 84),
 
             metadataLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
             metadataLabel.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 14),

@@ -11,6 +11,13 @@ final class MainWindowController: NSWindowController {
         )
 
         window.title = "Soundtime"
+        window.styleMask.insert(.fullSizeContentView)
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.titlebarSeparatorStyle = .none
+        window.backgroundColor = SoundtimeColors.windowBackground
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.isMovableByWindowBackground = true
         window.minSize = NSSize(width: 760, height: 460)
         window.contentViewController = contentViewController
         window.center()
