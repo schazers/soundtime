@@ -15,6 +15,17 @@ final class WorkspaceView: NSView {
     private var currentPlaybackStatus = "idle"
     private var playbackTimer: Timer?
     private let playbackController = AudioPlaybackController()
+    private let wavPreviewLevels = [
+        WAVPreviewLevel(targetBinCount: 512, samplesPerBin: 8),
+        WAVPreviewLevel(targetBinCount: 1_024, samplesPerBin: 8),
+        WAVPreviewLevel(targetBinCount: 2_048, samplesPerBin: 10),
+        WAVPreviewLevel(targetBinCount: 4_096, samplesPerBin: 12),
+    ]
+
+    private struct WAVPreviewLevel {
+        let targetBinCount: Int
+        let samplesPerBin: Int
+    }
 
     private let titleLabel: NSTextField = {
         let label = NSTextField(labelWithString: "Soundtime")
@@ -233,16 +244,68 @@ final class WorkspaceView: NSView {
     }
 
     private func loadDroppedWAVFile(at url: URL, importID: UUID) {
-        Task { [weak self, importID, url] in
+        let wavPreviewLevels = wavPreviewLevels
+
+        Task { [weak self, importID, url, wavPreviewLevels] in
             do {
-                let previewResult = try await AudioImportPipeline.loadWAVPreview(at: url)
+                guard let initialPreviewLevel = wavPreviewLevels.first else {
+                    return
+                }
+
+                let previewResult = try await AudioImportPipeline.loadWAVPreview(
+                    at: url,
+                    targetBinCount: initialPreviewLevel.targetBinCount,
+                    samplesPerBin: initialPreviewLevel.samplesPerBin
+                )
 
                 guard let self, self.activeImportID == importID else {
                     return
                 }
 
                 self.applyPreview(previewResult)
-                await self.finishDecodingWAV(at: url, importID: importID)
+                async let decodedWAV = AudioImportPipeline.loadDecodedWAV(at: url)
+
+                for previewLevel in wavPreviewLevels.dropFirst() {
+                    guard self.activeImportID == importID else {
+                        return
+                    }
+
+                    do {
+                        let refinedPreview = try await AudioImportPipeline.loadWAVPreview(
+                            at: url,
+                            targetBinCount: previewLevel.targetBinCount,
+                            samplesPerBin: previewLevel.samplesPerBin
+                        )
+
+                        guard self.activeImportID == importID else {
+                            return
+                        }
+
+                        self.applyPreviewRefinement(refinedPreview)
+                    } catch {
+                        break
+                    }
+                }
+
+                do {
+                    let (decodedAudioBuffer, waveformOverview) = try await decodedWAV
+
+                    guard self.activeImportID == importID else {
+                        return
+                    }
+
+                    self.applyDecodedWAV(
+                        decodedAudioBuffer: decodedAudioBuffer,
+                        waveformOverview: waveformOverview
+                    )
+                } catch {
+                    guard self.activeImportID == importID else {
+                        return
+                    }
+
+                    self.currentPlaybackStatus = "preview ready - edit decode failed: \(error.localizedDescription)"
+                    self.updateStatus(self.currentPlaybackStatus)
+                }
             } catch {
                 guard let self, self.activeImportID == importID else {
                     return
@@ -286,7 +349,7 @@ final class WorkspaceView: NSView {
 
         do {
             try playbackController.loadFile(at: previewResult.metadata.url)
-            currentPlaybackStatus = "press Space to play - finishing edit decode"
+            currentPlaybackStatus = "press Space to play - resolving waveform"
         } catch {
             playbackController.clear()
             currentPlaybackStatus = "preview ready - playback failed: \(error.localizedDescription)"
@@ -295,37 +358,34 @@ final class WorkspaceView: NSView {
         updateStatus(currentPlaybackStatus)
     }
 
-    private func finishDecodingWAV(at url: URL, importID: UUID) async {
-        do {
-            let (decodedAudioBuffer, waveformOverview) = try await AudioImportPipeline.loadDecodedWAV(at: url)
-
-            guard activeImportID == importID else {
-                return
-            }
-
-            self.decodedAudioBuffer = decodedAudioBuffer
-            audioTimeline = AudioEditTimeline(sourceBuffer: decodedAudioBuffer)
-            editUndoStack.removeAll()
-            displayedFrameCount = decodedAudioBuffer.frameCount
-            displayedSampleRate = decodedAudioBuffer.sampleRate
-
-            if !playbackController.hasSource {
-                try? playbackController.load(decodedAudioBuffer)
-            }
-
-            timelineSurface.displayWaveform(waveformOverview)
-            timelineSurface.displayPlayheadProgress(playbackController.snapshot().progress)
-            updateLoadedAudioSummary(for: decodedAudioBuffer)
-            currentPlaybackStatus = playbackController.isPlaying ? "playing" : "press Space to play"
-            updateStatus(currentPlaybackStatus)
-        } catch {
-            guard activeImportID == importID else {
-                return
-            }
-
-            currentPlaybackStatus = "preview ready - edit decode failed: \(error.localizedDescription)"
-            updateStatus(currentPlaybackStatus)
+    private func applyPreviewRefinement(_ previewResult: WAVPreviewImportResult) {
+        guard decodedAudioBuffer == nil else {
+            return
         }
+
+        displayedFrameCount = previewResult.fileInfo.frameCount
+        displayedSampleRate = previewResult.fileInfo.sampleRate
+        timelineSurface.displayWaveform(previewResult.waveformOverview)
+        timelineSurface.displayPlayheadProgress(playbackController.snapshot().progress)
+        updateTimeReadout()
+    }
+
+    private func applyDecodedWAV(decodedAudioBuffer: DecodedAudioBuffer, waveformOverview: WaveformOverview) {
+        self.decodedAudioBuffer = decodedAudioBuffer
+        audioTimeline = AudioEditTimeline(sourceBuffer: decodedAudioBuffer)
+        editUndoStack.removeAll()
+        displayedFrameCount = decodedAudioBuffer.frameCount
+        displayedSampleRate = decodedAudioBuffer.sampleRate
+
+        if !playbackController.hasSource {
+            try? playbackController.load(decodedAudioBuffer)
+        }
+
+        timelineSurface.displayWaveform(waveformOverview)
+        timelineSurface.displayPlayheadProgress(playbackController.snapshot().progress)
+        updateLoadedAudioSummary(for: decodedAudioBuffer)
+        currentPlaybackStatus = playbackController.isPlaying ? "playing" : "press Space to play"
+        updateStatus(currentPlaybackStatus)
     }
 
     private func deleteSelection() {
