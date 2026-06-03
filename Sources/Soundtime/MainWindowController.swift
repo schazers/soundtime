@@ -1,0 +1,20 @@
+import AppKit
+
+final class MainWindowController: NSWindowController {
+    convenience init() {
+        let contentViewController = WorkspaceViewController()
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1120, height: 680),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+
+        window.title = "Soundtime"
+        window.minSize = NSSize(width: 760, height: 460)
+        window.contentViewController = contentViewController
+        window.center()
+
+        self.init(window: window)
+    }
+}
