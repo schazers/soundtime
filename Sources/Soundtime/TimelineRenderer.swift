@@ -20,6 +20,7 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
     private var waveformOverview: WaveformOverview?
     private var playheadProgress: Float = 0
     private var selection: TimelineSelection?
+    private var trimPreview: TimelineTrimRange?
 
     init(device: MTLDevice, pixelFormat: MTLPixelFormat) throws {
         guard let commandQueue = device.makeCommandQueue() else {
@@ -67,6 +68,10 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         self.selection = selection
     }
 
+    func displayTrimPreview(_ trimPreview: TimelineTrimRange?) {
+        self.trimPreview = trimPreview
+    }
+
     func draw(in view: MTKView) {
         guard
             let renderPassDescriptor = view.currentRenderPassDescriptor,
@@ -85,12 +90,17 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
             drawableSize: drawableSize,
             backingScale: backingScale
         )
+        let trimPreviewVertices = makeTrimPreviewVertices(
+            drawableSize: drawableSize,
+            backingScale: backingScale
+        )
         let playheadVertices = makePlayheadVertices(drawableSize: drawableSize, backingScale: backingScale)
 
         encoder.setRenderPipelineState(pipelineState)
         draw(vertices: gridVertices, primitiveType: .line, encoder: encoder)
         draw(vertices: selectionVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: waveformVertices, primitiveType: .triangle, encoder: encoder)
+        draw(vertices: trimPreviewVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: playheadVertices, primitiveType: .triangle, encoder: encoder)
         encoder.endEncoding()
 
@@ -246,6 +256,68 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         return vertices
     }
 
+    private func makeTrimPreviewVertices(drawableSize: CGSize, backingScale: Float) -> [TimelineVertex] {
+        guard let waveformOverview, !waveformOverview.isEmpty else {
+            return []
+        }
+
+        let width = Float(drawableSize.width)
+        let height = Float(drawableSize.height)
+        guard width > 0, height > 0 else {
+            return []
+        }
+
+        let trimRange = trimPreview ?? TimelineTrimRange(startProgress: 0, endProgress: 1)
+        let startX = trimRange.startProgress * width
+        let endX = trimRange.endProgress * width
+        let size = SIMD2<Float>(width, height)
+        var vertices: [TimelineVertex] = []
+        vertices.reserveCapacity(36)
+
+        if trimRange.startProgress > 0.001 {
+            appendRectangle(
+                to: &vertices,
+                left: 0,
+                right: startX,
+                top: 0,
+                bottom: height,
+                color: SIMD4<Float>(0.0, 0.0, 0.0, 0.46),
+                drawableSize: size
+            )
+        }
+
+        if trimRange.endProgress < 0.999 {
+            appendRectangle(
+                to: &vertices,
+                left: endX,
+                right: width,
+                top: 0,
+                bottom: height,
+                color: SIMD4<Float>(0.0, 0.0, 0.0, 0.46),
+                drawableSize: size
+            )
+        }
+
+        appendTrimHandle(
+            to: &vertices,
+            x: startX,
+            direction: .leading,
+            color: SIMD4<Float>(1.0, 1.0, 1.0, 0.95),
+            drawableSize: size,
+            backingScale: backingScale
+        )
+        appendTrimHandle(
+            to: &vertices,
+            x: endX,
+            direction: .trailing,
+            color: SIMD4<Float>(1.0, 1.0, 1.0, 0.95),
+            drawableSize: size,
+            backingScale: backingScale
+        )
+
+        return vertices
+    }
+
     private func makePlayheadVertices(drawableSize: CGSize, backingScale: Float) -> [TimelineVertex] {
         let width = Float(drawableSize.width)
         let height = Float(drawableSize.height)
@@ -322,6 +394,69 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         vertices.append(topRight)
         vertices.append(bottomRight)
         vertices.append(bottomLeft)
+    }
+
+    private enum TrimHandleDirection {
+        case leading
+        case trailing
+    }
+
+    private func appendTrimHandle(
+        to vertices: inout [TimelineVertex],
+        x: Float,
+        direction: TrimHandleDirection,
+        color: SIMD4<Float>,
+        drawableSize: SIMD2<Float>,
+        backingScale: Float
+    ) {
+        let width = drawableSize.x
+        let height = drawableSize.y
+        let lineWidth = max(2 * backingScale, 1)
+        let gripWidth = max(12 * backingScale, 8)
+        let gripHeight = max(18 * backingScale, 12)
+        let clampedX = min(max(x, 0), width)
+        let lineLeft = min(max(clampedX - lineWidth * 0.5, 0), width)
+        let lineRight = min(lineLeft + lineWidth, width)
+
+        appendRectangle(
+            to: &vertices,
+            left: lineLeft,
+            right: lineRight,
+            top: 0,
+            bottom: height,
+            color: color,
+            drawableSize: drawableSize
+        )
+
+        let gripLeft: Float
+        let gripRight: Float
+        switch direction {
+        case .leading:
+            gripLeft = min(max(clampedX, 0), width)
+            gripRight = min(gripLeft + gripWidth, width)
+        case .trailing:
+            gripRight = min(max(clampedX, 0), width)
+            gripLeft = max(gripRight - gripWidth, 0)
+        }
+
+        appendRectangle(
+            to: &vertices,
+            left: gripLeft,
+            right: gripRight,
+            top: 0,
+            bottom: gripHeight,
+            color: color,
+            drawableSize: drawableSize
+        )
+        appendRectangle(
+            to: &vertices,
+            left: gripLeft,
+            right: gripRight,
+            top: max(height - gripHeight, 0),
+            bottom: height,
+            color: color,
+            drawableSize: drawableSize
+        )
     }
 
     private func makeVertex(
