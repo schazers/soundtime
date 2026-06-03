@@ -38,6 +38,10 @@ final class TimelineView: MTKView {
         window?.makeFirstResponder(self)
     }
 
+    func displayWaveform(_ waveformOverview: WaveformOverview?) {
+        timelineRenderer?.displayWaveform(waveformOverview)
+    }
+
     private func configure() {
         colorPixelFormat = .bgra8Unorm
         clearColor = MTLClearColor(red: 0.08, green: 0.08, blue: 0.08, alpha: 1.0)

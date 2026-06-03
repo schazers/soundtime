@@ -3,7 +3,7 @@ import Foundation
 struct AudioImportResult: Sendable {
     enum DecodeStatus: Sendable {
         case unsupported
-        case decoded(DecodedAudioBuffer)
+        case decoded(DecodedAudioBuffer, WaveformOverview)
         case failed(String)
     }
 
@@ -22,9 +22,10 @@ enum AudioImportPipeline {
 
             do {
                 let decodedAudioBuffer = try WAVAudioDecoder.decode(url: url)
+                let waveformOverview = WaveformOverviewBuilder.build(from: decodedAudioBuffer)
                 return AudioImportResult(
                     metadata: metadata,
-                    decodeStatus: .decoded(decodedAudioBuffer)
+                    decodeStatus: .decoded(decodedAudioBuffer, waveformOverview)
                 )
             } catch {
                 return AudioImportResult(

@@ -67,6 +67,7 @@ final class WorkspaceView: NSView {
         activeImportID = importID
         selectedAudioFile = nil
         decodedAudioBuffer = nil
+        timelineSurface.displayWaveform(nil)
         metadataLabel.stringValue = "\(url.lastPathComponent) - loading..."
 
         Task { [weak self, importID, url] in
@@ -84,11 +85,13 @@ final class WorkspaceView: NSView {
                 case .unsupported:
                     self.decodedAudioBuffer = nil
                     self.metadataLabel.stringValue = "\(result.metadata.formattedSummary) - WAV decode not available yet"
-                case let .decoded(decodedAudioBuffer):
+                case let .decoded(decodedAudioBuffer, waveformOverview):
                     self.decodedAudioBuffer = decodedAudioBuffer
+                    self.timelineSurface.displayWaveform(waveformOverview)
                     self.metadataLabel.stringValue = "\(result.metadata.displayName) - \(decodedAudioBuffer.formattedSummary)"
                 case let .failed(message):
                     self.decodedAudioBuffer = nil
+                    self.timelineSurface.displayWaveform(nil)
                     self.metadataLabel.stringValue = "\(result.metadata.formattedSummary) - WAV decode failed: \(message)"
                 }
             } catch {
@@ -98,6 +101,7 @@ final class WorkspaceView: NSView {
 
                 self.selectedAudioFile = nil
                 self.decodedAudioBuffer = nil
+                self.timelineSurface.displayWaveform(nil)
                 self.metadataLabel.stringValue = "\(url.lastPathComponent) - could not load audio"
             }
         }
