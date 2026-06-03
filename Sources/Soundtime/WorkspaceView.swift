@@ -9,6 +9,7 @@ final class WorkspaceView: NSView {
     private var editUndoStack: [AudioEditTimeline] = []
     private var loadedAudioSummary: String?
     private var selectedTimelineRange: TimelineSelection?
+    private var currentPlayheadFrame = 0
     private var currentPlaybackStatus = "idle"
     private var playbackTimer: Timer?
     private let playbackController = AudioPlaybackController()
@@ -31,6 +32,18 @@ final class WorkspaceView: NSView {
         label.maximumNumberOfLines = 1
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         label.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        return label
+    }()
+
+    private let timeReadoutLabel: NSTextField = {
+        let label = NSTextField(labelWithString: "00:00.000 / 00:00.000")
+        label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        label.alignment = .right
+        label.textColor = NSColor.secondaryLabelColor
+        label.lineBreakMode = .byClipping
+        label.setContentCompressionResistancePriority(.required, for: .horizontal)
+        label.setContentHuggingPriority(.required, for: .horizontal)
         label.translatesAutoresizingMaskIntoConstraints = false
         return label
     }()
@@ -77,6 +90,7 @@ final class WorkspaceView: NSView {
 
         addSubview(titleLabel)
         addSubview(metadataLabel)
+        addSubview(timeReadoutLabel)
         addSubview(timelineSurface)
         addSubview(exportProgressOverlay)
 
@@ -86,7 +100,10 @@ final class WorkspaceView: NSView {
 
             metadataLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
             metadataLabel.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 14),
-            metadataLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -22),
+            metadataLabel.trailingAnchor.constraint(equalTo: timeReadoutLabel.leadingAnchor, constant: -14),
+
+            timeReadoutLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
+            timeReadoutLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -22),
 
             timelineSurface.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 18),
             timelineSurface.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 22),
@@ -109,6 +126,7 @@ final class WorkspaceView: NSView {
         editUndoStack.removeAll()
         loadedAudioSummary = nil
         selectedTimelineRange = nil
+        currentPlayheadFrame = 0
         currentPlaybackStatus = "idle"
         playbackTimer?.invalidate()
         playbackTimer = nil
@@ -116,6 +134,7 @@ final class WorkspaceView: NSView {
         timelineSurface.displayWaveform(nil)
         timelineSurface.displaySelection(nil)
         timelineSurface.displayPlayheadProgress(0)
+        updateTimeReadout()
         metadataLabel.stringValue = "\(url.lastPathComponent) - loading..."
 
         Task { [weak self, importID, url] in
@@ -136,15 +155,18 @@ final class WorkspaceView: NSView {
                     self.editUndoStack.removeAll()
                     self.loadedAudioSummary = nil
                     self.selectedTimelineRange = nil
+                    self.currentPlayheadFrame = 0
                     self.currentPlaybackStatus = "idle"
                     self.playbackController.clear()
                     self.timelineSurface.displaySelection(nil)
                     self.timelineSurface.displayPlayheadProgress(0)
+                    self.updateTimeReadout()
                     self.metadataLabel.stringValue = "\(result.metadata.formattedSummary) - WAV decode not available yet"
                 case let .decoded(decodedAudioBuffer, waveformOverview):
                     self.decodedAudioBuffer = decodedAudioBuffer
                     self.audioTimeline = AudioEditTimeline(sourceBuffer: decodedAudioBuffer)
                     self.editUndoStack.removeAll()
+                    self.currentPlayheadFrame = 0
                     try self.playbackController.load(decodedAudioBuffer)
                     self.timelineSurface.displayWaveform(waveformOverview)
                     self.timelineSurface.displayPlayheadProgress(0)
@@ -158,11 +180,13 @@ final class WorkspaceView: NSView {
                     self.editUndoStack.removeAll()
                     self.loadedAudioSummary = nil
                     self.selectedTimelineRange = nil
+                    self.currentPlayheadFrame = 0
                     self.currentPlaybackStatus = "idle"
                     self.playbackController.clear()
                     self.timelineSurface.displaySelection(nil)
                     self.timelineSurface.displayPlayheadProgress(0)
                     self.timelineSurface.displayWaveform(nil)
+                    self.updateTimeReadout()
                     self.metadataLabel.stringValue = "\(result.metadata.formattedSummary) - WAV decode failed: \(message)"
                 }
             } catch {
@@ -176,11 +200,13 @@ final class WorkspaceView: NSView {
                 self.editUndoStack.removeAll()
                 self.loadedAudioSummary = nil
                 self.selectedTimelineRange = nil
+                self.currentPlayheadFrame = 0
                 self.currentPlaybackStatus = "idle"
                 self.playbackController.clear()
                 self.timelineSurface.displaySelection(nil)
                 self.timelineSurface.displayPlayheadProgress(0)
                 self.timelineSurface.displayWaveform(nil)
+                self.updateTimeReadout()
                 self.metadataLabel.stringValue = "\(url.lastPathComponent) - could not load audio"
             }
         }
@@ -346,7 +372,9 @@ final class WorkspaceView: NSView {
 
     private func refreshPlaybackProgress() {
         let snapshot = playbackController.snapshot()
+        currentPlayheadFrame = snapshot.frameIndex
         timelineSurface.displayPlayheadProgress(snapshot.progress)
+        updateTimeReadout()
 
         if !snapshot.isPlaying {
             stopPlaybackTimer()
@@ -378,6 +406,8 @@ final class WorkspaceView: NSView {
         } else {
             metadataLabel.stringValue = "\(loadedAudioSummary) - \(status)"
         }
+
+        updateTimeReadout()
     }
 
     private func formatDuration(_ duration: TimeInterval) -> String {
@@ -410,6 +440,7 @@ final class WorkspaceView: NSView {
     private func applyTimeline(_ audioTimeline: AudioEditTimeline) {
         self.audioTimeline = audioTimeline
         selectedTimelineRange = nil
+        currentPlayheadFrame = 0
         stopPlaybackTimer()
 
         let renderedBuffer = audioTimeline.render()
@@ -429,5 +460,40 @@ final class WorkspaceView: NSView {
         let waveformOverview = WaveformOverviewBuilder.build(from: renderedBuffer)
         timelineSurface.displayWaveform(waveformOverview)
         updateLoadedAudioSummary(for: renderedBuffer)
+        updateTimeReadout()
+    }
+
+    private func updateTimeReadout() {
+        guard let decodedAudioBuffer, decodedAudioBuffer.frameCount > 0 else {
+            timeReadoutLabel.stringValue = "00:00.000 / 00:00.000"
+            return
+        }
+
+        if let selectedTimelineRange, selectedTimelineRange.durationProgress > 0 {
+            let selectionStart = TimeInterval(selectedTimelineRange.startProgress) * decodedAudioBuffer.duration
+            let selectionEnd = TimeInterval(selectedTimelineRange.endProgress) * decodedAudioBuffer.duration
+            timeReadoutLabel.stringValue = "sel \(formatClockTime(selectionStart))-\(formatClockTime(selectionEnd))"
+            return
+        }
+
+        let playheadTime = Double(min(currentPlayheadFrame, decodedAudioBuffer.frameCount)) / decodedAudioBuffer.sampleRate
+        timeReadoutLabel.stringValue = "\(formatClockTime(playheadTime)) / \(formatClockTime(decodedAudioBuffer.duration))"
+    }
+
+    private func formatClockTime(_ duration: TimeInterval) -> String {
+        let clampedDuration = max(duration, 0)
+        let totalMilliseconds = Int((clampedDuration * 1_000).rounded(.down))
+        let milliseconds = totalMilliseconds % 1_000
+        let totalSeconds = totalMilliseconds / 1_000
+        let seconds = totalSeconds % 60
+        let totalMinutes = totalSeconds / 60
+        let minutes = totalMinutes % 60
+        let hours = totalMinutes / 60
+
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d.%03d", hours, minutes, seconds, milliseconds)
+        }
+
+        return String(format: "%02d:%02d.%03d", minutes, seconds, milliseconds)
     }
 }
