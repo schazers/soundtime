@@ -38,6 +38,7 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
     private var gridCache: GridCache?
     private var dynamicVertexBuffer: MTLBuffer?
     private var playheadProgress: Float = 0
+    private var hoverProgress: Float?
     private var selection: TimelineSelection?
     private var trimPreview: TimelineTrimRange?
 
@@ -84,6 +85,10 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         playheadProgress = min(max(progress, 0), 1)
     }
 
+    func displayHoverProgress(_ progress: Float?) {
+        hoverProgress = progress.map { min(max($0, 0), 1) }
+    }
+
     func displaySelection(_ selection: TimelineSelection?) {
         self.selection = selection
     }
@@ -109,6 +114,7 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
             drawableSize: renderSize,
             backingScale: backingScale
         )
+        let hoverGuideVertices = makeHoverGuideVertices(drawableSize: renderSize, backingScale: backingScale)
         let playheadVertices = makePlayheadVertices(drawableSize: renderSize, backingScale: backingScale)
 
         encoder.setRenderPipelineState(pipelineState)
@@ -120,6 +126,7 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
             draw(cachedVertices: waveformVertices, primitiveType: .triangle, encoder: encoder)
         }
         draw(vertices: trimPreviewVertices, primitiveType: .triangle, encoder: encoder)
+        draw(vertices: hoverGuideVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: playheadVertices, primitiveType: .triangle, encoder: encoder)
         encoder.endEncoding()
 
@@ -387,6 +394,42 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
             color: SIMD4<Float>(1.0, 1.0, 1.0, 0.95),
             drawableSize: size,
             backingScale: backingScale
+        )
+
+        return vertices
+    }
+
+    private func makeHoverGuideVertices(drawableSize: CGSize, backingScale: Float) -> [TimelineVertex] {
+        guard
+            let hoverProgress,
+            waveformOverview != nil
+        else {
+            return []
+        }
+
+        let width = Float(drawableSize.width)
+        let height = Float(drawableSize.height)
+        guard width > 0, height > 0 else {
+            return []
+        }
+
+        let guideX = pixelAligned(hoverProgress * width, backingScale: backingScale)
+        let guideWidth = pixelLength(backingScale: backingScale)
+        let left = max(guideX - guideWidth * 0.5, 0)
+        let right = min(left + guideWidth, width)
+        let color = SIMD4<Float>(0.68, 0.70, 0.72, 0.36)
+        let size = SIMD2<Float>(width, height)
+        var vertices: [TimelineVertex] = []
+        vertices.reserveCapacity(6)
+
+        appendRectangle(
+            to: &vertices,
+            left: left,
+            right: right,
+            top: 0,
+            bottom: height,
+            color: color,
+            drawableSize: size
         )
 
         return vertices
