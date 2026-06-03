@@ -18,6 +18,7 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
     private let commandQueue: MTLCommandQueue
     private let pipelineState: MTLRenderPipelineState
     private var waveformOverview: WaveformOverview?
+    private var playheadProgress: Float = 0
 
     init(device: MTLDevice, pixelFormat: MTLPixelFormat) throws {
         guard let commandQueue = device.makeCommandQueue() else {
@@ -48,6 +49,10 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
 
     func displayWaveform(_ waveformOverview: WaveformOverview?) {
         self.waveformOverview = waveformOverview
+    }
+
+    func displayPlayheadProgress(_ progress: Float) {
+        playheadProgress = min(max(progress, 0), 1)
     }
 
     func draw(in view: MTKView) {
@@ -200,7 +205,12 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
             return []
         }
 
-        let playheadX = min(max(80 * backingScale, 0), width)
+        let playheadX: Float
+        if waveformOverview == nil {
+            playheadX = min(max(80 * backingScale, 0), width)
+        } else {
+            playheadX = min(max(playheadProgress * width, 0), width)
+        }
         let playheadWidth = max(2 * backingScale, 1)
         let left = max(playheadX - playheadWidth * 0.5, 0)
         let right = min(left + playheadWidth, width)
