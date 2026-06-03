@@ -63,6 +63,7 @@ final class TimelineView: MTKView {
         super.viewDidMoveToWindow()
         window?.makeFirstResponder(self)
         window?.acceptsMouseMovedEvents = true
+        updatePreferredFrameRate()
     }
 
     func displayWaveform(_ waveformOverview: WaveformOverview?) {
@@ -107,7 +108,7 @@ final class TimelineView: MTKView {
         colorPixelFormat = .bgra8Unorm
         clearColor = MTLClearColor(red: 0.08, green: 0.08, blue: 0.08, alpha: 1.0)
         framebufferOnly = true
-        preferredFramesPerSecond = 60
+        preferredFramesPerSecond = 120
         enableSetNeedsDisplay = false
         isPaused = false
         autoResizeDrawable = true
@@ -117,6 +118,11 @@ final class TimelineView: MTKView {
         layer?.masksToBounds = true
 
         registerForDraggedTypes([.fileURL])
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        updatePreferredFrameRate()
     }
 
     override func updateTrackingAreas() {
@@ -149,6 +155,10 @@ final class TimelineView: MTKView {
         } catch {
             Swift.print("Soundtime could not create the timeline renderer: \\(error)")
         }
+    }
+
+    private func updatePreferredFrameRate() {
+        preferredFramesPerSecond = window?.screen?.maximumFramesPerSecond ?? NSScreen.main?.maximumFramesPerSecond ?? 120
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
@@ -283,7 +293,7 @@ final class TimelineView: MTKView {
             return
         }
 
-        let point = convert(event.locationInWindow, from: nil)
+        let point = currentDragPoint(for: event)
         if activeDragMode == .trimStart || activeDragMode == .trimEnd {
             displayHoverProgress(nil)
             if !isDraggingTrim, didMovePastSelectionThreshold(to: point) {
@@ -291,7 +301,7 @@ final class TimelineView: MTKView {
             }
 
             if isDraggingTrim, let activeDragMode {
-                updateTrimPreview(for: activeDragMode, progress: progress(for: event))
+                updateTrimPreview(for: activeDragMode, progress: progress(for: point))
             }
             return
         }
@@ -302,9 +312,9 @@ final class TimelineView: MTKView {
         }
 
         if isDraggingSelection {
-            updateSelection(from: selectionAnchorProgress, to: progress(for: event))
+            updateSelection(from: selectionAnchorProgress, to: progress(for: point))
         } else {
-            displayHoverProgress(progress(for: event), isArmed: true)
+            displayHoverProgress(progress(for: point), isArmed: true)
         }
     }
 
@@ -369,6 +379,14 @@ final class TimelineView: MTKView {
         progress(for: convert(event.locationInWindow, from: nil))
     }
 
+    private func currentDragPoint(for event: NSEvent) -> CGPoint {
+        guard let window else {
+            return convert(event.locationInWindow, from: nil)
+        }
+
+        return convert(window.mouseLocationOutsideOfEventStream, from: nil)
+    }
+
     private func progress(for point: CGPoint) -> Float {
         guard bounds.width > 0 else {
             return 0
@@ -403,6 +421,7 @@ final class TimelineView: MTKView {
         let visibleSelection = selection.durationProgress > 0.001 ? selection : nil
 
         displaySelection(visibleSelection)
+        draw()
         onSelectionChanged?(visibleSelection)
     }
 
