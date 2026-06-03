@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 
 final class WorkspaceView: NSView {
     private var activeImportID = UUID()
@@ -62,6 +63,9 @@ final class WorkspaceView: NSView {
         }
         timelineSurface.onUndo = { [weak self] in
             self?.undoLastEdit()
+        }
+        timelineSurface.onExportRequested = { [weak self] in
+            self?.exportCurrentAudio()
         }
         timelineSurface.onSeekRequested = { [weak self] progress in
             self?.seek(to: progress)
@@ -249,6 +253,64 @@ final class WorkspaceView: NSView {
         }
     }
 
+    private func exportCurrentAudio() {
+        guard let decodedAudioBuffer, decodedAudioBuffer.frameCount > 0 else {
+            return
+        }
+
+        let savePanel = NSSavePanel()
+        savePanel.title = "Export WAV"
+        savePanel.nameFieldStringValue = suggestedExportFilename()
+        savePanel.canCreateDirectories = true
+        savePanel.isExtensionHidden = false
+        savePanel.allowedContentTypes = [.wav]
+
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self, decodedAudioBuffer] response in
+            guard
+                response == .OK,
+                let destinationURL = savePanel.url
+            else {
+                return
+            }
+
+            self?.writeExport(decodedAudioBuffer, to: destinationURL)
+        }
+
+        if let window {
+            savePanel.beginSheetModal(for: window, completionHandler: completion)
+        } else if savePanel.runModal() == .OK, let destinationURL = savePanel.url {
+            writeExport(decodedAudioBuffer, to: destinationURL)
+        }
+    }
+
+    private func writeExport(_ decodedAudioBuffer: DecodedAudioBuffer, to destinationURL: URL) {
+        updateStatus("exporting...")
+
+        Task { [weak self, decodedAudioBuffer, destinationURL] in
+            do {
+                let exportURL = destinationURL.pathExtension.isEmpty ?
+                    destinationURL.appendingPathExtension("wav") :
+                    destinationURL
+
+                try await Task.detached(priority: .userInitiated) {
+                    try WAVFileWriter.write(decodedAudioBuffer, to: exportURL)
+                }.value
+
+                guard let self else {
+                    return
+                }
+
+                self.updateStatus("exported \(exportURL.lastPathComponent)")
+            } catch {
+                guard let self else {
+                    return
+                }
+
+                self.updateStatus("export failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
     private func startPlaybackTimer() {
         playbackTimer?.invalidate()
 
@@ -323,6 +385,11 @@ final class WorkspaceView: NSView {
         } else {
             loadedAudioSummary = decodedAudioBuffer.formattedSummary
         }
+    }
+
+    private func suggestedExportFilename() -> String {
+        let baseName = selectedAudioFile?.url.deletingPathExtension().lastPathComponent ?? "Soundtime Export"
+        return "\(baseName)-edited.wav"
     }
 
     private func applyTimeline(_ audioTimeline: AudioEditTimeline) {
