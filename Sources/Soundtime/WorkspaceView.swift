@@ -4,6 +4,7 @@ final class WorkspaceView: NSView {
     private var activeImportID = UUID()
     private var selectedAudioFile: AudioFileMetadata?
     private var decodedAudioBuffer: DecodedAudioBuffer?
+    private var audioTimeline: AudioEditTimeline?
     private var loadedAudioSummary: String?
     private var selectedTimelineRange: TimelineSelection?
     private var currentPlaybackStatus = "idle"
@@ -55,6 +56,9 @@ final class WorkspaceView: NSView {
         timelineSurface.onTogglePlayback = { [weak self] in
             self?.togglePlayback()
         }
+        timelineSurface.onDeleteSelection = { [weak self] in
+            self?.deleteSelection()
+        }
         timelineSurface.onSelectionChanged = { [weak self] selection in
             self?.updateSelection(selection)
         }
@@ -83,6 +87,7 @@ final class WorkspaceView: NSView {
         activeImportID = importID
         selectedAudioFile = nil
         decodedAudioBuffer = nil
+        audioTimeline = nil
         loadedAudioSummary = nil
         selectedTimelineRange = nil
         currentPlaybackStatus = "idle"
@@ -108,6 +113,7 @@ final class WorkspaceView: NSView {
                 switch result.decodeStatus {
                 case .unsupported:
                     self.decodedAudioBuffer = nil
+                    self.audioTimeline = nil
                     self.loadedAudioSummary = nil
                     self.selectedTimelineRange = nil
                     self.currentPlaybackStatus = "idle"
@@ -117,6 +123,7 @@ final class WorkspaceView: NSView {
                     self.metadataLabel.stringValue = "\(result.metadata.formattedSummary) - WAV decode not available yet"
                 case let .decoded(decodedAudioBuffer, waveformOverview):
                     self.decodedAudioBuffer = decodedAudioBuffer
+                    self.audioTimeline = AudioEditTimeline(sourceBuffer: decodedAudioBuffer)
                     try self.playbackController.load(decodedAudioBuffer)
                     self.timelineSurface.displayWaveform(waveformOverview)
                     self.timelineSurface.displayPlayheadProgress(0)
@@ -126,6 +133,7 @@ final class WorkspaceView: NSView {
                     self.updateStatus("press Space to play")
                 case let .failed(message):
                     self.decodedAudioBuffer = nil
+                    self.audioTimeline = nil
                     self.loadedAudioSummary = nil
                     self.selectedTimelineRange = nil
                     self.currentPlaybackStatus = "idle"
@@ -142,6 +150,7 @@ final class WorkspaceView: NSView {
 
                 self.selectedAudioFile = nil
                 self.decodedAudioBuffer = nil
+                self.audioTimeline = nil
                 self.loadedAudioSummary = nil
                 self.selectedTimelineRange = nil
                 self.currentPlaybackStatus = "idle"
@@ -154,8 +163,46 @@ final class WorkspaceView: NSView {
         }
     }
 
+    private func deleteSelection() {
+        guard
+            var audioTimeline,
+            let selectedTimelineRange,
+            selectedTimelineRange.durationProgress > 0
+        else {
+            return
+        }
+
+        let deletedDuration = selectedTimelineRange.duration(in: audioTimeline.duration)
+        let deletedFrameCount = audioTimeline.delete(selectedTimelineRange)
+        guard deletedFrameCount > 0 else {
+            return
+        }
+
+        self.audioTimeline = audioTimeline
+        self.selectedTimelineRange = nil
+        stopPlaybackTimer()
+        let renderedBuffer = audioTimeline.render()
+        decodedAudioBuffer = renderedBuffer
+        timelineSurface.displaySelection(nil)
+        timelineSurface.displayPlayheadProgress(0)
+        playbackController.clear()
+
+        if renderedBuffer.frameCount > 0 {
+            do {
+                try playbackController.load(renderedBuffer)
+            } catch {
+                updateStatus("playback failed: \(error.localizedDescription)")
+            }
+        }
+
+        let waveformOverview = WaveformOverviewBuilder.build(from: renderedBuffer)
+        timelineSurface.displayWaveform(waveformOverview)
+        updateLoadedAudioSummary(for: renderedBuffer)
+        updateStatus("deleted \(formatDuration(deletedDuration))")
+    }
+
     private func togglePlayback() {
-        guard decodedAudioBuffer != nil else {
+        guard let decodedAudioBuffer, decodedAudioBuffer.frameCount > 0 else {
             return
         }
 
@@ -242,5 +289,13 @@ final class WorkspaceView: NSView {
         let minutes = Int(duration) / 60
         let seconds = Int(duration) % 60
         return String(format: "%d:%02d", minutes, seconds)
+    }
+
+    private func updateLoadedAudioSummary(for decodedAudioBuffer: DecodedAudioBuffer) {
+        if let selectedAudioFile {
+            loadedAudioSummary = "\(selectedAudioFile.displayName) - \(decodedAudioBuffer.formattedSummary)"
+        } else {
+            loadedAudioSummary = decodedAudioBuffer.formattedSummary
+        }
     }
 }
