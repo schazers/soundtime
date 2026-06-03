@@ -82,19 +82,19 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
             return
         }
 
-        let drawableSize = view.drawableSize
+        let renderSize = view.bounds.size
         let backingScale = backingScale(for: view)
-        let gridVertices = makeGridVertices(drawableSize: drawableSize, backingScale: backingScale)
-        let selectionVertices = makeSelectionVertices(drawableSize: drawableSize)
+        let gridVertices = makeGridVertices(drawableSize: renderSize, backingScale: backingScale)
+        let selectionVertices = makeSelectionVertices(drawableSize: renderSize)
         let waveformVertices = makeWaveformVertices(
-            drawableSize: drawableSize,
+            drawableSize: renderSize,
             backingScale: backingScale
         )
         let trimPreviewVertices = makeTrimPreviewVertices(
-            drawableSize: drawableSize,
+            drawableSize: renderSize,
             backingScale: backingScale
         )
-        let playheadVertices = makePlayheadVertices(drawableSize: drawableSize, backingScale: backingScale)
+        let playheadVertices = makePlayheadVertices(drawableSize: renderSize, backingScale: backingScale)
 
         encoder.setRenderPipelineState(pipelineState)
         draw(vertices: gridVertices, primitiveType: .line, encoder: encoder)
@@ -475,9 +475,19 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
 
     @MainActor
     private func backingScale(for view: MTKView) -> Float {
-        let boundsWidth = max(Float(view.bounds.width), 1)
-        let drawableWidth = max(Float(view.drawableSize.width), 1)
-        return max(drawableWidth / boundsWidth, 1)
+        if let windowScale = view.window?.backingScaleFactor, windowScale > 0 {
+            return Float(windowScale)
+        }
+
+        if let layerScale = view.layer?.contentsScale, layerScale > 0 {
+            return Float(layerScale)
+        }
+
+        if let screenScale = NSScreen.main?.backingScaleFactor, screenScale > 0 {
+            return Float(screenScale)
+        }
+
+        return 1
     }
 
     private static let shaderSource = """
