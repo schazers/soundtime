@@ -99,8 +99,8 @@ final class TimelineView: MTKView {
         timelineRenderer?.displayTrimPreview(trimRange)
     }
 
-    func displayHoverProgress(_ progress: Float?) {
-        timelineRenderer?.displayHoverProgress(progress)
+    func displayHoverProgress(_ progress: Float?, isArmed: Bool = false) {
+        timelineRenderer?.displayHoverProgress(progress, isArmed: isArmed)
     }
 
     private func configure() {
@@ -252,10 +252,10 @@ final class TimelineView: MTKView {
         }
 
         window?.makeFirstResponder(self)
-        displayHoverProgress(nil)
         let progress = progress(for: event)
         let point = convert(event.locationInWindow, from: nil)
         if let trimDragMode = trimDragMode(for: point) {
+            displayHoverProgress(nil)
             activeDragMode = trimDragMode
             selectionAnchorProgress = progress
             selectionAnchorPoint = point
@@ -271,6 +271,7 @@ final class TimelineView: MTKView {
         selectionAnchorPoint = point
         isDraggingSelection = false
         isDraggingTrim = false
+        displayHoverProgress(progress, isArmed: true)
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -282,9 +283,9 @@ final class TimelineView: MTKView {
             return
         }
 
-        displayHoverProgress(nil)
         let point = convert(event.locationInWindow, from: nil)
         if activeDragMode == .trimStart || activeDragMode == .trimEnd {
+            displayHoverProgress(nil)
             if !isDraggingTrim, didMovePastSelectionThreshold(to: point) {
                 isDraggingTrim = true
             }
@@ -297,10 +298,13 @@ final class TimelineView: MTKView {
 
         if !isDraggingSelection, didMovePastSelectionThreshold(to: point) {
             isDraggingSelection = true
+            displayHoverProgress(nil)
         }
 
         if isDraggingSelection {
             updateSelection(from: selectionAnchorProgress, to: progress(for: event))
+        } else {
+            displayHoverProgress(progress(for: event), isArmed: true)
         }
     }
 
