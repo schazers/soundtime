@@ -18,7 +18,11 @@ enum WAVFileWriter {
         }
     }
 
-    static func write(_ buffer: DecodedAudioBuffer, to url: URL) throws {
+    static func write(
+        _ buffer: DecodedAudioBuffer,
+        to url: URL,
+        progressHandler: (@Sendable (Double) -> Void)? = nil
+    ) throws {
         guard
             buffer.sampleRate.isFinite,
             buffer.sampleRate > 0,
@@ -63,7 +67,9 @@ enum WAVFileWriter {
             blockAlign: UInt16(blockAlign),
             dataByteCount: UInt32(dataByteCount)
         ))
-        try writeSamples(from: buffer, to: fileHandle)
+        progressHandler?(0)
+        try writeSamples(from: buffer, to: fileHandle, progressHandler: progressHandler)
+        progressHandler?(1)
     }
 
     private static func makeHeader(
@@ -95,7 +101,8 @@ enum WAVFileWriter {
 
     private static func writeSamples(
         from buffer: DecodedAudioBuffer,
-        to fileHandle: FileHandle
+        to fileHandle: FileHandle,
+        progressHandler: (@Sendable (Double) -> Void)?
     ) throws {
         let framesPerChunk = 4_096
         var frameIndex = 0
@@ -114,6 +121,7 @@ enum WAVFileWriter {
 
             try fileHandle.write(contentsOf: data)
             frameIndex = endFrame
+            progressHandler?(Double(frameIndex) / Double(buffer.frameCount))
         }
     }
 

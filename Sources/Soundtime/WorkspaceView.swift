@@ -36,6 +36,7 @@ final class WorkspaceView: NSView {
     }()
 
     private let timelineSurface = TimelineView()
+    private let exportProgressOverlay = ExportProgressOverlayView()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -77,6 +78,7 @@ final class WorkspaceView: NSView {
         addSubview(titleLabel)
         addSubview(metadataLabel)
         addSubview(timelineSurface)
+        addSubview(exportProgressOverlay)
 
         NSLayoutConstraint.activate([
             titleLabel.topAnchor.constraint(equalTo: topAnchor, constant: 18),
@@ -90,6 +92,11 @@ final class WorkspaceView: NSView {
             timelineSurface.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 22),
             timelineSurface.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -22),
             timelineSurface.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -22),
+
+            exportProgressOverlay.topAnchor.constraint(equalTo: topAnchor),
+            exportProgressOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
+            exportProgressOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
+            exportProgressOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
     }
 
@@ -285,6 +292,8 @@ final class WorkspaceView: NSView {
 
     private func writeExport(_ decodedAudioBuffer: DecodedAudioBuffer, to destinationURL: URL) {
         updateStatus("exporting...")
+        exportProgressOverlay.showExporting()
+        let exportProgressOverlay = exportProgressOverlay
 
         Task { [weak self, decodedAudioBuffer, destinationURL] in
             do {
@@ -293,19 +302,25 @@ final class WorkspaceView: NSView {
                     destinationURL
 
                 try await Task.detached(priority: .userInitiated) {
-                    try WAVFileWriter.write(decodedAudioBuffer, to: exportURL)
+                    try WAVFileWriter.write(decodedAudioBuffer, to: exportURL) { progress in
+                        Task { @MainActor in
+                            exportProgressOverlay.updateProgress(progress)
+                        }
+                    }
                 }.value
 
                 guard let self else {
                     return
                 }
 
+                self.exportProgressOverlay.showComplete()
                 self.updateStatus("exported \(exportURL.lastPathComponent)")
             } catch {
                 guard let self else {
                     return
                 }
 
+                self.exportProgressOverlay.showFailure("Export failed.")
                 self.updateStatus("export failed: \(error.localizedDescription)")
             }
         }
