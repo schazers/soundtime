@@ -27,16 +27,7 @@ final class ExportProgressOverlayView: NSView {
         return label
     }()
 
-    private let progressIndicator: NSProgressIndicator = {
-        let indicator = NSProgressIndicator()
-        indicator.isIndeterminate = false
-        indicator.minValue = 0
-        indicator.maxValue = 1
-        indicator.doubleValue = 0
-        indicator.controlSize = .regular
-        indicator.translatesAutoresizingMaskIntoConstraints = false
-        return indicator
-    }()
+    private let progressBar = ExportProgressBarView()
 
     private let okButton: NSButton = {
         let button = NSButton(title: "OK", target: nil, action: nil)
@@ -61,7 +52,7 @@ final class ExportProgressOverlayView: NSView {
         presentationGeneration += 1
         isHidden = false
         statusLabel.stringValue = "Exporting..."
-        progressIndicator.doubleValue = 0
+        progressBar.progress = 0
         okButton.isHidden = true
     }
 
@@ -70,15 +61,14 @@ final class ExportProgressOverlayView: NSView {
             return
         }
 
-        progressIndicator.doubleValue = min(max(progress, 0), 1)
+        progressBar.progress = progress
     }
 
     func showComplete() {
         isFinished = true
         presentationGeneration += 1
         let generation = presentationGeneration
-        progressIndicator.doubleValue = 1
-        progressIndicator.needsDisplay = true
+        progressBar.progress = 1
         okButton.isHidden = true
         okButton.isEnabled = false
 
@@ -119,7 +109,7 @@ final class ExportProgressOverlayView: NSView {
 
         addSubview(panelView)
         panelView.addSubview(statusLabel)
-        panelView.addSubview(progressIndicator)
+        panelView.addSubview(progressBar)
         panelView.addSubview(okButton)
 
         NSLayoutConstraint.activate([
@@ -131,11 +121,12 @@ final class ExportProgressOverlayView: NSView {
             statusLabel.leadingAnchor.constraint(equalTo: panelView.leadingAnchor, constant: 22),
             statusLabel.trailingAnchor.constraint(equalTo: panelView.trailingAnchor, constant: -22),
 
-            progressIndicator.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 16),
-            progressIndicator.leadingAnchor.constraint(equalTo: panelView.leadingAnchor, constant: 26),
-            progressIndicator.trailingAnchor.constraint(equalTo: panelView.trailingAnchor, constant: -26),
+            progressBar.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 16),
+            progressBar.leadingAnchor.constraint(equalTo: panelView.leadingAnchor, constant: 26),
+            progressBar.trailingAnchor.constraint(equalTo: panelView.trailingAnchor, constant: -26),
+            progressBar.heightAnchor.constraint(equalToConstant: 10),
 
-            okButton.topAnchor.constraint(equalTo: progressIndicator.bottomAnchor, constant: 20),
+            okButton.topAnchor.constraint(equalTo: progressBar.bottomAnchor, constant: 20),
             okButton.centerXAnchor.constraint(equalTo: panelView.centerXAnchor),
             okButton.bottomAnchor.constraint(equalTo: panelView.bottomAnchor, constant: -18),
             okButton.widthAnchor.constraint(equalToConstant: 84),
@@ -145,5 +136,67 @@ final class ExportProgressOverlayView: NSView {
     @objc private func dismiss() {
         isHidden = true
         onDismiss?()
+    }
+}
+
+@MainActor
+private final class ExportProgressBarView: NSView {
+    private let trackLayer = CALayer()
+    private let fillLayer = CALayer()
+    private var clampedProgress: Double = 0
+
+    var progress: Double {
+        get {
+            clampedProgress
+        }
+        set {
+            clampedProgress = min(max(newValue, 0), 1)
+            updateFillLayerFrame()
+        }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configure()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configure()
+    }
+
+    override func layout() {
+        super.layout()
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        trackLayer.frame = bounds
+        trackLayer.cornerRadius = bounds.height / 2
+        fillLayer.cornerRadius = bounds.height / 2
+        updateFillLayerFrame()
+        CATransaction.commit()
+    }
+
+    private func configure() {
+        wantsLayer = true
+        translatesAutoresizingMaskIntoConstraints = false
+
+        trackLayer.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        fillLayer.backgroundColor = NSColor.systemTeal.cgColor
+
+        layer?.addSublayer(trackLayer)
+        trackLayer.addSublayer(fillLayer)
+    }
+
+    private func updateFillLayerFrame() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        fillLayer.frame = CGRect(
+            x: 0,
+            y: 0,
+            width: bounds.width * clampedProgress,
+            height: bounds.height
+        )
+        CATransaction.commit()
     }
 }
