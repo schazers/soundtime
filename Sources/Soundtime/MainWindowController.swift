@@ -4,7 +4,7 @@ final class MainWindowController: NSWindowController {
     convenience init() {
         let contentViewController = WorkspaceViewController()
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1500, height: 920),
+            contentRect: NSRect(x: 0, y: 0, width: 3000, height: 1840),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
