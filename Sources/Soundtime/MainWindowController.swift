@@ -1,15 +1,13 @@
 import AppKit
 
 final class MainWindowController: NSWindowController {
-    private static let fallbackLaunchSize = NSSize(width: 1500, height: 920)
-    private static let minimumLaunchSize = NSSize(width: 760, height: 460)
-    private static let preferredLaunchSize = NSSize(width: 2200, height: 1300)
-    private static let screenInset: CGFloat = 48
+    private static let fallbackContentSize = NSSize(width: 1500, height: 920)
+    private static let screenInset: CGFloat = 12
 
     convenience init() {
         let contentViewController = WorkspaceViewController()
         let window = NSWindow(
-            contentRect: Self.launchContentRect(),
+            contentRect: NSRect(origin: .zero, size: Self.fallbackContentSize),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
@@ -25,23 +23,21 @@ final class MainWindowController: NSWindowController {
         window.isMovableByWindowBackground = true
         window.minSize = NSSize(width: 760, height: 460)
         window.contentViewController = contentViewController
-        window.center()
+
+        if let launchFrame = Self.launchWindowFrame() {
+            window.setFrame(launchFrame, display: false)
+        } else {
+            window.center()
+        }
 
         self.init(window: window)
     }
 
-    private static func launchContentRect() -> NSRect {
+    private static func launchWindowFrame() -> NSRect? {
         guard let visibleFrame = NSScreen.main?.visibleFrame else {
-            return NSRect(origin: .zero, size: fallbackLaunchSize)
+            return nil
         }
 
-        let availableWidth = max(visibleFrame.width - screenInset * 2, minimumLaunchSize.width)
-        let availableHeight = max(visibleFrame.height - screenInset * 2, minimumLaunchSize.height)
-        let launchSize = NSSize(
-            width: min(preferredLaunchSize.width, availableWidth),
-            height: min(preferredLaunchSize.height, availableHeight)
-        )
-
-        return NSRect(origin: .zero, size: launchSize)
+        return visibleFrame.insetBy(dx: screenInset, dy: screenInset)
     }
 }
