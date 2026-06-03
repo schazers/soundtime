@@ -5,11 +5,15 @@ final class TimelineView: MTKView {
     var onTogglePlayback: (() -> Void)?
     var onDeleteSelection: (() -> Void)?
     var onUndo: (() -> Void)?
+    var onSeekRequested: ((Float) -> Void)?
     var onSelectionChanged: ((TimelineSelection?) -> Void)?
 
     private var timelineRenderer: TimelineRenderer?
     private var isSelectionEnabled = false
     private var selectionAnchorProgress: Float?
+    private var selectionAnchorPoint: CGPoint?
+    private var isDraggingSelection = false
+    private let selectionDragThreshold: CGFloat = 3
     private let supportedAudioExtensions: Set<String> = [
         "aif",
         "aiff",
@@ -50,6 +54,8 @@ final class TimelineView: MTKView {
 
         if !isSelectionEnabled {
             selectionAnchorProgress = nil
+            selectionAnchorPoint = nil
+            isDraggingSelection = false
             displaySelection(nil)
             onSelectionChanged?(nil)
         }
@@ -150,7 +156,8 @@ final class TimelineView: MTKView {
         window?.makeFirstResponder(self)
         let progress = progress(for: event)
         selectionAnchorProgress = progress
-        updateSelection(from: progress, to: progress)
+        selectionAnchorPoint = convert(event.locationInWindow, from: nil)
+        isDraggingSelection = false
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -162,7 +169,14 @@ final class TimelineView: MTKView {
             return
         }
 
-        updateSelection(from: selectionAnchorProgress, to: progress(for: event))
+        let point = convert(event.locationInWindow, from: nil)
+        if !isDraggingSelection, didMovePastSelectionThreshold(to: point) {
+            isDraggingSelection = true
+        }
+
+        if isDraggingSelection {
+            updateSelection(from: selectionAnchorProgress, to: progress(for: event))
+        }
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -174,8 +188,18 @@ final class TimelineView: MTKView {
             return
         }
 
-        updateSelection(from: selectionAnchorProgress, to: progress(for: event))
+        let progress = progress(for: event)
+        if isDraggingSelection {
+            updateSelection(from: selectionAnchorProgress, to: progress)
+        } else {
+            displaySelection(nil)
+            onSelectionChanged?(nil)
+            onSeekRequested?(progress)
+        }
+
         self.selectionAnchorProgress = nil
+        selectionAnchorPoint = nil
+        isDraggingSelection = false
     }
 
     private func firstSupportedAudioURL(from pasteboard: NSPasteboard) -> URL? {
@@ -217,5 +241,14 @@ final class TimelineView: MTKView {
 
         displaySelection(visibleSelection)
         onSelectionChanged?(visibleSelection)
+    }
+
+    private func didMovePastSelectionThreshold(to point: CGPoint) -> Bool {
+        guard let selectionAnchorPoint else {
+            return false
+        }
+
+        return abs(point.x - selectionAnchorPoint.x) >= selectionDragThreshold ||
+            abs(point.y - selectionAnchorPoint.y) >= selectionDragThreshold
     }
 }
