@@ -97,7 +97,7 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         let playheadVertices = makePlayheadVertices(drawableSize: renderSize, backingScale: backingScale)
 
         encoder.setRenderPipelineState(pipelineState)
-        draw(vertices: gridVertices, primitiveType: .line, encoder: encoder)
+        draw(vertices: gridVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: selectionVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: waveformVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: trimPreviewVertices, primitiveType: .triangle, encoder: encoder)
@@ -149,28 +149,35 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
 
         let gridColor = SIMD4<Float>(0.24, 0.25, 0.26, 1.0)
         let centerColor = SIMD4<Float>(0.34, 0.36, 0.37, 1.0)
-        let majorStep = max(96 * backingScale, 1)
+        let majorStep: Float = 96
+        let lineWidth = pixelLength(backingScale: backingScale)
+        let size = SIMD2<Float>(width, height)
         var vertices: [TimelineVertex] = []
 
-        var x: Float = 0.5
+        var x: Float = 0
         while x <= width {
-            appendLine(
+            let alignedX = pixelAligned(x, backingScale: backingScale)
+            appendRectangle(
                 to: &vertices,
-                from: SIMD2<Float>(x, 0),
-                to: SIMD2<Float>(x, height),
+                left: alignedX,
+                right: min(alignedX + lineWidth, width),
+                top: 0,
+                bottom: height,
                 color: gridColor,
-                drawableSize: SIMD2<Float>(width, height)
+                drawableSize: size
             )
             x += majorStep
         }
 
-        let centerY = floor(height * 0.5) + 0.5
-        appendLine(
+        let centerY = pixelAligned(height * 0.5, backingScale: backingScale)
+        appendRectangle(
             to: &vertices,
-            from: SIMD2<Float>(0, centerY),
-            to: SIMD2<Float>(width, centerY),
+            left: 0,
+            right: width,
+            top: centerY,
+            bottom: min(centerY + lineWidth, height),
             color: centerColor,
-            drawableSize: SIMD2<Float>(width, height)
+            drawableSize: size
         )
 
         return vertices
@@ -223,7 +230,7 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
 
         let centerY = height * 0.5
         let amplitudeHeight = height * 0.42
-        let minimumVisualHeight = max(backingScale, 1)
+        let minimumVisualHeight = pixelLength(backingScale: backingScale)
         let color = SIMD4<Float>(0.78, 0.92, 0.88, 1.0)
         let size = SIMD2<Float>(width, height)
         let bins = waveformOverview.bins
@@ -232,7 +239,10 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
 
         for (index, bin) in bins.enumerated() {
             let x0 = Float(index) / Float(bins.count) * width
-            let x1 = max(Float(index + 1) / Float(bins.count) * width, x0 + 1)
+            let x1 = max(
+                Float(index + 1) / Float(bins.count) * width,
+                x0 + pixelLength(backingScale: backingScale)
+            )
             var y0 = centerY - bin.maximumSample * amplitudeHeight
             var y1 = centerY - bin.minimumSample * amplitudeHeight
 
@@ -327,12 +337,13 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
 
         let playheadX: Float
         if waveformOverview == nil {
-            playheadX = min(max(80 * backingScale, 0), width)
+            playheadX = min(max(80, 0), width)
         } else {
             playheadX = min(max(playheadProgress * width, 0), width)
         }
-        let playheadWidth = max(2 * backingScale, 1)
-        let left = max(playheadX - playheadWidth * 0.5, 0)
+        let playheadWidth = pixelLength(2, backingScale: backingScale)
+        let alignedPlayheadX = pixelAligned(playheadX, backingScale: backingScale)
+        let left = max(alignedPlayheadX - playheadWidth * 0.5, 0)
         let right = min(left + playheadWidth, width)
         let color = SIMD4<Float>(0.0, 0.84, 0.78, 1.0)
         let size = SIMD2<Float>(width, height)
@@ -345,17 +356,6 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
             makeVertex(pixelPosition: SIMD2<Float>(right, height), color: color, drawableSize: size),
             makeVertex(pixelPosition: SIMD2<Float>(left, height), color: color, drawableSize: size),
         ]
-    }
-
-    private func appendLine(
-        to vertices: inout [TimelineVertex],
-        from start: SIMD2<Float>,
-        to end: SIMD2<Float>,
-        color: SIMD4<Float>,
-        drawableSize: SIMD2<Float>
-    ) {
-        vertices.append(makeVertex(pixelPosition: start, color: color, drawableSize: drawableSize))
-        vertices.append(makeVertex(pixelPosition: end, color: color, drawableSize: drawableSize))
     }
 
     private func appendRectangle(
@@ -411,11 +411,12 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
     ) {
         let width = drawableSize.x
         let height = drawableSize.y
-        let lineWidth = max(2 * backingScale, 1)
-        let gripWidth = max(12 * backingScale, 8)
-        let gripHeight = max(18 * backingScale, 12)
+        let lineWidth = pixelLength(2, backingScale: backingScale)
+        let gripWidth: Float = 12
+        let gripHeight: Float = 18
         let clampedX = min(max(x, 0), width)
-        let lineLeft = min(max(clampedX - lineWidth * 0.5, 0), width)
+        let alignedX = pixelAligned(clampedX, backingScale: backingScale)
+        let lineLeft = min(max(alignedX - lineWidth * 0.5, 0), width)
         let lineRight = min(lineLeft + lineWidth, width)
 
         appendRectangle(
@@ -457,6 +458,14 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
             color: color,
             drawableSize: drawableSize
         )
+    }
+
+    private func pixelLength(_ pixels: Float = 1, backingScale: Float) -> Float {
+        pixels / max(backingScale, 1)
+    }
+
+    private func pixelAligned(_ position: Float, backingScale: Float) -> Float {
+        round(position * max(backingScale, 1)) / max(backingScale, 1)
     }
 
     private func makeVertex(
