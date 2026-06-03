@@ -5,6 +5,7 @@ final class ExportProgressOverlayView: NSView {
     var onDismiss: (() -> Void)?
 
     private var isFinished = false
+    private var presentationGeneration = 0
 
     private let panelView: NSView = {
         let view = NSView()
@@ -57,6 +58,7 @@ final class ExportProgressOverlayView: NSView {
 
     func showExporting() {
         isFinished = false
+        presentationGeneration += 1
         isHidden = false
         statusLabel.stringValue = "Exporting..."
         progressIndicator.doubleValue = 0
@@ -73,16 +75,36 @@ final class ExportProgressOverlayView: NSView {
 
     func showComplete() {
         isFinished = true
-        statusLabel.stringValue = "Export complete."
+        presentationGeneration += 1
+        let generation = presentationGeneration
         progressIndicator.doubleValue = 1
-        okButton.isHidden = false
-        window?.makeFirstResponder(okButton)
+        progressIndicator.needsDisplay = true
+        okButton.isHidden = true
+        okButton.isEnabled = false
+
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 120_000_000)
+            guard
+                let self,
+                self.isFinished,
+                self.presentationGeneration == generation
+            else {
+                return
+            }
+
+            self.statusLabel.stringValue = "Export complete."
+            self.okButton.isHidden = false
+            self.okButton.isEnabled = true
+            self.window?.makeFirstResponder(self.okButton)
+        }
     }
 
     func showFailure(_ message: String) {
         isFinished = true
+        presentationGeneration += 1
         statusLabel.stringValue = message
         okButton.isHidden = false
+        okButton.isEnabled = true
         window?.makeFirstResponder(okButton)
     }
 
