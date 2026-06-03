@@ -14,6 +14,7 @@ This repository currently contains the native app shell:
 - AppKit window titled `Soundtime`
 - Metal-backed timeline workspace with a static grid and playhead
 - Single-file audio drag and drop with lightweight filename, duration, and size metadata
+- WAV PCM decode into an in-memory floating-point buffer
 
 ## Run
 
