@@ -103,26 +103,13 @@ final class TimelineView: MTKView {
         preferredFramesPerSecond = 60
         enableSetNeedsDisplay = false
         isPaused = false
-        autoResizeDrawable = false
-        presentsWithTransaction = true
+        autoResizeDrawable = true
 
         wantsLayer = true
         layer?.cornerRadius = 8
         layer?.masksToBounds = true
 
         registerForDraggedTypes([.fileURL])
-    }
-
-    override func layout() {
-        super.layout()
-        updateDrawableSize()
-        draw()
-    }
-
-    override func setFrameSize(_ newSize: NSSize) {
-        super.setFrameSize(newSize)
-        updateDrawableSize()
-        draw()
     }
 
     private func configureRenderer(with metalDevice: MTLDevice?) {
@@ -137,18 +124,6 @@ final class TimelineView: MTKView {
             delegate = renderer
         } catch {
             Swift.print("Soundtime could not create the timeline renderer: \\(error)")
-        }
-    }
-
-    private func updateDrawableSize() {
-        let scale = window?.backingScaleFactor ?? layer?.contentsScale ?? NSScreen.main?.backingScaleFactor ?? 1
-        let nextDrawableSize = CGSize(
-            width: max((bounds.width * scale).rounded(), 1),
-            height: max((bounds.height * scale).rounded(), 1)
-        )
-
-        if drawableSize != nextDrawableSize {
-            drawableSize = nextDrawableSize
         }
     }
 
