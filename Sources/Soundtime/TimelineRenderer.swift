@@ -12,12 +12,31 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         case shaderFunctionUnavailable
     }
 
+    private struct CachedVertexBuffer {
+        let buffer: MTLBuffer
+        let vertexCount: Int
+    }
+
+    private struct GridCacheKey: Equatable {
+        let width: Float
+        let height: Float
+        let backingScale: Float
+    }
+
+    private struct GridCache {
+        let key: GridCacheKey
+        let vertices: CachedVertexBuffer
+    }
+
     private static let inlineVertexUploadLimit = 4 * 1_024
 
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let pipelineState: MTLRenderPipelineState
     private var waveformOverview: WaveformOverview?
+    private var waveformVertices: CachedVertexBuffer?
+    private var gridCache: GridCache?
+    private var dynamicVertexBuffer: MTLBuffer?
     private var playheadProgress: Float = 0
     private var selection: TimelineSelection?
     private var trimPreview: TimelineTrimRange?
@@ -58,6 +77,7 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
 
     func displayWaveform(_ waveformOverview: WaveformOverview?) {
         self.waveformOverview = waveformOverview
+        waveformVertices = makeCachedBuffer(vertices: makeWaveformVertices(from: waveformOverview))
     }
 
     func displayPlayheadProgress(_ progress: Float) {
@@ -84,12 +104,7 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
 
         let renderSize = view.bounds.size
         let backingScale = backingScale(for: view)
-        let gridVertices = makeGridVertices(drawableSize: renderSize, backingScale: backingScale)
-        let selectionVertices = makeSelectionVertices(drawableSize: renderSize)
-        let waveformVertices = makeWaveformVertices(
-            drawableSize: renderSize,
-            backingScale: backingScale
-        )
+        let selectionVertices = makeSelectionVertices()
         let trimPreviewVertices = makeTrimPreviewVertices(
             drawableSize: renderSize,
             backingScale: backingScale
@@ -97,15 +112,32 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         let playheadVertices = makePlayheadVertices(drawableSize: renderSize, backingScale: backingScale)
 
         encoder.setRenderPipelineState(pipelineState)
-        draw(vertices: gridVertices, primitiveType: .triangle, encoder: encoder)
+        if let gridVertices = cachedGridVertices(drawableSize: renderSize, backingScale: backingScale) {
+            draw(cachedVertices: gridVertices, primitiveType: .triangle, encoder: encoder)
+        }
         draw(vertices: selectionVertices, primitiveType: .triangle, encoder: encoder)
-        draw(vertices: waveformVertices, primitiveType: .triangle, encoder: encoder)
+        if let waveformVertices {
+            draw(cachedVertices: waveformVertices, primitiveType: .triangle, encoder: encoder)
+        }
         draw(vertices: trimPreviewVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: playheadVertices, primitiveType: .triangle, encoder: encoder)
         encoder.endEncoding()
 
         commandBuffer.present(drawable)
         commandBuffer.commit()
+    }
+
+    private func draw(
+        cachedVertices: CachedVertexBuffer,
+        primitiveType: MTLPrimitiveType,
+        encoder: MTLRenderCommandEncoder
+    ) {
+        guard cachedVertices.vertexCount > 0 else {
+            return
+        }
+
+        encoder.setVertexBuffer(cachedVertices.buffer, offset: 0, index: 0)
+        encoder.drawPrimitives(type: primitiveType, vertexStart: 0, vertexCount: cachedVertices.vertexCount)
     }
 
     private func draw(
@@ -125,19 +157,71 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
             if buffer.count <= Self.inlineVertexUploadLimit {
                 encoder.setVertexBytes(baseAddress, length: buffer.count, index: 0)
             } else {
-                guard let vertexBuffer = device.makeBuffer(
-                    bytes: baseAddress,
-                    length: buffer.count,
-                    options: [.storageModeShared]
-                ) else {
+                guard let vertexBuffer = reusableDynamicVertexBuffer(length: buffer.count) else {
                     return
                 }
 
+                vertexBuffer.contents().copyMemory(from: baseAddress, byteCount: buffer.count)
                 encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
             }
 
             encoder.drawPrimitives(type: primitiveType, vertexStart: 0, vertexCount: vertices.count)
         }
+    }
+
+    private func reusableDynamicVertexBuffer(length: Int) -> MTLBuffer? {
+        if let dynamicVertexBuffer, dynamicVertexBuffer.length >= length {
+            return dynamicVertexBuffer
+        }
+
+        dynamicVertexBuffer = device.makeBuffer(length: length, options: [.storageModeShared])
+        return dynamicVertexBuffer
+    }
+
+    private func makeCachedBuffer(vertices: [TimelineVertex]) -> CachedVertexBuffer? {
+        guard !vertices.isEmpty else {
+            return nil
+        }
+
+        return vertices.withUnsafeBytes { buffer in
+            guard
+                let baseAddress = buffer.baseAddress,
+                let vertexBuffer = device.makeBuffer(
+                    bytes: baseAddress,
+                    length: buffer.count,
+                    options: [.storageModeShared]
+                )
+            else {
+                return nil
+            }
+
+            return CachedVertexBuffer(buffer: vertexBuffer, vertexCount: vertices.count)
+        }
+    }
+
+    private func cachedGridVertices(drawableSize: CGSize, backingScale: Float) -> CachedVertexBuffer? {
+        let width = Float(drawableSize.width)
+        let height = Float(drawableSize.height)
+        guard width > 0, height > 0 else {
+            gridCache = nil
+            return nil
+        }
+
+        let key = GridCacheKey(width: width, height: height, backingScale: backingScale)
+        if let gridCache, gridCache.key == key {
+            return gridCache.vertices
+        }
+
+        guard let vertices = makeCachedBuffer(
+            vertices: makeGridVertices(drawableSize: drawableSize, backingScale: backingScale)
+        ) else {
+            gridCache = nil
+            return nil
+        }
+
+        let nextCache = GridCache(key: key, vertices: vertices)
+        gridCache = nextCache
+        return nextCache.vertices
     }
 
     private func makeGridVertices(drawableSize: CGSize, backingScale: Float) -> [TimelineVertex] {
@@ -183,7 +267,7 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         return vertices
     }
 
-    private func makeSelectionVertices(drawableSize: CGSize) -> [TimelineVertex] {
+    private func makeSelectionVertices() -> [TimelineVertex] {
         guard
             let selection,
             waveformOverview != nil,
@@ -192,57 +276,38 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
             return []
         }
 
-        let width = Float(drawableSize.width)
-        let height = Float(drawableSize.height)
-        guard width > 0, height > 0 else {
-            return []
-        }
-
-        let left = selection.startProgress * width
-        let right = selection.endProgress * width
         let color = SIMD4<Float>(0.0, 0.84, 0.78, 0.22)
         var vertices: [TimelineVertex] = []
         vertices.reserveCapacity(6)
 
         appendRectangle(
             to: &vertices,
-            left: left,
-            right: right,
+            left: selection.startProgress,
+            right: selection.endProgress,
             top: 0,
-            bottom: height,
-            color: color,
-            drawableSize: SIMD2<Float>(width, height)
+            bottom: 1,
+            color: color
         )
 
         return vertices
     }
 
-    private func makeWaveformVertices(drawableSize: CGSize, backingScale: Float) -> [TimelineVertex] {
+    private func makeWaveformVertices(from waveformOverview: WaveformOverview?) -> [TimelineVertex] {
         guard let waveformOverview, !waveformOverview.isEmpty else {
             return []
         }
 
-        let width = Float(drawableSize.width)
-        let height = Float(drawableSize.height)
-        guard width > 0, height > 0 else {
-            return []
-        }
-
-        let centerY = height * 0.5
-        let amplitudeHeight = height * 0.42
-        let minimumVisualHeight = pixelLength(backingScale: backingScale)
+        let centerY: Float = 0.5
+        let amplitudeHeight: Float = 0.42
+        let minimumVisualHeight: Float = 0.002
         let color = SIMD4<Float>(0.78, 0.92, 0.88, 1.0)
-        let size = SIMD2<Float>(width, height)
         let bins = waveformOverview.bins
         var vertices: [TimelineVertex] = []
         vertices.reserveCapacity(bins.count * 6)
 
         for (index, bin) in bins.enumerated() {
-            let x0 = Float(index) / Float(bins.count) * width
-            let x1 = max(
-                Float(index + 1) / Float(bins.count) * width,
-                x0 + pixelLength(backingScale: backingScale)
-            )
+            let x0 = Float(index) / Float(bins.count)
+            let x1 = Float(index + 1) / Float(bins.count)
             var y0 = centerY - bin.maximumSample * amplitudeHeight
             var y1 = centerY - bin.minimumSample * amplitudeHeight
 
@@ -255,11 +320,10 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
             appendRectangle(
                 to: &vertices,
                 left: x0,
-                right: min(x1, width),
+                right: min(x1, 1),
                 top: max(y0, 0),
-                bottom: min(y1, height),
-                color: color,
-                drawableSize: size
+                bottom: min(y1, 1),
+                color: color
             )
         }
 
@@ -347,15 +411,53 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         let right = min(left + playheadWidth, width)
         let color = SIMD4<Float>(0.0, 0.84, 0.78, 1.0)
         let size = SIMD2<Float>(width, height)
+        var vertices: [TimelineVertex] = []
+        vertices.reserveCapacity(6)
 
-        return [
-            makeVertex(pixelPosition: SIMD2<Float>(left, 0), color: color, drawableSize: size),
-            makeVertex(pixelPosition: SIMD2<Float>(right, 0), color: color, drawableSize: size),
-            makeVertex(pixelPosition: SIMD2<Float>(left, height), color: color, drawableSize: size),
-            makeVertex(pixelPosition: SIMD2<Float>(right, 0), color: color, drawableSize: size),
-            makeVertex(pixelPosition: SIMD2<Float>(right, height), color: color, drawableSize: size),
-            makeVertex(pixelPosition: SIMD2<Float>(left, height), color: color, drawableSize: size),
-        ]
+        appendRectangle(
+            to: &vertices,
+            left: left,
+            right: right,
+            top: 0,
+            bottom: height,
+            color: color,
+            drawableSize: size
+        )
+
+        return vertices
+    }
+
+    private func appendRectangle(
+        to vertices: inout [TimelineVertex],
+        left: Float,
+        right: Float,
+        top: Float,
+        bottom: Float,
+        color: SIMD4<Float>
+    ) {
+        let topLeft = makeVertex(
+            normalizedPosition: SIMD2<Float>(left, top),
+            color: color
+        )
+        let topRight = makeVertex(
+            normalizedPosition: SIMD2<Float>(right, top),
+            color: color
+        )
+        let bottomLeft = makeVertex(
+            normalizedPosition: SIMD2<Float>(left, bottom),
+            color: color
+        )
+        let bottomRight = makeVertex(
+            normalizedPosition: SIMD2<Float>(right, bottom),
+            color: color
+        )
+
+        vertices.append(topLeft)
+        vertices.append(topRight)
+        vertices.append(bottomLeft)
+        vertices.append(topRight)
+        vertices.append(bottomRight)
+        vertices.append(bottomLeft)
     }
 
     private func appendRectangle(
@@ -367,33 +469,18 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         color: SIMD4<Float>,
         drawableSize: SIMD2<Float>
     ) {
-        let topLeft = makeVertex(
-            pixelPosition: SIMD2<Float>(left, top),
-            color: color,
-            drawableSize: drawableSize
-        )
-        let topRight = makeVertex(
-            pixelPosition: SIMD2<Float>(right, top),
-            color: color,
-            drawableSize: drawableSize
-        )
-        let bottomLeft = makeVertex(
-            pixelPosition: SIMD2<Float>(left, bottom),
-            color: color,
-            drawableSize: drawableSize
-        )
-        let bottomRight = makeVertex(
-            pixelPosition: SIMD2<Float>(right, bottom),
-            color: color,
-            drawableSize: drawableSize
-        )
+        guard drawableSize.x > 0, drawableSize.y > 0 else {
+            return
+        }
 
-        vertices.append(topLeft)
-        vertices.append(topRight)
-        vertices.append(bottomLeft)
-        vertices.append(topRight)
-        vertices.append(bottomRight)
-        vertices.append(bottomLeft)
+        appendRectangle(
+            to: &vertices,
+            left: left / drawableSize.x,
+            right: right / drawableSize.x,
+            top: top / drawableSize.y,
+            bottom: bottom / drawableSize.y,
+            color: color
+        )
     }
 
     private enum TrimHandleDirection {
@@ -468,16 +555,14 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         round(position * max(backingScale, 1)) / max(backingScale, 1)
     }
 
-    private func makeVertex(
-        pixelPosition: SIMD2<Float>,
-        color: SIMD4<Float>,
-        drawableSize: SIMD2<Float>
-    ) -> TimelineVertex {
-        let x = pixelPosition.x / drawableSize.x * 2 - 1
-        let y = 1 - pixelPosition.y / drawableSize.y * 2
-
+    private func makeVertex(normalizedPosition: SIMD2<Float>, color: SIMD4<Float>) -> TimelineVertex {
         return TimelineVertex(
-            position: SIMD4<Float>(x, y, 0, 1),
+            position: SIMD4<Float>(
+                min(max(normalizedPosition.x, 0), 1),
+                min(max(normalizedPosition.y, 0), 1),
+                0,
+                1
+            ),
             color: color
         )
     }
@@ -517,8 +602,15 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         uint vertexID [[vertex_id]],
         constant TimelineVertex *vertices [[buffer(0)]]
     ) {
+        float2 normalizedPosition = vertices[vertexID].position.xy;
+
         RasterizedVertex out;
-        out.position = vertices[vertexID].position;
+        out.position = float4(
+            normalizedPosition.x * 2.0 - 1.0,
+            1.0 - normalizedPosition.y * 2.0,
+            0.0,
+            1.0
+        );
         out.color = vertices[vertexID].color;
         return out;
     }
