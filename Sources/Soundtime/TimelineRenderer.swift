@@ -12,6 +12,9 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         case shaderFunctionUnavailable
     }
 
+    private static let inlineVertexUploadLimit = 4 * 1_024
+
+    private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let pipelineState: MTLRenderPipelineState
     private var waveformOverview: WaveformOverview?
@@ -34,6 +37,7 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         descriptor.fragmentFunction = fragmentFunction
         descriptor.colorAttachments[0].pixelFormat = pixelFormat
 
+        self.device = device
         self.commandQueue = commandQueue
         pipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
 
@@ -89,7 +93,20 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
                 return
             }
 
-            encoder.setVertexBytes(baseAddress, length: buffer.count, index: 0)
+            if buffer.count <= Self.inlineVertexUploadLimit {
+                encoder.setVertexBytes(baseAddress, length: buffer.count, index: 0)
+            } else {
+                guard let vertexBuffer = device.makeBuffer(
+                    bytes: baseAddress,
+                    length: buffer.count,
+                    options: [.storageModeShared]
+                ) else {
+                    return
+                }
+
+                encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+            }
+
             encoder.drawPrimitives(type: primitiveType, vertexStart: 0, vertexCount: vertices.count)
         }
     }
