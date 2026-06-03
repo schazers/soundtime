@@ -21,6 +21,7 @@ final class TimelineView: MTKView {
     private var selectionAnchorProgress: Float?
     private var selectionAnchorPoint: CGPoint?
     private var activeDragMode: TimelineDragMode?
+    private var hoverTrackingArea: NSTrackingArea?
     private var isDraggingSelection = false
     private var isDraggingTrim = false
     private let selectionDragThreshold: CGFloat = 3
@@ -61,6 +62,7 @@ final class TimelineView: MTKView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         window?.makeFirstResponder(self)
+        window?.acceptsMouseMovedEvents = true
     }
 
     func displayWaveform(_ waveformOverview: WaveformOverview?) {
@@ -80,6 +82,7 @@ final class TimelineView: MTKView {
             isDraggingSelection = false
             isDraggingTrim = false
             displaySelection(nil)
+            displayHoverProgress(nil)
             onSelectionChanged?(nil)
         }
     }
@@ -96,6 +99,10 @@ final class TimelineView: MTKView {
         timelineRenderer?.displayTrimPreview(trimRange)
     }
 
+    func displayHoverProgress(_ progress: Float?) {
+        timelineRenderer?.displayHoverProgress(progress)
+    }
+
     private func configure() {
         colorPixelFormat = .bgra8Unorm
         clearColor = MTLClearColor(red: 0.08, green: 0.08, blue: 0.08, alpha: 1.0)
@@ -110,6 +117,23 @@ final class TimelineView: MTKView {
         layer?.masksToBounds = true
 
         registerForDraggedTypes([.fileURL])
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+
+        if let hoverTrackingArea {
+            removeTrackingArea(hoverTrackingArea)
+        }
+
+        let trackingArea = NSTrackingArea(
+            rect: bounds,
+            options: [.activeInKeyWindow, .inVisibleRect, .mouseEnteredAndExited, .mouseMoved],
+            owner: self,
+            userInfo: nil
+        )
+        hoverTrackingArea = trackingArea
+        addTrackingArea(trackingArea)
     }
 
     private func configureRenderer(with metalDevice: MTLDevice?) {
@@ -209,6 +233,18 @@ final class TimelineView: MTKView {
         onUndo?()
     }
 
+    override func mouseEntered(with event: NSEvent) {
+        updateHoverGuide(for: event)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        updateHoverGuide(for: event)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        displayHoverProgress(nil)
+    }
+
     override func mouseDown(with event: NSEvent) {
         guard isSelectionEnabled else {
             super.mouseDown(with: event)
@@ -216,6 +252,7 @@ final class TimelineView: MTKView {
         }
 
         window?.makeFirstResponder(self)
+        displayHoverProgress(nil)
         let progress = progress(for: event)
         let point = convert(event.locationInWindow, from: nil)
         if let trimDragMode = trimDragMode(for: point) {
@@ -245,6 +282,7 @@ final class TimelineView: MTKView {
             return
         }
 
+        displayHoverProgress(nil)
         let point = convert(event.locationInWindow, from: nil)
         if activeDragMode == .trimStart || activeDragMode == .trimEnd {
             if !isDraggingTrim, didMovePastSelectionThreshold(to: point) {
@@ -299,6 +337,7 @@ final class TimelineView: MTKView {
         activeDragMode = nil
         isDraggingSelection = false
         isDraggingTrim = false
+        updateHoverGuide(for: event)
     }
 
     private func firstSupportedAudioURL(from pasteboard: NSPasteboard) -> URL? {
@@ -323,12 +362,33 @@ final class TimelineView: MTKView {
     }
 
     private func progress(for event: NSEvent) -> Float {
-        let point = convert(event.locationInWindow, from: nil)
+        progress(for: convert(event.locationInWindow, from: nil))
+    }
+
+    private func progress(for point: CGPoint) -> Float {
         guard bounds.width > 0 else {
             return 0
         }
 
         return min(max(Float(point.x / bounds.width), 0), 1)
+    }
+
+    private func updateHoverGuide(for event: NSEvent) {
+        guard
+            isSelectionEnabled,
+            activeDragMode == nil
+        else {
+            displayHoverProgress(nil)
+            return
+        }
+
+        let point = convert(event.locationInWindow, from: nil)
+        guard bounds.contains(point) else {
+            displayHoverProgress(nil)
+            return
+        }
+
+        displayHoverProgress(progress(for: point))
     }
 
     private func updateSelection(from startProgress: Float, to endProgress: Float) {
