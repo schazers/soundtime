@@ -1,7 +1,18 @@
 import MetalKit
 
 final class TimelineView: MTKView {
+    var onAudioFileDropped: ((URL) -> Void)?
+
     private var timelineRenderer: TimelineRenderer?
+    private let supportedAudioExtensions: Set<String> = [
+        "aif",
+        "aiff",
+        "flac",
+        "m4a",
+        "mp3",
+        "wav",
+        "wave",
+    ]
 
     init() {
         let metalDevice = MTLCreateSystemDefaultDevice()
@@ -39,6 +50,8 @@ final class TimelineView: MTKView {
         wantsLayer = true
         layer?.cornerRadius = 8
         layer?.masksToBounds = true
+
+        registerForDraggedTypes([.fileURL])
     }
 
     private func configureRenderer(with metalDevice: MTLDevice?) {
@@ -54,5 +67,54 @@ final class TimelineView: MTKView {
         } catch {
             Swift.print("Soundtime could not create the timeline renderer: \\(error)")
         }
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard firstSupportedAudioURL(from: sender.draggingPasteboard) != nil else {
+            return []
+        }
+
+        setDropHighlightVisible(true)
+        return .copy
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        setDropHighlightVisible(false)
+    }
+
+    override func draggingEnded(_ sender: NSDraggingInfo) {
+        setDropHighlightVisible(false)
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        setDropHighlightVisible(false)
+
+        guard let url = firstSupportedAudioURL(from: sender.draggingPasteboard) else {
+            return false
+        }
+
+        onAudioFileDropped?(url)
+        return true
+    }
+
+    private func firstSupportedAudioURL(from pasteboard: NSPasteboard) -> URL? {
+        let options: [NSPasteboard.ReadingOptionKey: Any] = [
+            .urlReadingFileURLsOnly: true,
+        ]
+
+        guard
+            let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: options) as? [URL]
+        else {
+            return nil
+        }
+
+        return urls.first { url in
+            supportedAudioExtensions.contains(url.pathExtension.lowercased())
+        }
+    }
+
+    private func setDropHighlightVisible(_ isVisible: Bool) {
+        layer?.borderColor = isVisible ? NSColor.systemTeal.cgColor : NSColor.clear.cgColor
+        layer?.borderWidth = isVisible ? 2 : 0
     }
 }
