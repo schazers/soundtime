@@ -12,9 +12,17 @@ struct AudioImportResult: Sendable {
 }
 
 enum AudioImportPipeline {
-    static func loadWAVPreview(at url: URL) async throws -> WAVPreviewImportResult {
+    static func loadWAVPreview(
+        at url: URL,
+        targetBinCount: Int = 512,
+        samplesPerBin: Int = 8
+    ) async throws -> WAVPreviewImportResult {
         try await Task.detached(priority: .userInitiated) {
-            let (fileInfo, waveformOverview) = try WAVAudioDecoder.buildSparsePreview(url: url)
+            let (fileInfo, waveformOverview) = try WAVAudioDecoder.buildSparsePreview(
+                url: url,
+                targetBinCount: targetBinCount,
+                samplesPerBin: samplesPerBin
+            )
             let metadata = try AudioFileMetadataLoader.loadQuickMetadata(
                 for: url,
                 duration: fileInfo.duration
