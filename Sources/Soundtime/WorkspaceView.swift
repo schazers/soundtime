@@ -3,6 +3,7 @@ import AppKit
 final class WorkspaceView: NSView {
     private var activeImportID = UUID()
     private var selectedAudioFile: AudioFileMetadata?
+    private var decodedAudioBuffer: DecodedAudioBuffer?
 
     private let titleLabel: NSTextField = {
         let label = NSTextField(labelWithString: "Soundtime")
@@ -65,30 +66,39 @@ final class WorkspaceView: NSView {
         let importID = UUID()
         activeImportID = importID
         selectedAudioFile = nil
+        decodedAudioBuffer = nil
         metadataLabel.stringValue = "\(url.lastPathComponent) - loading..."
 
-        Task { [weak self] in
+        Task { [weak self, importID, url] in
             do {
-                let metadata = try await AudioFileMetadataLoader.loadMetadata(for: url)
+                let result = try await AudioImportPipeline.loadDroppedFile(at: url)
 
-                await MainActor.run {
-                    guard let self, self.activeImportID == importID else {
-                        return
-                    }
+                guard let self, self.activeImportID == importID else {
+                    return
+                }
 
-                    self.selectedAudioFile = metadata
-                    self.metadataLabel.stringValue = metadata.formattedSummary
-                    self.window?.title = "Soundtime - \(metadata.displayName)"
+                self.selectedAudioFile = result.metadata
+                self.window?.title = "Soundtime - \(result.metadata.displayName)"
+
+                switch result.decodeStatus {
+                case .unsupported:
+                    self.decodedAudioBuffer = nil
+                    self.metadataLabel.stringValue = "\(result.metadata.formattedSummary) - WAV decode not available yet"
+                case let .decoded(decodedAudioBuffer):
+                    self.decodedAudioBuffer = decodedAudioBuffer
+                    self.metadataLabel.stringValue = "\(result.metadata.displayName) - \(decodedAudioBuffer.formattedSummary)"
+                case let .failed(message):
+                    self.decodedAudioBuffer = nil
+                    self.metadataLabel.stringValue = "\(result.metadata.formattedSummary) - WAV decode failed: \(message)"
                 }
             } catch {
-                await MainActor.run {
-                    guard let self, self.activeImportID == importID else {
-                        return
-                    }
-
-                    self.selectedAudioFile = nil
-                    self.metadataLabel.stringValue = "\(url.lastPathComponent) - could not read metadata"
+                guard let self, self.activeImportID == importID else {
+                    return
                 }
+
+                self.selectedAudioFile = nil
+                self.decodedAudioBuffer = nil
+                self.metadataLabel.stringValue = "\(url.lastPathComponent) - could not load audio"
             }
         }
     }

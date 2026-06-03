@@ -1,6 +1,6 @@
 import Foundation
 
-struct AudioFileMetadata: Equatable {
+struct AudioFileMetadata: Equatable, Sendable {
     let url: URL
     let displayName: String
     let duration: TimeInterval?
