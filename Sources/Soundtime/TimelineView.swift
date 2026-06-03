@@ -2,6 +2,7 @@ import MetalKit
 
 final class TimelineView: MTKView {
     var onAudioFileDropped: ((URL) -> Void)?
+    var onTogglePlayback: (() -> Void)?
 
     private var timelineRenderer: TimelineRenderer?
     private let supportedAudioExtensions: Set<String> = [
@@ -40,6 +41,10 @@ final class TimelineView: MTKView {
 
     func displayWaveform(_ waveformOverview: WaveformOverview?) {
         timelineRenderer?.displayWaveform(waveformOverview)
+    }
+
+    func displayPlayheadProgress(_ progress: Float) {
+        timelineRenderer?.displayPlayheadProgress(progress)
     }
 
     private func configure() {
@@ -99,6 +104,15 @@ final class TimelineView: MTKView {
 
         onAudioFileDropped?(url)
         return true
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 49 {
+            onTogglePlayback?()
+            return
+        }
+
+        super.keyDown(with: event)
     }
 
     private func firstSupportedAudioURL(from pasteboard: NSPasteboard) -> URL? {
