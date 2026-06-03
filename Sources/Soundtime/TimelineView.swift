@@ -4,6 +4,7 @@ final class TimelineView: MTKView {
     var onAudioFileDropped: ((URL) -> Void)?
     var onTogglePlayback: (() -> Void)?
     var onDeleteSelection: (() -> Void)?
+    var onUndo: (() -> Void)?
     var onSelectionChanged: ((TimelineSelection?) -> Void)?
 
     private var timelineRenderer: TimelineRenderer?
@@ -122,6 +123,11 @@ final class TimelineView: MTKView {
     }
 
     override func keyDown(with event: NSEvent) {
+        if event.keyCode == 6, event.modifierFlags.contains(.command) {
+            onUndo?()
+            return
+        }
+
         if event.keyCode == 49 {
             onTogglePlayback?()
             return

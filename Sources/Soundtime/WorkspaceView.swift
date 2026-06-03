@@ -5,6 +5,7 @@ final class WorkspaceView: NSView {
     private var selectedAudioFile: AudioFileMetadata?
     private var decodedAudioBuffer: DecodedAudioBuffer?
     private var audioTimeline: AudioEditTimeline?
+    private var editUndoStack: [AudioEditTimeline] = []
     private var loadedAudioSummary: String?
     private var selectedTimelineRange: TimelineSelection?
     private var currentPlaybackStatus = "idle"
@@ -59,6 +60,9 @@ final class WorkspaceView: NSView {
         timelineSurface.onDeleteSelection = { [weak self] in
             self?.deleteSelection()
         }
+        timelineSurface.onUndo = { [weak self] in
+            self?.undoLastEdit()
+        }
         timelineSurface.onSelectionChanged = { [weak self] selection in
             self?.updateSelection(selection)
         }
@@ -88,6 +92,7 @@ final class WorkspaceView: NSView {
         selectedAudioFile = nil
         decodedAudioBuffer = nil
         audioTimeline = nil
+        editUndoStack.removeAll()
         loadedAudioSummary = nil
         selectedTimelineRange = nil
         currentPlaybackStatus = "idle"
@@ -114,6 +119,7 @@ final class WorkspaceView: NSView {
                 case .unsupported:
                     self.decodedAudioBuffer = nil
                     self.audioTimeline = nil
+                    self.editUndoStack.removeAll()
                     self.loadedAudioSummary = nil
                     self.selectedTimelineRange = nil
                     self.currentPlaybackStatus = "idle"
@@ -124,6 +130,7 @@ final class WorkspaceView: NSView {
                 case let .decoded(decodedAudioBuffer, waveformOverview):
                     self.decodedAudioBuffer = decodedAudioBuffer
                     self.audioTimeline = AudioEditTimeline(sourceBuffer: decodedAudioBuffer)
+                    self.editUndoStack.removeAll()
                     try self.playbackController.load(decodedAudioBuffer)
                     self.timelineSurface.displayWaveform(waveformOverview)
                     self.timelineSurface.displayPlayheadProgress(0)
@@ -134,6 +141,7 @@ final class WorkspaceView: NSView {
                 case let .failed(message):
                     self.decodedAudioBuffer = nil
                     self.audioTimeline = nil
+                    self.editUndoStack.removeAll()
                     self.loadedAudioSummary = nil
                     self.selectedTimelineRange = nil
                     self.currentPlaybackStatus = "idle"
@@ -151,6 +159,7 @@ final class WorkspaceView: NSView {
                 self.selectedAudioFile = nil
                 self.decodedAudioBuffer = nil
                 self.audioTimeline = nil
+                self.editUndoStack.removeAll()
                 self.loadedAudioSummary = nil
                 self.selectedTimelineRange = nil
                 self.currentPlaybackStatus = "idle"
@@ -165,40 +174,32 @@ final class WorkspaceView: NSView {
 
     private func deleteSelection() {
         guard
-            var audioTimeline,
+            let currentTimeline = audioTimeline,
             let selectedTimelineRange,
             selectedTimelineRange.durationProgress > 0
         else {
             return
         }
 
-        let deletedDuration = selectedTimelineRange.duration(in: audioTimeline.duration)
-        let deletedFrameCount = audioTimeline.delete(selectedTimelineRange)
+        var editedTimeline = currentTimeline
+        let deletedDuration = selectedTimelineRange.duration(in: currentTimeline.duration)
+        let deletedFrameCount = editedTimeline.delete(selectedTimelineRange)
         guard deletedFrameCount > 0 else {
             return
         }
 
-        self.audioTimeline = audioTimeline
-        self.selectedTimelineRange = nil
-        stopPlaybackTimer()
-        let renderedBuffer = audioTimeline.render()
-        decodedAudioBuffer = renderedBuffer
-        timelineSurface.displaySelection(nil)
-        timelineSurface.displayPlayheadProgress(0)
-        playbackController.clear()
+        editUndoStack.append(currentTimeline)
+        applyTimeline(editedTimeline)
+        updateStatus("deleted \(formatDuration(deletedDuration))")
+    }
 
-        if renderedBuffer.frameCount > 0 {
-            do {
-                try playbackController.load(renderedBuffer)
-            } catch {
-                updateStatus("playback failed: \(error.localizedDescription)")
-            }
+    private func undoLastEdit() {
+        guard let previousTimeline = editUndoStack.popLast() else {
+            return
         }
 
-        let waveformOverview = WaveformOverviewBuilder.build(from: renderedBuffer)
-        timelineSurface.displayWaveform(waveformOverview)
-        updateLoadedAudioSummary(for: renderedBuffer)
-        updateStatus("deleted \(formatDuration(deletedDuration))")
+        applyTimeline(previousTimeline)
+        updateStatus("undo")
     }
 
     private func togglePlayback() {
@@ -297,5 +298,29 @@ final class WorkspaceView: NSView {
         } else {
             loadedAudioSummary = decodedAudioBuffer.formattedSummary
         }
+    }
+
+    private func applyTimeline(_ audioTimeline: AudioEditTimeline) {
+        self.audioTimeline = audioTimeline
+        selectedTimelineRange = nil
+        stopPlaybackTimer()
+
+        let renderedBuffer = audioTimeline.render()
+        decodedAudioBuffer = renderedBuffer
+        timelineSurface.displaySelection(nil)
+        timelineSurface.displayPlayheadProgress(0)
+        playbackController.clear()
+
+        if renderedBuffer.frameCount > 0 {
+            do {
+                try playbackController.load(renderedBuffer)
+            } catch {
+                updateStatus("playback failed: \(error.localizedDescription)")
+            }
+        }
+
+        let waveformOverview = WaveformOverviewBuilder.build(from: renderedBuffer)
+        timelineSurface.displayWaveform(waveformOverview)
+        updateLoadedAudioSummary(for: renderedBuffer)
     }
 }
