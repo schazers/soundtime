@@ -14,6 +14,8 @@ final class WorkspaceView: NSView {
         let label = NSTextField(labelWithString: "Soundtime")
         label.font = .systemFont(ofSize: 16, weight: .semibold)
         label.textColor = NSColor.labelColor
+        label.setContentCompressionResistancePriority(.required, for: .horizontal)
+        label.setContentHuggingPriority(.required, for: .horizontal)
         label.translatesAutoresizingMaskIntoConstraints = false
         return label
     }()
@@ -23,6 +25,9 @@ final class WorkspaceView: NSView {
         label.font = .systemFont(ofSize: 13, weight: .regular)
         label.textColor = NSColor.secondaryLabelColor
         label.lineBreakMode = .byTruncatingMiddle
+        label.maximumNumberOfLines = 1
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        label.setContentHuggingPriority(.defaultLow, for: .horizontal)
         label.translatesAutoresizingMaskIntoConstraints = false
         return label
     }()
@@ -64,7 +69,7 @@ final class WorkspaceView: NSView {
 
             metadataLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
             metadataLabel.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 14),
-            metadataLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -22),
+            metadataLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -22),
 
             timelineSurface.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 18),
             timelineSurface.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 22),
