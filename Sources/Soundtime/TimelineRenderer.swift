@@ -39,6 +39,7 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
     private var dynamicVertexBuffer: MTLBuffer?
     private var playheadProgress: Float = 0
     private var hoverProgress: Float?
+    private var isHoverGuideArmed = false
     private var selection: TimelineSelection?
     private var trimPreview: TimelineTrimRange?
 
@@ -85,8 +86,9 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         playheadProgress = min(max(progress, 0), 1)
     }
 
-    func displayHoverProgress(_ progress: Float?) {
+    func displayHoverProgress(_ progress: Float?, isArmed: Bool = false) {
         hoverProgress = progress.map { min(max($0, 0), 1) }
+        isHoverGuideArmed = progress != nil && isArmed
     }
 
     func displaySelection(_ selection: TimelineSelection?) {
@@ -417,7 +419,8 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         let guideWidth = pixelLength(backingScale: backingScale)
         let left = max(guideX - guideWidth * 0.5, 0)
         let right = min(left + guideWidth, width)
-        let color = SIMD4<Float>(0.68, 0.70, 0.72, 0.36)
+        let alpha: Float = isHoverGuideArmed ? 0.56 : 0.36
+        let color = SIMD4<Float>(0.68, 0.70, 0.72, alpha)
         let size = SIMD2<Float>(width, height)
         var vertices: [TimelineVertex] = []
         vertices.reserveCapacity(6)
