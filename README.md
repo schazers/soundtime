@@ -15,6 +15,7 @@ This repository currently contains the native app shell:
 - Metal-backed timeline workspace with a static grid and playhead
 - Single-file audio drag and drop with lightweight filename, duration, and size metadata
 - WAV PCM decode into an in-memory floating-point buffer
+- Full-file waveform overview rendered through Metal
 
 ## Run
 

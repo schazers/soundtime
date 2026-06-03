@@ -14,6 +14,7 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
 
     private let commandQueue: MTLCommandQueue
     private let pipelineState: MTLRenderPipelineState
+    private var waveformOverview: WaveformOverview?
 
     init(device: MTLDevice, pixelFormat: MTLPixelFormat) throws {
         guard let commandQueue = device.makeCommandQueue() else {
@@ -41,6 +42,10 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
+    func displayWaveform(_ waveformOverview: WaveformOverview?) {
+        self.waveformOverview = waveformOverview
+    }
+
     func draw(in view: MTKView) {
         guard
             let renderPassDescriptor = view.currentRenderPassDescriptor,
@@ -54,10 +59,15 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         let drawableSize = view.drawableSize
         let backingScale = backingScale(for: view)
         let gridVertices = makeGridVertices(drawableSize: drawableSize, backingScale: backingScale)
+        let waveformVertices = makeWaveformVertices(
+            drawableSize: drawableSize,
+            backingScale: backingScale
+        )
         let playheadVertices = makePlayheadVertices(drawableSize: drawableSize, backingScale: backingScale)
 
         encoder.setRenderPipelineState(pipelineState)
         draw(vertices: gridVertices, primitiveType: .line, encoder: encoder)
+        draw(vertices: waveformVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: playheadVertices, primitiveType: .triangle, encoder: encoder)
         encoder.endEncoding()
 
@@ -120,6 +130,52 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         return vertices
     }
 
+    private func makeWaveformVertices(drawableSize: CGSize, backingScale: Float) -> [TimelineVertex] {
+        guard let waveformOverview, !waveformOverview.isEmpty else {
+            return []
+        }
+
+        let width = Float(drawableSize.width)
+        let height = Float(drawableSize.height)
+        guard width > 0, height > 0 else {
+            return []
+        }
+
+        let centerY = height * 0.5
+        let amplitudeHeight = height * 0.42
+        let minimumVisualHeight = max(backingScale, 1)
+        let color = SIMD4<Float>(0.78, 0.92, 0.88, 1.0)
+        let size = SIMD2<Float>(width, height)
+        let bins = waveformOverview.bins
+        var vertices: [TimelineVertex] = []
+        vertices.reserveCapacity(bins.count * 6)
+
+        for (index, bin) in bins.enumerated() {
+            let x0 = Float(index) / Float(bins.count) * width
+            let x1 = max(Float(index + 1) / Float(bins.count) * width, x0 + 1)
+            var y0 = centerY - bin.maximumSample * amplitudeHeight
+            var y1 = centerY - bin.minimumSample * amplitudeHeight
+
+            if y1 - y0 < minimumVisualHeight {
+                let midpoint = (y0 + y1) * 0.5
+                y0 = midpoint - minimumVisualHeight * 0.5
+                y1 = midpoint + minimumVisualHeight * 0.5
+            }
+
+            appendRectangle(
+                to: &vertices,
+                left: x0,
+                right: min(x1, width),
+                top: max(y0, 0),
+                bottom: min(y1, height),
+                color: color,
+                drawableSize: size
+            )
+        }
+
+        return vertices
+    }
+
     private func makePlayheadVertices(drawableSize: CGSize, backingScale: Float) -> [TimelineVertex] {
         let width = Float(drawableSize.width)
         let height = Float(drawableSize.height)
@@ -153,6 +209,44 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
     ) {
         vertices.append(makeVertex(pixelPosition: start, color: color, drawableSize: drawableSize))
         vertices.append(makeVertex(pixelPosition: end, color: color, drawableSize: drawableSize))
+    }
+
+    private func appendRectangle(
+        to vertices: inout [TimelineVertex],
+        left: Float,
+        right: Float,
+        top: Float,
+        bottom: Float,
+        color: SIMD4<Float>,
+        drawableSize: SIMD2<Float>
+    ) {
+        let topLeft = makeVertex(
+            pixelPosition: SIMD2<Float>(left, top),
+            color: color,
+            drawableSize: drawableSize
+        )
+        let topRight = makeVertex(
+            pixelPosition: SIMD2<Float>(right, top),
+            color: color,
+            drawableSize: drawableSize
+        )
+        let bottomLeft = makeVertex(
+            pixelPosition: SIMD2<Float>(left, bottom),
+            color: color,
+            drawableSize: drawableSize
+        )
+        let bottomRight = makeVertex(
+            pixelPosition: SIMD2<Float>(right, bottom),
+            color: color,
+            drawableSize: drawableSize
+        )
+
+        vertices.append(topLeft)
+        vertices.append(topRight)
+        vertices.append(bottomLeft)
+        vertices.append(topRight)
+        vertices.append(bottomRight)
+        vertices.append(bottomLeft)
     }
 
     private func makeVertex(
