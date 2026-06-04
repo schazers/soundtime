@@ -16,7 +16,7 @@ This repository currently contains the native app shell:
 - Single-file audio drag and drop with lightweight filename, duration, and size metadata
 - Progressive sparse WAV previews so dropped files become visible, playable, and visually refine before full decode completes
 - WAV PCM decode into an in-memory floating-point buffer
-- Full-file waveform overview rendered through Metal
+- High-resolution full-file waveform overview rendered through Metal
 - Spacebar playback for decoded WAV files with a moving playhead
 - Header time readout for playhead position, timeline duration, and selection bounds
 - Draggable start/end trim handles for fast boundary trims

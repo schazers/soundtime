@@ -1,9 +1,11 @@
 import Foundation
 
 enum WaveformOverviewBuilder {
+    static let defaultTargetBinCount = 65_536
+
     static func build(
         from buffer: DecodedAudioBuffer,
-        targetBinCount: Int = 4_096
+        targetBinCount: Int = defaultTargetBinCount
     ) -> WaveformOverview {
         guard buffer.frameCount > 0, buffer.channelCount > 0 else {
             return WaveformOverview(duration: buffer.duration, bins: [])
