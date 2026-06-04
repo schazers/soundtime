@@ -7,13 +7,13 @@ class TimelineMetalLayerView: NSView {
     var preferredFramesPerSecond = 60
     var colorPixelFormat: MTLPixelFormat = .bgra8Unorm {
         didSet {
-            metalLayer?.pixelFormat = colorPixelFormat
+            timelineMetalLayer?.pixelFormat = colorPixelFormat
         }
     }
     var clearColor = MTLClearColor(red: 0.08, green: 0.08, blue: 0.08, alpha: 1.0)
     var framebufferOnly = true {
         didSet {
-            metalLayer?.framebufferOnly = framebufferOnly
+            timelineMetalLayer?.framebufferOnly = framebufferOnly
         }
     }
 
@@ -33,7 +33,7 @@ class TimelineMetalLayerView: NSView {
         return 1
     }
 
-    private var metalLayer: CAMetalLayer? {
+    var timelineMetalLayer: CAMetalLayer? {
         layer as? CAMetalLayer
     }
 
@@ -81,9 +81,20 @@ class TimelineMetalLayerView: NSView {
         renderer.render(to: target)
     }
 
+    func renderTimeline(using renderer: TimelineRenderer?, frame: TimelineDisplayLinkFrame) {
+        guard
+            let renderer,
+            let target = makeRenderTarget(drawable: frame.drawable)
+        else {
+            return
+        }
+
+        renderer.render(to: target)
+    }
+
     private func configureLayerHosting() {
         wantsLayer = true
-        configure(metalLayer: metalLayer)
+        configure(metalLayer: timelineMetalLayer)
         updateDrawableSize()
     }
 
@@ -106,13 +117,21 @@ class TimelineMetalLayerView: NSView {
         guard
             bounds.width > 0,
             bounds.height > 0,
-            let metalLayer
+            let metalLayer = timelineMetalLayer
         else {
             return nil
         }
 
         updateDrawableSize()
         guard let drawable = metalLayer.nextDrawable() else {
+            return nil
+        }
+
+        return makeRenderTarget(drawable: drawable)
+    }
+
+    private func makeRenderTarget(drawable: CAMetalDrawable) -> TimelineRenderTarget? {
+        guard bounds.width > 0, bounds.height > 0 else {
             return nil
         }
 
@@ -131,7 +150,7 @@ class TimelineMetalLayerView: NSView {
     }
 
     private func updateDrawableSize() {
-        guard let metalLayer else {
+        guard let metalLayer = timelineMetalLayer else {
             return
         }
 

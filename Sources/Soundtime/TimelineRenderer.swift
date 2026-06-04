@@ -421,17 +421,29 @@ final class TimelineRenderer: NSObject {
 
     private func recordFrameRate() {
         let currentTime = CFAbsoluteTimeGetCurrent()
-        if let previousFrameTime {
-            let frameInterval = currentTime - previousFrameTime
-            if frameInterval > 0, frameInterval < 0.25 {
-                frameIntervalCount += 1
-                frameIntervalSum += frameInterval
-                frameIntervalSquareSum += frameInterval * frameInterval
-                worstFrameInterval = max(worstFrameInterval, frameInterval)
-            }
+        guard let previousFrameTime else {
+            resetFrameRateWindow(startingAt: currentTime)
+            self.previousFrameTime = currentTime
+            frameRateFrameCount = 1
+            return
         }
 
-        previousFrameTime = currentTime
+        let frameInterval = currentTime - previousFrameTime
+        guard frameInterval < 0.25 else {
+            resetFrameRateWindow(startingAt: currentTime)
+            self.previousFrameTime = currentTime
+            frameRateFrameCount = 1
+            return
+        }
+
+        if frameInterval > 0 {
+            frameIntervalCount += 1
+            frameIntervalSum += frameInterval
+            frameIntervalSquareSum += frameInterval * frameInterval
+            worstFrameInterval = max(worstFrameInterval, frameInterval)
+        }
+
+        self.previousFrameTime = currentTime
         frameRateFrameCount += 1
 
         let elapsedTime = currentTime - frameRateWindowStartTime
@@ -469,6 +481,15 @@ final class TimelineRenderer: NSObject {
         frameIntervalSquareSum = 0
         worstFrameInterval = 0
         onFrameStatsChanged?(frameStats)
+    }
+
+    private func resetFrameRateWindow(startingAt currentTime: CFTimeInterval) {
+        frameRateWindowStartTime = currentTime
+        frameRateFrameCount = 0
+        frameIntervalCount = 0
+        frameIntervalSum = 0
+        frameIntervalSquareSum = 0
+        worstFrameInterval = 0
     }
 
     private func cachedGridVertices(
