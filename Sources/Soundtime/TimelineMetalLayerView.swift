@@ -98,6 +98,7 @@ class TimelineMetalLayerView: NSView {
         metalLayer.isOpaque = true
         metalLayer.presentsWithTransaction = false
         metalLayer.displaySyncEnabled = true
+        metalLayer.maximumDrawableCount = 3
         metalLayer.contentsScale = backingScale
     }
 
