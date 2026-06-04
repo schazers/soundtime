@@ -1,6 +1,7 @@
-import MetalKit
+import AppKit
+import Metal
 
-final class TimelineView: MTKView, NSMenuItemValidation {
+final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onAudioFileDropped: ((URL) -> Void)?
     var onTogglePlayback: (() -> Void)?
     var onDeleteSelection: (() -> Void)?
@@ -40,6 +41,8 @@ final class TimelineView: MTKView, NSMenuItemValidation {
     private var rightPanVelocityProgressPerSecond: Float = 0
     private var rightPanMomentumTimer: Timer?
     private var rightPanMomentumLastTime: TimeInterval?
+    private var transientRenderTimer: Timer?
+    private var transientRenderEndTime: CFTimeInterval?
     private let selectionDragThreshold: CGFloat = 3
     private let trimHandleHitWidth: CGFloat = 18
     private let rightPanVelocitySmoothing: Float = 0.42
@@ -48,6 +51,7 @@ final class TimelineView: MTKView, NSMenuItemValidation {
     private let rightPanStationaryDecayRate: Double = 18
     private let rightPanMomentumReleaseWindow: TimeInterval = 0.12
     private let rightPanMovementThreshold: CGFloat = 0.25
+    private let transientRenderPulseDuration: CFTimeInterval = 0.18
     private let targetFramesPerSecond = 144
     private let scrollZoomSensitivity: Float = 0.01
     private let supportedAudioExtensions: Set<String> = [
@@ -67,10 +71,8 @@ final class TimelineView: MTKView, NSMenuItemValidation {
         configureRenderer(with: metalDevice)
     }
 
-    required init(coder: NSCoder) {
-        let metalDevice = MTLCreateSystemDefaultDevice()
+    required init?(coder: NSCoder) {
         super.init(coder: coder)
-        device = metalDevice
         configure()
         configureRenderer(with: metalDevice)
     }
@@ -88,6 +90,7 @@ final class TimelineView: MTKView, NSMenuItemValidation {
         window?.makeFirstResponder(self)
         window?.acceptsMouseMovedEvents = true
         updatePreferredFrameRate()
+        renderTimelineFrame()
     }
 
     func displayWaveform(_ waveformOverview: WaveformOverview?) {
@@ -124,26 +127,35 @@ final class TimelineView: MTKView, NSMenuItemValidation {
         let clampedProgress = min(max(progress, 0), 1)
         pageViewportIfNeeded(forPlayheadProgress: clampedProgress)
         timelineRenderer?.displayPlayheadProgress(clampedProgress, force: syncRenderer)
+        renderTimelineFrame()
     }
 
     func displayPlaybackActive(_ isActive: Bool) {
         timelineRenderer?.displayPlaybackActive(isActive)
+        renderTimelineFrame()
+        if !isActive {
+            startTransientRenderPulse()
+        }
     }
 
     func displaySelection(_ selection: TimelineSelection?) {
         timelineRenderer?.displaySelection(selection)
+        renderTimelineFrame()
     }
 
     func displayTrimPreview(_ trimRange: TimelineTrimRange?) {
         timelineRenderer?.displayTrimPreview(trimRange)
+        renderTimelineFrame()
     }
 
     func displayHoverProgress(_ progress: Float?, isArmed: Bool = false) {
         timelineRenderer?.displayHoverProgress(progress, isArmed: isArmed)
+        renderTimelineFrame()
     }
 
     func displayGainPreview(selection: TimelineSelection?, gain: Float) {
         timelineRenderer?.displayGainPreview(selection: selection, gain: gain)
+        renderTimelineFrame()
     }
 
     private func configure() {
@@ -151,9 +163,6 @@ final class TimelineView: MTKView, NSMenuItemValidation {
         clearColor = MTLClearColor(red: 0.08, green: 0.08, blue: 0.08, alpha: 1.0)
         framebufferOnly = true
         preferredFramesPerSecond = targetFramesPerSecond
-        enableSetNeedsDisplay = false
-        isPaused = false
-        autoResizeDrawable = true
 
         wantsLayer = true
         layer?.cornerRadius = 8
@@ -162,9 +171,15 @@ final class TimelineView: MTKView, NSMenuItemValidation {
         registerForDraggedTypes([.fileURL])
     }
 
+    override func layout() {
+        super.layout()
+        renderTimelineFrame()
+    }
+
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
         updatePreferredFrameRate()
+        renderTimelineFrame()
     }
 
     override func updateTrackingAreas() {
@@ -199,7 +214,7 @@ final class TimelineView: MTKView, NSMenuItemValidation {
                     self?.onFrameStatsChanged?(frameStats)
                 }
             }
-            delegate = renderer
+            renderTimelineFrame()
         } catch {
             Swift.print("Soundtime could not create the timeline renderer: \\(error)")
         }
@@ -207,6 +222,46 @@ final class TimelineView: MTKView, NSMenuItemValidation {
 
     private func updatePreferredFrameRate() {
         preferredFramesPerSecond = targetFramesPerSecond
+    }
+
+    private func renderTimelineFrame() {
+        renderTimeline(using: timelineRenderer)
+    }
+
+    private func startTransientRenderPulse() {
+        transientRenderEndTime = CFAbsoluteTimeGetCurrent() + transientRenderPulseDuration
+        guard transientRenderTimer == nil else {
+            return
+        }
+
+        let frameRate = max(preferredFramesPerSecond, 60)
+        let timer = Timer(timeInterval: 1 / Double(frameRate), repeats: true) { [weak self] timer in
+            guard let self else {
+                timer.invalidate()
+                return
+            }
+
+            MainActor.assumeIsolated {
+                self.stepTransientRenderPulse()
+            }
+        }
+        timer.tolerance = 0
+        transientRenderTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stepTransientRenderPulse() {
+        guard
+            let transientRenderEndTime,
+            CFAbsoluteTimeGetCurrent() <= transientRenderEndTime
+        else {
+            transientRenderTimer?.invalidate()
+            transientRenderTimer = nil
+            self.transientRenderEndTime = nil
+            return
+        }
+
+        renderTimelineFrame()
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
@@ -705,7 +760,7 @@ final class TimelineView: MTKView, NSMenuItemValidation {
         viewport = nextViewport
         timelineRenderer?.displayViewport(nextViewport)
         window?.invalidateCursorRects(for: self)
-        draw()
+        renderTimelineFrame()
     }
 
     private func pageViewportIfNeeded(forPlayheadProgress progress: Float) {
