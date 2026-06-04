@@ -187,14 +187,17 @@ final class WorkspaceView: NSView {
                     self.displayPlaybackVisuals(progress: 0, isPlaying: false)
                     self.updateTimeReadout()
                     self.metadataLabel.stringValue = "\(result.metadata.formattedSummary) - WAV decode not available yet"
-                case let .decoded(decodedAudioBuffer, waveformOverview):
+                case let .decoded(decodedAudioBuffer, waveformOverview, zeroCrossingIndex):
                     self.decodedAudioBuffer = decodedAudioBuffer
                     self.audioTimeline = AudioEditTimeline(sourceBuffer: decodedAudioBuffer)
                     self.editUndoStack.removeAll()
                     self.currentPlayheadFrame = 0
                     self.displayedFrameCount = decodedAudioBuffer.frameCount
                     self.displayedSampleRate = decodedAudioBuffer.sampleRate
-                    try self.playbackController.load(decodedAudioBuffer)
+                    try self.playbackController.load(
+                        decodedAudioBuffer,
+                        zeroCrossingIndex: zeroCrossingIndex
+                    )
                     self.timelineSurface.displayWaveform(waveformOverview)
                     self.displayPlaybackVisuals(progress: 0, isPlaying: false)
                     self.loadedAudioSummary = "\(result.metadata.displayName) - \(decodedAudioBuffer.formattedSummary)"
@@ -288,7 +291,7 @@ final class WorkspaceView: NSView {
                 }
 
                 do {
-                    let (decodedAudioBuffer, waveformOverview) = try await decodedWAV
+                    let (decodedAudioBuffer, waveformOverview, zeroCrossingIndex) = try await decodedWAV
 
                     guard self.activeImportID == importID else {
                         return
@@ -296,7 +299,8 @@ final class WorkspaceView: NSView {
 
                     self.applyDecodedWAV(
                         decodedAudioBuffer: decodedAudioBuffer,
-                        waveformOverview: waveformOverview
+                        waveformOverview: waveformOverview,
+                        zeroCrossingIndex: zeroCrossingIndex
                     )
                 } catch {
                     guard self.activeImportID == importID else {
@@ -348,7 +352,10 @@ final class WorkspaceView: NSView {
         displayPlaybackVisuals(progress: 0, isPlaying: false)
 
         do {
-            try playbackController.loadFile(at: previewResult.metadata.url)
+            try playbackController.loadFile(
+                at: previewResult.metadata.url,
+                zeroCrossingProbe: previewResult.zeroCrossingProbe
+            )
             currentPlaybackStatus = "press Space to play - resolving waveform"
         } catch {
             playbackController.clear()
@@ -371,7 +378,11 @@ final class WorkspaceView: NSView {
         updateTimeReadout()
     }
 
-    private func applyDecodedWAV(decodedAudioBuffer: DecodedAudioBuffer, waveformOverview: WaveformOverview) {
+    private func applyDecodedWAV(
+        decodedAudioBuffer: DecodedAudioBuffer,
+        waveformOverview: WaveformOverview,
+        zeroCrossingIndex: AudioZeroCrossingIndex
+    ) {
         self.decodedAudioBuffer = decodedAudioBuffer
         audioTimeline = AudioEditTimeline(sourceBuffer: decodedAudioBuffer)
         editUndoStack.removeAll()
@@ -379,7 +390,9 @@ final class WorkspaceView: NSView {
         displayedSampleRate = decodedAudioBuffer.sampleRate
 
         if !playbackController.hasSource {
-            try? playbackController.load(decodedAudioBuffer)
+            try? playbackController.load(decodedAudioBuffer, zeroCrossingIndex: zeroCrossingIndex)
+        } else {
+            playbackController.updateZeroCrossingIndex(zeroCrossingIndex)
         }
 
         timelineSurface.displayWaveform(waveformOverview)
@@ -656,7 +669,8 @@ final class WorkspaceView: NSView {
 
         if renderedBuffer.frameCount > 0 {
             do {
-                try playbackController.load(renderedBuffer)
+                let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: renderedBuffer)
+                try playbackController.load(renderedBuffer, zeroCrossingIndex: zeroCrossingIndex)
             } catch {
                 updateStatus("playback failed: \(error.localizedDescription)")
             }

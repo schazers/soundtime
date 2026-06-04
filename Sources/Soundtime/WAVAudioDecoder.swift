@@ -76,6 +76,35 @@ enum WAVAudioDecoder {
         return try decodeSamples(in: data, fileInfo: fileInfo)
     }
 
+    static func makeZeroCrossingProbe(url: URL, fileInfo: WAVFileInfo) throws -> WAVZeroCrossingProbe {
+        try validateDecodable(fileInfo)
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        return WAVZeroCrossingProbe(data: data, fileInfo: fileInfo)
+    }
+
+    static func mixedSample(in data: Data, fileInfo: WAVFileInfo, frameIndex: Int) throws -> Float {
+        guard fileInfo.frameCount > 0 else {
+            return 0
+        }
+
+        let bytesPerSample = bytesPerSample(for: fileInfo)
+        let clampedFrameIndex = min(max(frameIndex, 0), fileInfo.frameCount - 1)
+        let frameOffset = fileInfo.dataRange.lowerBound + clampedFrameIndex * fileInfo.blockAlign
+        var sample: Float = 0
+
+        for channelIndex in 0..<fileInfo.channelCount {
+            let sampleOffset = frameOffset + channelIndex * bytesPerSample
+            sample += try decodeSample(
+                in: data,
+                at: sampleOffset,
+                formatTag: fileInfo.formatTag,
+                bitsPerSample: fileInfo.bitsPerSample
+            )
+        }
+
+        return sample / Float(fileInfo.channelCount)
+    }
+
     private static func inspect(in data: Data, url: URL) throws -> WAVFileInfo {
         guard
             data.count >= 12,

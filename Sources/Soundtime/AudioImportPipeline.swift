@@ -3,7 +3,7 @@ import Foundation
 struct AudioImportResult: Sendable {
     enum DecodeStatus: Sendable {
         case unsupported
-        case decoded(DecodedAudioBuffer, WaveformOverview)
+        case decoded(DecodedAudioBuffer, WaveformOverview, AudioZeroCrossingIndex)
         case failed(String)
     }
 
@@ -27,20 +27,30 @@ enum AudioImportPipeline {
                 for: url,
                 duration: fileInfo.duration
             )
+            let zeroCrossingProbe = try? WAVAudioDecoder.makeZeroCrossingProbe(
+                url: url,
+                fileInfo: fileInfo
+            )
 
             return WAVPreviewImportResult(
                 metadata: metadata,
                 fileInfo: fileInfo,
-                waveformOverview: waveformOverview
+                waveformOverview: waveformOverview,
+                zeroCrossingProbe: zeroCrossingProbe
             )
         }.value
     }
 
-    static func loadDecodedWAV(at url: URL) async throws -> (DecodedAudioBuffer, WaveformOverview) {
+    static func loadDecodedWAV(at url: URL) async throws -> (
+        DecodedAudioBuffer,
+        WaveformOverview,
+        AudioZeroCrossingIndex
+    ) {
         try await Task.detached(priority: .userInitiated) {
             let decodedAudioBuffer = try WAVAudioDecoder.decode(url: url)
             let waveformOverview = WaveformOverviewBuilder.build(from: decodedAudioBuffer)
-            return (decodedAudioBuffer, waveformOverview)
+            let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: decodedAudioBuffer)
+            return (decodedAudioBuffer, waveformOverview, zeroCrossingIndex)
         }.value
     }
 
@@ -55,9 +65,10 @@ enum AudioImportPipeline {
             do {
                 let decodedAudioBuffer = try WAVAudioDecoder.decode(url: url)
                 let waveformOverview = WaveformOverviewBuilder.build(from: decodedAudioBuffer)
+                let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: decodedAudioBuffer)
                 return AudioImportResult(
                     metadata: metadata,
-                    decodeStatus: .decoded(decodedAudioBuffer, waveformOverview)
+                    decodeStatus: .decoded(decodedAudioBuffer, waveformOverview, zeroCrossingIndex)
                 )
             } catch {
                 return AudioImportResult(
