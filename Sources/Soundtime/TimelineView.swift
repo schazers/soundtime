@@ -43,6 +43,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var rightPanMomentumLastTime: TimeInterval?
     private var transientRenderTimer: Timer?
     private var transientRenderEndTime: CFTimeInterval?
+    private var isTimelineRenderScheduled = false
     private let selectionDragThreshold: CGFloat = 3
     private let trimHandleHitWidth: CGFloat = 18
     private let rightPanVelocitySmoothing: Float = 0.42
@@ -90,7 +91,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         window?.makeFirstResponder(self)
         window?.acceptsMouseMovedEvents = true
         updatePreferredFrameRate()
-        renderTimelineFrame()
+        requestTimelineRender()
     }
 
     func displayWaveform(_ waveformOverview: WaveformOverview?) {
@@ -127,12 +128,12 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         let clampedProgress = min(max(progress, 0), 1)
         pageViewportIfNeeded(forPlayheadProgress: clampedProgress)
         timelineRenderer?.displayPlayheadProgress(clampedProgress, force: syncRenderer)
-        renderTimelineFrame()
+        requestTimelineRender()
     }
 
     func displayPlaybackActive(_ isActive: Bool) {
         timelineRenderer?.displayPlaybackActive(isActive)
-        renderTimelineFrame()
+        requestTimelineRender()
         if !isActive {
             startTransientRenderPulse()
         }
@@ -140,22 +141,22 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     func displaySelection(_ selection: TimelineSelection?) {
         timelineRenderer?.displaySelection(selection)
-        renderTimelineFrame()
+        requestTimelineRender()
     }
 
     func displayTrimPreview(_ trimRange: TimelineTrimRange?) {
         timelineRenderer?.displayTrimPreview(trimRange)
-        renderTimelineFrame()
+        requestTimelineRender()
     }
 
     func displayHoverProgress(_ progress: Float?, isArmed: Bool = false) {
         timelineRenderer?.displayHoverProgress(progress, isArmed: isArmed)
-        renderTimelineFrame()
+        requestTimelineRender()
     }
 
     func displayGainPreview(selection: TimelineSelection?, gain: Float) {
         timelineRenderer?.displayGainPreview(selection: selection, gain: gain)
-        renderTimelineFrame()
+        requestTimelineRender()
     }
 
     private func configure() {
@@ -173,13 +174,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     override func layout() {
         super.layout()
-        renderTimelineFrame()
+        requestTimelineRender()
     }
 
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
         updatePreferredFrameRate()
-        renderTimelineFrame()
+        requestTimelineRender()
     }
 
     override func updateTrackingAreas() {
@@ -214,7 +215,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                     self?.onFrameStatsChanged?(frameStats)
                 }
             }
-            renderTimelineFrame()
+            requestTimelineRender()
         } catch {
             Swift.print("Soundtime could not create the timeline renderer: \\(error)")
         }
@@ -224,7 +225,19 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         preferredFramesPerSecond = targetFramesPerSecond
     }
 
-    private func renderTimelineFrame() {
+    private func requestTimelineRender() {
+        guard !isTimelineRenderScheduled else {
+            return
+        }
+
+        isTimelineRenderScheduled = true
+        Task { @MainActor [weak self] in
+            self?.renderScheduledTimelineFrame()
+        }
+    }
+
+    private func renderScheduledTimelineFrame() {
+        isTimelineRenderScheduled = false
         renderTimeline(using: timelineRenderer)
     }
 
@@ -261,7 +274,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
-        renderTimelineFrame()
+        requestTimelineRender()
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
@@ -760,7 +773,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         viewport = nextViewport
         timelineRenderer?.displayViewport(nextViewport)
         window?.invalidateCursorRects(for: self)
-        renderTimelineFrame()
+        requestTimelineRender()
     }
 
     private func pageViewportIfNeeded(forPlayheadProgress progress: Float) {

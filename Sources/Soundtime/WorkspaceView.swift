@@ -855,8 +855,8 @@ final class WorkspaceView: NSView {
         isPlaying: Bool,
         syncPlayhead: Bool = true
     ) {
-        timelineSurface.displayPlaybackActive(isPlaying)
         timelineSurface.displayPlayheadProgress(progress, syncRenderer: syncPlayhead)
+        timelineSurface.displayPlaybackActive(isPlaying)
     }
 
     private func refreshPlaybackProgress(syncPlayheadWhenPlaying: Bool = false) {
