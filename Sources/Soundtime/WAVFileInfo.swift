@@ -46,4 +46,5 @@ struct WAVPreviewImportResult: Sendable {
     let metadata: AudioFileMetadata
     let fileInfo: WAVFileInfo
     let waveformOverview: WaveformOverview
+    let zeroCrossingProbe: WAVZeroCrossingProbe?
 }

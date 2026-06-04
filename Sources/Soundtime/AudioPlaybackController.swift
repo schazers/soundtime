@@ -64,6 +64,8 @@ final class AudioPlaybackController {
     private let engine = AVAudioEngine()
     private let playerNode = AVAudioPlayerNode()
     private var playbackSource: PlaybackSource?
+    private var zeroCrossingIndex: AudioZeroCrossingIndex?
+    private var zeroCrossingProbe: WAVZeroCrossingProbe?
     private var scheduledPlaybackBuffer: AVAudioPCMBuffer?
     private var scheduledStartFrame = 0
     private var pausedFrame = 0
@@ -81,9 +83,14 @@ final class AudioPlaybackController {
         engine.attach(playerNode)
     }
 
-    func load(_ decodedAudioBuffer: DecodedAudioBuffer) throws {
+    func load(
+        _ decodedAudioBuffer: DecodedAudioBuffer,
+        zeroCrossingIndex: AudioZeroCrossingIndex? = nil
+    ) throws {
         stopEnginePlayback()
         playbackSource = .decoded(decodedAudioBuffer)
+        self.zeroCrossingIndex = zeroCrossingIndex
+        zeroCrossingProbe = nil
         scheduledStartFrame = 0
         pausedFrame = 0
 
@@ -92,10 +99,12 @@ final class AudioPlaybackController {
         engine.connect(playerNode, to: engine.mainMixerNode, format: format)
     }
 
-    func loadFile(at url: URL) throws {
+    func loadFile(at url: URL, zeroCrossingProbe: WAVZeroCrossingProbe? = nil) throws {
         stopEnginePlayback()
         let audioFile = try AVAudioFile(forReading: url)
         playbackSource = .file(audioFile)
+        zeroCrossingIndex = nil
+        self.zeroCrossingProbe = zeroCrossingProbe
         scheduledStartFrame = 0
         pausedFrame = 0
 
@@ -106,8 +115,14 @@ final class AudioPlaybackController {
     func clear() {
         stopEnginePlayback()
         playbackSource = nil
+        zeroCrossingIndex = nil
+        zeroCrossingProbe = nil
         scheduledStartFrame = 0
         pausedFrame = 0
+    }
+
+    func updateZeroCrossingIndex(_ zeroCrossingIndex: AudioZeroCrossingIndex?) {
+        self.zeroCrossingIndex = zeroCrossingIndex
     }
 
     @discardableResult
@@ -130,6 +145,11 @@ final class AudioPlaybackController {
         if pausedFrame >= sourceFrameCount {
             pausedFrame = 0
         }
+        pausedFrame = snappedFrameToZeroCrossing(
+            pausedFrame,
+            frameCount: sourceFrameCount,
+            allowsEnd: false
+        )
 
         scheduledStartFrame = pausedFrame
         playerNode.stop()
@@ -166,7 +186,15 @@ final class AudioPlaybackController {
     }
 
     func pause() {
-        pausedFrame = currentFrame()
+        guard let playbackSource else {
+            return
+        }
+
+        pausedFrame = snappedFrameToZeroCrossing(
+            currentFrame(),
+            frameCount: playbackSource.frameCount,
+            allowsEnd: true
+        )
         playerNode.pause()
         isPlayerRunning = false
     }
@@ -182,12 +210,17 @@ final class AudioPlaybackController {
             max(Int((clampedProgress * Float(sourceFrameCount)).rounded(.down)), 0),
             sourceFrameCount
         )
-        let shouldResumePlayback = isPlayerRunning && targetFrame < sourceFrameCount
+        let snappedTargetFrame = snappedFrameToZeroCrossing(
+            targetFrame,
+            frameCount: sourceFrameCount,
+            allowsEnd: targetFrame >= sourceFrameCount
+        )
+        let shouldResumePlayback = isPlayerRunning && snappedTargetFrame < sourceFrameCount
 
         playerNode.stop()
         scheduledPlaybackBuffer = nil
-        scheduledStartFrame = targetFrame
-        pausedFrame = targetFrame
+        scheduledStartFrame = snappedTargetFrame
+        pausedFrame = snappedTargetFrame
         isPlayerRunning = false
 
         if shouldResumePlayback {
@@ -243,6 +276,33 @@ final class AudioPlaybackController {
         scheduledPlaybackBuffer = nil
         isPlayerRunning = false
         pausedFrame = 0
+    }
+
+    private func snappedFrameToZeroCrossing(
+        _ frame: Int,
+        frameCount: Int,
+        allowsEnd: Bool
+    ) -> Int {
+        let clampedFrame = min(max(frame, 0), frameCount)
+        guard clampedFrame > 0, clampedFrame < frameCount else {
+            return clampedFrame
+        }
+
+        let snappedFrame: Int
+        if let zeroCrossingIndex, zeroCrossingIndex.frameCount == frameCount {
+            snappedFrame = zeroCrossingIndex.nearestFrame(to: clampedFrame)
+        } else if let zeroCrossingProbe {
+            snappedFrame = zeroCrossingProbe.nearestFrame(to: clampedFrame)
+        } else {
+            snappedFrame = clampedFrame
+        }
+
+        let boundedFrame = min(max(snappedFrame, 0), frameCount)
+        if !allowsEnd, boundedFrame >= frameCount {
+            return max(frameCount - 1, 0)
+        }
+
+        return boundedFrame
     }
 
     private func playbackFormat(for decodedAudioBuffer: DecodedAudioBuffer) throws -> AVAudioFormat {
