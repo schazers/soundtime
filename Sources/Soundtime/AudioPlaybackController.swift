@@ -70,9 +70,12 @@ final class AudioPlaybackController {
     private var scheduledStartFrame = 0
     private var pausedFrame = 0
     private var isPlayerRunning = false
+    private var isRestartPending = false
+    private var transportRampTask: Task<Void, Never>?
+    private let transportRampDuration: TimeInterval = 0.018
 
     var isPlaying: Bool {
-        isPlayerRunning
+        isPlayerRunning || isRestartPending
     }
 
     var hasSource: Bool {
@@ -81,6 +84,7 @@ final class AudioPlaybackController {
 
     init() {
         engine.attach(playerNode)
+        playerNode.volume = 1
     }
 
     func load(
@@ -127,7 +131,7 @@ final class AudioPlaybackController {
 
     @discardableResult
     func togglePlayback() throws -> Bool {
-        if isPlayerRunning {
+        if isPlaying {
             pause()
             return false
         }
@@ -152,37 +156,19 @@ final class AudioPlaybackController {
         )
 
         scheduledStartFrame = pausedFrame
+        cancelTransportRamp()
         playerNode.stop()
-
-        switch playbackSource {
-        case let .decoded(decodedAudioBuffer):
-            let playbackBuffer = try makePlaybackBuffer(
-                from: decodedAudioBuffer,
-                startingAt: pausedFrame
-            )
-            scheduledPlaybackBuffer = playbackBuffer
-            playerNode.scheduleBuffer(playbackBuffer, at: nil)
-        case let .file(audioFile):
-            let remainingFrameCount = sourceFrameCount - pausedFrame
-            guard remainingFrameCount > 0 else {
-                throw PlaybackError.invalidFormat
-            }
-
-            scheduledPlaybackBuffer = nil
-            playerNode.scheduleSegment(
-                audioFile,
-                startingFrame: AVAudioFramePosition(pausedFrame),
-                frameCount: AVAudioFrameCount(remainingFrameCount),
-                at: nil
-            )
-        }
+        try schedulePlayback(startingAt: pausedFrame)
 
         if !engine.isRunning {
             try engine.start()
         }
 
+        playerNode.volume = 0
         playerNode.play()
         isPlayerRunning = true
+        isRestartPending = false
+        beginTransportRamp(to: 1)
     }
 
     func pause() {
@@ -190,16 +176,29 @@ final class AudioPlaybackController {
             return
         }
 
+        let frame = currentFrame()
         pausedFrame = snappedFrameToZeroCrossing(
-            currentFrame(),
+            frame,
             frameCount: playbackSource.frameCount,
             allowsEnd: true
         )
-        playerNode.pause()
         isPlayerRunning = false
+        isRestartPending = false
+        beginTransportRamp(to: 0) { [weak self] in
+            guard let self else {
+                return
+            }
+
+            playerNode.pause()
+            playerNode.volume = 1
+        }
     }
 
     func seek(toProgress progress: Float) throws {
+        try seek(toProgress: progress, shouldRampIfPlaying: true)
+    }
+
+    private func seek(toProgress progress: Float, shouldRampIfPlaying: Bool) throws {
         guard let playbackSource else {
             throw PlaybackError.noAudioLoaded
         }
@@ -215,16 +214,65 @@ final class AudioPlaybackController {
             frameCount: sourceFrameCount,
             allowsEnd: targetFrame >= sourceFrameCount
         )
-        let shouldResumePlayback = isPlayerRunning && snappedTargetFrame < sourceFrameCount
+        let shouldResumePlayback = isPlaying && snappedTargetFrame < sourceFrameCount
 
-        playerNode.stop()
         scheduledPlaybackBuffer = nil
         scheduledStartFrame = snappedTargetFrame
         pausedFrame = snappedTargetFrame
-        isPlayerRunning = false
 
-        if shouldResumePlayback {
-            try play()
+        guard shouldResumePlayback else {
+            cancelTransportRamp()
+            playerNode.stop()
+            playerNode.volume = 1
+            isPlayerRunning = false
+            isRestartPending = false
+            return
+        }
+
+        guard shouldRampIfPlaying else {
+            cancelTransportRamp()
+            playerNode.stop()
+            try schedulePlayback(startingAt: snappedTargetFrame)
+
+            if !engine.isRunning {
+                try engine.start()
+            }
+
+            playerNode.volume = 0
+            playerNode.play()
+            isPlayerRunning = true
+            isRestartPending = false
+            beginTransportRamp(to: 1)
+            return
+        }
+
+        isPlayerRunning = false
+        isRestartPending = true
+        beginTransportRamp(to: 0) { [weak self] in
+            guard let self else {
+                return
+            }
+
+            playerNode.stop()
+            scheduledPlaybackBuffer = nil
+
+            do {
+                try schedulePlayback(startingAt: snappedTargetFrame)
+
+                if !engine.isRunning {
+                    try engine.start()
+                }
+
+                playerNode.volume = 0
+                playerNode.play()
+                isPlayerRunning = true
+                isRestartPending = false
+                beginTransportRamp(to: 1)
+            } catch {
+                playerNode.volume = 1
+                isPlayerRunning = false
+                isRestartPending = false
+            }
         }
     }
 
@@ -242,7 +290,7 @@ final class AudioPlaybackController {
         return Snapshot(
             frameIndex: min(frameIndex, sourceFrameCount),
             frameCount: sourceFrameCount,
-            isPlaying: isPlayerRunning
+            isPlaying: isPlaying
         )
     }
 
@@ -265,17 +313,86 @@ final class AudioPlaybackController {
     }
 
     private func finishAtEnd() {
+        cancelTransportRamp()
         playerNode.stop()
         scheduledPlaybackBuffer = nil
         pausedFrame = playbackSource?.frameCount ?? 0
         isPlayerRunning = false
+        isRestartPending = false
+        playerNode.volume = 1
     }
 
     private func stopEnginePlayback() {
+        cancelTransportRamp()
         playerNode.stop()
         scheduledPlaybackBuffer = nil
         isPlayerRunning = false
+        isRestartPending = false
         pausedFrame = 0
+        playerNode.volume = 1
+    }
+
+    private func schedulePlayback(startingAt startFrame: Int) throws {
+        guard let playbackSource else {
+            throw PlaybackError.noAudioLoaded
+        }
+
+        scheduledStartFrame = startFrame
+
+        switch playbackSource {
+        case let .decoded(decodedAudioBuffer):
+            let playbackBuffer = try makePlaybackBuffer(
+                from: decodedAudioBuffer,
+                startingAt: startFrame
+            )
+            scheduledPlaybackBuffer = playbackBuffer
+            playerNode.scheduleBuffer(playbackBuffer, at: nil)
+        case let .file(audioFile):
+            let remainingFrameCount = playbackSource.frameCount - startFrame
+            guard remainingFrameCount > 0 else {
+                throw PlaybackError.invalidFormat
+            }
+
+            scheduledPlaybackBuffer = nil
+            playerNode.scheduleSegment(
+                audioFile,
+                startingFrame: AVAudioFramePosition(startFrame),
+                frameCount: AVAudioFrameCount(remainingFrameCount),
+                at: nil
+            )
+        }
+    }
+
+    private func beginTransportRamp(to targetVolume: Float, completion: (() -> Void)? = nil) {
+        transportRampTask?.cancel()
+
+        let initialVolume = playerNode.volume
+        let stepCount = 18
+        let stepDuration = transportRampDuration / Double(stepCount)
+
+        transportRampTask = Task { @MainActor in
+            for stepIndex in 1...stepCount {
+                try? await Task.sleep(nanoseconds: UInt64(stepDuration * 1_000_000_000))
+                guard !Task.isCancelled else {
+                    return
+                }
+
+                let progress = Float(stepIndex) / Float(stepCount)
+                let easedProgress = progress * progress * (3 - 2 * progress)
+                playerNode.volume = initialVolume + (targetVolume - initialVolume) * easedProgress
+            }
+
+            guard !Task.isCancelled else {
+                return
+            }
+
+            completion?()
+        }
+    }
+
+    private func cancelTransportRamp() {
+        transportRampTask?.cancel()
+        transportRampTask = nil
     }
 
     private func snappedFrameToZeroCrossing(
