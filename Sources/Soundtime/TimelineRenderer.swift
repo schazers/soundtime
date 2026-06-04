@@ -24,6 +24,7 @@ final class TimelineRenderer: NSObject {
     private enum RendererError: Error {
         case commandQueueUnavailable
         case shaderFunctionUnavailable
+        case dynamicVertexBufferUnavailable
     }
 
     private struct CachedVertexBuffer {
@@ -64,11 +65,82 @@ final class TimelineRenderer: NSObject {
         let vertices: CachedVertexBuffer
     }
 
-    private static let inlineVertexUploadLimit = 4 * 1_024
+    private final class DynamicVertexBufferRing {
+        private let buffers: [MTLBuffer]
+        private let capacity: Int
+        private let alignment: Int
+        private var bufferIndex = 0
+        private var writeOffset = 0
+
+        init?(
+            device: MTLDevice,
+            bufferCount: Int,
+            capacity: Int,
+            alignment: Int
+        ) {
+            guard bufferCount > 0, capacity > 0, alignment > 0 else {
+                return nil
+            }
+
+            var buffers: [MTLBuffer] = []
+            buffers.reserveCapacity(bufferCount)
+            for index in 0..<bufferCount {
+                guard let buffer = device.makeBuffer(
+                    length: capacity,
+                    options: [.storageModeShared, .cpuCacheModeWriteCombined]
+                ) else {
+                    return nil
+                }
+                buffer.label = "Timeline dynamic vertices \(index)"
+                buffers.append(buffer)
+            }
+
+            self.buffers = buffers
+            self.capacity = capacity
+            self.alignment = alignment
+        }
+
+        func beginFrame() {
+            bufferIndex = (bufferIndex + 1) % buffers.count
+            writeOffset = 0
+        }
+
+        func stage(_ bytes: UnsafeRawBufferPointer) -> (buffer: MTLBuffer, offset: Int)? {
+            guard let baseAddress = bytes.baseAddress, bytes.count > 0 else {
+                return nil
+            }
+
+            let offset = aligned(writeOffset)
+            guard offset + bytes.count <= capacity else {
+                return nil
+            }
+
+            let buffer = buffers[bufferIndex]
+            buffer.contents()
+                .advanced(by: offset)
+                .copyMemory(from: baseAddress, byteCount: bytes.count)
+            writeOffset = offset + bytes.count
+            return (buffer, offset)
+        }
+
+        private func aligned(_ offset: Int) -> Int {
+            let remainder = offset % alignment
+            guard remainder != 0 else {
+                return offset
+            }
+
+            return offset + alignment - remainder
+        }
+    }
+
+    private static let dynamicVertexBufferCount = 6
+    private static let dynamicVertexBufferCapacity = 4 * 1_024 * 1_024
+    private static let dynamicVertexBufferAlignment = 256
 
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let pipelineState: MTLRenderPipelineState
+    private let dynamicVertexBufferRing: DynamicVertexBufferRing
     private var renderState = TimelineRenderState.empty
     private var waveformMipLevels: [WaveformMipLevel] = []
     private var gridCache: GridCache?
@@ -98,6 +170,14 @@ final class TimelineRenderer: NSObject {
         guard let commandQueue = device.makeCommandQueue() else {
             throw RendererError.commandQueueUnavailable
         }
+        guard let dynamicVertexBufferRing = DynamicVertexBufferRing(
+            device: device,
+            bufferCount: Self.dynamicVertexBufferCount,
+            capacity: Self.dynamicVertexBufferCapacity,
+            alignment: Self.dynamicVertexBufferAlignment
+        ) else {
+            throw RendererError.dynamicVertexBufferUnavailable
+        }
 
         let library = try device.makeLibrary(source: Self.shaderSource, options: nil)
         guard
@@ -121,6 +201,7 @@ final class TimelineRenderer: NSObject {
 
         self.device = device
         self.commandQueue = commandQueue
+        self.dynamicVertexBufferRing = dynamicVertexBufferRing
         pipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
 
         super.init()
@@ -211,6 +292,7 @@ final class TimelineRenderer: NSObject {
             return
         }
 
+        dynamicVertexBufferRing.beginFrame()
         encodeTimeline(
             into: encoder,
             viewportSize: target.viewportSize,
@@ -295,20 +377,17 @@ final class TimelineRenderer: NSObject {
         }
 
         vertices.withUnsafeBytes { buffer in
-            guard let baseAddress = buffer.baseAddress else {
-                return
-            }
-
-            if buffer.count <= Self.inlineVertexUploadLimit {
-                encoder.setVertexBytes(baseAddress, length: buffer.count, index: 0)
+            if let stagedVertices = dynamicVertexBufferRing.stage(buffer) {
+                encoder.setVertexBuffer(stagedVertices.buffer, offset: stagedVertices.offset, index: 0)
             } else {
-                // Each large dynamic draw needs its own buffer. Reusing one buffer within
-                // a frame can overwrite vertices before the GPU consumes earlier draws.
-                guard let vertexBuffer = device.makeBuffer(
-                    bytes: baseAddress,
-                    length: buffer.count,
-                    options: [.storageModeShared]
-                ) else {
+                guard
+                    let baseAddress = buffer.baseAddress,
+                    let vertexBuffer = device.makeBuffer(
+                        bytes: baseAddress,
+                        length: buffer.count,
+                        options: [.storageModeShared, .cpuCacheModeWriteCombined]
+                    )
+                else {
                     return
                 }
 
