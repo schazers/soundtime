@@ -18,6 +18,7 @@ final class TimelineView: MTKView {
 
     private var timelineRenderer: TimelineRenderer?
     private let selectionOverlayLayer = CALayer()
+    private var viewport = TimelineViewport.full
     private var isSelectionEnabled = false
     private var displayedSelection: TimelineSelection?
     private var selectionAnchorProgress: Float?
@@ -28,6 +29,7 @@ final class TimelineView: MTKView {
     private var isDraggingTrim = false
     private let selectionDragThreshold: CGFloat = 3
     private let trimHandleHitWidth: CGFloat = 18
+    private let scrollZoomSensitivity: Float = 0.01
     private let supportedAudioExtensions: Set<String> = [
         "aif",
         "aiff",
@@ -71,6 +73,10 @@ final class TimelineView: MTKView {
     func displayWaveform(_ waveformOverview: WaveformOverview?) {
         let wasSelectionEnabled = isSelectionEnabled
         isSelectionEnabled = waveformOverview?.isEmpty == false
+        if !wasSelectionEnabled || !isSelectionEnabled {
+            setViewport(.full)
+        }
+
         timelineRenderer?.displayWaveform(waveformOverview)
         displayTrimPreview(nil)
 
@@ -161,6 +167,7 @@ final class TimelineView: MTKView {
         do {
             let renderer = try TimelineRenderer(device: metalDevice, pixelFormat: colorPixelFormat)
             timelineRenderer = renderer
+            renderer.displayViewport(viewport)
             delegate = renderer
         } catch {
             Swift.print("Soundtime could not create the timeline renderer: \\(error)")
@@ -248,19 +255,21 @@ final class TimelineView: MTKView {
             return
         }
 
-        addCursorRect(
-            NSRect(x: 0, y: 0, width: trimHandleHitWidth, height: bounds.height),
-            cursor: .resizeLeftRight
-        )
-        addCursorRect(
-            NSRect(
-                x: max(bounds.width - trimHandleHitWidth, 0),
-                y: 0,
-                width: trimHandleHitWidth,
-                height: bounds.height
-            ),
-            cursor: .resizeLeftRight
-        )
+        for progress in [Float(0), Float(1)] {
+            guard let handleX = trimHandleX(forTimelineProgress: progress) else {
+                continue
+            }
+
+            addCursorRect(
+                NSRect(
+                    x: max(handleX - trimHandleHitWidth * 0.5, 0),
+                    y: 0,
+                    width: min(trimHandleHitWidth, bounds.width),
+                    height: bounds.height
+                ),
+                cursor: .resizeLeftRight
+            )
+        }
     }
 
     @objc func exportAudio(_ sender: Any?) {
@@ -281,6 +290,55 @@ final class TimelineView: MTKView {
 
     override func mouseExited(with event: NSEvent) {
         displayHoverProgress(nil)
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard isSelectionEnabled else {
+            super.scrollWheel(with: event)
+            return
+        }
+
+        if event.modifierFlags.contains(.option) {
+            let anchorProgress = progress(for: convert(event.locationInWindow, from: nil))
+            let zoomFactor = exp(Float(event.scrollingDeltaY) * scrollZoomSensitivity)
+            setViewport(viewport.zoomed(by: zoomFactor, around: anchorProgress))
+            return
+        }
+
+        let horizontalDelta = event.scrollingDeltaX
+        let verticalDelta = event.scrollingDeltaY
+        let panDelta = abs(horizontalDelta) >= abs(verticalDelta) ? horizontalDelta : -verticalDelta
+        guard panDelta != 0, bounds.width > 0 else {
+            return
+        }
+
+        let progressDelta = Float(panDelta / bounds.width) * viewport.durationProgress
+        setViewport(viewport.panned(byProgress: progressDelta))
+    }
+
+    override func magnify(with event: NSEvent) {
+        guard isSelectionEnabled else {
+            super.magnify(with: event)
+            return
+        }
+
+        let anchorProgress = progress(for: convert(event.locationInWindow, from: nil))
+        let zoomFactor = max(1 + Float(event.magnification), 0.1)
+        setViewport(viewport.zoomed(by: zoomFactor, around: anchorProgress))
+    }
+
+    override func smartMagnify(with event: NSEvent) {
+        guard isSelectionEnabled else {
+            super.smartMagnify(with: event)
+            return
+        }
+
+        let anchorProgress = progress(for: convert(event.locationInWindow, from: nil))
+        if viewport.isFull {
+            setViewport(viewport.zoomed(by: 4, around: anchorProgress))
+        } else {
+            setViewport(.full)
+        }
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -421,7 +479,20 @@ final class TimelineView: MTKView {
             return 0
         }
 
-        return min(max(Float(point.x / bounds.width), 0), 1)
+        let viewportProgress = Float(point.x / bounds.width)
+        return viewport.timelineProgress(forViewportProgress: viewportProgress)
+    }
+
+    private func setViewport(_ nextViewport: TimelineViewport) {
+        guard viewport != nextViewport else {
+            return
+        }
+
+        viewport = nextViewport
+        timelineRenderer?.displayViewport(nextViewport)
+        updateSelectionOverlay(flushImmediately: false)
+        window?.invalidateCursorRects(for: self)
+        draw()
     }
 
     private func updateHoverGuide(for event: NSEvent) {
@@ -483,8 +554,16 @@ final class TimelineView: MTKView {
             return
         }
 
-        let left = CGFloat(displayedSelection.startProgress) * bounds.width
-        let right = CGFloat(displayedSelection.endProgress) * bounds.width
+        let leftProgress = viewport.viewportProgress(forTimelineProgress: displayedSelection.startProgress)
+        let rightProgress = viewport.viewportProgress(forTimelineProgress: displayedSelection.endProgress)
+        guard rightProgress > 0, leftProgress < 1 else {
+            selectionOverlayLayer.isHidden = true
+            selectionOverlayLayer.frame = .zero
+            return
+        }
+
+        let left = CGFloat(max(leftProgress, 0)) * bounds.width
+        let right = CGFloat(min(rightProgress, 1)) * bounds.width
         selectionOverlayLayer.frame = CGRect(
             x: left,
             y: 0,
@@ -514,15 +593,28 @@ final class TimelineView: MTKView {
             return nil
         }
 
-        if point.x <= trimHandleHitWidth {
+        if let startHandleX = trimHandleX(forTimelineProgress: 0),
+           abs(point.x - startHandleX) <= trimHandleHitWidth * 0.5
+        {
             return .trimStart
         }
 
-        if point.x >= bounds.width - trimHandleHitWidth {
+        if let endHandleX = trimHandleX(forTimelineProgress: 1),
+           abs(point.x - endHandleX) <= trimHandleHitWidth * 0.5
+        {
             return .trimEnd
         }
 
         return nil
+    }
+
+    private func trimHandleX(forTimelineProgress progress: Float) -> CGFloat? {
+        let viewportProgress = viewport.viewportProgress(forTimelineProgress: progress)
+        guard viewportProgress >= 0, viewportProgress <= 1 else {
+            return nil
+        }
+
+        return CGFloat(viewportProgress) * bounds.width
     }
 
     private func didMovePastSelectionThreshold(to point: CGPoint) -> Bool {
