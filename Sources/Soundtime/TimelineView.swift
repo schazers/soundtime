@@ -126,10 +126,18 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
     }
 
-    func displayPlayheadProgress(_ progress: Float, syncRenderer: Bool = true) {
+    func displayPlayheadProgress(
+        _ progress: Float,
+        syncRenderer: Bool = true,
+        anchorTimestamp: CFTimeInterval? = nil
+    ) {
         let clampedProgress = min(max(progress, 0), 1)
         pageViewportIfNeeded(forPlayheadProgress: clampedProgress)
-        timelineRenderer?.displayPlayheadProgress(clampedProgress, force: syncRenderer)
+        timelineRenderer?.displayPlayheadProgress(
+            clampedProgress,
+            force: syncRenderer,
+            anchorTimestamp: anchorTimestamp
+        )
         requestTimelineRender()
     }
 
