@@ -17,10 +17,17 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         let vertexCount: Int
     }
 
+    private struct WaveformMipLevel {
+        let overview: WaveformOverview
+        let binCount: Int
+    }
+
     private struct GridCacheKey: Equatable {
         let width: Float
         let height: Float
         let backingScale: Float
+        let viewportStart: Float
+        let viewportDuration: Float
     }
 
     private struct GridCache {
@@ -34,10 +41,11 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
     private let commandQueue: MTLCommandQueue
     private let pipelineState: MTLRenderPipelineState
     private var waveformOverview: WaveformOverview?
-    private var waveformVertices: CachedVertexBuffer?
+    private var waveformMipLevels: [WaveformMipLevel] = []
     private var gridCache: GridCache?
     private var dynamicVertexBuffer: MTLBuffer?
     private var playheadProgress: Float = 0
+    private var viewport = TimelineViewport.full
     private var hoverProgress: Float?
     private var isHoverGuideArmed = false
     private var selection: TimelineSelection?
@@ -79,11 +87,21 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
 
     func displayWaveform(_ waveformOverview: WaveformOverview?) {
         self.waveformOverview = waveformOverview
-        waveformVertices = makeCachedBuffer(vertices: makeWaveformVertices(from: waveformOverview))
+        waveformMipLevels = makeWaveformMipLevels(from: waveformOverview)
+        gridCache = nil
     }
 
     func displayPlayheadProgress(_ progress: Float) {
         playheadProgress = min(max(progress, 0), 1)
+    }
+
+    func displayViewport(_ viewport: TimelineViewport) {
+        guard self.viewport != viewport else {
+            return
+        }
+
+        self.viewport = viewport
+        gridCache = nil
     }
 
     func displayHoverProgress(_ progress: Float?, isArmed: Bool = false) {
@@ -112,6 +130,7 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         let renderSize = view.bounds.size
         let backingScale = backingScale(for: view)
         let selectionVertices = makeSelectionVertices()
+        let waveformVertices = makeWaveformVertices(drawableSize: renderSize)
         let trimPreviewVertices = makeTrimPreviewVertices(
             drawableSize: renderSize,
             backingScale: backingScale
@@ -124,9 +143,7 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
             draw(cachedVertices: gridVertices, primitiveType: .triangle, encoder: encoder)
         }
         draw(vertices: selectionVertices, primitiveType: .triangle, encoder: encoder)
-        if let waveformVertices {
-            draw(cachedVertices: waveformVertices, primitiveType: .triangle, encoder: encoder)
-        }
+        draw(vertices: waveformVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: trimPreviewVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: hoverGuideVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: playheadVertices, primitiveType: .triangle, encoder: encoder)
@@ -216,7 +233,13 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
             return nil
         }
 
-        let key = GridCacheKey(width: width, height: height, backingScale: backingScale)
+        let key = GridCacheKey(
+            width: width,
+            height: height,
+            backingScale: backingScale,
+            viewportStart: viewport.startProgress,
+            viewportDuration: viewport.durationProgress
+        )
         if let gridCache, gridCache.key == key {
             return gridCache.vertices
         }
@@ -242,13 +265,27 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
 
         let gridColor = SIMD4<Float>(0.24, 0.25, 0.26, 1.0)
         let centerColor = SIMD4<Float>(0.34, 0.36, 0.37, 1.0)
-        let majorStep: Float = 96
+        let targetPixelStep: Float = 96
         let lineWidth = pixelLength(backingScale: backingScale)
         let size = SIMD2<Float>(width, height)
         var vertices: [TimelineVertex] = []
 
-        var x: Float = 0
-        while x <= width {
+        let approximateProgressStep = max(viewport.durationProgress * targetPixelStep / width, 0.0001)
+        let progressStep = niceProgressStep(approximateProgressStep)
+        let firstGridProgress = floor(viewport.startProgress / progressStep) * progressStep
+        var gridProgress = firstGridProgress
+
+        while gridProgress <= viewport.endProgress + progressStep {
+            let viewportProgress = viewport.viewportProgress(forTimelineProgress: gridProgress)
+            let x = viewportProgress * width
+            guard x >= -targetPixelStep else {
+                gridProgress += progressStep
+                continue
+            }
+            guard x <= width + targetPixelStep else {
+                break
+            }
+
             let alignedX = pixelAligned(x, backingScale: backingScale)
             appendRectangle(
                 to: &vertices,
@@ -259,7 +296,7 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
                 color: gridColor,
                 drawableSize: size
             )
-            x += majorStep
+            gridProgress += progressStep
         }
 
         let centerY = pixelAligned(height * 0.5, backingScale: backingScale)
@@ -285,14 +322,20 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
             return []
         }
 
+        let left = viewport.viewportProgress(forTimelineProgress: selection.startProgress)
+        let right = viewport.viewportProgress(forTimelineProgress: selection.endProgress)
+        guard right > 0, left < 1 else {
+            return []
+        }
+
         let color = SIMD4<Float>(0.0, 0.84, 0.78, 0.22)
         var vertices: [TimelineVertex] = []
         vertices.reserveCapacity(6)
 
         appendRectangle(
             to: &vertices,
-            left: selection.startProgress,
-            right: selection.endProgress,
+            left: max(left, 0),
+            right: min(right, 1),
             top: 0,
             bottom: 1,
             color: color
@@ -301,8 +344,11 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         return vertices
     }
 
-    private func makeWaveformVertices(from waveformOverview: WaveformOverview?) -> [TimelineVertex] {
-        guard let waveformOverview, !waveformOverview.isEmpty else {
+    private func makeWaveformVertices(drawableSize: CGSize) -> [TimelineVertex] {
+        guard
+            let mipLevel = waveformMipLevel(for: drawableSize),
+            !mipLevel.overview.isEmpty
+        else {
             return []
         }
 
@@ -310,13 +356,27 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         let amplitudeHeight: Float = 0.42
         let minimumVisualHeight: Float = 0.002
         let color = SIMD4<Float>(0.78, 0.92, 0.88, 1.0)
-        let bins = waveformOverview.bins
-        var vertices: [TimelineVertex] = []
-        vertices.reserveCapacity(bins.count * 6)
+        let bins = mipLevel.overview.bins
+        let binCount = bins.count
+        let startIndex = max(Int(floor(viewport.startProgress * Float(binCount))) - 1, 0)
+        let endIndex = min(Int(ceil(viewport.endProgress * Float(binCount))) + 1, binCount)
+        guard startIndex < endIndex else {
+            return []
+        }
 
-        for (index, bin) in bins.enumerated() {
-            let x0 = Float(index) / Float(bins.count)
-            let x1 = Float(index + 1) / Float(bins.count)
+        var vertices: [TimelineVertex] = []
+        vertices.reserveCapacity((endIndex - startIndex) * 6)
+
+        for index in startIndex..<endIndex {
+            let bin = bins[index]
+            let timelineX0 = Float(index) / Float(binCount)
+            let timelineX1 = Float(index + 1) / Float(binCount)
+            let x0 = viewport.viewportProgress(forTimelineProgress: timelineX0)
+            let x1 = viewport.viewportProgress(forTimelineProgress: timelineX1)
+            guard x1 > 0, x0 < 1 else {
+                continue
+            }
+
             var y0 = centerY - bin.maximumSample * amplitudeHeight
             var y1 = centerY - bin.minimumSample * amplitudeHeight
 
@@ -328,7 +388,7 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
 
             appendRectangle(
                 to: &vertices,
-                left: x0,
+                left: max(x0, 0),
                 right: min(x1, 1),
                 top: max(y0, 0),
                 bottom: min(y1, 1),
@@ -351,17 +411,18 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         }
 
         let trimRange = trimPreview ?? TimelineTrimRange(startProgress: 0, endProgress: 1)
-        let startX = trimRange.startProgress * width
-        let endX = trimRange.endProgress * width
+        let startX = viewport.viewportProgress(forTimelineProgress: trimRange.startProgress) * width
+        let endX = viewport.viewportProgress(forTimelineProgress: trimRange.endProgress) * width
         let size = SIMD2<Float>(width, height)
         var vertices: [TimelineVertex] = []
         vertices.reserveCapacity(36)
 
         if trimRange.startProgress > 0.001 {
+            let visibleRight = min(max(startX, 0), width)
             appendRectangle(
                 to: &vertices,
                 left: 0,
-                right: startX,
+                right: visibleRight,
                 top: 0,
                 bottom: height,
                 color: SIMD4<Float>(0.0, 0.0, 0.0, 0.46),
@@ -370,9 +431,10 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         }
 
         if trimRange.endProgress < 0.999 {
+            let visibleLeft = min(max(endX, 0), width)
             appendRectangle(
                 to: &vertices,
-                left: endX,
+                left: visibleLeft,
                 right: width,
                 top: 0,
                 bottom: height,
@@ -381,22 +443,26 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
             )
         }
 
-        appendTrimHandle(
-            to: &vertices,
-            x: startX,
-            direction: .leading,
-            color: SIMD4<Float>(1.0, 1.0, 1.0, 0.95),
-            drawableSize: size,
-            backingScale: backingScale
-        )
-        appendTrimHandle(
-            to: &vertices,
-            x: endX,
-            direction: .trailing,
-            color: SIMD4<Float>(1.0, 1.0, 1.0, 0.95),
-            drawableSize: size,
-            backingScale: backingScale
-        )
+        if startX >= 0, startX <= width {
+            appendTrimHandle(
+                to: &vertices,
+                x: startX,
+                direction: .leading,
+                color: SIMD4<Float>(1.0, 1.0, 1.0, 0.95),
+                drawableSize: size,
+                backingScale: backingScale
+            )
+        }
+        if endX >= 0, endX <= width {
+            appendTrimHandle(
+                to: &vertices,
+                x: endX,
+                direction: .trailing,
+                color: SIMD4<Float>(1.0, 1.0, 1.0, 0.95),
+                drawableSize: size,
+                backingScale: backingScale
+            )
+        }
 
         return vertices
     }
@@ -415,7 +481,12 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
             return []
         }
 
-        let guideX = pixelAligned(hoverProgress * width, backingScale: backingScale)
+        let guideProgress = viewport.viewportProgress(forTimelineProgress: hoverProgress)
+        guard guideProgress >= 0, guideProgress <= 1 else {
+            return []
+        }
+
+        let guideX = pixelAligned(guideProgress * width, backingScale: backingScale)
         let guideWidth = pixelLength(backingScale: backingScale)
         let left = max(guideX - guideWidth * 0.5, 0)
         let right = min(left + guideWidth, width)
@@ -449,7 +520,12 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         if waveformOverview == nil {
             playheadX = min(max(80, 0), width)
         } else {
-            playheadX = min(max(playheadProgress * width, 0), width)
+            let playheadViewportProgress = viewport.viewportProgress(forTimelineProgress: playheadProgress)
+            guard playheadViewportProgress >= 0, playheadViewportProgress <= 1 else {
+                return []
+            }
+
+            playheadX = min(max(playheadViewportProgress * width, 0), width)
         }
         let playheadWidth = pixelLength(2, backingScale: backingScale)
         let alignedPlayheadX = pixelAligned(playheadX, backingScale: backingScale)
@@ -471,6 +547,63 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         )
 
         return vertices
+    }
+
+    private func makeWaveformMipLevels(from waveformOverview: WaveformOverview?) -> [WaveformMipLevel] {
+        guard let waveformOverview, !waveformOverview.isEmpty else {
+            return []
+        }
+
+        var levels = [
+            WaveformMipLevel(overview: waveformOverview, binCount: waveformOverview.bins.count),
+        ]
+        var bins = waveformOverview.bins
+
+        while bins.count > 256 {
+            var nextBins: [WaveformOverview.Bin] = []
+            nextBins.reserveCapacity((bins.count + 1) / 2)
+
+            var index = 0
+            while index < bins.count {
+                let firstBin = bins[index]
+                if index + 1 < bins.count {
+                    let secondBin = bins[index + 1]
+                    nextBins.append(WaveformOverview.Bin(
+                        minimumSample: min(firstBin.minimumSample, secondBin.minimumSample),
+                        maximumSample: max(firstBin.maximumSample, secondBin.maximumSample)
+                    ))
+                } else {
+                    nextBins.append(firstBin)
+                }
+                index += 2
+            }
+
+            bins = nextBins
+            levels.append(WaveformMipLevel(
+                overview: WaveformOverview(duration: waveformOverview.duration, bins: bins),
+                binCount: bins.count
+            ))
+        }
+
+        return levels
+    }
+
+    private func waveformMipLevel(for drawableSize: CGSize) -> WaveformMipLevel? {
+        guard !waveformMipLevels.isEmpty else {
+            return nil
+        }
+
+        let width = max(Float(drawableSize.width), 1)
+        let targetVisibleBins = max(width * 1.6, 256)
+
+        for mipLevel in waveformMipLevels {
+            let visibleBins = Float(mipLevel.binCount) * viewport.durationProgress
+            if visibleBins <= targetVisibleBins {
+                return mipLevel
+            }
+        }
+
+        return waveformMipLevels.last
     }
 
     private func appendRectangle(
@@ -599,6 +732,27 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
 
     private func pixelAligned(_ position: Float, backingScale: Float) -> Float {
         round(position * max(backingScale, 1)) / max(backingScale, 1)
+    }
+
+    private func niceProgressStep(_ progressStep: Float) -> Float {
+        guard progressStep > 0 else {
+            return 0.1
+        }
+
+        let exponent = floor(log10(progressStep))
+        let base = pow(10, exponent)
+        let normalizedStep = progressStep / base
+
+        if normalizedStep <= 1 {
+            return base
+        }
+        if normalizedStep <= 2 {
+            return 2 * base
+        }
+        if normalizedStep <= 5 {
+            return 5 * base
+        }
+        return 10 * base
     }
 
     private func makeVertex(normalizedPosition: SIMD2<Float>, color: SIMD4<Float>) -> TimelineVertex {

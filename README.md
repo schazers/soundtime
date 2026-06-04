@@ -21,6 +21,7 @@ This repository currently contains the native app shell:
 - Header time readout for playhead position, timeline duration, and selection bounds
 - Draggable start/end trim handles for fast boundary trims
 - Click-drag timeline selection with selected duration in the header
+- Pinch or Option-scroll to zoom the waveform, and scroll to pan the visible timeline
 - Delete/Backspace removes the selected range non-destructively
 - Command-Z restores the previous edit timeline
 - Click the waveform to seek the playhead
