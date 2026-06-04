@@ -2,6 +2,25 @@ import AppKit
 import UniformTypeIdentifiers
 
 final class WorkspaceView: NSView {
+    private enum FadeEffect {
+        case fadeIn
+        case fadeOut
+
+        var displayName: String {
+            switch self {
+            case .fadeIn:
+                return "fade in"
+            case .fadeOut:
+                return "fade out"
+            }
+        }
+    }
+
+    private enum LastEffect {
+        case gain(decibels: Double)
+        case fade(FadeEffect)
+    }
+
     private var activeImportID = UUID()
     private var selectedAudioFile: AudioFileMetadata?
     private var decodedAudioBuffer: DecodedAudioBuffer?
@@ -9,12 +28,14 @@ final class WorkspaceView: NSView {
     private var editUndoStack: [AudioEditTimeline] = []
     private var loadedAudioSummary: String?
     private var selectedTimelineRange: TimelineSelection?
+    private var lastEffect: LastEffect?
     private var currentPlayheadFrame = 0
     private var displayedFrameCount = 0
     private var displayedSampleRate: Double = 0
     private var currentPlaybackStatus = "idle"
     private var playbackTimer: Timer?
     private let playbackController = AudioPlaybackController()
+    private let playbackRefreshRate: TimeInterval = 144
     private let wavPreviewLevels = [
         WAVPreviewLevel(targetBinCount: 512, samplesPerBin: 8),
         WAVPreviewLevel(targetBinCount: 1_024, samplesPerBin: 8),
@@ -61,8 +82,22 @@ final class WorkspaceView: NSView {
         return label
     }()
 
+    private let framesPerSecondLabel: NSTextField = {
+        let label = NSTextField(labelWithString: "0 fps - +/-0.0 max 0.0")
+        label.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        label.alignment = .right
+        label.textColor = NSColor.secondaryLabelColor
+        label.lineBreakMode = .byClipping
+        label.setContentCompressionResistancePriority(.required, for: .horizontal)
+        label.setContentHuggingPriority(.required, for: .horizontal)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        return label
+    }()
+
+    private let volumeControl = VolumeControlView()
     private let timelineSurface = TimelineView()
     private let exportProgressOverlay = ExportProgressOverlayView()
+    private let gainEffectOverlay = GainEffectOverlayView()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -94,8 +129,23 @@ final class WorkspaceView: NSView {
         timelineSurface.onExportRequested = { [weak self] in
             self?.exportCurrentAudio()
         }
+        timelineSurface.onGainRequested = { [weak self] in
+            self?.showGainEffect()
+        }
+        timelineSurface.onFadeInRequested = { [weak self] in
+            self?.applyFadeEffect(.fadeIn)
+        }
+        timelineSurface.onFadeOutRequested = { [weak self] in
+            self?.applyFadeEffect(.fadeOut)
+        }
+        timelineSurface.onReapplyLastEffect = { [weak self] in
+            self?.reapplyLastEffect()
+        }
         timelineSurface.onSeekRequested = { [weak self] progress in
             self?.seek(to: progress)
+        }
+        timelineSurface.onPlayFromProgress = { [weak self] progress in
+            self?.play(from: progress)
         }
         timelineSurface.onSelectionChanged = { [weak self] selection in
             self?.updateSelection(selection)
@@ -103,20 +153,47 @@ final class WorkspaceView: NSView {
         timelineSurface.onTrimRequested = { [weak self] trimRange in
             self?.trimTimeline(to: trimRange)
         }
+        timelineSurface.onFrameStatsChanged = { [weak self] frameStats in
+            self?.updateFrameStats(frameStats)
+        }
+        volumeControl.onVolumeChanged = { [weak self] volume in
+            self?.playbackController.setPerceptualVolume(volume)
+        }
+        gainEffectOverlay.onGainChanged = { [weak self] _, gain in
+            self?.previewSelectedGain(gain)
+        }
+        gainEffectOverlay.onConfirm = { [weak self] decibels, gain in
+            self?.confirmSelectedGain(decibels: decibels, gain: gain)
+        }
+        gainEffectOverlay.onCancel = { [weak self] in
+            self?.cancelSelectedGainPreview()
+        }
 
         addSubview(titleLabel)
         addSubview(metadataLabel)
+        addSubview(framesPerSecondLabel)
+        addSubview(volumeControl)
         addSubview(timeReadoutLabel)
         addSubview(timelineSurface)
         addSubview(exportProgressOverlay)
+        addSubview(gainEffectOverlay)
 
         NSLayoutConstraint.activate([
-            titleLabel.topAnchor.constraint(equalTo: topAnchor, constant: 17),
+            titleLabel.topAnchor.constraint(equalTo: topAnchor, constant: 30),
             titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 84),
 
             metadataLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
             metadataLabel.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 14),
-            metadataLabel.trailingAnchor.constraint(equalTo: timeReadoutLabel.leadingAnchor, constant: -14),
+            metadataLabel.trailingAnchor.constraint(equalTo: framesPerSecondLabel.leadingAnchor, constant: -14),
+
+            framesPerSecondLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
+            framesPerSecondLabel.trailingAnchor.constraint(equalTo: volumeControl.leadingAnchor, constant: -12),
+            framesPerSecondLabel.widthAnchor.constraint(equalToConstant: 164),
+
+            volumeControl.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
+            volumeControl.trailingAnchor.constraint(equalTo: timeReadoutLabel.leadingAnchor, constant: -18),
+            volumeControl.widthAnchor.constraint(equalToConstant: 150),
+            volumeControl.heightAnchor.constraint(equalToConstant: 24),
 
             timeReadoutLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
             timeReadoutLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -22),
@@ -130,7 +207,14 @@ final class WorkspaceView: NSView {
             exportProgressOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
             exportProgressOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
             exportProgressOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            gainEffectOverlay.topAnchor.constraint(equalTo: topAnchor),
+            gainEffectOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
+            gainEffectOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
+            gainEffectOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
+
+        updateEffectCommandState()
     }
 
     private func loadDroppedAudioFile(at url: URL) {
@@ -142,6 +226,8 @@ final class WorkspaceView: NSView {
         editUndoStack.removeAll()
         loadedAudioSummary = nil
         selectedTimelineRange = nil
+        timelineSurface.displayGainPreview(selection: nil, gain: 1)
+        updateEffectCommandState()
         currentPlayheadFrame = 0
         displayedFrameCount = 0
         displayedSampleRate = 0
@@ -178,6 +264,7 @@ final class WorkspaceView: NSView {
                     self.editUndoStack.removeAll()
                     self.loadedAudioSummary = nil
                     self.selectedTimelineRange = nil
+                    self.updateEffectCommandState()
                     self.currentPlayheadFrame = 0
                     self.displayedFrameCount = 0
                     self.displayedSampleRate = 0
@@ -202,6 +289,7 @@ final class WorkspaceView: NSView {
                     self.displayPlaybackVisuals(progress: 0, isPlaying: false)
                     self.loadedAudioSummary = "\(result.metadata.displayName) - \(decodedAudioBuffer.formattedSummary)"
                     self.selectedTimelineRange = nil
+                    self.updateEffectCommandState()
                     self.currentPlaybackStatus = "press Space to play"
                     self.updateStatus("press Space to play")
                 case let .failed(message):
@@ -210,6 +298,7 @@ final class WorkspaceView: NSView {
                     self.editUndoStack.removeAll()
                     self.loadedAudioSummary = nil
                     self.selectedTimelineRange = nil
+                    self.updateEffectCommandState()
                     self.currentPlayheadFrame = 0
                     self.displayedFrameCount = 0
                     self.displayedSampleRate = 0
@@ -232,6 +321,7 @@ final class WorkspaceView: NSView {
                 self.editUndoStack.removeAll()
                 self.loadedAudioSummary = nil
                 self.selectedTimelineRange = nil
+                self.updateEffectCommandState()
                 self.currentPlayheadFrame = 0
                 self.displayedFrameCount = 0
                 self.displayedSampleRate = 0
@@ -321,6 +411,7 @@ final class WorkspaceView: NSView {
                 self.editUndoStack.removeAll()
                 self.loadedAudioSummary = nil
                 self.selectedTimelineRange = nil
+                self.updateEffectCommandState()
                 self.currentPlayheadFrame = 0
                 self.displayedFrameCount = 0
                 self.displayedSampleRate = 0
@@ -341,6 +432,7 @@ final class WorkspaceView: NSView {
         audioTimeline = nil
         editUndoStack.removeAll()
         selectedTimelineRange = nil
+        updateEffectCommandState()
         currentPlayheadFrame = 0
         displayedFrameCount = previewResult.fileInfo.frameCount
         displayedSampleRate = previewResult.fileInfo.sampleRate
@@ -388,6 +480,7 @@ final class WorkspaceView: NSView {
         editUndoStack.removeAll()
         displayedFrameCount = decodedAudioBuffer.frameCount
         displayedSampleRate = decodedAudioBuffer.sampleRate
+        updateEffectCommandState()
 
         if !playbackController.hasSource {
             try? playbackController.load(decodedAudioBuffer, zeroCrossingIndex: zeroCrossingIndex)
@@ -444,6 +537,160 @@ final class WorkspaceView: NSView {
         updateStatus("trimmed \(formatDuration(originalDuration - editedTimeline.duration))")
     }
 
+    private func showGainEffect() {
+        guard canApplyGainEffect else {
+            return
+        }
+
+        gainEffectOverlay.show()
+    }
+
+    private func reapplyLastEffect() {
+        guard
+            canApplyGainEffect,
+            let lastEffect
+        else {
+            return
+        }
+
+        switch lastEffect {
+        case let .gain(decibels):
+            let gain = GainEffectOverlayView.linearGain(forDecibels: decibels)
+            applyGainEffect(decibels: decibels, gain: gain)
+        case let .fade(fadeEffect):
+            applyFadeEffect(fadeEffect)
+        }
+    }
+
+    private func previewSelectedGain(_ gain: Float) {
+        guard let selectedTimelineRange, canApplyGainEffect else {
+            timelineSurface.displayGainPreview(selection: nil, gain: 1)
+            return
+        }
+
+        timelineSurface.displayGainPreview(selection: selectedTimelineRange, gain: gain)
+    }
+
+    private func cancelSelectedGainPreview() {
+        timelineSurface.displayGainPreview(selection: nil, gain: 1)
+        updateStatus(currentPlaybackStatus)
+    }
+
+    private func confirmSelectedGain(decibels: Double, gain: Float) {
+        timelineSurface.displayGainPreview(selection: nil, gain: 1)
+        applyGainEffect(decibels: decibels, gain: gain)
+    }
+
+    private func applyGainEffect(decibels: Double, gain: Float) {
+        guard
+            let currentTimeline = audioTimeline,
+            let selectedTimelineRange,
+            selectedTimelineRange.durationProgress > 0
+        else {
+            return
+        }
+
+        let renderedBuffer = currentTimeline.render()
+        let startFrame = min(
+            max(Int((selectedTimelineRange.startProgress * Float(renderedBuffer.frameCount)).rounded(.down)), 0),
+            renderedBuffer.frameCount
+        )
+        let endFrame = min(
+            max(Int((selectedTimelineRange.endProgress * Float(renderedBuffer.frameCount)).rounded(.up)), startFrame),
+            renderedBuffer.frameCount
+        )
+        guard startFrame < endFrame else {
+            return
+        }
+
+        var samplesByChannel = renderedBuffer.samplesByChannel
+        for channelIndex in samplesByChannel.indices {
+            guard startFrame < samplesByChannel[channelIndex].count else {
+                continue
+            }
+
+            let clampedEndFrame = min(endFrame, samplesByChannel[channelIndex].count)
+            for frameIndex in startFrame..<clampedEndFrame {
+                samplesByChannel[channelIndex][frameIndex] = clampAudioSample(samplesByChannel[channelIndex][frameIndex] * gain)
+            }
+        }
+
+        let editedBuffer = DecodedAudioBuffer(
+            url: renderedBuffer.url,
+            sampleRate: renderedBuffer.sampleRate,
+            channelCount: renderedBuffer.channelCount,
+            frameCount: renderedBuffer.frameCount,
+            samplesByChannel: samplesByChannel
+        )
+        let editedTimeline = AudioEditTimeline(sourceBuffer: editedBuffer)
+        editUndoStack.append(currentTimeline)
+        lastEffect = .gain(decibels: decibels)
+        applyTimeline(editedTimeline)
+        updateStatus(String(format: "gain %+.1f dB", decibels))
+    }
+
+    private func applyFadeEffect(_ fadeEffect: FadeEffect) {
+        guard
+            let currentTimeline = audioTimeline,
+            let selectedTimelineRange,
+            selectedTimelineRange.durationProgress > 0
+        else {
+            return
+        }
+
+        let renderedBuffer = currentTimeline.render()
+        let startFrame = min(
+            max(Int((selectedTimelineRange.startProgress * Float(renderedBuffer.frameCount)).rounded(.down)), 0),
+            renderedBuffer.frameCount
+        )
+        let endFrame = min(
+            max(Int((selectedTimelineRange.endProgress * Float(renderedBuffer.frameCount)).rounded(.up)), startFrame),
+            renderedBuffer.frameCount
+        )
+        guard endFrame - startFrame > 1 else {
+            return
+        }
+
+        var samplesByChannel = renderedBuffer.samplesByChannel
+        let selectedFrameCount = endFrame - startFrame
+        for channelIndex in samplesByChannel.indices {
+            guard startFrame < samplesByChannel[channelIndex].count else {
+                continue
+            }
+
+            let clampedEndFrame = min(endFrame, samplesByChannel[channelIndex].count)
+            for frameIndex in startFrame..<clampedEndFrame {
+                let offset = frameIndex - startFrame
+                let progress = Float(offset) / Float(max(selectedFrameCount - 1, 1))
+                let curve = smoothstep(progress)
+                let gain: Float
+                switch fadeEffect {
+                case .fadeIn:
+                    gain = curve
+                case .fadeOut:
+                    gain = 1 - curve
+                }
+
+                samplesByChannel[channelIndex][frameIndex] = clampAudioSample(
+                    samplesByChannel[channelIndex][frameIndex] * gain
+                )
+            }
+        }
+
+        let editedBuffer = DecodedAudioBuffer(
+            url: renderedBuffer.url,
+            sampleRate: renderedBuffer.sampleRate,
+            channelCount: renderedBuffer.channelCount,
+            frameCount: renderedBuffer.frameCount,
+            samplesByChannel: samplesByChannel
+        )
+        let editedTimeline = AudioEditTimeline(sourceBuffer: editedBuffer)
+        editUndoStack.append(currentTimeline)
+        lastEffect = .fade(fadeEffect)
+        applyTimeline(editedTimeline)
+        updateStatus("\(fadeEffect.displayName) \(formatDuration(selectedTimelineRange.duration(in: renderedBuffer.duration)))")
+    }
+
     private func undoLastEdit() {
         guard let previousTimeline = editUndoStack.popLast() else {
             return
@@ -460,7 +707,7 @@ final class WorkspaceView: NSView {
 
         do {
             let isPlaying = try playbackController.togglePlayback()
-            refreshPlaybackProgress()
+            refreshPlaybackProgress(syncPlayheadWhenPlaying: true)
 
             if isPlaying {
                 startPlaybackTimer()
@@ -482,7 +729,7 @@ final class WorkspaceView: NSView {
 
         do {
             try playbackController.seek(toProgress: progress)
-            refreshPlaybackProgress()
+            refreshPlaybackProgress(syncPlayheadWhenPlaying: true)
 
             if playbackController.isPlaying {
                 startPlaybackTimer()
@@ -494,6 +741,27 @@ final class WorkspaceView: NSView {
         } catch {
             stopPlaybackTimer()
             updateStatus("seek failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func play(from progress: Float) {
+        guard playbackController.hasSource else {
+            return
+        }
+
+        do {
+            try playbackController.seek(toProgress: progress)
+
+            if !playbackController.isPlaying {
+                try playbackController.play()
+            }
+
+            refreshPlaybackProgress(syncPlayheadWhenPlaying: true)
+            startPlaybackTimer()
+            updateStatus("playing")
+        } catch {
+            stopPlaybackTimer()
+            updateStatus("playback failed: \(error.localizedDescription)")
         }
     }
 
@@ -566,11 +834,12 @@ final class WorkspaceView: NSView {
     private func startPlaybackTimer() {
         playbackTimer?.invalidate()
 
-        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 1 / playbackRefreshRate, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.refreshPlaybackProgress()
+                self?.refreshPlaybackProgress(syncPlayheadWhenPlaying: false)
             }
         }
+        timer.tolerance = 0
 
         playbackTimer = timer
         RunLoop.main.add(timer, forMode: .common)
@@ -581,15 +850,23 @@ final class WorkspaceView: NSView {
         playbackTimer = nil
     }
 
-    private func displayPlaybackVisuals(progress: Float, isPlaying: Bool) {
+    private func displayPlaybackVisuals(
+        progress: Float,
+        isPlaying: Bool,
+        syncPlayhead: Bool = true
+    ) {
         timelineSurface.displayPlaybackActive(isPlaying)
-        timelineSurface.displayPlayheadProgress(progress)
+        timelineSurface.displayPlayheadProgress(progress, syncRenderer: syncPlayhead)
     }
 
-    private func refreshPlaybackProgress() {
+    private func refreshPlaybackProgress(syncPlayheadWhenPlaying: Bool = false) {
         let snapshot = playbackController.snapshot()
         currentPlayheadFrame = snapshot.frameIndex
-        displayPlaybackVisuals(progress: snapshot.progress, isPlaying: snapshot.isPlaying)
+        displayPlaybackVisuals(
+            progress: snapshot.progress,
+            isPlaying: snapshot.isPlaying,
+            syncPlayhead: !snapshot.isPlaying || syncPlayheadWhenPlaying
+        )
         updateTimeReadout()
 
         if !snapshot.isPlaying {
@@ -602,7 +879,36 @@ final class WorkspaceView: NSView {
 
     private func updateSelection(_ selection: TimelineSelection?) {
         selectedTimelineRange = selection
+        timelineSurface.displayGainPreview(selection: nil, gain: 1)
+        updateEffectCommandState()
         updateStatus(currentPlaybackStatus)
+    }
+
+    private func updateFrameStats(_ frameStats: TimelineFrameStats) {
+        framesPerSecondLabel.stringValue = String(
+            format: "%d fps - +/-%.1f max %.1f",
+            frameStats.framesPerSecond,
+            frameStats.frameTimeJitterMilliseconds,
+            frameStats.worstFrameTimeMilliseconds
+        )
+    }
+
+    private var canApplyGainEffect: Bool {
+        guard
+            audioTimeline != nil,
+            decodedAudioBuffer != nil,
+            let selectedTimelineRange
+        else {
+            return false
+        }
+
+        return selectedTimelineRange.durationProgress > 0
+    }
+
+    private func updateEffectCommandState() {
+        timelineSurface.canApplyGainEffect = canApplyGainEffect
+        timelineSurface.canApplyFadeEffect = canApplyGainEffect
+        timelineSurface.canReapplyLastEffect = lastEffect != nil && canApplyGainEffect
     }
 
     private func updateStatus(_ status: String) {
@@ -656,6 +962,8 @@ final class WorkspaceView: NSView {
     private func applyTimeline(_ audioTimeline: AudioEditTimeline) {
         self.audioTimeline = audioTimeline
         selectedTimelineRange = nil
+        timelineSurface.displayGainPreview(selection: nil, gain: 1)
+        updateEffectCommandState()
         currentPlayheadFrame = 0
         stopPlaybackTimer()
 
@@ -722,5 +1030,14 @@ final class WorkspaceView: NSView {
         }
 
         return String(format: "%02d:%02d.%03d", minutes, seconds, milliseconds)
+    }
+
+    private func clampAudioSample(_ sample: Float) -> Float {
+        min(max(sample, -1), 1)
+    }
+
+    private func smoothstep(_ progress: Float) -> Float {
+        let clampedProgress = min(max(progress, 0), 1)
+        return clampedProgress * clampedProgress * (3 - 2 * clampedProgress)
     }
 }

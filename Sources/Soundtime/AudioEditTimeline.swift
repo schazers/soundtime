@@ -1,6 +1,8 @@
 import Foundation
 
 struct AudioEditTimeline: Sendable {
+    private static let spliceFadeDuration: TimeInterval = 0.005
+
     private struct Segment: Sendable {
         let sourceStartFrame: Int
         let frameCount: Int
@@ -69,6 +71,9 @@ struct AudioEditTimeline: Sendable {
             samplesByChannel[channelIndex].reserveCapacity(renderedFrameCount)
         }
 
+        var isFirstRenderedSegment = true
+        let spliceFadeFrameCount = max(Int(sourceBuffer.sampleRate * Self.spliceFadeDuration), 1)
+
         for segment in segments where segment.frameCount > 0 {
             for channelIndex in samplesByChannel.indices {
                 let sourceSamples = sourceBuffer.samplesByChannel[channelIndex]
@@ -77,8 +82,23 @@ struct AudioEditTimeline: Sendable {
                     continue
                 }
 
-                samplesByChannel[channelIndex].append(contentsOf: sourceSamples[segment.sourceStartFrame..<sourceEndFrame])
+                if !isFirstRenderedSegment {
+                    applySpliceFadeOut(
+                        outputSamples: &samplesByChannel[channelIndex],
+                        fadeFrameCount: spliceFadeFrameCount
+                    )
+                }
+
+                appendSegmentSamples(
+                    to: &samplesByChannel[channelIndex],
+                    sourceSamples: sourceSamples,
+                    sourceStartFrame: segment.sourceStartFrame,
+                    sourceEndFrame: sourceEndFrame,
+                    fadeInFrameCount: isFirstRenderedSegment ? 0 : spliceFadeFrameCount
+                )
             }
+
+            isFirstRenderedSegment = false
         }
 
         return DecodedAudioBuffer(
@@ -88,6 +108,56 @@ struct AudioEditTimeline: Sendable {
             frameCount: renderedFrameCount,
             samplesByChannel: samplesByChannel
         )
+    }
+
+    private func applySpliceFadeOut(
+        outputSamples: inout [Float],
+        fadeFrameCount: Int
+    ) {
+        let fadeFrameCount = min(fadeFrameCount, outputSamples.count)
+        guard fadeFrameCount > 1 else {
+            return
+        }
+
+        let outputStartIndex = outputSamples.count - fadeFrameCount
+        for offset in 0..<fadeFrameCount {
+            let progress = Float(offset) / Float(fadeFrameCount - 1)
+            let outputIndex = outputStartIndex + offset
+            outputSamples[outputIndex] *= 1 - smoothstep(progress)
+        }
+    }
+
+    private func appendSegmentSamples(
+        to outputSamples: inout [Float],
+        sourceSamples: [Float],
+        sourceStartFrame: Int,
+        sourceEndFrame: Int,
+        fadeInFrameCount: Int
+    ) {
+        guard sourceStartFrame < sourceEndFrame else {
+            return
+        }
+
+        let fadeFrameCount = min(fadeInFrameCount, sourceEndFrame - sourceStartFrame)
+        guard fadeFrameCount > 1 else {
+            outputSamples.append(contentsOf: sourceSamples[sourceStartFrame..<sourceEndFrame])
+            return
+        }
+
+        for offset in 0..<fadeFrameCount {
+            let progress = Float(offset) / Float(fadeFrameCount - 1)
+            outputSamples.append(sourceSamples[sourceStartFrame + offset] * smoothstep(progress))
+        }
+
+        let remainingStartFrame = sourceStartFrame + fadeFrameCount
+        if remainingStartFrame < sourceEndFrame {
+            outputSamples.append(contentsOf: sourceSamples[remainingStartFrame..<sourceEndFrame])
+        }
+    }
+
+    private func smoothstep(_ progress: Float) -> Float {
+        let clampedProgress = min(max(progress, 0), 1)
+        return clampedProgress * clampedProgress * (3 - 2 * clampedProgress)
     }
 
     private mutating func deleteFrames(in frameRange: Range<Int>) -> Int {

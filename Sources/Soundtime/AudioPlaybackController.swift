@@ -66,13 +66,18 @@ final class AudioPlaybackController {
     private var playbackSource: PlaybackSource?
     private var zeroCrossingIndex: AudioZeroCrossingIndex?
     private var zeroCrossingProbe: WAVZeroCrossingProbe?
-    private var scheduledPlaybackBuffer: AVAudioPCMBuffer?
+    private var scheduledPlaybackBuffers: [(endFrame: Int, buffer: AVAudioPCMBuffer)] = []
     private var scheduledStartFrame = 0
+    private var scheduledEndFrame = 0
     private var pausedFrame = 0
     private var isPlayerRunning = false
     private var isRestartPending = false
     private var transportRampTask: Task<Void, Never>?
+    private var masterVolume: Float = 1
+    private var transportGain: Float = 1
     private let transportRampDuration: TimeInterval = 0.018
+    private let playbackChunkDuration: TimeInterval = 1
+    private let playbackScheduleAheadDuration: TimeInterval = 3
 
     var isPlaying: Bool {
         isPlayerRunning || isRestartPending
@@ -85,6 +90,13 @@ final class AudioPlaybackController {
     init() {
         engine.attach(playerNode)
         playerNode.volume = 1
+        applyOutputVolume()
+    }
+
+    func setPerceptualVolume(_ volume: Float) {
+        let clampedVolume = min(max(volume, 0), 1)
+        masterVolume = clampedVolume * clampedVolume
+        applyOutputVolume()
     }
 
     func load(
@@ -96,6 +108,7 @@ final class AudioPlaybackController {
         self.zeroCrossingIndex = zeroCrossingIndex
         zeroCrossingProbe = nil
         scheduledStartFrame = 0
+        scheduledEndFrame = 0
         pausedFrame = 0
 
         let format = try playbackFormat(for: decodedAudioBuffer)
@@ -110,6 +123,7 @@ final class AudioPlaybackController {
         zeroCrossingIndex = nil
         self.zeroCrossingProbe = zeroCrossingProbe
         scheduledStartFrame = 0
+        scheduledEndFrame = 0
         pausedFrame = 0
 
         engine.disconnectNodeOutput(playerNode)
@@ -122,6 +136,7 @@ final class AudioPlaybackController {
         zeroCrossingIndex = nil
         zeroCrossingProbe = nil
         scheduledStartFrame = 0
+        scheduledEndFrame = 0
         pausedFrame = 0
     }
 
@@ -164,7 +179,8 @@ final class AudioPlaybackController {
             try engine.start()
         }
 
-        playerNode.volume = 0
+        transportGain = 0
+        applyOutputVolume()
         playerNode.play()
         isPlayerRunning = true
         isRestartPending = false
@@ -190,7 +206,8 @@ final class AudioPlaybackController {
             }
 
             playerNode.pause()
-            playerNode.volume = 1
+            transportGain = 1
+            applyOutputVolume()
         }
     }
 
@@ -216,14 +233,17 @@ final class AudioPlaybackController {
         )
         let shouldResumePlayback = isPlaying && snappedTargetFrame < sourceFrameCount
 
-        scheduledPlaybackBuffer = nil
+        scheduledPlaybackBuffers.removeAll()
         scheduledStartFrame = snappedTargetFrame
+        scheduledEndFrame = snappedTargetFrame
         pausedFrame = snappedTargetFrame
 
         guard shouldResumePlayback else {
             cancelTransportRamp()
             playerNode.stop()
-            playerNode.volume = 1
+            scheduledPlaybackBuffers.removeAll()
+            transportGain = 1
+            applyOutputVolume()
             isPlayerRunning = false
             isRestartPending = false
             return
@@ -232,13 +252,15 @@ final class AudioPlaybackController {
         guard shouldRampIfPlaying else {
             cancelTransportRamp()
             playerNode.stop()
+            scheduledPlaybackBuffers.removeAll()
             try schedulePlayback(startingAt: snappedTargetFrame)
 
             if !engine.isRunning {
                 try engine.start()
             }
 
-            playerNode.volume = 0
+            transportGain = 0
+            applyOutputVolume()
             playerNode.play()
             isPlayerRunning = true
             isRestartPending = false
@@ -254,7 +276,7 @@ final class AudioPlaybackController {
             }
 
             playerNode.stop()
-            scheduledPlaybackBuffer = nil
+            scheduledPlaybackBuffers.removeAll()
 
             do {
                 try schedulePlayback(startingAt: snappedTargetFrame)
@@ -263,13 +285,15 @@ final class AudioPlaybackController {
                     try engine.start()
                 }
 
-                playerNode.volume = 0
+                transportGain = 0
+                applyOutputVolume()
                 playerNode.play()
                 isPlayerRunning = true
                 isRestartPending = false
                 beginTransportRamp(to: 1)
             } catch {
-                playerNode.volume = 1
+                transportGain = 1
+                applyOutputVolume()
                 isPlayerRunning = false
                 isRestartPending = false
             }
@@ -285,6 +309,13 @@ final class AudioPlaybackController {
         let frameIndex = currentFrame()
         if isPlayerRunning, frameIndex >= sourceFrameCount {
             finishAtEnd()
+        } else if isPlayerRunning {
+            do {
+                try schedulePlaybackAhead(from: frameIndex)
+                pruneScheduledPlaybackBuffers(before: frameIndex)
+            } catch {
+                finishAtEnd()
+            }
         }
 
         return Snapshot(
@@ -315,58 +346,103 @@ final class AudioPlaybackController {
     private func finishAtEnd() {
         cancelTransportRamp()
         playerNode.stop()
-        scheduledPlaybackBuffer = nil
+        scheduledPlaybackBuffers.removeAll()
         pausedFrame = playbackSource?.frameCount ?? 0
         isPlayerRunning = false
         isRestartPending = false
-        playerNode.volume = 1
+        transportGain = 1
+        applyOutputVolume()
     }
 
     private func stopEnginePlayback() {
         cancelTransportRamp()
         playerNode.stop()
-        scheduledPlaybackBuffer = nil
+        scheduledPlaybackBuffers.removeAll()
         isPlayerRunning = false
         isRestartPending = false
         pausedFrame = 0
-        playerNode.volume = 1
+        scheduledStartFrame = 0
+        scheduledEndFrame = 0
+        transportGain = 1
+        applyOutputVolume()
     }
 
     private func schedulePlayback(startingAt startFrame: Int) throws {
-        guard let playbackSource else {
+        guard playbackSource != nil else {
             throw PlaybackError.noAudioLoaded
         }
 
         scheduledStartFrame = startFrame
+        scheduledEndFrame = startFrame
+        scheduledPlaybackBuffers.removeAll()
+        try schedulePlaybackAhead(from: startFrame)
+    }
+
+    private func schedulePlaybackAhead(from frame: Int) throws {
+        guard let playbackSource else {
+            throw PlaybackError.noAudioLoaded
+        }
+
+        let sourceFrameCount = playbackSource.frameCount
+        guard scheduledEndFrame < sourceFrameCount else {
+            return
+        }
+
+        let scheduleAheadFrames = max(Int(playbackSource.sampleRate * playbackScheduleAheadDuration), 1)
+        let targetEndFrame = min(max(frame, scheduledEndFrame) + scheduleAheadFrames, sourceFrameCount)
+
+        while scheduledEndFrame < targetEndFrame {
+            let chunkFrameCount = min(
+                max(Int(playbackSource.sampleRate * playbackChunkDuration), 1),
+                targetEndFrame - scheduledEndFrame
+            )
+            guard chunkFrameCount > 0 else {
+                return
+            }
+
+            try schedulePlaybackChunk(startingAt: scheduledEndFrame, frameCount: chunkFrameCount)
+            scheduledEndFrame += chunkFrameCount
+        }
+    }
+
+    private func schedulePlaybackChunk(startingAt startFrame: Int, frameCount: Int) throws {
+        guard let playbackSource else {
+            throw PlaybackError.noAudioLoaded
+        }
 
         switch playbackSource {
         case let .decoded(decodedAudioBuffer):
             let playbackBuffer = try makePlaybackBuffer(
                 from: decodedAudioBuffer,
-                startingAt: startFrame
+                startingAt: startFrame,
+                frameCount: frameCount
             )
-            scheduledPlaybackBuffer = playbackBuffer
+            scheduledPlaybackBuffers.append((endFrame: startFrame + frameCount, buffer: playbackBuffer))
             playerNode.scheduleBuffer(playbackBuffer, at: nil)
         case let .file(audioFile):
-            let remainingFrameCount = playbackSource.frameCount - startFrame
-            guard remainingFrameCount > 0 else {
+            guard frameCount > 0 else {
                 throw PlaybackError.invalidFormat
             }
 
-            scheduledPlaybackBuffer = nil
             playerNode.scheduleSegment(
                 audioFile,
                 startingFrame: AVAudioFramePosition(startFrame),
-                frameCount: AVAudioFrameCount(remainingFrameCount),
+                frameCount: AVAudioFrameCount(frameCount),
                 at: nil
             )
+        }
+    }
+
+    private func pruneScheduledPlaybackBuffers(before frame: Int) {
+        scheduledPlaybackBuffers.removeAll { scheduledBuffer in
+            scheduledBuffer.endFrame < frame
         }
     }
 
     private func beginTransportRamp(to targetVolume: Float, completion: (() -> Void)? = nil) {
         transportRampTask?.cancel()
 
-        let initialVolume = playerNode.volume
+        let initialVolume = transportGain
         let stepCount = 18
         let stepDuration = transportRampDuration / Double(stepCount)
 
@@ -379,7 +455,8 @@ final class AudioPlaybackController {
 
                 let progress = Float(stepIndex) / Float(stepCount)
                 let easedProgress = progress * progress * (3 - 2 * progress)
-                playerNode.volume = initialVolume + (targetVolume - initialVolume) * easedProgress
+                transportGain = initialVolume + (targetVolume - initialVolume) * easedProgress
+                applyOutputVolume()
             }
 
             guard !Task.isCancelled else {
@@ -393,6 +470,10 @@ final class AudioPlaybackController {
     private func cancelTransportRamp() {
         transportRampTask?.cancel()
         transportRampTask = nil
+    }
+
+    private func applyOutputVolume() {
+        engine.mainMixerNode.outputVolume = masterVolume * transportGain
     }
 
     private func snappedFrameToZeroCrossing(
@@ -441,11 +522,12 @@ final class AudioPlaybackController {
 
     private func makePlaybackBuffer(
         from decodedAudioBuffer: DecodedAudioBuffer,
-        startingAt startFrame: Int
+        startingAt startFrame: Int,
+        frameCount requestedFrameCount: Int
     ) throws -> AVAudioPCMBuffer {
         let clampedStartFrame = min(max(startFrame, 0), decodedAudioBuffer.frameCount)
-        let remainingFrameCount = decodedAudioBuffer.frameCount - clampedStartFrame
-        guard remainingFrameCount > 0 else {
+        let frameCount = min(max(requestedFrameCount, 0), decodedAudioBuffer.frameCount - clampedStartFrame)
+        guard frameCount > 0 else {
             throw PlaybackError.invalidFormat
         }
 
@@ -454,13 +536,13 @@ final class AudioPlaybackController {
         guard
             let playbackBuffer = AVAudioPCMBuffer(
                 pcmFormat: format,
-                frameCapacity: AVAudioFrameCount(remainingFrameCount)
+                frameCapacity: AVAudioFrameCount(frameCount)
             )
         else {
             throw PlaybackError.bufferCreationFailed
         }
 
-        playbackBuffer.frameLength = AVAudioFrameCount(remainingFrameCount)
+        playbackBuffer.frameLength = AVAudioFrameCount(frameCount)
 
         guard let channelData = playbackBuffer.floatChannelData else {
             throw PlaybackError.bufferCreationFailed
@@ -470,7 +552,7 @@ final class AudioPlaybackController {
             let sourceSamples = decodedAudioBuffer.samplesByChannel[channelIndex]
             let destinationSamples = channelData[channelIndex]
 
-            for frameIndex in 0..<remainingFrameCount {
+            for frameIndex in 0..<frameCount {
                 destinationSamples[frameIndex] = sourceSamples[clampedStartFrame + frameIndex]
             }
         }
