@@ -1,4 +1,5 @@
 import MetalKit
+import QuartzCore
 import simd
 
 struct TimelineFrameStats: Equatable, Sendable {
@@ -13,6 +14,7 @@ struct TimelineRenderTarget {
     let drawable: MTLDrawable
     let viewportSize: CGSize
     let backingScale: Float
+    let displayTimestamp: CFTimeInterval
 }
 
 final class TimelineRenderer: NSObject {
@@ -145,8 +147,6 @@ final class TimelineRenderer: NSObject {
     private var waveformMipLevels: [WaveformMipLevel] = []
     private var gridCache: GridCache?
     private var waveformCache: WaveformCache?
-    private var visualPlayheadProgress: Float?
-    private var visualPlaybackFrameRate: Double = 144
     private var previousRenderedPlayheadX: Float?
     private var previousRenderedPlayheadTime: CFTimeInterval?
     private var playheadTouchEnergy: Float = 0
@@ -164,7 +164,6 @@ final class TimelineRenderer: NSObject {
     private let playheadTouchRadiusDuration: TimeInterval = 0.42
     private let playheadTouchDecayDuration: CFTimeInterval = 0.046
     private let playheadKickDecayDuration: CFTimeInterval = 0.3
-    private let visualPlaybackFrameRateSmoothing = 0.12
 
     init(device: MTLDevice, pixelFormat: MTLPixelFormat) throws {
         guard let commandQueue = device.makeCommandQueue() else {
@@ -212,31 +211,52 @@ final class TimelineRenderer: NSObject {
         waveformMipLevels = makeWaveformMipLevels(from: waveformOverview)
         gridCache = nil
         waveformCache = nil
-        visualPlayheadProgress = nil
         previousRenderedPlayheadX = nil
         previousRenderedPlayheadTime = nil
     }
 
     func displayPlayheadProgress(_ progress: Float, force: Bool = true) {
+        let currentTime = CACurrentMediaTime()
         let clampedProgress = min(max(progress, 0), 1)
         if renderState.isPlaybackActive, !force {
             return
         }
 
-        renderState = renderState.withPlayheadProgress(clampedProgress)
-        visualPlayheadProgress = clampedProgress
+        let anchoredProgress: Float
+        if
+            renderState.isPlaybackActive,
+            let projectedProgress = projectedPlayheadProgress(at: currentTime),
+            let duration = renderState.waveformOverview?.duration,
+            duration.isFinite,
+            duration > 0
+        {
+            let backwardCorrection = projectedProgress - clampedProgress
+            let maximumSilentCorrection = Float(0.12 / duration)
+            if backwardCorrection > 0, backwardCorrection <= maximumSilentCorrection {
+                anchoredProgress = projectedProgress
+            } else {
+                anchoredProgress = clampedProgress
+            }
+        } else {
+            anchoredProgress = clampedProgress
+        }
+
+        renderState = renderState.withPlayheadProgress(anchoredProgress, anchorTimestamp: currentTime)
         previousRenderedPlayheadX = nil
         previousRenderedPlayheadTime = nil
     }
 
     func displayPlaybackActive(_ isActive: Bool) {
+        let currentTime = CACurrentMediaTime()
         updatePlayheadTouchEnergy(isPlaybackActive: renderState.isPlaybackActive)
         updatePlayheadKickEnergy()
         let wasPlaybackActive = renderState.isPlaybackActive
-        renderState = renderState.withPlaybackActive(isActive)
+        let anchoredProgress = projectedPlayheadProgress(at: currentTime) ?? renderState.playheadProgress
+        renderState = renderState
+            .withPlayheadProgress(anchoredProgress, anchorTimestamp: currentTime)
+            .withPlaybackActive(isActive)
 
         if wasPlaybackActive != isActive {
-            visualPlayheadProgress = renderState.playheadProgress
             previousRenderedPlayheadX = nil
             previousRenderedPlayheadTime = nil
         }
@@ -296,7 +316,8 @@ final class TimelineRenderer: NSObject {
         encodeTimeline(
             into: encoder,
             viewportSize: target.viewportSize,
-            backingScale: target.backingScale
+            backingScale: target.backingScale,
+            displayTimestamp: target.displayTimestamp
         )
         encoder.endEncoding()
 
@@ -307,11 +328,15 @@ final class TimelineRenderer: NSObject {
     private func encodeTimeline(
         into encoder: MTLRenderCommandEncoder,
         viewportSize: CGSize,
-        backingScale: Float
+        backingScale: Float,
+        displayTimestamp: CFTimeInterval
     ) {
         recordFrameRate()
         let renderState = renderState
-        let renderedPlayheadProgress = currentPlayheadProgress(renderState: renderState)
+        let renderedPlayheadProgress = currentPlayheadProgress(
+            renderState: renderState,
+            displayTimestamp: displayTimestamp
+        )
         let selectionVertices = makeSelectionVertices(renderState: renderState)
         let waveformVertices = cachedWaveformVertices(drawableSize: viewportSize, renderState: renderState)
         let trimPreviewVertices = makeTrimPreviewVertices(
@@ -452,11 +477,6 @@ final class TimelineRenderer: NSObject {
         }
 
         let framesPerSecond = Int((Double(frameRateFrameCount) / elapsedTime).rounded())
-        let measuredFrameRate = max(Double(framesPerSecond), 1)
-        visualPlaybackFrameRate =
-            visualPlaybackFrameRate * (1 - visualPlaybackFrameRateSmoothing) +
-            measuredFrameRate * visualPlaybackFrameRateSmoothing
-
         let averageFrameInterval = frameIntervalCount > 0 ?
             frameIntervalSum / Double(frameIntervalCount) :
             0
@@ -858,7 +878,22 @@ final class TimelineRenderer: NSObject {
         return min(max(Float(playheadTouchRadiusDuration / duration), .ulpOfOne), 1)
     }
 
-    private func currentPlayheadProgress(renderState: TimelineRenderState) -> Float {
+    func projectedPlayheadProgress(at displayTimestamp: CFTimeInterval) -> Float? {
+        projectedPlayheadProgress(at: displayTimestamp, renderState: renderState)
+    }
+
+    private func currentPlayheadProgress(
+        renderState: TimelineRenderState,
+        displayTimestamp: CFTimeInterval
+    ) -> Float {
+        projectedPlayheadProgress(at: displayTimestamp, renderState: renderState) ??
+            min(max(renderState.playheadProgress, 0), 1)
+    }
+
+    private func projectedPlayheadProgress(
+        at displayTimestamp: CFTimeInterval,
+        renderState: TimelineRenderState
+    ) -> Float? {
         let clampedProgress = min(max(renderState.playheadProgress, 0), 1)
         guard
             renderState.isPlaybackActive,
@@ -869,12 +904,9 @@ final class TimelineRenderer: NSObject {
             return clampedProgress
         }
 
-        let currentVisualProgress = visualPlayheadProgress ?? clampedProgress
-        let frameRate = max(visualPlaybackFrameRate, 1)
-        let frameProgress = Float(1 / (duration * frameRate))
-        let nextVisualProgress = min(max(currentVisualProgress + frameProgress, 0), 1)
-        visualPlayheadProgress = nextVisualProgress
-        return nextVisualProgress
+        let elapsedTime = max(displayTimestamp - renderState.playheadAnchorTimestamp, 0)
+        let progress = clampedProgress + Float(elapsedTime / duration)
+        return min(max(progress, 0), 1)
     }
 
     private func currentPlayheadTouchEnergy(isPlaybackActive: Bool) -> Float {
@@ -1497,7 +1529,8 @@ extension TimelineRenderer: MTKViewDelegate {
             renderPassDescriptor: renderPassDescriptor,
             drawable: drawable,
             viewportSize: view.bounds.size,
-            backingScale: backingScale(for: view)
+            backingScale: backingScale(for: view),
+            displayTimestamp: CACurrentMediaTime()
         ))
     }
 }

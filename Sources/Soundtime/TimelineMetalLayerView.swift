@@ -84,7 +84,10 @@ class TimelineMetalLayerView: NSView {
     func renderTimeline(using renderer: TimelineRenderer?, frame: TimelineDisplayLinkFrame) {
         guard
             let renderer,
-            let target = makeRenderTarget(drawable: frame.drawable)
+            let target = makeRenderTarget(
+                drawable: frame.drawable,
+                displayTimestamp: frame.targetPresentationTimestamp
+            )
         else {
             return
         }
@@ -127,10 +130,13 @@ class TimelineMetalLayerView: NSView {
             return nil
         }
 
-        return makeRenderTarget(drawable: drawable)
+        return makeRenderTarget(drawable: drawable, displayTimestamp: CACurrentMediaTime())
     }
 
-    private func makeRenderTarget(drawable: CAMetalDrawable) -> TimelineRenderTarget? {
+    private func makeRenderTarget(
+        drawable: CAMetalDrawable,
+        displayTimestamp: CFTimeInterval
+    ) -> TimelineRenderTarget? {
         guard bounds.width > 0, bounds.height > 0 else {
             return nil
         }
@@ -145,7 +151,8 @@ class TimelineMetalLayerView: NSView {
             renderPassDescriptor: renderPassDescriptor,
             drawable: drawable,
             viewportSize: bounds.size,
-            backingScale: Float(backingScale)
+            backingScale: Float(backingScale),
+            displayTimestamp: displayTimestamp
         )
     }
 
