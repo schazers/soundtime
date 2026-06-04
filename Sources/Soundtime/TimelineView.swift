@@ -274,6 +274,15 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        if
+            isTimelinePlaybackActive,
+            let playheadProgress = timelineRenderer?.projectedPlayheadProgress(
+                at: frame.targetPresentationTimestamp
+            )
+        {
+            pageViewportIfNeeded(forPlayheadProgress: playheadProgress)
+        }
+
         needsTimelineRender = false
         renderTimeline(using: timelineRenderer, frame: frame)
         stopTimelineDisplayLinkIfIdle()
@@ -809,7 +818,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             nextViewport.endProgress < 1 - epsilon
         {
             let nextStartProgress = min(
-                nextViewport.startProgress + nextViewport.durationProgress,
+                max(progress, nextViewport.startProgress + nextViewport.durationProgress),
                 1 - nextViewport.durationProgress
             )
 

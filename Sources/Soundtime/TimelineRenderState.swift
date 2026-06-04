@@ -10,6 +10,7 @@ struct TimelineRenderState: Sendable {
         waveformOverview: nil,
         viewport: .full,
         playheadProgress: 0,
+        playheadAnchorTimestamp: 0,
         isPlaybackActive: false,
         hoverProgress: nil,
         isHoverGuideArmed: false,
@@ -21,6 +22,7 @@ struct TimelineRenderState: Sendable {
     let waveformOverview: WaveformOverview?
     let viewport: TimelineViewport
     let playheadProgress: Float
+    let playheadAnchorTimestamp: CFTimeInterval
     let isPlaybackActive: Bool
     let hoverProgress: Float?
     let isHoverGuideArmed: Bool
@@ -33,6 +35,7 @@ struct TimelineRenderState: Sendable {
             waveformOverview: waveformOverview,
             viewport: viewport,
             playheadProgress: playheadProgress,
+            playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
             hoverProgress: hoverProgress,
             isHoverGuideArmed: isHoverGuideArmed,
@@ -47,6 +50,7 @@ struct TimelineRenderState: Sendable {
             waveformOverview: waveformOverview,
             viewport: viewport,
             playheadProgress: playheadProgress,
+            playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
             hoverProgress: hoverProgress,
             isHoverGuideArmed: isHoverGuideArmed,
@@ -56,11 +60,15 @@ struct TimelineRenderState: Sendable {
         )
     }
 
-    func withPlayheadProgress(_ playheadProgress: Float) -> TimelineRenderState {
+    func withPlayheadProgress(
+        _ playheadProgress: Float,
+        anchorTimestamp: CFTimeInterval? = nil
+    ) -> TimelineRenderState {
         TimelineRenderState(
             waveformOverview: waveformOverview,
             viewport: viewport,
             playheadProgress: min(max(playheadProgress, 0), 1),
+            playheadAnchorTimestamp: anchorTimestamp ?? playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
             hoverProgress: hoverProgress,
             isHoverGuideArmed: isHoverGuideArmed,
@@ -75,6 +83,7 @@ struct TimelineRenderState: Sendable {
             waveformOverview: waveformOverview,
             viewport: viewport,
             playheadProgress: playheadProgress,
+            playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
             hoverProgress: hoverProgress,
             isHoverGuideArmed: isHoverGuideArmed,
@@ -90,6 +99,7 @@ struct TimelineRenderState: Sendable {
             waveformOverview: waveformOverview,
             viewport: viewport,
             playheadProgress: playheadProgress,
+            playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
             hoverProgress: clampedProgress,
             isHoverGuideArmed: clampedProgress != nil && isArmed,
@@ -104,6 +114,7 @@ struct TimelineRenderState: Sendable {
             waveformOverview: waveformOverview,
             viewport: viewport,
             playheadProgress: playheadProgress,
+            playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
             hoverProgress: hoverProgress,
             isHoverGuideArmed: isHoverGuideArmed,
@@ -118,6 +129,7 @@ struct TimelineRenderState: Sendable {
             waveformOverview: waveformOverview,
             viewport: viewport,
             playheadProgress: playheadProgress,
+            playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
             hoverProgress: hoverProgress,
             isHoverGuideArmed: isHoverGuideArmed,
@@ -132,6 +144,7 @@ struct TimelineRenderState: Sendable {
             waveformOverview: waveformOverview,
             viewport: viewport,
             playheadProgress: playheadProgress,
+            playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
             hoverProgress: hoverProgress,
             isHoverGuideArmed: isHoverGuideArmed,
