@@ -215,16 +215,27 @@ final class TimelineRenderer: NSObject {
         previousRenderedPlayheadTime = nil
     }
 
-    func displayPlayheadProgress(_ progress: Float, force: Bool = true) {
-        let currentTime = CACurrentMediaTime()
+    func displayPlayheadProgress(
+        _ progress: Float,
+        force: Bool = true,
+        anchorTimestamp: CFTimeInterval? = nil
+    ) {
+        let currentTime = anchorTimestamp ?? CACurrentMediaTime()
         let clampedProgress = min(max(progress, 0), 1)
         if renderState.isPlaybackActive, !force {
+            if anchorTimestamp != nil {
+                renderState = renderState.withPlayheadProgress(
+                    clampedProgress,
+                    anchorTimestamp: currentTime
+                )
+            }
             return
         }
 
         let anchoredProgress: Float
         if
             renderState.isPlaybackActive,
+            anchorTimestamp == nil,
             let projectedProgress = projectedPlayheadProgress(at: currentTime),
             let duration = renderState.waveformOverview?.duration,
             duration.isFinite,
@@ -251,14 +262,18 @@ final class TimelineRenderer: NSObject {
         updatePlayheadTouchEnergy(isPlaybackActive: renderState.isPlaybackActive)
         updatePlayheadKickEnergy()
         let wasPlaybackActive = renderState.isPlaybackActive
-        let anchoredProgress = projectedPlayheadProgress(at: currentTime) ?? renderState.playheadProgress
-        renderState = renderState
-            .withPlayheadProgress(anchoredProgress, anchorTimestamp: currentTime)
-            .withPlaybackActive(isActive)
 
         if wasPlaybackActive != isActive {
+            let anchoredProgress = isActive ?
+                (projectedPlayheadProgress(at: currentTime) ?? renderState.playheadProgress) :
+                renderState.playheadProgress
+            renderState = renderState
+                .withPlayheadProgress(anchoredProgress, anchorTimestamp: currentTime)
+                .withPlaybackActive(isActive)
             previousRenderedPlayheadX = nil
             previousRenderedPlayheadTime = nil
+        } else {
+            renderState = renderState.withPlaybackActive(isActive)
         }
 
         if isActive {

@@ -466,7 +466,11 @@ final class WorkspaceView: NSView {
         displayedSampleRate = previewResult.fileInfo.sampleRate
         timelineSurface.displayWaveform(previewResult.waveformOverview)
         let snapshot = playbackController.snapshot()
-        displayPlaybackVisuals(progress: snapshot.progress, isPlaying: snapshot.isPlaying)
+        displayPlaybackVisuals(
+            progress: snapshot.progress,
+            isPlaying: snapshot.isPlaying,
+            anchorTimestamp: snapshot.hostTimestamp
+        )
         updateTimeReadout()
     }
 
@@ -490,7 +494,11 @@ final class WorkspaceView: NSView {
 
         timelineSurface.displayWaveform(waveformOverview)
         let snapshot = playbackController.snapshot()
-        displayPlaybackVisuals(progress: snapshot.progress, isPlaying: snapshot.isPlaying)
+        displayPlaybackVisuals(
+            progress: snapshot.progress,
+            isPlaying: snapshot.isPlaying,
+            anchorTimestamp: snapshot.hostTimestamp
+        )
         updateLoadedAudioSummary(for: decodedAudioBuffer)
         currentPlaybackStatus = playbackController.isPlaying ? "playing" : "press Space to play"
         updateStatus(currentPlaybackStatus)
@@ -853,9 +861,14 @@ final class WorkspaceView: NSView {
     private func displayPlaybackVisuals(
         progress: Float,
         isPlaying: Bool,
-        syncPlayhead: Bool = true
+        syncPlayhead: Bool = true,
+        anchorTimestamp: TimeInterval? = nil
     ) {
-        timelineSurface.displayPlayheadProgress(progress, syncRenderer: syncPlayhead)
+        timelineSurface.displayPlayheadProgress(
+            progress,
+            syncRenderer: syncPlayhead,
+            anchorTimestamp: anchorTimestamp
+        )
         timelineSurface.displayPlaybackActive(isPlaying)
     }
 
@@ -865,7 +878,8 @@ final class WorkspaceView: NSView {
         displayPlaybackVisuals(
             progress: snapshot.progress,
             isPlaying: snapshot.isPlaying,
-            syncPlayhead: !snapshot.isPlaying || syncPlayheadWhenPlaying
+            syncPlayhead: !snapshot.isPlaying || syncPlayheadWhenPlaying,
+            anchorTimestamp: snapshot.hostTimestamp
         )
         updateTimeReadout()
 

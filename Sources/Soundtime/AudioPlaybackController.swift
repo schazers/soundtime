@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import QuartzCore
 
 @MainActor
 final class AudioPlaybackController {
@@ -30,6 +31,7 @@ final class AudioPlaybackController {
         let frameIndex: Int
         let frameCount: Int
         let isPlaying: Bool
+        let hostTimestamp: TimeInterval
 
         var progress: Float {
             guard frameCount > 0 else {
@@ -70,6 +72,7 @@ final class AudioPlaybackController {
     private var scheduledStartFrame = 0
     private var scheduledEndFrame = 0
     private var pausedFrame = 0
+    private var pausedFrameHostTimestamp = CACurrentMediaTime()
     private var isPlayerRunning = false
     private var isRestartPending = false
     private var transportRampTask: Task<Void, Never>?
@@ -110,6 +113,7 @@ final class AudioPlaybackController {
         scheduledStartFrame = 0
         scheduledEndFrame = 0
         pausedFrame = 0
+        pausedFrameHostTimestamp = CACurrentMediaTime()
 
         let format = try playbackFormat(for: decodedAudioBuffer)
         engine.disconnectNodeOutput(playerNode)
@@ -125,6 +129,7 @@ final class AudioPlaybackController {
         scheduledStartFrame = 0
         scheduledEndFrame = 0
         pausedFrame = 0
+        pausedFrameHostTimestamp = CACurrentMediaTime()
 
         engine.disconnectNodeOutput(playerNode)
         engine.connect(playerNode, to: engine.mainMixerNode, format: audioFile.processingFormat)
@@ -138,6 +143,7 @@ final class AudioPlaybackController {
         scheduledStartFrame = 0
         scheduledEndFrame = 0
         pausedFrame = 0
+        pausedFrameHostTimestamp = CACurrentMediaTime()
     }
 
     func updateZeroCrossingIndex(_ zeroCrossingIndex: AudioZeroCrossingIndex?) {
@@ -163,12 +169,10 @@ final class AudioPlaybackController {
         let sourceFrameCount = playbackSource.frameCount
         if pausedFrame >= sourceFrameCount {
             pausedFrame = 0
+        } else if sourceFrameCount > 0 {
+            pausedFrame = min(max(pausedFrame, 0), sourceFrameCount - 1)
         }
-        pausedFrame = snappedFrameToZeroCrossing(
-            pausedFrame,
-            frameCount: sourceFrameCount,
-            allowsEnd: false
-        )
+        pausedFrameHostTimestamp = CACurrentMediaTime()
 
         scheduledStartFrame = pausedFrame
         cancelTransportRamp()
@@ -192,12 +196,9 @@ final class AudioPlaybackController {
             return
         }
 
-        let frame = currentFrame()
-        pausedFrame = snappedFrameToZeroCrossing(
-            frame,
-            frameCount: playbackSource.frameCount,
-            allowsEnd: true
-        )
+        let timedFrame = currentTimedFrame()
+        pausedFrame = min(max(timedFrame.frameIndex, 0), playbackSource.frameCount)
+        pausedFrameHostTimestamp = timedFrame.hostTimestamp
         isPlayerRunning = false
         isRestartPending = false
         beginTransportRamp(to: 0) { [weak self] in
@@ -237,6 +238,7 @@ final class AudioPlaybackController {
         scheduledStartFrame = snappedTargetFrame
         scheduledEndFrame = snappedTargetFrame
         pausedFrame = snappedTargetFrame
+        pausedFrameHostTimestamp = CACurrentMediaTime()
 
         guard shouldResumePlayback else {
             cancelTransportRamp()
@@ -302,11 +304,17 @@ final class AudioPlaybackController {
 
     func snapshot() -> Snapshot {
         guard let playbackSource else {
-            return Snapshot(frameIndex: 0, frameCount: 0, isPlaying: false)
+            return Snapshot(
+                frameIndex: 0,
+                frameCount: 0,
+                isPlaying: false,
+                hostTimestamp: CACurrentMediaTime()
+            )
         }
 
         let sourceFrameCount = playbackSource.frameCount
-        let frameIndex = currentFrame()
+        let timedFrame = currentTimedFrame()
+        let frameIndex = timedFrame.frameIndex
         if isPlayerRunning, frameIndex >= sourceFrameCount {
             finishAtEnd()
         } else if isPlayerRunning {
@@ -321,26 +329,29 @@ final class AudioPlaybackController {
         return Snapshot(
             frameIndex: min(frameIndex, sourceFrameCount),
             frameCount: sourceFrameCount,
-            isPlaying: isPlaying
+            isPlaying: isPlaying,
+            hostTimestamp: timedFrame.hostTimestamp
         )
     }
 
-    private func currentFrame() -> Int {
+    private func currentTimedFrame() -> (frameIndex: Int, hostTimestamp: TimeInterval) {
         guard let playbackSource else {
-            return 0
+            return (0, CACurrentMediaTime())
         }
+        let currentHostTimestamp = CACurrentMediaTime()
         guard isPlayerRunning else {
-            return pausedFrame
+            return (pausedFrame, pausedFrameHostTimestamp)
         }
         guard
             let nodeTime = playerNode.lastRenderTime,
             let playerTime = playerNode.playerTime(forNodeTime: nodeTime)
         else {
-            return scheduledStartFrame
+            return (scheduledStartFrame, currentHostTimestamp)
         }
 
         let elapsedFrames = max(Int(playerTime.sampleTime), 0)
-        return min(scheduledStartFrame + elapsedFrames, playbackSource.frameCount)
+        let frameIndex = min(scheduledStartFrame + elapsedFrames, playbackSource.frameCount)
+        return (frameIndex, AVAudioTime.seconds(forHostTime: nodeTime.hostTime))
     }
 
     private func finishAtEnd() {
@@ -348,6 +359,7 @@ final class AudioPlaybackController {
         playerNode.stop()
         scheduledPlaybackBuffers.removeAll()
         pausedFrame = playbackSource?.frameCount ?? 0
+        pausedFrameHostTimestamp = CACurrentMediaTime()
         isPlayerRunning = false
         isRestartPending = false
         transportGain = 1
@@ -361,6 +373,7 @@ final class AudioPlaybackController {
         isPlayerRunning = false
         isRestartPending = false
         pausedFrame = 0
+        pausedFrameHostTimestamp = CACurrentMediaTime()
         scheduledStartFrame = 0
         scheduledEndFrame = 0
         transportGain = 1
