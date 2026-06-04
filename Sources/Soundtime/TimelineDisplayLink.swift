@@ -1,0 +1,57 @@
+import QuartzCore
+
+struct TimelineDisplayLinkFrame {
+    let drawable: CAMetalDrawable
+    let targetTimestamp: CFTimeInterval
+    let targetPresentationTimestamp: CFTimeInterval
+}
+
+final class TimelineDisplayLink: NSObject, CAMetalDisplayLinkDelegate {
+    var onFrame: ((TimelineDisplayLinkFrame) -> Void)?
+
+    private let displayLink: CAMetalDisplayLink
+
+    init(metalLayer: CAMetalLayer, preferredFramesPerSecond: Int) {
+        displayLink = CAMetalDisplayLink(metalLayer: metalLayer)
+        super.init()
+
+        displayLink.delegate = self
+        displayLink.preferredFrameLatency = 1
+        updatePreferredFramesPerSecond(preferredFramesPerSecond)
+        displayLink.isPaused = true
+        displayLink.add(to: .main, forMode: .common)
+    }
+
+    deinit {
+        displayLink.invalidate()
+    }
+
+    func updatePreferredFramesPerSecond(_ preferredFramesPerSecond: Int) {
+        let preferred = Float(max(preferredFramesPerSecond, 60))
+        displayLink.preferredFrameRateRange = CAFrameRateRange(
+            minimum: 60,
+            maximum: preferred,
+            preferred: preferred
+        )
+    }
+
+    func start() {
+        displayLink.isPaused = false
+    }
+
+    func stop() {
+        displayLink.isPaused = true
+    }
+
+    func invalidate() {
+        displayLink.invalidate()
+    }
+
+    func metalDisplayLink(_ link: CAMetalDisplayLink, needsUpdate update: CAMetalDisplayLink.Update) {
+        onFrame?(TimelineDisplayLinkFrame(
+            drawable: update.drawable,
+            targetTimestamp: update.targetTimestamp,
+            targetPresentationTimestamp: update.targetPresentationTimestamp
+        ))
+    }
+}

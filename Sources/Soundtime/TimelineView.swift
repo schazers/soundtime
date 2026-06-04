@@ -41,9 +41,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var rightPanVelocityProgressPerSecond: Float = 0
     private var rightPanMomentumTimer: Timer?
     private var rightPanMomentumLastTime: TimeInterval?
-    private var transientRenderTimer: Timer?
+    private var timelineDisplayLink: TimelineDisplayLink?
     private var transientRenderEndTime: CFTimeInterval?
-    private var isTimelineRenderScheduled = false
+    private var needsTimelineRender = false
+    private var isTimelinePlaybackActive = false
     private let selectionDragThreshold: CGFloat = 3
     private let trimHandleHitWidth: CGFloat = 18
     private let rightPanVelocitySmoothing: Float = 0.42
@@ -90,6 +91,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         super.viewDidMoveToWindow()
         window?.makeFirstResponder(self)
         window?.acceptsMouseMovedEvents = true
+        configureDisplayLinkIfNeeded()
         updatePreferredFrameRate()
         requestTimelineRender()
     }
@@ -132,6 +134,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     func displayPlaybackActive(_ isActive: Bool) {
+        isTimelinePlaybackActive = isActive
         timelineRenderer?.displayPlaybackActive(isActive)
         requestTimelineRender()
         if !isActive {
@@ -223,58 +226,75 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     private func updatePreferredFrameRate() {
         preferredFramesPerSecond = targetFramesPerSecond
+        timelineDisplayLink?.updatePreferredFramesPerSecond(targetFramesPerSecond)
     }
 
     private func requestTimelineRender() {
-        guard !isTimelineRenderScheduled else {
+        needsTimelineRender = true
+        startTimelineDisplayLink()
+    }
+
+    private func configureDisplayLinkIfNeeded() {
+        guard timelineDisplayLink == nil, let timelineMetalLayer else {
             return
         }
 
-        isTimelineRenderScheduled = true
-        Task { @MainActor [weak self] in
-            self?.renderScheduledTimelineFrame()
+        let displayLink = TimelineDisplayLink(
+            metalLayer: timelineMetalLayer,
+            preferredFramesPerSecond: targetFramesPerSecond
+        )
+        displayLink.onFrame = { [weak self] frame in
+            MainActor.assumeIsolated {
+                self?.displayLinkDidTick(frame)
+            }
         }
+        timelineDisplayLink = displayLink
     }
 
-    private func renderScheduledTimelineFrame() {
-        isTimelineRenderScheduled = false
-        renderTimeline(using: timelineRenderer)
+    private func startTimelineDisplayLink() {
+        configureDisplayLinkIfNeeded()
+        timelineDisplayLink?.start()
+    }
+
+    private func stopTimelineDisplayLinkIfIdle() {
+        guard !needsTimelineRender, !isTimelinePlaybackActive, !hasActiveTransientRenderPulse() else {
+            return
+        }
+
+        timelineDisplayLink?.stop()
+    }
+
+    private func displayLinkDidTick(_ frame: TimelineDisplayLinkFrame) {
+        let shouldRender = needsTimelineRender ||
+            isTimelinePlaybackActive ||
+            hasActiveTransientRenderPulse()
+
+        guard shouldRender else {
+            timelineDisplayLink?.stop()
+            return
+        }
+
+        needsTimelineRender = false
+        renderTimeline(using: timelineRenderer, frame: frame)
+        stopTimelineDisplayLinkIfIdle()
     }
 
     private func startTransientRenderPulse() {
         transientRenderEndTime = CFAbsoluteTimeGetCurrent() + transientRenderPulseDuration
-        guard transientRenderTimer == nil else {
-            return
-        }
-
-        let frameRate = max(preferredFramesPerSecond, 60)
-        let timer = Timer(timeInterval: 1 / Double(frameRate), repeats: true) { [weak self] timer in
-            guard let self else {
-                timer.invalidate()
-                return
-            }
-
-            MainActor.assumeIsolated {
-                self.stepTransientRenderPulse()
-            }
-        }
-        timer.tolerance = 0
-        transientRenderTimer = timer
-        RunLoop.main.add(timer, forMode: .common)
+        startTimelineDisplayLink()
     }
 
-    private func stepTransientRenderPulse() {
-        guard
-            let transientRenderEndTime,
-            CFAbsoluteTimeGetCurrent() <= transientRenderEndTime
-        else {
-            transientRenderTimer?.invalidate()
-            transientRenderTimer = nil
-            self.transientRenderEndTime = nil
-            return
+    private func hasActiveTransientRenderPulse() -> Bool {
+        guard let transientRenderEndTime else {
+            return false
         }
 
-        requestTimelineRender()
+        if CFAbsoluteTimeGetCurrent() <= transientRenderEndTime {
+            return true
+        }
+
+        self.transientRenderEndTime = nil
+        return false
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
