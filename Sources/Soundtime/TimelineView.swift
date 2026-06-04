@@ -102,6 +102,10 @@ final class TimelineView: MTKView {
         timelineRenderer?.displayPlayheadProgress(clampedProgress)
     }
 
+    func displayPlaybackActive(_ isActive: Bool) {
+        timelineRenderer?.displayPlaybackActive(isActive)
+    }
+
     func displaySelection(_ selection: TimelineSelection?) {
         timelineRenderer?.displaySelection(nil)
         displayedSelection = selection
@@ -238,6 +242,10 @@ final class TimelineView: MTKView {
         }
 
         if event.keyCode == 49 {
+            guard !event.isARepeat else {
+                return
+            }
+
             onTogglePlayback?()
             return
         }
