@@ -22,6 +22,7 @@ This repository currently contains the native app shell:
 - Draggable start/end trim handles for fast boundary trims
 - Click-drag timeline selection with selected duration in the header
 - Pinch or Option-scroll to zoom the waveform, and scroll to pan the visible timeline
+- Zoomed playback pages the visible timeline forward as the playhead reaches the right edge
 - Delete/Backspace removes the selected range non-destructively
 - Command-Z restores the previous edit timeline
 - Click the waveform to seek the playhead

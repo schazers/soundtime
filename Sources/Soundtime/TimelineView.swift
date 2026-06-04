@@ -97,7 +97,9 @@ final class TimelineView: MTKView {
     }
 
     func displayPlayheadProgress(_ progress: Float) {
-        timelineRenderer?.displayPlayheadProgress(progress)
+        let clampedProgress = min(max(progress, 0), 1)
+        pageViewportIfNeeded(forPlayheadProgress: clampedProgress)
+        timelineRenderer?.displayPlayheadProgress(clampedProgress)
     }
 
     func displaySelection(_ selection: TimelineSelection?) {
@@ -493,6 +495,55 @@ final class TimelineView: MTKView {
         updateSelectionOverlay(flushImmediately: false)
         window?.invalidateCursorRects(for: self)
         draw()
+    }
+
+    private func pageViewportIfNeeded(forPlayheadProgress progress: Float) {
+        guard isSelectionEnabled, !viewport.isFull else {
+            return
+        }
+
+        let epsilon: Float = 0.00001
+        var nextViewport = viewport
+
+        while
+            progress >= nextViewport.endProgress - epsilon,
+            nextViewport.endProgress < 1 - epsilon
+        {
+            let nextStartProgress = min(
+                nextViewport.startProgress + nextViewport.durationProgress,
+                1 - nextViewport.durationProgress
+            )
+
+            guard nextStartProgress > nextViewport.startProgress + epsilon else {
+                break
+            }
+
+            nextViewport = TimelineViewport(
+                startProgress: nextStartProgress,
+                durationProgress: nextViewport.durationProgress
+            )
+        }
+
+        while
+            progress < nextViewport.startProgress - epsilon,
+            nextViewport.startProgress > epsilon
+        {
+            let nextStartProgress = max(
+                nextViewport.startProgress - nextViewport.durationProgress,
+                0
+            )
+
+            guard nextStartProgress < nextViewport.startProgress - epsilon else {
+                break
+            }
+
+            nextViewport = TimelineViewport(
+                startProgress: nextStartProgress,
+                durationProgress: nextViewport.durationProgress
+            )
+        }
+
+        setViewport(nextViewport)
     }
 
     private func updateHoverGuide(for event: NSEvent) {
