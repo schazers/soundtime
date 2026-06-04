@@ -8,7 +8,14 @@ struct TimelineFrameStats: Equatable, Sendable {
     let worstFrameTimeMilliseconds: Double
 }
 
-final class TimelineRenderer: NSObject, MTKViewDelegate {
+struct TimelineRenderTarget {
+    let renderPassDescriptor: MTLRenderPassDescriptor
+    let drawable: MTLDrawable
+    let viewportSize: CGSize
+    let backingScale: Float
+}
+
+final class TimelineRenderer: NSObject {
     private struct TimelineVertex {
         var position: SIMD4<Float>
         var color: SIMD4<Float>
@@ -119,8 +126,6 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         super.init()
     }
 
-    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
-
     func displayWaveform(_ waveformOverview: WaveformOverview?) {
         renderState = renderState.withWaveformOverview(waveformOverview)
         waveformMipLevels = makeWaveformMipLevels(from: waveformOverview)
@@ -198,40 +203,52 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         waveformCache = nil
     }
 
-    func draw(in view: MTKView) {
+    func render(to target: TimelineRenderTarget) {
         guard
-            let renderPassDescriptor = view.currentRenderPassDescriptor,
-            let drawable = view.currentDrawable,
             let commandBuffer = commandQueue.makeCommandBuffer(),
-            let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor)
+            let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: target.renderPassDescriptor)
         else {
             return
         }
-        recordFrameRate()
 
+        encodeTimeline(
+            into: encoder,
+            viewportSize: target.viewportSize,
+            backingScale: target.backingScale
+        )
+        encoder.endEncoding()
+
+        commandBuffer.present(target.drawable)
+        commandBuffer.commit()
+    }
+
+    private func encodeTimeline(
+        into encoder: MTLRenderCommandEncoder,
+        viewportSize: CGSize,
+        backingScale: Float
+    ) {
+        recordFrameRate()
         let renderState = renderState
-        let renderSize = view.bounds.size
-        let backingScale = backingScale(for: view)
         let renderedPlayheadProgress = currentPlayheadProgress(renderState: renderState)
         let selectionVertices = makeSelectionVertices(renderState: renderState)
-        let waveformVertices = cachedWaveformVertices(drawableSize: renderSize, renderState: renderState)
+        let waveformVertices = cachedWaveformVertices(drawableSize: viewportSize, renderState: renderState)
         let trimPreviewVertices = makeTrimPreviewVertices(
-            drawableSize: renderSize,
+            drawableSize: viewportSize,
             backingScale: backingScale,
             renderState: renderState
         )
         let playheadTouchVertices = makePlayheadTouchVertices(
-            drawableSize: renderSize,
+            drawableSize: viewportSize,
             playheadProgress: renderedPlayheadProgress,
             renderState: renderState
         )
         let hoverGuideVertices = makeHoverGuideVertices(
-            drawableSize: renderSize,
+            drawableSize: viewportSize,
             backingScale: backingScale,
             renderState: renderState
         )
         let playheadVertices = makePlayheadVertices(
-            drawableSize: renderSize,
+            drawableSize: viewportSize,
             backingScale: backingScale,
             playheadProgress: renderedPlayheadProgress,
             renderState: renderState
@@ -239,7 +256,7 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
 
         encoder.setRenderPipelineState(pipelineState)
         if let gridVertices = cachedGridVertices(
-            drawableSize: renderSize,
+            drawableSize: viewportSize,
             backingScale: backingScale,
             renderState: renderState
         ) {
@@ -253,10 +270,6 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         draw(vertices: trimPreviewVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: hoverGuideVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: playheadVertices, primitiveType: .triangle, encoder: encoder)
-        encoder.endEncoding()
-
-        commandBuffer.present(drawable)
-        commandBuffer.commit()
     }
 
     private func draw(
@@ -1367,4 +1380,24 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         return in.color;
     }
     """
+}
+
+extension TimelineRenderer: MTKViewDelegate {
+    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+
+    func draw(in view: MTKView) {
+        guard
+            let renderPassDescriptor = view.currentRenderPassDescriptor,
+            let drawable = view.currentDrawable
+        else {
+            return
+        }
+
+        render(to: TimelineRenderTarget(
+            renderPassDescriptor: renderPassDescriptor,
+            drawable: drawable,
+            viewportSize: view.bounds.size,
+            backingScale: backingScale(for: view)
+        ))
+    }
 }
