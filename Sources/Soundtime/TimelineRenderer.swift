@@ -1,6 +1,13 @@
 import MetalKit
 import simd
 
+struct TimelineFrameStats: Equatable, Sendable {
+    let framesPerSecond: Int
+    let averageFrameTimeMilliseconds: Double
+    let frameTimeJitterMilliseconds: Double
+    let worstFrameTimeMilliseconds: Double
+}
+
 final class TimelineRenderer: NSObject, MTKViewDelegate {
     private struct TimelineVertex {
         var position: SIMD4<Float>
@@ -35,6 +42,26 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         let vertices: CachedVertexBuffer
     }
 
+    private struct WaveformCacheKey: Equatable {
+        let width: Float
+        let viewportStart: Float
+        let viewportDuration: Float
+        let mipBinCount: Int
+        let gainSelectionStart: Float
+        let gainSelectionEnd: Float
+        let gain: Float
+    }
+
+    private struct WaveformCache {
+        let key: WaveformCacheKey
+        let vertices: CachedVertexBuffer
+    }
+
+    private struct GainPreview {
+        let selection: TimelineSelection
+        let gain: Float
+    }
+
     private static let inlineVertexUploadLimit = 4 * 1_024
 
     private let device: MTLDevice
@@ -43,10 +70,16 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
     private var waveformOverview: WaveformOverview?
     private var waveformMipLevels: [WaveformMipLevel] = []
     private var gridCache: GridCache?
+    private var waveformCache: WaveformCache?
     private var playheadProgress: Float = 0
+    private var visualPlayheadProgress: Float?
+    private var visualPlaybackFrameRate: Double = 144
+    private var previousRenderedPlayheadX: Float?
+    private var previousRenderedPlayheadTime: CFTimeInterval?
     private var viewport = TimelineViewport.full
     private var hoverProgress: Float?
     private var isHoverGuideArmed = false
+    private var gainPreview: GainPreview?
     private var isPlaybackActive = false
     private var playheadTouchEnergy: Float = 0
     private var lastPlayheadTouchEnergyUpdateTime = CFAbsoluteTimeGetCurrent()
@@ -54,9 +87,18 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
     private var lastPlayheadKickEnergyUpdateTime = CFAbsoluteTimeGetCurrent()
     private var selection: TimelineSelection?
     private var trimPreview: TimelineTrimRange?
-    private let playheadTouchRadius: Float = 0.014
+    private var frameRateWindowStartTime = CFAbsoluteTimeGetCurrent()
+    private var previousFrameTime: CFTimeInterval?
+    private var frameRateFrameCount = 0
+    private var frameIntervalCount = 0
+    private var frameIntervalSum: Double = 0
+    private var frameIntervalSquareSum: Double = 0
+    private var worstFrameInterval: Double = 0
+    var onFrameStatsChanged: ((TimelineFrameStats) -> Void)?
+    private let playheadTouchRadiusDuration: TimeInterval = 0.42
     private let playheadTouchDecayDuration: CFTimeInterval = 0.046
     private let playheadKickDecayDuration: CFTimeInterval = 0.3
+    private let visualPlaybackFrameRateSmoothing = 0.12
 
     init(device: MTLDevice, pixelFormat: MTLPixelFormat) throws {
         guard let commandQueue = device.makeCommandQueue() else {
@@ -95,11 +137,24 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
     func displayWaveform(_ waveformOverview: WaveformOverview?) {
         self.waveformOverview = waveformOverview
         waveformMipLevels = makeWaveformMipLevels(from: waveformOverview)
+        gainPreview = nil
         gridCache = nil
+        waveformCache = nil
+        visualPlayheadProgress = nil
+        previousRenderedPlayheadX = nil
+        previousRenderedPlayheadTime = nil
     }
 
-    func displayPlayheadProgress(_ progress: Float) {
-        playheadProgress = min(max(progress, 0), 1)
+    func displayPlayheadProgress(_ progress: Float, force: Bool = true) {
+        let clampedProgress = min(max(progress, 0), 1)
+        if isPlaybackActive, !force {
+            return
+        }
+
+        playheadProgress = clampedProgress
+        visualPlayheadProgress = clampedProgress
+        previousRenderedPlayheadX = nil
+        previousRenderedPlayheadTime = nil
     }
 
     func displayPlaybackActive(_ isActive: Bool) {
@@ -107,6 +162,12 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         updatePlayheadKickEnergy()
         let wasPlaybackActive = isPlaybackActive
         isPlaybackActive = isActive
+
+        if wasPlaybackActive != isActive {
+            visualPlayheadProgress = playheadProgress
+            previousRenderedPlayheadX = nil
+            previousRenderedPlayheadTime = nil
+        }
 
         if isActive {
             playheadTouchEnergy = 1
@@ -123,6 +184,9 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
 
         self.viewport = viewport
         gridCache = nil
+        waveformCache = nil
+        previousRenderedPlayheadX = nil
+        previousRenderedPlayheadTime = nil
     }
 
     func displayHoverProgress(_ progress: Float?, isArmed: Bool = false) {
@@ -138,6 +202,15 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         self.trimPreview = trimPreview
     }
 
+    func displayGainPreview(selection: TimelineSelection?, gain: Float) {
+        if let selection, selection.durationProgress > 0 {
+            gainPreview = GainPreview(selection: selection, gain: max(gain, 0))
+        } else {
+            gainPreview = nil
+        }
+        waveformCache = nil
+    }
+
     func draw(in view: MTKView) {
         guard
             let renderPassDescriptor = view.currentRenderPassDescriptor,
@@ -147,25 +220,36 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         else {
             return
         }
+        recordFrameRate()
 
         let renderSize = view.bounds.size
         let backingScale = backingScale(for: view)
+        let renderedPlayheadProgress = currentPlayheadProgress()
         let selectionVertices = makeSelectionVertices()
-        let waveformVertices = makeWaveformVertices(drawableSize: renderSize)
+        let waveformVertices = cachedWaveformVertices(drawableSize: renderSize)
         let trimPreviewVertices = makeTrimPreviewVertices(
             drawableSize: renderSize,
             backingScale: backingScale
         )
-        let playheadTouchVertices = makePlayheadTouchVertices(drawableSize: renderSize)
+        let playheadTouchVertices = makePlayheadTouchVertices(
+            drawableSize: renderSize,
+            playheadProgress: renderedPlayheadProgress
+        )
         let hoverGuideVertices = makeHoverGuideVertices(drawableSize: renderSize, backingScale: backingScale)
-        let playheadVertices = makePlayheadVertices(drawableSize: renderSize, backingScale: backingScale)
+        let playheadVertices = makePlayheadVertices(
+            drawableSize: renderSize,
+            backingScale: backingScale,
+            playheadProgress: renderedPlayheadProgress
+        )
 
         encoder.setRenderPipelineState(pipelineState)
         if let gridVertices = cachedGridVertices(drawableSize: renderSize, backingScale: backingScale) {
             draw(cachedVertices: gridVertices, primitiveType: .triangle, encoder: encoder)
         }
         draw(vertices: selectionVertices, primitiveType: .triangle, encoder: encoder)
-        draw(vertices: waveformVertices, primitiveType: .triangle, encoder: encoder)
+        if let waveformVertices {
+            draw(cachedVertices: waveformVertices, primitiveType: .triangle, encoder: encoder)
+        }
         draw(vertices: playheadTouchVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: trimPreviewVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: hoverGuideVertices, primitiveType: .triangle, encoder: encoder)
@@ -244,6 +328,58 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         }
     }
 
+    private func recordFrameRate() {
+        let currentTime = CFAbsoluteTimeGetCurrent()
+        if let previousFrameTime {
+            let frameInterval = currentTime - previousFrameTime
+            if frameInterval > 0, frameInterval < 0.25 {
+                frameIntervalCount += 1
+                frameIntervalSum += frameInterval
+                frameIntervalSquareSum += frameInterval * frameInterval
+                worstFrameInterval = max(worstFrameInterval, frameInterval)
+            }
+        }
+
+        previousFrameTime = currentTime
+        frameRateFrameCount += 1
+
+        let elapsedTime = currentTime - frameRateWindowStartTime
+        guard elapsedTime >= 0.25 else {
+            return
+        }
+
+        let framesPerSecond = Int((Double(frameRateFrameCount) / elapsedTime).rounded())
+        let measuredFrameRate = max(Double(framesPerSecond), 1)
+        visualPlaybackFrameRate =
+            visualPlaybackFrameRate * (1 - visualPlaybackFrameRateSmoothing) +
+            measuredFrameRate * visualPlaybackFrameRateSmoothing
+
+        let averageFrameInterval = frameIntervalCount > 0 ?
+            frameIntervalSum / Double(frameIntervalCount) :
+            0
+        let averageSquareFrameInterval = frameIntervalCount > 0 ?
+            frameIntervalSquareSum / Double(frameIntervalCount) :
+            0
+        let frameIntervalVariance = max(
+            averageSquareFrameInterval - averageFrameInterval * averageFrameInterval,
+            0
+        )
+        let frameStats = TimelineFrameStats(
+            framesPerSecond: framesPerSecond,
+            averageFrameTimeMilliseconds: averageFrameInterval * 1_000,
+            frameTimeJitterMilliseconds: sqrt(frameIntervalVariance) * 1_000,
+            worstFrameTimeMilliseconds: worstFrameInterval * 1_000
+        )
+
+        frameRateWindowStartTime = currentTime
+        frameRateFrameCount = 0
+        frameIntervalCount = 0
+        frameIntervalSum = 0
+        frameIntervalSquareSum = 0
+        worstFrameInterval = 0
+        onFrameStatsChanged?(frameStats)
+    }
+
     private func cachedGridVertices(drawableSize: CGSize, backingScale: Float) -> CachedVertexBuffer? {
         let width = Float(drawableSize.width)
         let height = Float(drawableSize.height)
@@ -273,6 +409,57 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         let nextCache = GridCache(key: key, vertices: vertices)
         gridCache = nextCache
         return nextCache.vertices
+    }
+
+    private func cachedWaveformVertices(drawableSize: CGSize) -> CachedVertexBuffer? {
+        guard
+            let mipLevel = waveformMipLevel(for: drawableSize),
+            !mipLevel.overview.isEmpty
+        else {
+            waveformCache = nil
+            return nil
+        }
+
+        let key = waveformCacheKey(drawableSize: drawableSize, mipLevel: mipLevel)
+        if let waveformCache, waveformCache.key == key {
+            return waveformCache.vertices
+        }
+
+        guard let vertices = makeCachedBuffer(
+            vertices: makeWaveformVertices(drawableSize: drawableSize, mipLevel: mipLevel)
+        ) else {
+            waveformCache = nil
+            return nil
+        }
+
+        let nextCache = WaveformCache(key: key, vertices: vertices)
+        waveformCache = nextCache
+        return nextCache.vertices
+    }
+
+    private func waveformCacheKey(drawableSize: CGSize, mipLevel: WaveformMipLevel) -> WaveformCacheKey {
+        let gainSelectionStart: Float
+        let gainSelectionEnd: Float
+        let gain: Float
+        if let gainPreview {
+            gainSelectionStart = gainPreview.selection.startProgress
+            gainSelectionEnd = gainPreview.selection.endProgress
+            gain = gainPreview.gain
+        } else {
+            gainSelectionStart = -1
+            gainSelectionEnd = -1
+            gain = 1
+        }
+
+        return WaveformCacheKey(
+            width: Float(drawableSize.width),
+            viewportStart: viewport.startProgress,
+            viewportDuration: viewport.durationProgress,
+            mipBinCount: mipLevel.binCount,
+            gainSelectionStart: gainSelectionStart,
+            gainSelectionEnd: gainSelectionEnd,
+            gain: gain
+        )
     }
 
     private func makeGridVertices(drawableSize: CGSize, backingScale: Float) -> [TimelineVertex] {
@@ -363,14 +550,7 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         return vertices
     }
 
-    private func makeWaveformVertices(drawableSize: CGSize) -> [TimelineVertex] {
-        guard
-            let mipLevel = waveformMipLevel(for: drawableSize),
-            !mipLevel.overview.isEmpty
-        else {
-            return []
-        }
-
+    private func makeWaveformVertices(drawableSize: CGSize, mipLevel: WaveformMipLevel) -> [TimelineVertex] {
         let centerY: Float = 0.5
         let amplitudeHeight: Float = 0.42
         let minimumVisualHeight: Float = 0.008
@@ -396,8 +576,9 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
                 continue
             }
 
-            var y0 = centerY - bin.maximumSample * amplitudeHeight
-            var y1 = centerY - bin.minimumSample * amplitudeHeight
+            let gain = previewGain(forBinStart: timelineX0, end: timelineX1)
+            var y0 = centerY - clampAudioSample(bin.maximumSample * gain) * amplitudeHeight
+            var y1 = centerY - clampAudioSample(bin.minimumSample * gain) * amplitudeHeight
 
             if y1 - y0 < minimumVisualHeight {
                 let midpoint = (y0 + y1) * 0.5
@@ -418,7 +599,24 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         return vertices
     }
 
-    private func makePlayheadTouchVertices(drawableSize: CGSize) -> [TimelineVertex] {
+    private func previewGain(forBinStart binStart: Float, end binEnd: Float) -> Float {
+        guard let gainPreview else {
+            return 1
+        }
+
+        let selection = gainPreview.selection
+        guard binEnd > selection.startProgress, binStart < selection.endProgress else {
+            return 1
+        }
+
+        return gainPreview.gain
+    }
+
+    private func clampAudioSample(_ sample: Float) -> Float {
+        min(max(sample, -1), 1)
+    }
+
+    private func makePlayheadTouchVertices(drawableSize: CGSize, playheadProgress: Float) -> [TimelineVertex] {
         guard
             let mipLevel = waveformMipLevel(for: drawableSize),
             !mipLevel.overview.isEmpty
@@ -432,9 +630,11 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         let amplitudeHeight: Float = 0.42
         let minimumVisualHeight: Float = 0.004
         let touchEnergy = currentPlayheadTouchEnergy()
-        let clampedPlayhead = min(max(playheadProgress, 0), 1)
-        let visibleTouchStart = max(clampedPlayhead - playheadTouchRadius, viewport.startProgress)
-        let visibleTouchEnd = min(clampedPlayhead + playheadTouchRadius, viewport.endProgress)
+        let clampedPlayhead = playheadProgress
+        let touchRadius = playheadTouchRadiusProgress(forDuration: mipLevel.overview.duration)
+        let coreRadius = max(touchRadius * 0.42, .ulpOfOne)
+        let visibleTouchStart = max(clampedPlayhead - touchRadius, viewport.startProgress)
+        let visibleTouchEnd = min(clampedPlayhead + touchRadius, viewport.endProgress)
         let startIndex = max(Int(floor(visibleTouchStart * Float(binCount))) - 1, 0)
         let endIndex = min(Int(ceil(visibleTouchEnd * Float(binCount))) + 1, binCount)
 
@@ -457,8 +657,8 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
 
             let binCenter = (timelineX0 + timelineX1) * 0.5
             let distance = abs(binCenter - clampedPlayhead)
-            let influence = contactFalloff(1 - min(distance / playheadTouchRadius, 1))
-            let coreInfluence = contactCoreFalloff(1 - min(distance / (playheadTouchRadius * 0.42), 1))
+            let influence = contactFalloff(1 - min(distance / touchRadius, 1))
+            let coreInfluence = contactCoreFalloff(1 - min(distance / coreRadius, 1))
             guard influence > 0.001 else {
                 continue
             }
@@ -497,6 +697,33 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         }
 
         return vertices
+    }
+
+    private func playheadTouchRadiusProgress(forDuration duration: TimeInterval) -> Float {
+        guard duration.isFinite, duration > 0 else {
+            return 0.014
+        }
+
+        return min(max(Float(playheadTouchRadiusDuration / duration), .ulpOfOne), 1)
+    }
+
+    private func currentPlayheadProgress() -> Float {
+        let clampedProgress = min(max(playheadProgress, 0), 1)
+        guard
+            isPlaybackActive,
+            let duration = waveformOverview?.duration,
+            duration.isFinite,
+            duration > 0
+        else {
+            return clampedProgress
+        }
+
+        let currentVisualProgress = visualPlayheadProgress ?? clampedProgress
+        let frameRate = max(visualPlaybackFrameRate, 1)
+        let frameProgress = Float(1 / (duration * frameRate))
+        let nextVisualProgress = min(max(currentVisualProgress + frameProgress, 0), 1)
+        visualPlayheadProgress = nextVisualProgress
+        return nextVisualProgress
     }
 
     private func currentPlayheadTouchEnergy() -> Float {
@@ -654,7 +881,11 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         return vertices
     }
 
-    private func makePlayheadVertices(drawableSize: CGSize, backingScale: Float) -> [TimelineVertex] {
+    private func makePlayheadVertices(
+        drawableSize: CGSize,
+        backingScale: Float,
+        playheadProgress: Float
+    ) -> [TimelineVertex] {
         let width = Float(drawableSize.width)
         let height = Float(drawableSize.height)
         guard width > 0, height > 0 else {
@@ -667,28 +898,58 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         } else {
             let playheadViewportProgress = viewport.viewportProgress(forTimelineProgress: playheadProgress)
             guard playheadViewportProgress >= 0, playheadViewportProgress <= 1 else {
+                previousRenderedPlayheadX = nil
+                previousRenderedPlayheadTime = nil
                 return []
             }
 
             playheadX = min(max(playheadViewportProgress * width, 0), width)
         }
         let kickEnergy = currentPlayheadKickEnergy()
-        let alignedPlayheadX = pixelAligned(playheadX, backingScale: backingScale)
         let baseColor = SIMD3<Float>(0.0, 0.84, 0.78)
         let burstColor = SIMD3<Float>(0.025, 0.855, 0.795)
         let blendedColor = baseColor + (burstColor - baseColor) * kickEnergy
         let size = SIMD2<Float>(width, height)
         var vertices: [TimelineVertex] = []
-        vertices.reserveCapacity(12)
+        vertices.reserveCapacity(60)
+
+        if isPlaybackActive,
+           let previousRenderedPlayheadX,
+           let previousRenderedPlayheadTime
+        {
+            let currentTime = CFAbsoluteTimeGetCurrent()
+            let elapsedTime = currentTime - previousRenderedPlayheadTime
+            let movement = playheadX - previousRenderedPlayheadX
+            if elapsedTime > 0, elapsedTime < 0.05, abs(movement) > 1, abs(movement) < width * 0.2 {
+                let sweepPadding = pixelLength(0.75, backingScale: backingScale)
+                let sweepLeft = min(previousRenderedPlayheadX, playheadX) - sweepPadding
+                let sweepRight = max(previousRenderedPlayheadX, playheadX) + sweepPadding
+                appendRectangle(
+                    to: &vertices,
+                    left: max(sweepLeft, 0),
+                    right: min(sweepRight, width),
+                    top: 0,
+                    bottom: height,
+                    color: SIMD4<Float>(
+                        blendedColor.x,
+                        blendedColor.y,
+                        blendedColor.z,
+                        min(max(abs(movement) / 18, 0.08), 0.18)
+                    ),
+                    drawableSize: size
+                )
+            }
+        }
 
         if kickEnergy > 0.001 {
             let kickWidth = pixelLength(2 + 12 * kickEnergy, backingScale: backingScale)
             let kickLeftWidth = kickWidth * 0.42
             let kickRightWidth = kickWidth * 0.58
-            appendRectangle(
+            appendSubpixelVerticalBand(
                 to: &vertices,
-                left: max(alignedPlayheadX - kickLeftWidth, 0),
-                right: min(alignedPlayheadX + kickRightWidth, width),
+                centerX: playheadX,
+                leftWidth: kickLeftWidth,
+                rightWidth: kickRightWidth,
                 top: 0,
                 bottom: height,
                 color: SIMD4<Float>(
@@ -697,23 +958,28 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
                     blendedColor.z,
                     0.52 * kickEnergy
                 ),
-                drawableSize: size
+                drawableSize: size,
+                backingScale: backingScale
             )
         }
 
-        let baseWidth = pixelLength(2, backingScale: backingScale)
+        let baseWidth = pixelLength(3.5, backingScale: backingScale)
         let halfBaseWidth = baseWidth * 0.5
 
-        appendRectangle(
+        appendSubpixelVerticalBand(
             to: &vertices,
-            left: max(alignedPlayheadX - halfBaseWidth, 0),
-            right: min(alignedPlayheadX + halfBaseWidth, width),
+            centerX: playheadX,
+            leftWidth: halfBaseWidth,
+            rightWidth: halfBaseWidth,
             top: 0,
             bottom: height,
             color: SIMD4<Float>(blendedColor.x, blendedColor.y, blendedColor.z, 1.0),
-            drawableSize: size
+            drawableSize: size,
+            backingScale: backingScale
         )
 
+        previousRenderedPlayheadX = playheadX
+        previousRenderedPlayheadTime = CFAbsoluteTimeGetCurrent()
         return vertices
     }
 
@@ -828,6 +1094,59 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
             bottom: bottom / drawableSize.y,
             color: color
         )
+    }
+
+    private func appendSubpixelVerticalBand(
+        to vertices: inout [TimelineVertex],
+        centerX: Float,
+        leftWidth: Float,
+        rightWidth: Float,
+        top: Float,
+        bottom: Float,
+        color: SIMD4<Float>,
+        drawableSize: SIMD2<Float>,
+        backingScale: Float
+    ) {
+        let scale = max(backingScale, 1)
+        let width = drawableSize.x
+        guard width > 0, drawableSize.y > 0 else {
+            return
+        }
+
+        let leftPixel = (centerX - leftWidth) * scale
+        let rightPixel = (centerX + rightWidth) * scale
+        let firstPixel = Int(floor(leftPixel))
+        let lastPixel = Int(ceil(rightPixel))
+
+        for pixel in firstPixel..<lastPixel {
+            let pixelLeft = Float(pixel)
+            let pixelRight = Float(pixel + 1)
+            let coverage = min(rightPixel, pixelRight) - max(leftPixel, pixelLeft)
+            guard coverage > 0 else {
+                continue
+            }
+
+            let left = max(pixelLeft / scale, 0)
+            let right = min(pixelRight / scale, width)
+            guard right > left else {
+                continue
+            }
+
+            appendRectangle(
+                to: &vertices,
+                left: left,
+                right: right,
+                top: top,
+                bottom: bottom,
+                color: SIMD4<Float>(
+                    color.x,
+                    color.y,
+                    color.z,
+                    color.w * min(max(coverage, 0), 1)
+                ),
+                drawableSize: drawableSize
+            )
+        }
     }
 
     private enum TrimHandleDirection {

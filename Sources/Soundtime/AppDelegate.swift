@@ -28,6 +28,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainMenu.addItem(editMenuItem)
         editMenuItem.submenu = makeEditMenu()
 
+        let effectsMenuItem = NSMenuItem(title: "Effects", action: nil, keyEquivalent: "")
+        mainMenu.addItem(effectsMenuItem)
+        effectsMenuItem.submenu = makeEffectsMenu()
+
         NSApplication.shared.mainMenu = mainMenu
     }
 
@@ -58,6 +62,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             title: "Undo",
             action: #selector(TimelineView.undoTimelineEdit(_:)),
             keyEquivalent: "z"
+        ))
+
+        return menu
+    }
+
+    private func makeEffectsMenu() -> NSMenu {
+        let menu = NSMenu(title: "Effects")
+
+        menu.addItem(NSMenuItem(
+            title: "Reapply last effect",
+            action: #selector(TimelineView.reapplyLastEffect(_:)),
+            keyEquivalent: "r"
+        ))
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(
+            title: "Gain...",
+            action: #selector(TimelineView.showGainEffect(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Fade In",
+            action: #selector(TimelineView.applyFadeInEffect(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Fade Out",
+            action: #selector(TimelineView.applyFadeOutEffect(_:)),
+            keyEquivalent: ""
         ))
 
         return menu

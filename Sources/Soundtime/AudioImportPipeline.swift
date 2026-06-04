@@ -46,7 +46,7 @@ enum AudioImportPipeline {
         WaveformOverview,
         AudioZeroCrossingIndex
     ) {
-        try await Task.detached(priority: .userInitiated) {
+        try await Task.detached(priority: .utility) {
             let decodedAudioBuffer = try WAVAudioDecoder.decode(url: url)
             let waveformOverview = WaveformOverviewBuilder.build(from: decodedAudioBuffer)
             let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: decodedAudioBuffer)

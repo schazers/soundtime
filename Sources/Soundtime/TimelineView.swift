@@ -1,14 +1,23 @@
 import MetalKit
 
-final class TimelineView: MTKView {
+final class TimelineView: MTKView, NSMenuItemValidation {
     var onAudioFileDropped: ((URL) -> Void)?
     var onTogglePlayback: (() -> Void)?
     var onDeleteSelection: (() -> Void)?
     var onUndo: (() -> Void)?
     var onExportRequested: (() -> Void)?
+    var onGainRequested: (() -> Void)?
+    var onFadeInRequested: (() -> Void)?
+    var onFadeOutRequested: (() -> Void)?
+    var onReapplyLastEffect: (() -> Void)?
     var onSeekRequested: ((Float) -> Void)?
+    var onPlayFromProgress: ((Float) -> Void)?
     var onSelectionChanged: ((TimelineSelection?) -> Void)?
     var onTrimRequested: ((TimelineTrimRange) -> Void)?
+    var onFrameStatsChanged: ((TimelineFrameStats) -> Void)?
+    var canApplyGainEffect = false
+    var canApplyFadeEffect = false
+    var canReapplyLastEffect = false
 
     private enum TimelineDragMode {
         case selection
@@ -27,8 +36,21 @@ final class TimelineView: MTKView {
     private var hoverTrackingArea: NSTrackingArea?
     private var isDraggingSelection = false
     private var isDraggingTrim = false
+    private var rightPanPreviousPoint: CGPoint?
+    private var rightPanPreviousTime: TimeInterval?
+    private var rightPanLastMovementTime: TimeInterval?
+    private var rightPanVelocityProgressPerSecond: Float = 0
+    private var rightPanMomentumTimer: Timer?
+    private var rightPanMomentumLastTime: TimeInterval?
     private let selectionDragThreshold: CGFloat = 3
     private let trimHandleHitWidth: CGFloat = 18
+    private let rightPanVelocitySmoothing: Float = 0.42
+    private let rightPanMomentumDecayRate: Double = 5.2
+    private let rightPanMomentumMinimumVelocity: Float = 0.0015
+    private let rightPanStationaryDecayRate: Double = 18
+    private let rightPanMomentumReleaseWindow: TimeInterval = 0.12
+    private let rightPanMovementThreshold: CGFloat = 0.25
+    private let targetFramesPerSecond = 144
     private let scrollZoomSensitivity: Float = 0.01
     private let supportedAudioExtensions: Set<String> = [
         "aif",
@@ -90,16 +112,20 @@ final class TimelineView: MTKView {
             activeDragMode = nil
             isDraggingSelection = false
             isDraggingTrim = false
+            rightPanPreviousPoint = nil
+            rightPanPreviousTime = nil
+            rightPanLastMovementTime = nil
+            stopRightPanMomentum()
             displaySelection(nil)
             displayHoverProgress(nil)
             onSelectionChanged?(nil)
         }
     }
 
-    func displayPlayheadProgress(_ progress: Float) {
+    func displayPlayheadProgress(_ progress: Float, syncRenderer: Bool = true) {
         let clampedProgress = min(max(progress, 0), 1)
         pageViewportIfNeeded(forPlayheadProgress: clampedProgress)
-        timelineRenderer?.displayPlayheadProgress(clampedProgress)
+        timelineRenderer?.displayPlayheadProgress(clampedProgress, force: syncRenderer)
     }
 
     func displayPlaybackActive(_ isActive: Bool) {
@@ -120,11 +146,15 @@ final class TimelineView: MTKView {
         timelineRenderer?.displayHoverProgress(progress, isArmed: isArmed)
     }
 
+    func displayGainPreview(selection: TimelineSelection?, gain: Float) {
+        timelineRenderer?.displayGainPreview(selection: selection, gain: gain)
+    }
+
     private func configure() {
         colorPixelFormat = .bgra8Unorm
         clearColor = MTLClearColor(red: 0.08, green: 0.08, blue: 0.08, alpha: 1.0)
         framebufferOnly = true
-        preferredFramesPerSecond = 120
+        preferredFramesPerSecond = targetFramesPerSecond
         enableSetNeedsDisplay = false
         isPaused = false
         autoResizeDrawable = true
@@ -174,6 +204,11 @@ final class TimelineView: MTKView {
             let renderer = try TimelineRenderer(device: metalDevice, pixelFormat: colorPixelFormat)
             timelineRenderer = renderer
             renderer.displayViewport(viewport)
+            renderer.onFrameStatsChanged = { [weak self] frameStats in
+                Task { @MainActor [weak self] in
+                    self?.onFrameStatsChanged?(frameStats)
+                }
+            }
             delegate = renderer
         } catch {
             Swift.print("Soundtime could not create the timeline renderer: \\(error)")
@@ -181,7 +216,7 @@ final class TimelineView: MTKView {
     }
 
     private func updatePreferredFrameRate() {
-        preferredFramesPerSecond = window?.screen?.maximumFramesPerSecond ?? NSScreen.main?.maximumFramesPerSecond ?? 120
+        preferredFramesPerSecond = targetFramesPerSecond
     }
 
     private func configureSelectionOverlay() {
@@ -241,6 +276,11 @@ final class TimelineView: MTKView {
             return
         }
 
+        if event.keyCode == 15, event.modifierFlags.contains(.command) {
+            onReapplyLastEffect?()
+            return
+        }
+
         if event.keyCode == 49 {
             guard !event.isARepeat else {
                 return
@@ -290,6 +330,35 @@ final class TimelineView: MTKView {
         onUndo?()
     }
 
+    @objc func showGainEffect(_ sender: Any?) {
+        onGainRequested?()
+    }
+
+    @objc func applyFadeInEffect(_ sender: Any?) {
+        onFadeInRequested?()
+    }
+
+    @objc func applyFadeOutEffect(_ sender: Any?) {
+        onFadeOutRequested?()
+    }
+
+    @objc func reapplyLastEffect(_ sender: Any?) {
+        onReapplyLastEffect?()
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        switch menuItem.action {
+        case #selector(showGainEffect(_:)):
+            return canApplyGainEffect
+        case #selector(applyFadeInEffect(_:)), #selector(applyFadeOutEffect(_:)):
+            return canApplyFadeEffect
+        case #selector(reapplyLastEffect(_:)):
+            return canReapplyLastEffect
+        default:
+            return true
+        }
+    }
+
     override func mouseEntered(with event: NSEvent) {
         updateHoverGuide(for: event)
     }
@@ -307,6 +376,8 @@ final class TimelineView: MTKView {
             super.scrollWheel(with: event)
             return
         }
+
+        stopRightPanMomentum()
 
         let horizontalDelta = event.scrollingDeltaX
         let verticalDelta = event.scrollingDeltaY
@@ -332,6 +403,8 @@ final class TimelineView: MTKView {
             return
         }
 
+        stopRightPanMomentum()
+
         let anchorProgress = progress(for: convert(event.locationInWindow, from: nil))
         let zoomFactor = max(1 + Float(event.magnification), 0.1)
         setViewport(viewport.zoomed(by: zoomFactor, around: anchorProgress))
@@ -342,6 +415,8 @@ final class TimelineView: MTKView {
             super.smartMagnify(with: event)
             return
         }
+
+        stopRightPanMomentum()
 
         let anchorProgress = progress(for: convert(event.locationInWindow, from: nil))
         if viewport.isFull {
@@ -358,8 +433,22 @@ final class TimelineView: MTKView {
         }
 
         window?.makeFirstResponder(self)
+        stopRightPanMomentum()
         let point = currentDragPoint(for: event)
         let progress = progress(for: point)
+        if event.clickCount >= 2 {
+            displayHoverProgress(nil)
+            displaySelection(nil)
+            onSelectionChanged?(nil)
+            selectionAnchorProgress = nil
+            selectionAnchorPoint = nil
+            activeDragMode = nil
+            isDraggingSelection = false
+            isDraggingTrim = false
+            onPlayFromProgress?(progress)
+            return
+        }
+
         if let trimDragMode = trimDragMode(for: point) {
             displayHoverProgress(nil)
             activeDragMode = trimDragMode
@@ -448,6 +537,149 @@ final class TimelineView: MTKView {
         isDraggingSelection = false
         isDraggingTrim = false
         updateHoverGuide(for: event)
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        guard isSelectionEnabled else {
+            super.rightMouseDown(with: event)
+            return
+        }
+
+        window?.makeFirstResponder(self)
+        stopRightPanMomentum()
+        rightPanPreviousPoint = currentDragPoint(for: event)
+        rightPanPreviousTime = event.timestamp
+        rightPanLastMovementTime = nil
+        rightPanVelocityProgressPerSecond = 0
+        selectionAnchorProgress = nil
+        selectionAnchorPoint = nil
+        activeDragMode = nil
+        isDraggingSelection = false
+        isDraggingTrim = false
+        displayHoverProgress(nil)
+    }
+
+    override func rightMouseDragged(with event: NSEvent) {
+        guard
+            isSelectionEnabled,
+            let previousPoint = rightPanPreviousPoint,
+            bounds.width > 0
+        else {
+            super.rightMouseDragged(with: event)
+            return
+        }
+
+        let point = currentDragPoint(for: event)
+        let horizontalDelta = previousPoint.x - point.x
+        let progressDelta = Float(horizontalDelta / bounds.width) * viewport.durationProgress
+        let elapsedTime: TimeInterval
+        if let previousTime = rightPanPreviousTime {
+            elapsedTime = max(event.timestamp - previousTime, 1 / 240)
+        } else {
+            elapsedTime = 1 / 120
+        }
+
+        if abs(horizontalDelta) >= rightPanMovementThreshold {
+            setViewport(viewport.panned(byProgress: progressDelta))
+            let instantVelocity = progressDelta / Float(elapsedTime)
+            rightPanVelocityProgressPerSecond =
+                rightPanVelocityProgressPerSecond * (1 - rightPanVelocitySmoothing) +
+                instantVelocity * rightPanVelocitySmoothing
+            rightPanLastMovementTime = event.timestamp
+        } else {
+            let decay = Float(exp(-rightPanStationaryDecayRate * elapsedTime))
+            rightPanVelocityProgressPerSecond *= decay
+        }
+
+        rightPanPreviousPoint = point
+        rightPanPreviousTime = event.timestamp
+    }
+
+    override func rightMouseUp(with event: NSEvent) {
+        guard isSelectionEnabled else {
+            super.rightMouseUp(with: event)
+            return
+        }
+
+        if let lastMovementTime = rightPanLastMovementTime {
+            let idleTime = max(event.timestamp - lastMovementTime, 0)
+            if idleTime > rightPanMomentumReleaseWindow {
+                rightPanVelocityProgressPerSecond = 0
+            } else {
+                let decay = Float(exp(-rightPanStationaryDecayRate * idleTime))
+                rightPanVelocityProgressPerSecond *= decay
+            }
+        } else {
+            rightPanVelocityProgressPerSecond = 0
+        }
+
+        rightPanPreviousPoint = nil
+        rightPanPreviousTime = nil
+        rightPanLastMovementTime = nil
+        startRightPanMomentumIfNeeded()
+        updateHoverGuide(for: event)
+    }
+
+    private func startRightPanMomentumIfNeeded() {
+        stopRightPanMomentum(clearVelocity: false)
+
+        guard
+            isSelectionEnabled,
+            !viewport.isFull,
+            abs(rightPanVelocityProgressPerSecond) >= rightPanMomentumMinimumVelocity
+        else {
+            rightPanVelocityProgressPerSecond = 0
+            return
+        }
+
+        rightPanMomentumLastTime = CFAbsoluteTimeGetCurrent()
+        let frameRate = window?.screen?.maximumFramesPerSecond ?? NSScreen.main?.maximumFramesPerSecond ?? 120
+        let timer = Timer(timeInterval: 1 / Double(max(frameRate, 60)), repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.stepRightPanMomentum()
+            }
+        }
+
+        rightPanMomentumTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stepRightPanMomentum() {
+        guard
+            isSelectionEnabled,
+            !viewport.isFull,
+            bounds.width > 0,
+            abs(rightPanVelocityProgressPerSecond) >= rightPanMomentumMinimumVelocity
+        else {
+            stopRightPanMomentum()
+            return
+        }
+
+        let currentTime = CFAbsoluteTimeGetCurrent()
+        let elapsedTime = min(max(currentTime - (rightPanMomentumLastTime ?? currentTime), 1 / 240), 1 / 20)
+        rightPanMomentumLastTime = currentTime
+
+        let progressDelta = rightPanVelocityProgressPerSecond * Float(elapsedTime)
+        let nextViewport = viewport.panned(byProgress: progressDelta)
+        guard nextViewport != viewport else {
+            stopRightPanMomentum()
+            return
+        }
+
+        setViewport(nextViewport)
+        let decay = Float(exp(-rightPanMomentumDecayRate * elapsedTime))
+        rightPanVelocityProgressPerSecond *= decay
+    }
+
+    private func stopRightPanMomentum(clearVelocity: Bool = true) {
+        rightPanMomentumTimer?.invalidate()
+        rightPanMomentumTimer = nil
+        rightPanMomentumLastTime = nil
+
+        if clearVelocity {
+            rightPanVelocityProgressPerSecond = 0
+            rightPanLastMovementTime = nil
+        }
     }
 
     private func firstSupportedAudioURL(from pasteboard: NSPasteboard) -> URL? {
