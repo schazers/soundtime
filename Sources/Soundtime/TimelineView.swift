@@ -308,21 +308,21 @@ final class TimelineView: MTKView {
             return
         }
 
-        if event.modifierFlags.contains(.option) {
+        let horizontalDelta = event.scrollingDeltaX
+        let verticalDelta = event.scrollingDeltaY
+
+        if abs(verticalDelta) >= abs(horizontalDelta), verticalDelta != 0 {
             let anchorProgress = progress(for: convert(event.locationInWindow, from: nil))
-            let zoomFactor = exp(Float(event.scrollingDeltaY) * scrollZoomSensitivity)
+            let zoomFactor = exp(Float(verticalDelta) * scrollZoomSensitivity)
             setViewport(viewport.zoomed(by: zoomFactor, around: anchorProgress))
             return
         }
 
-        let horizontalDelta = event.scrollingDeltaX
-        let verticalDelta = event.scrollingDeltaY
-        let panDelta = abs(horizontalDelta) >= abs(verticalDelta) ? horizontalDelta : -verticalDelta
-        guard panDelta != 0, bounds.width > 0 else {
+        guard horizontalDelta != 0, bounds.width > 0 else {
             return
         }
 
-        let progressDelta = Float(panDelta / bounds.width) * viewport.durationProgress
+        let progressDelta = Float(horizontalDelta / bounds.width) * viewport.durationProgress
         setViewport(viewport.panned(byProgress: progressDelta))
     }
 
