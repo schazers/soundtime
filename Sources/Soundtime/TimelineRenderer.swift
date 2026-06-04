@@ -43,7 +43,6 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
     private var waveformOverview: WaveformOverview?
     private var waveformMipLevels: [WaveformMipLevel] = []
     private var gridCache: GridCache?
-    private var dynamicVertexBuffer: MTLBuffer?
     private var playheadProgress: Float = 0
     private var viewport = TimelineViewport.full
     private var hoverProgress: Float?
@@ -183,25 +182,21 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
             if buffer.count <= Self.inlineVertexUploadLimit {
                 encoder.setVertexBytes(baseAddress, length: buffer.count, index: 0)
             } else {
-                guard let vertexBuffer = reusableDynamicVertexBuffer(length: buffer.count) else {
+                // Each large dynamic draw needs its own buffer. Reusing one buffer within
+                // a frame can overwrite vertices before the GPU consumes earlier draws.
+                guard let vertexBuffer = device.makeBuffer(
+                    bytes: baseAddress,
+                    length: buffer.count,
+                    options: [.storageModeShared]
+                ) else {
                     return
                 }
 
-                vertexBuffer.contents().copyMemory(from: baseAddress, byteCount: buffer.count)
                 encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
             }
 
             encoder.drawPrimitives(type: primitiveType, vertexStart: 0, vertexCount: vertices.count)
         }
-    }
-
-    private func reusableDynamicVertexBuffer(length: Int) -> MTLBuffer? {
-        if let dynamicVertexBuffer, dynamicVertexBuffer.length >= length {
-            return dynamicVertexBuffer
-        }
-
-        dynamicVertexBuffer = device.makeBuffer(length: length, options: [.storageModeShared])
-        return dynamicVertexBuffer
     }
 
     private func makeCachedBuffer(vertices: [TimelineVertex]) -> CachedVertexBuffer? {
