@@ -151,7 +151,7 @@ final class WorkspaceView: NSView {
         playbackController.clear()
         timelineSurface.displayWaveform(nil)
         timelineSurface.displaySelection(nil)
-        timelineSurface.displayPlayheadProgress(0)
+        displayPlaybackVisuals(progress: 0, isPlaying: false)
         updateTimeReadout()
         metadataLabel.stringValue = "\(url.lastPathComponent) - loading..."
 
@@ -184,7 +184,7 @@ final class WorkspaceView: NSView {
                     self.currentPlaybackStatus = "idle"
                     self.playbackController.clear()
                     self.timelineSurface.displaySelection(nil)
-                    self.timelineSurface.displayPlayheadProgress(0)
+                    self.displayPlaybackVisuals(progress: 0, isPlaying: false)
                     self.updateTimeReadout()
                     self.metadataLabel.stringValue = "\(result.metadata.formattedSummary) - WAV decode not available yet"
                 case let .decoded(decodedAudioBuffer, waveformOverview):
@@ -196,7 +196,7 @@ final class WorkspaceView: NSView {
                     self.displayedSampleRate = decodedAudioBuffer.sampleRate
                     try self.playbackController.load(decodedAudioBuffer)
                     self.timelineSurface.displayWaveform(waveformOverview)
-                    self.timelineSurface.displayPlayheadProgress(0)
+                    self.displayPlaybackVisuals(progress: 0, isPlaying: false)
                     self.loadedAudioSummary = "\(result.metadata.displayName) - \(decodedAudioBuffer.formattedSummary)"
                     self.selectedTimelineRange = nil
                     self.currentPlaybackStatus = "press Space to play"
@@ -213,7 +213,7 @@ final class WorkspaceView: NSView {
                     self.currentPlaybackStatus = "idle"
                     self.playbackController.clear()
                     self.timelineSurface.displaySelection(nil)
-                    self.timelineSurface.displayPlayheadProgress(0)
+                    self.displayPlaybackVisuals(progress: 0, isPlaying: false)
                     self.timelineSurface.displayWaveform(nil)
                     self.updateTimeReadout()
                     self.metadataLabel.stringValue = "\(result.metadata.formattedSummary) - WAV decode failed: \(message)"
@@ -235,7 +235,7 @@ final class WorkspaceView: NSView {
                 self.currentPlaybackStatus = "idle"
                 self.playbackController.clear()
                 self.timelineSurface.displaySelection(nil)
-                self.timelineSurface.displayPlayheadProgress(0)
+                self.displayPlaybackVisuals(progress: 0, isPlaying: false)
                 self.timelineSurface.displayWaveform(nil)
                 self.updateTimeReadout()
                 self.metadataLabel.stringValue = "\(url.lastPathComponent) - could not load audio"
@@ -323,7 +323,7 @@ final class WorkspaceView: NSView {
                 self.currentPlaybackStatus = "idle"
                 self.playbackController.clear()
                 self.timelineSurface.displaySelection(nil)
-                self.timelineSurface.displayPlayheadProgress(0)
+                self.displayPlaybackVisuals(progress: 0, isPlaying: false)
                 self.timelineSurface.displayWaveform(nil)
                 self.updateTimeReadout()
                 self.metadataLabel.stringValue = "\(url.lastPathComponent) - WAV preview failed: \(error.localizedDescription)"
@@ -345,7 +345,7 @@ final class WorkspaceView: NSView {
 
         timelineSurface.displayWaveform(previewResult.waveformOverview)
         timelineSurface.displaySelection(nil)
-        timelineSurface.displayPlayheadProgress(0)
+        displayPlaybackVisuals(progress: 0, isPlaying: false)
 
         do {
             try playbackController.loadFile(at: previewResult.metadata.url)
@@ -366,7 +366,8 @@ final class WorkspaceView: NSView {
         displayedFrameCount = previewResult.fileInfo.frameCount
         displayedSampleRate = previewResult.fileInfo.sampleRate
         timelineSurface.displayWaveform(previewResult.waveformOverview)
-        timelineSurface.displayPlayheadProgress(playbackController.snapshot().progress)
+        let snapshot = playbackController.snapshot()
+        displayPlaybackVisuals(progress: snapshot.progress, isPlaying: snapshot.isPlaying)
         updateTimeReadout()
     }
 
@@ -382,7 +383,8 @@ final class WorkspaceView: NSView {
         }
 
         timelineSurface.displayWaveform(waveformOverview)
-        timelineSurface.displayPlayheadProgress(playbackController.snapshot().progress)
+        let snapshot = playbackController.snapshot()
+        displayPlaybackVisuals(progress: snapshot.progress, isPlaying: snapshot.isPlaying)
         updateLoadedAudioSummary(for: decodedAudioBuffer)
         currentPlaybackStatus = playbackController.isPlaying ? "playing" : "press Space to play"
         updateStatus(currentPlaybackStatus)
@@ -566,10 +568,15 @@ final class WorkspaceView: NSView {
         playbackTimer = nil
     }
 
+    private func displayPlaybackVisuals(progress: Float, isPlaying: Bool) {
+        timelineSurface.displayPlaybackActive(isPlaying)
+        timelineSurface.displayPlayheadProgress(progress)
+    }
+
     private func refreshPlaybackProgress() {
         let snapshot = playbackController.snapshot()
         currentPlayheadFrame = snapshot.frameIndex
-        timelineSurface.displayPlayheadProgress(snapshot.progress)
+        displayPlaybackVisuals(progress: snapshot.progress, isPlaying: snapshot.isPlaying)
         updateTimeReadout()
 
         if !snapshot.isPlaying {
@@ -644,7 +651,7 @@ final class WorkspaceView: NSView {
         displayedFrameCount = renderedBuffer.frameCount
         displayedSampleRate = renderedBuffer.sampleRate
         timelineSurface.displaySelection(nil)
-        timelineSurface.displayPlayheadProgress(0)
+        displayPlaybackVisuals(progress: 0, isPlaying: false)
         playbackController.clear()
 
         if renderedBuffer.frameCount > 0 {

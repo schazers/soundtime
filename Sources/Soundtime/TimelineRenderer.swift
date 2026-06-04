@@ -47,8 +47,16 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
     private var viewport = TimelineViewport.full
     private var hoverProgress: Float?
     private var isHoverGuideArmed = false
+    private var isPlaybackActive = false
+    private var playheadTouchEnergy: Float = 0
+    private var lastPlayheadTouchEnergyUpdateTime = CFAbsoluteTimeGetCurrent()
+    private var playheadKickEnergy: Float = 0
+    private var lastPlayheadKickEnergyUpdateTime = CFAbsoluteTimeGetCurrent()
     private var selection: TimelineSelection?
     private var trimPreview: TimelineTrimRange?
+    private let playheadTouchRadius: Float = 0.014
+    private let playheadTouchDecayDuration: CFTimeInterval = 0.046
+    private let playheadKickDecayDuration: CFTimeInterval = 0.3
 
     init(device: MTLDevice, pixelFormat: MTLPixelFormat) throws {
         guard let commandQueue = device.makeCommandQueue() else {
@@ -94,6 +102,20 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         playheadProgress = min(max(progress, 0), 1)
     }
 
+    func displayPlaybackActive(_ isActive: Bool) {
+        updatePlayheadTouchEnergy()
+        updatePlayheadKickEnergy()
+        let wasPlaybackActive = isPlaybackActive
+        isPlaybackActive = isActive
+
+        if isActive {
+            playheadTouchEnergy = 1
+            if !wasPlaybackActive {
+                playheadKickEnergy = 1
+            }
+        }
+    }
+
     func displayViewport(_ viewport: TimelineViewport) {
         guard self.viewport != viewport else {
             return
@@ -134,6 +156,7 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
             drawableSize: renderSize,
             backingScale: backingScale
         )
+        let playheadTouchVertices = makePlayheadTouchVertices(drawableSize: renderSize)
         let hoverGuideVertices = makeHoverGuideVertices(drawableSize: renderSize, backingScale: backingScale)
         let playheadVertices = makePlayheadVertices(drawableSize: renderSize, backingScale: backingScale)
 
@@ -143,6 +166,7 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         }
         draw(vertices: selectionVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: waveformVertices, primitiveType: .triangle, encoder: encoder)
+        draw(vertices: playheadTouchVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: trimPreviewVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: hoverGuideVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: playheadVertices, primitiveType: .triangle, encoder: encoder)
@@ -349,8 +373,8 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
 
         let centerY: Float = 0.5
         let amplitudeHeight: Float = 0.42
-        let minimumVisualHeight: Float = 0.002
-        let color = SIMD4<Float>(0.78, 0.92, 0.88, 1.0)
+        let minimumVisualHeight: Float = 0.008
+        let color = SIMD4<Float>(0.70, 0.72, 0.72, 1.0)
         let bins = mipLevel.overview.bins
         let binCount = bins.count
         let startIndex = max(Int(floor(viewport.startProgress * Float(binCount))) - 1, 0)
@@ -392,6 +416,132 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
         }
 
         return vertices
+    }
+
+    private func makePlayheadTouchVertices(drawableSize: CGSize) -> [TimelineVertex] {
+        guard
+            let mipLevel = waveformMipLevel(for: drawableSize),
+            !mipLevel.overview.isEmpty
+        else {
+            return []
+        }
+
+        let bins = mipLevel.overview.bins
+        let binCount = bins.count
+        let centerY: Float = 0.5
+        let amplitudeHeight: Float = 0.42
+        let minimumVisualHeight: Float = 0.004
+        let touchEnergy = currentPlayheadTouchEnergy()
+        let clampedPlayhead = min(max(playheadProgress, 0), 1)
+        let visibleTouchStart = max(clampedPlayhead - playheadTouchRadius, viewport.startProgress)
+        let visibleTouchEnd = min(clampedPlayhead + playheadTouchRadius, viewport.endProgress)
+        let startIndex = max(Int(floor(visibleTouchStart * Float(binCount))) - 1, 0)
+        let endIndex = min(Int(ceil(visibleTouchEnd * Float(binCount))) + 1, binCount)
+
+        guard startIndex < endIndex else {
+            return []
+        }
+
+        var vertices: [TimelineVertex] = []
+        vertices.reserveCapacity((endIndex - startIndex) * 6)
+
+        for index in startIndex..<endIndex {
+            let bin = bins[index]
+            let timelineX0 = Float(index) / Float(binCount)
+            let timelineX1 = Float(index + 1) / Float(binCount)
+            let x0 = viewport.viewportProgress(forTimelineProgress: timelineX0)
+            let x1 = viewport.viewportProgress(forTimelineProgress: timelineX1)
+            guard x1 > 0, x0 < 1 else {
+                continue
+            }
+
+            let binCenter = (timelineX0 + timelineX1) * 0.5
+            let distance = abs(binCenter - clampedPlayhead)
+            let influence = contactFalloff(1 - min(distance / playheadTouchRadius, 1))
+            let coreInfluence = contactCoreFalloff(1 - min(distance / (playheadTouchRadius * 0.42), 1))
+            guard influence > 0.001 else {
+                continue
+            }
+
+            let geometryInfluence = max(influence, coreInfluence) * touchEnergy
+            let expansion = 1 + 0.22 * geometryInfluence
+            var y0 = centerY - bin.maximumSample * amplitudeHeight * expansion
+            var y1 = centerY - bin.minimumSample * amplitudeHeight * expansion
+
+            if y1 - y0 < minimumVisualHeight {
+                let midpoint = (y0 + y1) * 0.5
+                let visualHeight = minimumVisualHeight + 0.014 * geometryInfluence
+                y0 = midpoint - visualHeight * 0.5
+                y1 = midpoint + visualHeight * 0.5
+            }
+
+            let baseColor = SIMD3<Float>(0.70, 0.72, 0.72)
+            let whiteColor = SIMD3<Float>(1.0, 1.0, 1.0)
+            let colorInfluence = max(influence, coreInfluence)
+            let blendedColor = baseColor + (whiteColor - baseColor) * colorInfluence
+            let color = SIMD4<Float>(
+                blendedColor.x,
+                blendedColor.y,
+                blendedColor.z,
+                0.12 + 0.88 * colorInfluence
+            )
+
+            appendRectangle(
+                to: &vertices,
+                left: max(x0, 0),
+                right: min(x1, 1),
+                top: max(y0, 0),
+                bottom: min(y1, 1),
+                color: color
+            )
+        }
+
+        return vertices
+    }
+
+    private func currentPlayheadTouchEnergy() -> Float {
+        updatePlayheadTouchEnergy()
+        return playheadTouchEnergy
+    }
+
+    private func updatePlayheadTouchEnergy() {
+        let currentTime = CFAbsoluteTimeGetCurrent()
+        defer {
+            lastPlayheadTouchEnergyUpdateTime = currentTime
+        }
+
+        guard !isPlaybackActive else {
+            playheadTouchEnergy = 1
+            return
+        }
+
+        let elapsedTime = currentTime - lastPlayheadTouchEnergyUpdateTime
+        guard elapsedTime > 0 else {
+            return
+        }
+
+        let decayAmount = Float(elapsedTime / playheadTouchDecayDuration)
+        playheadTouchEnergy = max(playheadTouchEnergy - decayAmount, 0)
+    }
+
+    private func currentPlayheadKickEnergy() -> Float {
+        updatePlayheadKickEnergy()
+        return playheadKickEnergy
+    }
+
+    private func updatePlayheadKickEnergy() {
+        let currentTime = CFAbsoluteTimeGetCurrent()
+        defer {
+            lastPlayheadKickEnergyUpdateTime = currentTime
+        }
+
+        let elapsedTime = currentTime - lastPlayheadKickEnergyUpdateTime
+        guard elapsedTime > 0 else {
+            return
+        }
+
+        let decayAmount = Float(elapsedTime / playheadKickDecayDuration)
+        playheadKickEnergy = max(playheadKickEnergy - decayAmount, 0)
     }
 
     private func makeTrimPreviewVertices(drawableSize: CGSize, backingScale: Float) -> [TimelineVertex] {
@@ -522,22 +672,45 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
 
             playheadX = min(max(playheadViewportProgress * width, 0), width)
         }
-        let playheadWidth = pixelLength(2, backingScale: backingScale)
+        let kickEnergy = currentPlayheadKickEnergy()
         let alignedPlayheadX = pixelAligned(playheadX, backingScale: backingScale)
-        let left = max(alignedPlayheadX - playheadWidth * 0.5, 0)
-        let right = min(left + playheadWidth, width)
-        let color = SIMD4<Float>(0.0, 0.84, 0.78, 1.0)
+        let baseColor = SIMD3<Float>(0.0, 0.84, 0.78)
+        let burstColor = SIMD3<Float>(0.025, 0.855, 0.795)
+        let blendedColor = baseColor + (burstColor - baseColor) * kickEnergy
         let size = SIMD2<Float>(width, height)
         var vertices: [TimelineVertex] = []
-        vertices.reserveCapacity(6)
+        vertices.reserveCapacity(12)
+
+        if kickEnergy > 0.001 {
+            let kickWidth = pixelLength(2 + 12 * kickEnergy, backingScale: backingScale)
+            let kickLeftWidth = kickWidth * 0.42
+            let kickRightWidth = kickWidth * 0.58
+            appendRectangle(
+                to: &vertices,
+                left: max(alignedPlayheadX - kickLeftWidth, 0),
+                right: min(alignedPlayheadX + kickRightWidth, width),
+                top: 0,
+                bottom: height,
+                color: SIMD4<Float>(
+                    blendedColor.x,
+                    blendedColor.y,
+                    blendedColor.z,
+                    0.52 * kickEnergy
+                ),
+                drawableSize: size
+            )
+        }
+
+        let baseWidth = pixelLength(2, backingScale: backingScale)
+        let halfBaseWidth = baseWidth * 0.5
 
         appendRectangle(
             to: &vertices,
-            left: left,
-            right: right,
+            left: max(alignedPlayheadX - halfBaseWidth, 0),
+            right: min(alignedPlayheadX + halfBaseWidth, width),
             top: 0,
             bottom: height,
-            color: color,
+            color: SIMD4<Float>(blendedColor.x, blendedColor.y, blendedColor.z, 1.0),
             drawableSize: size
         )
 
@@ -748,6 +921,17 @@ final class TimelineRenderer: NSObject, MTKViewDelegate {
             return 5 * base
         }
         return 10 * base
+    }
+
+    private func contactFalloff(_ value: Float) -> Float {
+        let clampedValue = min(max(value, 0), 1)
+        let smoothedValue = clampedValue * clampedValue * (3 - 2 * clampedValue)
+        return smoothedValue * smoothedValue
+    }
+
+    private func contactCoreFalloff(_ value: Float) -> Float {
+        let clampedValue = min(max(value, 0), 1)
+        return clampedValue * clampedValue
     }
 
     private func makeVertex(normalizedPosition: SIMD2<Float>, color: SIMD4<Float>) -> TimelineVertex {
