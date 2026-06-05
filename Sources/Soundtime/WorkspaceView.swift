@@ -638,8 +638,13 @@ final class WorkspaceView: NSView {
 
         selectedTrackID = trackID
         activeTrackID = trackID
-        selectedTimelineRange = nil
-        timelineSurface.displaySelection(nil)
+        let fullTrackSelection = TimelineSelection(
+            startProgress: 0,
+            endProgress: 1,
+            trackID: trackID
+        )
+        selectedTimelineRange = fullTrackSelection
+        timelineSurface.displaySelection(fullTrackSelection)
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
         timelineSurface.displaySelectedTrack(trackID)
         refreshTrackControls()
