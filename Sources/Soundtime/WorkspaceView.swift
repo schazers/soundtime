@@ -378,7 +378,7 @@ final class WorkspaceView: NSView {
 
             framesPerSecondLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
             framesPerSecondLabel.trailingAnchor.constraint(equalTo: volumeControl.leadingAnchor, constant: -12),
-            framesPerSecondLabel.widthAnchor.constraint(equalToConstant: 248),
+            framesPerSecondLabel.widthAnchor.constraint(equalToConstant: 330),
 
             volumeControl.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
             volumeControl.trailingAnchor.constraint(equalTo: timeReadoutLabel.leadingAnchor, constant: -18),
@@ -2904,13 +2904,18 @@ final class WorkspaceView: NSView {
     }
 
     private func updateFrameStats(_ frameStats: TimelineFrameStats) {
+        let shaderBufferMegabytes = Int((Double(frameStats.shaderBufferByteCount) / 1_048_576).rounded())
         framesPerSecondLabel.stringValue = String(
-            format: "%d fps %@ c%d g%d u%d +/-%.1f max %.1f",
+            format: "%d fps %@ c%d g%d b%d/%dMB u%d/%d m%d +/-%.1f max %.1f",
             frameStats.framesPerSecond,
             frameStats.waveformRenderer,
             frameStats.cpuWaveformVertexCount,
             frameStats.gpuWaveformDrawCount,
+            frameStats.shaderBufferCount,
+            shaderBufferMegabytes,
             frameStats.shaderBufferUploadCount,
+            frameStats.shaderBufferUploadInFlightCount,
+            frameStats.waveformMipCacheCount,
             frameStats.frameTimeJitterMilliseconds,
             frameStats.worstFrameTimeMilliseconds
         )
