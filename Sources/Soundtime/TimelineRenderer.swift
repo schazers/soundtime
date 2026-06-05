@@ -1505,7 +1505,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     private func makeWaveformShaderBinBuffer(
         from bins: [WaveformOverview.Bin],
-        label: String
+        label: String,
+        shouldYieldForPlayback: Bool = false
     ) -> MTLBuffer? {
         guard !bins.isEmpty else {
             return nil
@@ -1522,6 +1523,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let destination = buffer.contents()
             .bindMemory(to: WaveformShaderBin.self, capacity: bins.count)
         for (index, bin) in bins.enumerated() {
+            if shouldYieldForPlayback, index.isMultiple(of: 8_192) {
+                try? ImportWorkBudget.shared.waitIfPlaybackActive()
+            }
             destination[index] = WaveformShaderBin(
                 minimumSample: bin.minimumSample,
                 maximumSample: bin.maximumSample,
@@ -1587,7 +1591,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         waveformGeometryQueue.async { [weak self] in
-            let buffer = self?.makeWaveformShaderBinBuffer(from: bins, label: label)
+            let buffer = self?.makeWaveformShaderBinBuffer(
+                from: bins,
+                label: label,
+                shouldYieldForPlayback: true
+            )
             self?.waveformShaderBufferStore.publish(buffer, for: key)
             self?.waveformShaderBufferStore.trim(
                 toMaximumCount: self?.maximumCachedWaveformShaderBinBuffers ?? 768,
@@ -2602,6 +2610,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         var binIndex = 0
         while binIndex < bins.count {
+            if sampledBinCount.isMultiple(of: 256) {
+                try? ImportWorkBudget.shared.waitIfPlaybackActive()
+            }
             let bin = bins[binIndex]
             let score = transientParticleScore(for: bin)
             let bucket = min(
@@ -4523,7 +4534,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
     }
 
-    private func makeWaveformMipLevels(from waveformOverview: WaveformOverview?) -> [WaveformMipLevel] {
+    private func makeWaveformMipLevels(
+        from waveformOverview: WaveformOverview?,
+        shouldYieldForPlayback: Bool = false
+    ) -> [WaveformMipLevel] {
         guard let waveformOverview, !waveformOverview.isEmpty else {
             return []
         }
@@ -4538,7 +4552,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             let mipOverview = sampledWaveformOverview(
                 from: waveformOverview,
                 targetBinCount: targetBinCount,
-                samplesPerBin: generatedWaveformMipSamplesPerBin
+                samplesPerBin: generatedWaveformMipSamplesPerBin,
+                shouldYieldForPlayback: shouldYieldForPlayback
             )
             levels.append(WaveformMipLevel(
                 overview: mipOverview,
@@ -4584,7 +4599,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private func sampledWaveformOverview(
         from waveformOverview: WaveformOverview,
         targetBinCount: Int,
-        samplesPerBin: Int
+        samplesPerBin: Int,
+        shouldYieldForPlayback: Bool = false
     ) -> WaveformOverview {
         let sourceBins = waveformOverview.bins
         let sourceBinCount = sourceBins.count
@@ -4594,6 +4610,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         bins.reserveCapacity(targetBinCount)
 
         for targetIndex in 0..<targetBinCount {
+            if shouldYieldForPlayback, targetIndex.isMultiple(of: 1_024) {
+                try? ImportWorkBudget.shared.waitIfPlaybackActive()
+            }
             let sourceStartIndex = targetIndex * sourceBinCount / targetBinCount
             let sourceEndIndex = max(
                 sourceStartIndex + 1,
@@ -4683,7 +4702,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 return
             }
 
-            let levels = self.makeWaveformMipLevels(from: waveformOverview)
+            let levels = self.makeWaveformMipLevels(
+                from: waveformOverview,
+                shouldYieldForPlayback: true
+            )
             self.publishCompleteWaveformMipLevels(levels, for: key)
         }
     }
