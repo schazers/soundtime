@@ -21,6 +21,13 @@ typedef struct SoundtimeAudioCoreSnapshot {
     uint64_t droppedCommandCount;
 } SoundtimeAudioCoreSnapshot;
 
+typedef struct SoundtimeAudioCoreClockSample {
+    uint64_t frameIndex;
+    uint64_t renderedFrameCount;
+    double hostTimestamp;
+    bool isPlaying;
+} SoundtimeAudioCoreClockSample;
+
 SoundtimeAudioCoreEngine* soundtime_audio_core_create(void);
 void soundtime_audio_core_destroy(SoundtimeAudioCoreEngine* engine);
 void soundtime_audio_core_reset(SoundtimeAudioCoreEngine* engine);
@@ -53,6 +60,10 @@ void soundtime_audio_core_set_transport_ramp_duration(
     double durationSeconds
 );
 SoundtimeAudioCoreSnapshot soundtime_audio_core_snapshot(const SoundtimeAudioCoreEngine* engine);
+bool soundtime_audio_core_pop_clock_sample(
+    SoundtimeAudioCoreEngine* engine,
+    SoundtimeAudioCoreClockSample* sample
+);
 void soundtime_audio_core_render_silence(
     SoundtimeAudioCoreEngine* engine,
     float* const* outputs,
