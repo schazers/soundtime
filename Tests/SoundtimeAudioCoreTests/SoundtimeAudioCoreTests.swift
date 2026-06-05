@@ -55,6 +55,7 @@ final class SoundtimeAudioCoreTests: XCTestCase {
         }
         XCTAssertTrue(didLoad)
 
+        soundtime_audio_core_set_transport_ramp_duration(engine, 0)
         soundtime_audio_core_set_gain(engine, 0.5)
         soundtime_audio_core_play(engine)
 
@@ -68,6 +69,50 @@ final class SoundtimeAudioCoreTests: XCTestCase {
         XCTAssertEqual(snapshot.frameCount, 3)
         XCTAssertEqual(snapshot.hostTimestamp, 3.25)
         XCTAssertTrue(snapshot.isPlaying)
+    }
+
+    func testTransportRampIsSampleAccurate() throws {
+        let engine = try XCTUnwrap(soundtime_audio_core_create())
+        defer {
+            soundtime_audio_core_destroy(engine)
+        }
+
+        var samples: [Float] = [
+            1, 1,
+            1, 1,
+            1, 1,
+            1, 1,
+            1, 1,
+            1, 1,
+            1, 1,
+            1, 1,
+        ]
+        let didLoad = samples.withUnsafeMutableBufferPointer { sampleBuffer in
+            soundtime_audio_core_set_interleaved_source(
+                engine,
+                sampleBuffer.baseAddress,
+                8,
+                2,
+                10
+            )
+        }
+        XCTAssertTrue(didLoad)
+
+        soundtime_audio_core_set_transport_ramp_duration(engine, 0.2)
+        soundtime_audio_core_play(engine)
+
+        var output = render(engine: engine, channelCount: 2, frameCount: 3, hostTimestamp: 0)
+        XCTAssertEqual(output[0], [0.5, 1, 1])
+        XCTAssertEqual(output[1], [0.5, 1, 1])
+
+        soundtime_audio_core_pause(engine)
+        output = render(engine: engine, channelCount: 2, frameCount: 3, hostTimestamp: 0.3)
+        XCTAssertEqual(output[0], [0.5, 0, 0])
+        XCTAssertEqual(output[1], [0.5, 0, 0])
+
+        let snapshot = soundtime_audio_core_snapshot(engine)
+        XCTAssertEqual(snapshot.frameIndex, 5)
+        XCTAssertFalse(snapshot.isPlaying)
     }
 
     private func renderSilence(

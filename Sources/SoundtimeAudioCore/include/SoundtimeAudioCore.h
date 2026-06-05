@@ -41,6 +41,10 @@ void soundtime_audio_core_play(SoundtimeAudioCoreEngine* engine);
 void soundtime_audio_core_pause(SoundtimeAudioCoreEngine* engine);
 void soundtime_audio_core_seek(SoundtimeAudioCoreEngine* engine, uint64_t frameIndex);
 void soundtime_audio_core_set_gain(SoundtimeAudioCoreEngine* engine, float gain);
+void soundtime_audio_core_set_transport_ramp_duration(
+    SoundtimeAudioCoreEngine* engine,
+    double durationSeconds
+);
 SoundtimeAudioCoreSnapshot soundtime_audio_core_snapshot(const SoundtimeAudioCoreEngine* engine);
 void soundtime_audio_core_render_silence(
     SoundtimeAudioCoreEngine* engine,
