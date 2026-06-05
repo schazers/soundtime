@@ -11,12 +11,20 @@ let package = Package(
         .executable(name: "Soundtime", targets: ["Soundtime"]),
     ],
     targets: [
+        .target(
+            name: "SoundtimeAudioCore",
+            publicHeadersPath: "include"
+        ),
         .executableTarget(
             name: "Soundtime",
+            dependencies: [
+                "SoundtimeAudioCore",
+            ],
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("Metal"),
             ]
         ),
-    ]
+    ],
+    cxxLanguageStandard: .cxx20
 )
