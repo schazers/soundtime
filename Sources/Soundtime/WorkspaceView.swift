@@ -632,6 +632,9 @@ final class WorkspaceView: NSView {
                     guard self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
                         return
                     }
+                    guard await self.waitForImportWorkBudget(trackID: trackID, importID: importID) else {
+                        return
+                    }
 
                     let nextBinCount = min(previewLevel.targetBinCount, previewResult.fileInfo.frameCount)
                     guard nextBinCount > latestPreviewBinCount else {
@@ -648,6 +651,9 @@ final class WorkspaceView: NSView {
                         guard self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
                             return
                         }
+                        guard await self.waitForImportWorkBudget(trackID: trackID, importID: importID) else {
+                            return
+                        }
 
                         latestPreviewBinCount = waveformOverview.bins.count
                         self.applyTrackPreviewRefinement(
@@ -661,10 +667,21 @@ final class WorkspaceView: NSView {
                 }
 
                 do {
+                    guard await self.waitForImportWorkBudget(
+                        trackID: trackID,
+                        importID: importID,
+                        idleSettleDuration: 0.65
+                    ) else {
+                        return
+                    }
+
                     let (decodedAudioBuffer, waveformOverview, zeroCrossingIndex) =
                         try await AudioImportPipeline.loadDecodedWAV(at: url)
 
                     guard self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
+                        return
+                    }
+                    guard await self.waitForImportWorkBudget(trackID: trackID, importID: importID) else {
                         return
                     }
 
@@ -694,6 +711,60 @@ final class WorkspaceView: NSView {
 
     private func isTrackImportCurrent(trackID: UUID, importID: UUID) -> Bool {
         projectTracks.contains { $0.id == trackID && $0.importID == importID }
+    }
+
+    private func waitForImportWorkBudget(
+        trackID: UUID,
+        importID: UUID,
+        idleSettleDuration: TimeInterval = 0.18
+    ) async -> Bool {
+        await waitForImportWorkBudget(
+            idleSettleDuration: idleSettleDuration,
+            isCurrent: { [weak self] in
+                self?.isTrackImportCurrent(trackID: trackID, importID: importID) == true
+            }
+        )
+    }
+
+    private func waitForSingleFileImportWorkBudget(
+        importID: UUID,
+        idleSettleDuration: TimeInterval = 0.18
+    ) async -> Bool {
+        await waitForImportWorkBudget(
+            idleSettleDuration: idleSettleDuration,
+            isCurrent: { [weak self] in
+                self?.activeImportID == importID
+            }
+        )
+    }
+
+    private func waitForImportWorkBudget(
+        idleSettleDuration: TimeInterval,
+        isCurrent: () -> Bool
+    ) async -> Bool {
+        let pollingInterval: TimeInterval = 0.08
+        var idleStartedAt: TimeInterval?
+
+        while true {
+            guard isCurrent(), !Task.isCancelled else {
+                return false
+            }
+
+            if playbackController.isPlaying {
+                idleStartedAt = nil
+            } else {
+                let now = CACurrentMediaTime()
+                if let idleStartedAt {
+                    if now - idleStartedAt >= idleSettleDuration {
+                        return true
+                    }
+                } else {
+                    idleStartedAt = now
+                }
+            }
+
+            try? await Task.sleep(for: .milliseconds(Int(pollingInterval * 1_000)))
+        }
     }
 
     private func removeProjectTrack(_ trackID: UUID) {
@@ -1311,6 +1382,9 @@ final class WorkspaceView: NSView {
                     guard self.activeImportID == importID else {
                         return
                     }
+                    guard await self.waitForSingleFileImportWorkBudget(importID: importID) else {
+                        return
+                    }
 
                     let nextBinCount = min(previewLevel.targetBinCount, previewResult.fileInfo.frameCount)
                     guard nextBinCount > latestPreviewBinCount else {
@@ -1327,6 +1401,9 @@ final class WorkspaceView: NSView {
                         guard self.activeImportID == importID else {
                             return
                         }
+                        guard await self.waitForSingleFileImportWorkBudget(importID: importID) else {
+                            return
+                        }
 
                         latestPreviewBinCount = waveformOverview.bins.count
                         self.applyPreviewRefinement(
@@ -1339,10 +1416,20 @@ final class WorkspaceView: NSView {
                 }
 
                 do {
+                    guard await self.waitForSingleFileImportWorkBudget(
+                        importID: importID,
+                        idleSettleDuration: 0.65
+                    ) else {
+                        return
+                    }
+
                     let (decodedAudioBuffer, waveformOverview, zeroCrossingIndex) =
                         try await AudioImportPipeline.loadDecodedWAV(at: url)
 
                     guard self.activeImportID == importID else {
+                        return
+                    }
+                    guard await self.waitForSingleFileImportWorkBudget(importID: importID) else {
                         return
                     }
 
