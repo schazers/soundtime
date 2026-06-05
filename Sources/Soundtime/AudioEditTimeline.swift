@@ -38,10 +38,14 @@ struct AudioEditTimeline: Sendable {
         return Double(frameCount) / sourceBuffer.sampleRate
     }
 
+    func frameRange(for selection: TimelineSelection) -> Range<Int> {
+        let startFrame = Int((selection.startProgress * Float(frameCount)).rounded(.down))
+        let endFrame = Int((selection.endProgress * Float(frameCount)).rounded(.up))
+        return max(startFrame, 0)..<min(max(endFrame, startFrame), frameCount)
+    }
+
     mutating func delete(_ selection: TimelineSelection) -> Int {
-        let deleteStartFrame = Int((selection.startProgress * Float(frameCount)).rounded(.down))
-        let deleteEndFrame = Int((selection.endProgress * Float(frameCount)).rounded(.up))
-        return deleteFrames(in: deleteStartFrame..<deleteEndFrame)
+        deleteFrames(in: frameRange(for: selection))
     }
 
     mutating func trim(to trimRange: TimelineTrimRange) -> Int {
@@ -62,23 +66,46 @@ struct AudioEditTimeline: Sendable {
     }
 
     func render() -> DecodedAudioBuffer {
+        render(frameRange: 0..<frameCount)
+    }
+
+    func render(selection: TimelineSelection) -> DecodedAudioBuffer {
+        render(frameRange: frameRange(for: selection))
+    }
+
+    func render(frameRange requestedFrameRange: Range<Int>) -> DecodedAudioBuffer {
         let renderedFrameCount = frameCount
+        let frameRange = max(requestedFrameRange.lowerBound, 0)..<min(requestedFrameRange.upperBound, renderedFrameCount)
         var samplesByChannel = (0..<sourceBuffer.channelCount).map { _ in
             [Float]()
         }
 
         for channelIndex in samplesByChannel.indices {
-            samplesByChannel[channelIndex].reserveCapacity(renderedFrameCount)
+            samplesByChannel[channelIndex].reserveCapacity(max(frameRange.count, 0))
         }
 
         var isFirstRenderedSegment = true
         let spliceFadeFrameCount = max(Int(sourceBuffer.sampleRate * Self.spliceFadeDuration), 1)
+        var timelineFrame = 0
 
         for segment in segments where segment.frameCount > 0 {
+            let segmentTimelineStart = timelineFrame
+            let segmentTimelineEnd = timelineFrame + segment.frameCount
+            timelineFrame = segmentTimelineEnd
+            let renderStart = max(segmentTimelineStart, frameRange.lowerBound)
+            let renderEnd = min(segmentTimelineEnd, frameRange.upperBound)
+            guard renderStart < renderEnd else {
+                continue
+            }
+
+            let segmentOffset = renderStart - segmentTimelineStart
+            let sourceStartFrame = segment.sourceStartFrame + segmentOffset
+            let sourceEndFrame = sourceStartFrame + (renderEnd - renderStart)
+
             for channelIndex in samplesByChannel.indices {
                 let sourceSamples = sourceBuffer.samplesByChannel[channelIndex]
-                let sourceEndFrame = min(segment.sourceEndFrame, sourceSamples.count)
-                guard segment.sourceStartFrame < sourceEndFrame else {
+                let boundedSourceEndFrame = min(sourceEndFrame, sourceSamples.count)
+                guard sourceStartFrame < boundedSourceEndFrame else {
                     continue
                 }
 
@@ -92,8 +119,8 @@ struct AudioEditTimeline: Sendable {
                 appendSegmentSamples(
                     to: &samplesByChannel[channelIndex],
                     sourceSamples: sourceSamples,
-                    sourceStartFrame: segment.sourceStartFrame,
-                    sourceEndFrame: sourceEndFrame,
+                    sourceStartFrame: sourceStartFrame,
+                    sourceEndFrame: boundedSourceEndFrame,
                     fadeInFrameCount: isFirstRenderedSegment ? 0 : spliceFadeFrameCount
                 )
             }
@@ -105,7 +132,7 @@ struct AudioEditTimeline: Sendable {
             url: sourceBuffer.url,
             sampleRate: sourceBuffer.sampleRate,
             channelCount: sourceBuffer.channelCount,
-            frameCount: renderedFrameCount,
+            frameCount: frameRange.count,
             samplesByChannel: samplesByChannel
         )
     }

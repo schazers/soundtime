@@ -5,6 +5,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onAudioFileDropped: ((URL) -> Void)?
     var onTogglePlayback: (() -> Void)?
     var onDeleteSelection: (() -> Void)?
+    var onCutSelection: (() -> Void)?
+    var onCopySelection: (() -> Void)?
+    var onPasteAudio: (() -> Void)?
     var onUndo: (() -> Void)?
     var onExportRequested: (() -> Void)?
     var onOpenProjectRequested: (() -> Void)?
@@ -461,6 +464,21 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        if event.keyCode == 7, event.modifierFlags.contains(.command) {
+            onCutSelection?()
+            return
+        }
+
+        if event.keyCode == 8, event.modifierFlags.contains(.command) {
+            onCopySelection?()
+            return
+        }
+
+        if event.keyCode == 9, event.modifierFlags.contains(.command) {
+            onPasteAudio?()
+            return
+        }
+
         if event.keyCode == 14, event.modifierFlags.contains(.command) {
             onExportRequested?()
             return
@@ -544,6 +562,18 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     @objc func undoTimelineEdit(_ sender: Any?) {
         onUndo?()
+    }
+
+    @objc func cutTimelineSelection(_ sender: Any?) {
+        onCutSelection?()
+    }
+
+    @objc func copyTimelineSelection(_ sender: Any?) {
+        onCopySelection?()
+    }
+
+    @objc func pasteTimelineAudio(_ sender: Any?) {
+        onPasteAudio?()
     }
 
     @objc func showGainEffect(_ sender: Any?) {
