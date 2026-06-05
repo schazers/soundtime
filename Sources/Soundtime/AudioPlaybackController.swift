@@ -99,6 +99,18 @@ final class AudioPlaybackController: PlaybackEngine {
         engine.connect(playerNode, to: engine.mainMixerNode, format: audioFile.processingFormat)
     }
 
+    func replaceWithDecodedSource(
+        _ decodedAudioBuffer: DecodedAudioBuffer,
+        zeroCrossingIndex: AudioZeroCrossingIndex? = nil
+    ) throws {
+        guard playbackSource != nil else {
+            try load(decodedAudioBuffer, zeroCrossingIndex: zeroCrossingIndex)
+            return
+        }
+
+        updateZeroCrossingIndex(zeroCrossingIndex)
+    }
+
     func clear() {
         stopEnginePlayback()
         playbackSource = nil
