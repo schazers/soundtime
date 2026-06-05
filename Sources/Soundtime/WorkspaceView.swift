@@ -75,7 +75,7 @@ final class WorkspaceView: NSView {
     private var currentPlaybackStatus = "idle"
     private var playbackTimer: Timer?
     private let playbackController: PlaybackEngine = PlaybackEngineFactory.makeDefault()
-    private let playbackRefreshRate: TimeInterval = 30
+    private let playbackRefreshRate: TimeInterval = 10
     private var visualPlayheadProgress: Float = 0
     private var visualPlayheadAnchorTimestamp = CACurrentMediaTime()
     private var visualPlaybackActive = false
@@ -84,7 +84,7 @@ final class WorkspaceView: NSView {
     private let visualAudioSyncDeadband: TimeInterval = 0.006
     private let visualAudioSyncHardCorrectionThreshold: TimeInterval = 0.075
     private let visualAudioSyncResponseDuration: TimeInterval = 0.12
-    private let visualAudioSyncMinimumCorrectionInterval: TimeInterval = 1.0 / 30.0
+    private let visualAudioSyncMinimumCorrectionInterval: TimeInterval = 0.1
     private let wavPreviewLevels = [
         WAVPreviewLevel(targetBinCount: 512, samplesPerBin: 6),
         WAVPreviewLevel(targetBinCount: 768, samplesPerBin: 6),
@@ -2498,7 +2498,18 @@ final class WorkspaceView: NSView {
             return
         }
 
-        let playheadTime = Double(min(currentPlayheadFrame, displayedFrameCount)) / displayedSampleRate
+        let playheadFrame: Int
+        if visualPlaybackActive {
+            let projectedProgress = projectedVisualPlayheadProgress(
+                at: CACurrentMediaTime(),
+                duration: displayedDuration
+            )
+            playheadFrame = Int((projectedProgress * Float(displayedFrameCount)).rounded(.down))
+        } else {
+            playheadFrame = currentPlayheadFrame
+        }
+
+        let playheadTime = Double(min(playheadFrame, displayedFrameCount)) / displayedSampleRate
         timeReadoutLabel.stringValue = "\(formatClockTime(playheadTime)) / \(formatClockTime(displayedDuration))"
     }
 

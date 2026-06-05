@@ -81,6 +81,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var needsTimelineRender = false
     private let renderFlightGate = RenderFlightGate()
     private var isTimelinePlaybackActive = false
+    private var timelineDuration: TimeInterval = 0
+    private var pagingPlayheadProgress: Float = 0
+    private var pagingPlayheadAnchorTimestamp = CACurrentMediaTime()
     private let selectionDragThreshold: CGFloat = 0.25
     private let trimHandleHitWidth: CGFloat = 18
     private let rightPanVelocitySmoothing: Float = 0.42
@@ -134,6 +137,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     func displayWaveform(_ waveformOverview: WaveformOverview?) {
+        timelineDuration = waveformOverview?.duration ?? 0
         let wasSelectionEnabled = isSelectionEnabled
         isSelectionEnabled = waveformOverview?.isEmpty == false
         if !wasSelectionEnabled || !isSelectionEnabled {
@@ -168,6 +172,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     func displayTracks(_ tracks: [TimelineRenderState.Track]) {
+        timelineDuration = tracks.reduce(TimeInterval(0)) { result, track in
+            max(result, track.waveformOverview?.duration ?? 0)
+        }
         let wasSelectionEnabled = isSelectionEnabled
         isSelectionEnabled = tracks.contains { $0.waveformOverview?.isEmpty == false }
         if !wasSelectionEnabled || !isSelectionEnabled {
@@ -236,6 +243,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         anchorTimestamp: CFTimeInterval? = nil
     ) {
         let clampedProgress = min(max(progress, 0), 1)
+        pagingPlayheadProgress = clampedProgress
+        pagingPlayheadAnchorTimestamp = anchorTimestamp ?? CACurrentMediaTime()
         pageViewportIfNeeded(forPlayheadProgress: clampedProgress)
         updateTimelineRenderer { renderer in
             renderer.displayPlayheadProgress(
@@ -413,9 +422,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         if
             isTimelinePlaybackActive,
-            let playheadProgress = timelineRenderer?.projectedPlayheadProgress(
-                at: frame.targetPresentationTimestamp
-            )
+            !viewport.isFull,
+            let playheadProgress = projectedPagingPlayheadProgress(at: frame.targetPresentationTimestamp)
         {
             pageViewportIfNeeded(forPlayheadProgress: playheadProgress)
         }
@@ -450,6 +458,16 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private func startTransientRenderPulse(duration: CFTimeInterval? = nil) {
         transientRenderEndTime = CFAbsoluteTimeGetCurrent() + (duration ?? transientRenderPulseDuration)
         startTimelineDisplayLink()
+    }
+
+    private func projectedPagingPlayheadProgress(at timestamp: CFTimeInterval) -> Float? {
+        guard isTimelinePlaybackActive, timelineDuration.isFinite, timelineDuration > 0 else {
+            return nil
+        }
+
+        let elapsedTime = max(timestamp - pagingPlayheadAnchorTimestamp, 0)
+        let projectedProgress = pagingPlayheadProgress + Float(elapsedTime / timelineDuration)
+        return min(max(projectedProgress, 0), 1)
     }
 
     private func hasActiveTransientRenderPulse() -> Bool {
