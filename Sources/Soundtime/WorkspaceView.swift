@@ -29,6 +29,7 @@ final class WorkspaceView: NSView {
         var waveformOverview: WaveformOverview?
         var decodedAudioBuffer: DecodedAudioBuffer?
         var zeroCrossingIndex: AudioZeroCrossingIndex?
+        var zeroCrossingProbe: WAVZeroCrossingProbe?
         var audioTimeline: AudioEditTimeline?
         var volume: Float
         var isMuted: Bool
@@ -60,8 +61,6 @@ final class WorkspaceView: NSView {
     private var hasRestoredLastProject = false
     private var isLoadingProject = false
     private var audioClipboard: AudioClipboard?
-    private var trackPlaybackReloadTask: Task<Void, Never>?
-    private var projectPlaybackMixID = UUID()
     private var activeImportID = UUID()
     private var selectedAudioFile: AudioFileMetadata?
     private var decodedAudioBuffer: DecodedAudioBuffer?
@@ -429,10 +428,10 @@ final class WorkspaceView: NSView {
                 self?.updateTrack(trackID) { $0.isSoloed = isSoloed }
             }
             controlView.onVolumeChanged = { [weak self, trackID = track.id] volume in
-                self?.updateTrack(trackID, reloadPlayback: false) { $0.volume = volume }
+                self?.updateTrack(trackID) { $0.volume = volume }
             }
             controlView.onVolumeEditingEnded = { [weak self] in
-                self?.reloadProjectPlaybackImmediately()
+                self?.updateProjectPlaybackTrackMix()
             }
             trackControlsStack.addArrangedSubview(controlView)
         }
@@ -440,7 +439,6 @@ final class WorkspaceView: NSView {
 
     private func updateTrack(
         _ trackID: UUID,
-        reloadPlayback: Bool = true,
         update: (inout ProjectTrack) -> Void
     ) {
         guard let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }) else {
@@ -450,31 +448,12 @@ final class WorkspaceView: NSView {
         update(&projectTracks[trackIndex])
         activeTrackID = trackID
         refreshProjectTrackMixDisplay()
-        if reloadPlayback {
-            reloadProjectPlaybackImmediately()
-        } else {
-            scheduleProjectPlaybackReload()
-        }
+        updateProjectPlaybackTrackMix()
         updateStatus(currentPlaybackStatus)
     }
 
-    private func scheduleProjectPlaybackReload() {
-        trackPlaybackReloadTask?.cancel()
-        trackPlaybackReloadTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(90))
-            guard !Task.isCancelled else {
-                return
-            }
-
-            self?.trackPlaybackReloadTask = nil
-            self?.reloadPlaybackFromProjectMix(preserveProgress: true)
-        }
-    }
-
     private func reloadProjectPlaybackImmediately() {
-        trackPlaybackReloadTask?.cancel()
-        trackPlaybackReloadTask = nil
-        reloadPlaybackFromProjectMix(preserveProgress: true)
+        reloadPlaybackFromProjectTracks(preserveProgress: true)
     }
 
     private func loadDroppedAudioFile(at url: URL) {
@@ -612,6 +591,7 @@ final class WorkspaceView: NSView {
             waveformOverview: nil,
             decodedAudioBuffer: nil,
             zeroCrossingIndex: nil,
+            zeroCrossingProbe: nil,
             audioTimeline: nil,
             volume: settings?.volume ?? 1,
             isMuted: settings?.isMuted ?? false,
@@ -724,7 +704,7 @@ final class WorkspaceView: NSView {
         syncActiveTrackFields()
         refreshProjectTimelineDisplay()
         updateProjectDisplayTiming()
-        reloadPlaybackFromProjectMix(preserveProgress: false)
+        reloadPlaybackFromProjectTracks(preserveProgress: false)
     }
 
     private func applyTrackPreview(trackID: UUID, previewResult: WAVPreviewImportResult) {
@@ -734,22 +714,13 @@ final class WorkspaceView: NSView {
 
         projectTracks[trackIndex].name = previewResult.metadata.displayName
         projectTracks[trackIndex].waveformOverview = previewResult.waveformOverview
+        projectTracks[trackIndex].zeroCrossingProbe = previewResult.zeroCrossingProbe
         activeTrackID = trackID
         window?.title = projectWindowTitle()
         refreshProjectTimelineDisplay()
         updateProjectDisplayTiming()
         syncActiveTrackFields()
-        if !playbackController.hasSource, projectMixTrackSnapshots().isEmpty {
-            do {
-                try playbackController.loadFile(
-                    at: previewResult.metadata.url,
-                    zeroCrossingProbe: previewResult.zeroCrossingProbe
-                )
-            } catch {
-                updateStatus("preview ready - playback failed: \(error.localizedDescription)")
-                return
-            }
-        }
+        reloadPlaybackFromProjectTracks(preserveProgress: true)
         updateStatus("preview ready - resolving waveform")
     }
 
@@ -781,12 +752,13 @@ final class WorkspaceView: NSView {
         projectTracks[trackIndex].decodedAudioBuffer = decodedAudioBuffer
         projectTracks[trackIndex].waveformOverview = waveformOverview
         projectTracks[trackIndex].zeroCrossingIndex = zeroCrossingIndex
+        projectTracks[trackIndex].zeroCrossingProbe = nil
         projectTracks[trackIndex].audioTimeline = AudioEditTimeline(sourceBuffer: decodedAudioBuffer)
         activeTrackID = trackID
         syncActiveTrackFields()
         refreshProjectTimelineDisplay(rebuildControls: false)
         updateProjectDisplayTiming(sampleRateHint: decodedAudioBuffer.sampleRate)
-        reloadPlaybackFromProjectMix(preserveProgress: true)
+        reloadPlaybackFromProjectTracks(preserveProgress: true)
         updateEffectCommandState()
         updateStatus("track ready")
     }
@@ -866,72 +838,25 @@ final class WorkspaceView: NSView {
         return "Soundtime - Untitled Project"
     }
 
-    private func reloadPlaybackFromProjectMix(preserveProgress: Bool) {
+    private func reloadPlaybackFromProjectTracks(preserveProgress: Bool) {
         let previousSnapshot = playbackController.snapshot()
         let previousProgress = previousSnapshot.progress
         let wasPlaying = previousSnapshot.isPlaying
-        let mixTracks = projectMixTrackSnapshots()
+        let playbackTracks = projectPlaybackTracks()
 
-        guard !mixTracks.isEmpty else {
-            if !playbackController.hasSource {
-                playbackController.clear()
-                currentPlayheadFrame = 0
-                displayPlaybackVisuals(progress: 0, isPlaying: false)
-                updateTimeReadout()
-            }
+        guard !playbackTracks.isEmpty else {
+            playbackController.clear()
+            currentPlayheadFrame = 0
+            displayPlaybackVisuals(progress: 0, isPlaying: false)
+            updateTimeReadout()
             return
         }
 
-        let mixID = UUID()
-        projectPlaybackMixID = mixID
-        let outputURL = currentProjectURL ?? URL(fileURLWithPath: "Soundtime Project Mix.wav")
-        if mixTracks.count > 1 {
-            updateStatus("preparing playback mix")
-        }
-
-        Task { [weak self, mixID, mixTracks, outputURL, preserveProgress, previousProgress, wasPlaying] in
-            let mixResult = await Task.detached(priority: .userInitiated) {
-                Self.makeProjectMix(from: mixTracks, outputURL: outputURL)
-            }.value
-
-            guard let self, self.projectPlaybackMixID == mixID else {
-                return
-            }
-
-            guard let mixResult else {
-                self.updateStatus("project playback failed: no decoded tracks")
-                return
-            }
-
-            self.applyProjectPlaybackMix(
-                mixResult,
-                preserveProgress: preserveProgress,
-                previousProgress: previousProgress,
-                wasPlaying: wasPlaying
-            )
-        }
-    }
-
-    private func applyProjectPlaybackMix(
-        _ mixResult: ProjectMixResult,
-        preserveProgress: Bool,
-        previousProgress: Float,
-        wasPlaying: Bool
-    ) {
-        decodedAudioBuffer = mixResult.buffer
-        displayedFrameCount = mixResult.buffer.frameCount
-        displayedSampleRate = mixResult.buffer.sampleRate
         do {
-            let liveSnapshot = playbackController.snapshot()
-            let targetProgress = liveSnapshot.isPlaying ? liveSnapshot.progress : previousProgress
-            let shouldPlay = liveSnapshot.isPlaying || wasPlaying
-            try playbackController.replaceWithDecodedSource(
-                mixResult.buffer,
-                zeroCrossingIndex: mixResult.zeroCrossingIndex
-            )
+            try playbackController.loadProjectTracks(playbackTracks)
             if preserveProgress {
-                try playbackController.seek(toProgress: targetProgress)
-                if shouldPlay {
+                try playbackController.seek(toProgress: previousProgress)
+                if wasPlaying {
                     try playbackController.play()
                 }
             } else if playbackController.hasSource {
@@ -946,13 +871,14 @@ final class WorkspaceView: NSView {
                 syncPlayhead: true,
                 anchorTimestamp: snapshot.hostTimestamp
             )
-            if mixResult.trackCount > 1 {
-                updateStatus("playback mix ready")
-            }
         } catch {
             updateStatus("project playback failed: \(error.localizedDescription)")
         }
         updateTimeReadout()
+    }
+
+    private func updateProjectPlaybackTrackMix() {
+        playbackController.updateProjectTrackMix(projectPlaybackTracks())
     }
 
     private func projectMixBuffer() -> DecodedAudioBuffer? {
@@ -960,6 +886,33 @@ final class WorkspaceView: NSView {
             from: projectMixTrackSnapshots(),
             outputURL: currentProjectURL ?? URL(fileURLWithPath: "Soundtime Project Mix.wav")
         )?.buffer
+    }
+
+    private func projectPlaybackTracks() -> [ProjectPlaybackTrack] {
+        projectTracks.compactMap { track in
+            let source: ProjectPlaybackTrack.Source
+            if let decodedAudioBuffer = track.decodedAudioBuffer {
+                source = .decoded(
+                    decodedAudioBuffer: decodedAudioBuffer,
+                    zeroCrossingIndex: track.zeroCrossingIndex
+                )
+            } else if track.waveformOverview != nil {
+                source = .file(
+                    url: track.sourceURL,
+                    zeroCrossingProbe: track.zeroCrossingProbe
+                )
+            } else {
+                return nil
+            }
+
+            return ProjectPlaybackTrack(
+                id: track.id,
+                source: source,
+                volume: track.volume,
+                isMuted: track.isMuted,
+                isSoloed: track.isSoloed
+            )
+        }
     }
 
     private func projectMixTrackSnapshots() -> [ProjectMixTrackSnapshot] {
@@ -1120,7 +1073,7 @@ final class WorkspaceView: NSView {
         syncActiveTrackFields()
         refreshProjectTimelineDisplay(rebuildControls: false)
         updateProjectDisplayTiming(sampleRateHint: materialized.buffer.sampleRate)
-        reloadPlaybackFromProjectMix(preserveProgress: preservePlaybackProgress)
+        reloadPlaybackFromProjectTracks(preserveProgress: preservePlaybackProgress)
         updateEffectCommandState()
         updateStatus(status)
     }
@@ -2403,7 +2356,7 @@ final class WorkspaceView: NSView {
         }
 
         refreshProjectTimelineDisplay()
-        reloadPlaybackFromProjectMix(preserveProgress: false)
+        reloadPlaybackFromProjectTracks(preserveProgress: false)
         updateLoadedAudioSummary(for: renderedBuffer)
         updateTimeReadout()
     }

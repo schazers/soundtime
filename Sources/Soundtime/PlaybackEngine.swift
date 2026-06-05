@@ -39,6 +39,25 @@ enum PlaybackError: LocalizedError {
     }
 }
 
+struct ProjectPlaybackTrack: Sendable {
+    enum Source: Sendable {
+        case decoded(
+            decodedAudioBuffer: DecodedAudioBuffer,
+            zeroCrossingIndex: AudioZeroCrossingIndex?
+        )
+        case file(
+            url: URL,
+            zeroCrossingProbe: WAVZeroCrossingProbe?
+        )
+    }
+
+    let id: UUID
+    let source: Source
+    let volume: Float
+    let isMuted: Bool
+    let isSoloed: Bool
+}
+
 @MainActor
 protocol PlaybackEngine: AnyObject {
     var isPlaying: Bool { get }
@@ -50,16 +69,37 @@ protocol PlaybackEngine: AnyObject {
         zeroCrossingIndex: AudioZeroCrossingIndex?
     ) throws
     func loadFile(at url: URL, zeroCrossingProbe: WAVZeroCrossingProbe?) throws
+    func loadProjectTracks(_ tracks: [ProjectPlaybackTrack]) throws
     func replaceWithDecodedSource(
         _ decodedAudioBuffer: DecodedAudioBuffer,
         zeroCrossingIndex: AudioZeroCrossingIndex?
     ) throws
     func clear()
     func updateZeroCrossingIndex(_ zeroCrossingIndex: AudioZeroCrossingIndex?)
+    func updateProjectTrackMix(_ tracks: [ProjectPlaybackTrack])
     @discardableResult
     func togglePlayback() throws -> Bool
     func play() throws
     func pause()
     func seek(toProgress progress: Float) throws
     func snapshot() -> PlaybackSnapshot
+}
+
+@MainActor
+extension PlaybackEngine {
+    func loadProjectTracks(_ tracks: [ProjectPlaybackTrack]) throws {
+        guard let firstTrack = tracks.first else {
+            clear()
+            return
+        }
+
+        switch firstTrack.source {
+        case let .decoded(decodedAudioBuffer, zeroCrossingIndex):
+            try load(decodedAudioBuffer, zeroCrossingIndex: zeroCrossingIndex)
+        case let .file(url, zeroCrossingProbe):
+            try loadFile(at: url, zeroCrossingProbe: zeroCrossingProbe)
+        }
+    }
+
+    func updateProjectTrackMix(_ tracks: [ProjectPlaybackTrack]) {}
 }
