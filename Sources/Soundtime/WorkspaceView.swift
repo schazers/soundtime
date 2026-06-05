@@ -401,12 +401,45 @@ final class WorkspaceView: NSView {
         projectTracks.map { track in
             TimelineRenderState.Track(
                 id: track.id,
+                waveformVersion: waveformVersion(for: track),
                 waveformOverview: track.waveformOverview,
                 volume: track.volume,
                 isMuted: track.isMuted,
                 isSoloed: track.isSoloed
             )
         }
+    }
+
+    private func waveformVersion(for track: ProjectTrack) -> Int {
+        var hasher = Hasher()
+        hasher.combine(track.editRevision)
+        guard let waveformOverview = track.waveformOverview else {
+            return hasher.finalize()
+        }
+
+        hasher.combine(waveformOverview.bins.count)
+        hasher.combine(waveformOverview.duration)
+        for index in waveformFingerprintIndices(for: waveformOverview.bins.count) {
+            let bin = waveformOverview.bins[index]
+            hasher.combine(bin.minimumSample)
+            hasher.combine(bin.maximumSample)
+        }
+
+        return hasher.finalize()
+    }
+
+    private func waveformFingerprintIndices(for binCount: Int) -> [Int] {
+        guard binCount > 0 else {
+            return []
+        }
+
+        return [
+            0,
+            binCount / 3,
+            binCount / 2,
+            min((binCount * 2) / 3, binCount - 1),
+            binCount - 1,
+        ]
     }
 
     private func refreshTrackControls() {
@@ -2289,6 +2322,7 @@ final class WorkspaceView: NSView {
 
     private func displayPlaybackActiveIfNeeded(_ isPlaying: Bool) {
         visualPlaybackActive = isPlaying
+        ImportWorkBudget.shared.setPlaybackActive(isPlaying)
         guard displayedPlaybackActive != isPlaying else {
             return
         }

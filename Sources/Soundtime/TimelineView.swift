@@ -2,6 +2,31 @@ import AppKit
 import Metal
 
 final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
+    private final class RenderFlightGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var isInFlight = false
+
+        func begin() -> Bool {
+            lock.lock()
+            defer {
+                lock.unlock()
+            }
+
+            guard !isInFlight else {
+                return false
+            }
+
+            isInFlight = true
+            return true
+        }
+
+        func finish() {
+            lock.lock()
+            isInFlight = false
+            lock.unlock()
+        }
+    }
+
     var onAudioFileDropped: ((URL) -> Void)?
     var onTogglePlayback: (() -> Void)?
     var onDeleteSelection: (() -> Void)?
@@ -54,7 +79,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var timelineDisplayLink: TimelineDisplayLink?
     private var transientRenderEndTime: CFTimeInterval?
     private var needsTimelineRender = false
-    private var isTimelineRenderInFlight = false
+    private let renderFlightGate = RenderFlightGate()
     private var isTimelinePlaybackActive = false
     private let selectionDragThreshold: CGFloat = 0.25
     private let trimHandleHitWidth: CGFloat = 18
@@ -403,7 +428,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     private func submitTimelineRender(frame: TimelineDisplayLinkFrame) -> Bool {
-        guard !isTimelineRenderInFlight else {
+        guard renderFlightGate.begin() else {
             return false
         }
 
@@ -411,17 +436,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             let timelineRenderer,
             let renderTarget = makeTimelineRenderTarget(frame: frame)
         else {
+            renderFlightGate.finish()
             return false
         }
 
-        isTimelineRenderInFlight = true
         timelineRenderQueue.async { [weak self, timelineRenderer, renderTarget] in
             timelineRenderer.render(to: renderTarget)
-            DispatchQueue.main.async { [weak self] in
-                MainActor.assumeIsolated {
-                    self?.isTimelineRenderInFlight = false
-                }
-            }
+            self?.renderFlightGate.finish()
         }
         return true
     }

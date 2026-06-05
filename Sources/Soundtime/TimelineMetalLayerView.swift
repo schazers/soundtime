@@ -16,6 +16,9 @@ class TimelineMetalLayerView: NSView {
             timelineMetalLayer?.framebufferOnly = framebufferOnly
         }
     }
+    private let drawableStateLock = NSLock()
+    private var cachedDrawableViewportSize = CGSize(width: 1, height: 1)
+    private var cachedDrawableBackingScale: CGFloat = 1
 
     private var backingScale: CGFloat {
         if let windowScale = window?.backingScaleFactor, windowScale > 0 {
@@ -123,7 +126,8 @@ class TimelineMetalLayerView: NSView {
         drawable: CAMetalDrawable,
         displayTimestamp: CFTimeInterval
     ) -> TimelineRenderTarget? {
-        guard bounds.width > 0, bounds.height > 0 else {
+        let drawableState = currentDrawableState()
+        guard drawableState.viewportSize.width > 0, drawableState.viewportSize.height > 0 else {
             return nil
         }
 
@@ -136,8 +140,8 @@ class TimelineMetalLayerView: NSView {
         return TimelineRenderTarget(
             renderPassDescriptor: renderPassDescriptor,
             drawable: drawable,
-            viewportSize: bounds.size,
-            backingScale: Float(backingScale),
+            viewportSize: drawableState.viewportSize,
+            backingScale: Float(drawableState.backingScale),
             displayTimestamp: displayTimestamp
         )
     }
@@ -148,10 +152,39 @@ class TimelineMetalLayerView: NSView {
         }
 
         let scale = backingScale
-        metalLayer.contentsScale = scale
-        metalLayer.drawableSize = CGSize(
+        let drawableSize = CGSize(
             width: max(bounds.width * scale, 1),
             height: max(bounds.height * scale, 1)
+        )
+        let viewportSize = bounds.size
+
+        drawableStateLock.lock()
+        let didChange =
+            cachedDrawableViewportSize != viewportSize ||
+            cachedDrawableBackingScale != scale ||
+            metalLayer.drawableSize != drawableSize ||
+            metalLayer.contentsScale != scale
+        cachedDrawableViewportSize = viewportSize
+        cachedDrawableBackingScale = scale
+        drawableStateLock.unlock()
+
+        guard didChange else {
+            return
+        }
+
+        metalLayer.contentsScale = scale
+        metalLayer.drawableSize = drawableSize
+    }
+
+    private func currentDrawableState() -> (viewportSize: CGSize, backingScale: CGFloat) {
+        drawableStateLock.lock()
+        defer {
+            drawableStateLock.unlock()
+        }
+
+        return (
+            viewportSize: cachedDrawableViewportSize,
+            backingScale: cachedDrawableBackingScale
         )
     }
 }

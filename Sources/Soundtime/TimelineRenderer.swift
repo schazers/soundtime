@@ -40,6 +40,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let binCount: Int
     }
 
+    private struct WaveformMipCacheKey: Hashable {
+        let trackID: UUID
+        let waveformVersion: Int
+        let binCount: Int
+        let duration: TimeInterval
+    }
+
     private struct GridCacheKey: Equatable {
         let width: Float
         let height: Float
@@ -187,6 +194,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var waveformMipLevels: [WaveformMipLevel] = []
     private var previousWaveformMipLevels: [WaveformMipLevel] = []
     private var trackWaveformMipLevels: [UUID: [WaveformMipLevel]] = [:]
+    private var waveformMipLevelCache: [WaveformMipCacheKey: [WaveformMipLevel]] = [:]
     private var gridCache: GridCache?
     private var waveformCache: WaveformCache?
     private var previousWaveformCache: WaveformCache?
@@ -220,6 +228,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let playheadKickTrailLineCount = 10
     private let playheadContactFadeDuration: CFTimeInterval = 0.6
     private let playheadContactMaximumEventCount = 160
+    private let maximumCachedWaveformMipPyramids = 12
 
     init(device: MTLDevice, pixelFormat: MTLPixelFormat) throws {
         guard let commandQueue = device.makeCommandQueue() else {
@@ -267,6 +276,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let tracks = waveformOverview.map {
             [TimelineRenderState.Track(
                 id: trackID,
+                waveformVersion: 0,
                 waveformOverview: $0,
                 volume: 1,
                 isMuted: false,
@@ -277,8 +287,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
 
     func displayTracks(_ tracks: [TimelineRenderState.Track]) {
-        let firstOverview = tracks.first?.waveformOverview
-        let nextWaveformMipLevels = makeWaveformMipLevels(from: firstOverview)
+        let nextTrackWaveformMipLevels = Dictionary(
+            uniqueKeysWithValues: tracks.map { track in
+                (track.id, cachedWaveformMipLevels(for: track))
+            }
+        )
+        let nextWaveformMipLevels = tracks.first.flatMap { nextTrackWaveformMipLevels[$0.id] } ?? []
         if !waveformMipLevels.isEmpty, !nextWaveformMipLevels.isEmpty, tracks.count == 1 {
             previousWaveformMipLevels = waveformMipLevels
             previousWaveformCache = waveformCache
@@ -290,11 +304,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         waveformMipLevels = nextWaveformMipLevels
-        trackWaveformMipLevels = Dictionary(
-            uniqueKeysWithValues: tracks.map { track in
-                (track.id, makeWaveformMipLevels(from: track.waveformOverview))
-            }
-        )
+        trackWaveformMipLevels = nextTrackWaveformMipLevels
         gridCache = nil
         waveformCache = nil
         playheadContactEvents.removeAll()
@@ -878,6 +888,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         var hasher = Hasher()
         for track in renderState.tracks {
             hasher.combine(track.id)
+            hasher.combine(track.waveformVersion)
             hasher.combine(track.waveformOverview?.bins.count ?? 0)
             hasher.combine(track.waveformOverview?.duration ?? 0)
             hasher.combine(track.volume)
@@ -1913,6 +1924,30 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             ))
         }
 
+        return levels
+    }
+
+    private func cachedWaveformMipLevels(for track: TimelineRenderState.Track) -> [WaveformMipLevel] {
+        guard let waveformOverview = track.waveformOverview, !waveformOverview.isEmpty else {
+            return []
+        }
+
+        let key = WaveformMipCacheKey(
+            trackID: track.id,
+            waveformVersion: track.waveformVersion,
+            binCount: waveformOverview.bins.count,
+            duration: waveformOverview.duration
+        )
+        if let cachedLevels = waveformMipLevelCache[key] {
+            return cachedLevels
+        }
+
+        if waveformMipLevelCache.count >= maximumCachedWaveformMipPyramids {
+            waveformMipLevelCache.removeAll(keepingCapacity: true)
+        }
+
+        let levels = makeWaveformMipLevels(from: waveformOverview)
+        waveformMipLevelCache[key] = levels
         return levels
     }
 
