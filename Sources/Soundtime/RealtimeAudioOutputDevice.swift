@@ -2,14 +2,12 @@ import AVFoundation
 import Foundation
 import SoundtimeAudioCore
 
-@MainActor
 protocol RealtimeAudioOutputDevice: AnyObject {
     func configure(corePointer: OpaquePointer, sampleRate: Double) throws
     func start() throws
     func stop()
 }
 
-@MainActor
 final class AVAudioSourceNodeOutputDevice: RealtimeAudioOutputDevice {
     private let engine = AVAudioEngine()
     private var sourceNode: AVAudioSourceNode?
