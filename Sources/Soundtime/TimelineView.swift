@@ -176,6 +176,20 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
     }
 
+    func displayTrackMixSettings(_ tracks: [TimelineRenderState.Track]) {
+        let wasSelectionEnabled = isSelectionEnabled
+        isSelectionEnabled = tracks.contains { $0.waveformOverview?.isEmpty == false }
+
+        updateTimelineRenderer { renderer in
+            renderer.displayTrackMixSettings(tracks)
+        }
+        requestTimelineRender()
+
+        if wasSelectionEnabled != isSelectionEnabled {
+            window?.invalidateCursorRects(for: self)
+        }
+    }
+
     func updateWaveformTouchTuning(
         trailDuration: TimeInterval,
         trailFalloffSteepness: Float,
