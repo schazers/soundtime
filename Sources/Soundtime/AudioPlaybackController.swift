@@ -378,7 +378,10 @@ final class AudioPlaybackController: PlaybackEngine {
         }
 
         let scheduleAheadFrames = max(Int(playbackSource.sampleRate * playbackScheduleAheadDuration), 1)
-        let targetEndFrame = min(max(frame, scheduledEndFrame) + scheduleAheadFrames, sourceFrameCount)
+        let targetEndFrame = min(frame + scheduleAheadFrames, sourceFrameCount)
+        guard scheduledEndFrame < targetEndFrame else {
+            return
+        }
 
         while scheduledEndFrame < targetEndFrame {
             let chunkFrameCount = min(
