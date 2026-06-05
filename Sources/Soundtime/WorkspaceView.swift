@@ -42,6 +42,18 @@ final class WorkspaceView: NSView {
         let waveformOverview: WaveformOverview
     }
 
+    private struct ProjectMixTrackSnapshot: Sendable {
+        let volume: Float
+        let decodedAudioBuffer: DecodedAudioBuffer
+        let zeroCrossingIndex: AudioZeroCrossingIndex?
+    }
+
+    private struct ProjectMixResult: Sendable {
+        let buffer: DecodedAudioBuffer
+        let zeroCrossingIndex: AudioZeroCrossingIndex
+        let trackCount: Int
+    }
+
     private var projectTracks: [ProjectTrack] = []
     private var activeTrackID: UUID?
     private var currentProjectURL: URL?
@@ -49,6 +61,7 @@ final class WorkspaceView: NSView {
     private var isLoadingProject = false
     private var audioClipboard: AudioClipboard?
     private var trackPlaybackReloadTask: Task<Void, Never>?
+    private var projectPlaybackMixID = UUID()
     private var activeImportID = UUID()
     private var selectedAudioFile: AudioFileMetadata?
     private var decodedAudioBuffer: DecodedAudioBuffer?
@@ -726,7 +739,7 @@ final class WorkspaceView: NSView {
         refreshProjectTimelineDisplay()
         updateProjectDisplayTiming()
         syncActiveTrackFields()
-        if !playbackController.hasSource, projectMixBuffer() == nil {
+        if !playbackController.hasSource, projectMixTrackSnapshots().isEmpty {
             do {
                 try playbackController.loadFile(
                     at: previewResult.metadata.url,
@@ -780,13 +793,13 @@ final class WorkspaceView: NSView {
 
     private func syncActiveTrackFields() {
         guard let activeTrack = activeProjectTrack else {
-            decodedAudioBuffer = projectMixBuffer()
+            decodedAudioBuffer = nil
             audioTimeline = nil
             selectedAudioFile = nil
             return
         }
 
-        decodedAudioBuffer = activeTrack.decodedAudioBuffer ?? projectMixBuffer()
+        decodedAudioBuffer = activeTrack.decodedAudioBuffer ?? decodedAudioBuffer
         audioTimeline = activeTrack.audioTimeline
         if let duration = activeTrack.waveformOverview?.duration {
             selectedAudioFile = AudioFileMetadata(
@@ -857,24 +870,68 @@ final class WorkspaceView: NSView {
         let previousSnapshot = playbackController.snapshot()
         let previousProgress = previousSnapshot.progress
         let wasPlaying = previousSnapshot.isPlaying
+        let mixTracks = projectMixTrackSnapshots()
 
-        guard let mixBuffer = projectMixBuffer() else {
-            playbackController.clear()
-            currentPlayheadFrame = 0
-            displayPlaybackVisuals(progress: 0, isPlaying: false)
-            updateTimeReadout()
+        guard !mixTracks.isEmpty else {
+            if !playbackController.hasSource {
+                playbackController.clear()
+                currentPlayheadFrame = 0
+                displayPlaybackVisuals(progress: 0, isPlaying: false)
+                updateTimeReadout()
+            }
             return
         }
 
-        decodedAudioBuffer = mixBuffer
-        displayedFrameCount = mixBuffer.frameCount
-        displayedSampleRate = mixBuffer.sampleRate
+        let mixID = UUID()
+        projectPlaybackMixID = mixID
+        let outputURL = currentProjectURL ?? URL(fileURLWithPath: "Soundtime Project Mix.wav")
+        if mixTracks.count > 1 {
+            updateStatus("preparing playback mix")
+        }
+
+        Task { [weak self, mixID, mixTracks, outputURL, preserveProgress, previousProgress, wasPlaying] in
+            let mixResult = await Task.detached(priority: .userInitiated) {
+                Self.makeProjectMix(from: mixTracks, outputURL: outputURL)
+            }.value
+
+            guard let self, self.projectPlaybackMixID == mixID else {
+                return
+            }
+
+            guard let mixResult else {
+                self.updateStatus("project playback failed: no decoded tracks")
+                return
+            }
+
+            self.applyProjectPlaybackMix(
+                mixResult,
+                preserveProgress: preserveProgress,
+                previousProgress: previousProgress,
+                wasPlaying: wasPlaying
+            )
+        }
+    }
+
+    private func applyProjectPlaybackMix(
+        _ mixResult: ProjectMixResult,
+        preserveProgress: Bool,
+        previousProgress: Float,
+        wasPlaying: Bool
+    ) {
+        decodedAudioBuffer = mixResult.buffer
+        displayedFrameCount = mixResult.buffer.frameCount
+        displayedSampleRate = mixResult.buffer.sampleRate
         do {
-            let zeroCrossingIndex = projectMixZeroCrossingIndex(for: mixBuffer)
-            try playbackController.replaceWithDecodedSource(mixBuffer, zeroCrossingIndex: zeroCrossingIndex)
+            let liveSnapshot = playbackController.snapshot()
+            let targetProgress = liveSnapshot.isPlaying ? liveSnapshot.progress : previousProgress
+            let shouldPlay = liveSnapshot.isPlaying || wasPlaying
+            try playbackController.replaceWithDecodedSource(
+                mixResult.buffer,
+                zeroCrossingIndex: mixResult.zeroCrossingIndex
+            )
             if preserveProgress {
-                try playbackController.seek(toProgress: previousProgress)
-                if wasPlaying {
+                try playbackController.seek(toProgress: targetProgress)
+                if shouldPlay {
                     try playbackController.play()
                 }
             } else if playbackController.hasSource {
@@ -889,6 +946,9 @@ final class WorkspaceView: NSView {
                 syncPlayhead: true,
                 anchorTimestamp: snapshot.hostTimestamp
             )
+            if mixResult.trackCount > 1 {
+                updateStatus("playback mix ready")
+            }
         } catch {
             updateStatus("project playback failed: \(error.localizedDescription)")
         }
@@ -896,29 +956,60 @@ final class WorkspaceView: NSView {
     }
 
     private func projectMixBuffer() -> DecodedAudioBuffer? {
-        let decodedTracks = audibleProjectTracks.compactMap { track -> (ProjectTrack, DecodedAudioBuffer)? in
+        Self.makeProjectMix(
+            from: projectMixTrackSnapshots(),
+            outputURL: currentProjectURL ?? URL(fileURLWithPath: "Soundtime Project Mix.wav")
+        )?.buffer
+    }
+
+    private func projectMixTrackSnapshots() -> [ProjectMixTrackSnapshot] {
+        audibleProjectTracks.compactMap { track in
             guard let decodedAudioBuffer = track.decodedAudioBuffer else {
                 return nil
             }
-            return (track, decodedAudioBuffer)
-        }
 
+            return ProjectMixTrackSnapshot(
+                volume: track.volume,
+                decodedAudioBuffer: decodedAudioBuffer,
+                zeroCrossingIndex: track.zeroCrossingIndex
+            )
+        }
+    }
+
+    private nonisolated static func makeProjectMix(
+        from decodedTracks: [ProjectMixTrackSnapshot],
+        outputURL: URL
+    ) -> ProjectMixResult? {
         guard let firstTrack = decodedTracks.first else {
             return nil
         }
 
+        let firstBuffer = firstTrack.decodedAudioBuffer
         if
             decodedTracks.count == 1,
-            abs(firstTrack.0.volume - 1) <= Float.ulpOfOne,
-            !firstTrack.0.isMuted
+            abs(firstTrack.volume - 1) <= Float.ulpOfOne
         {
-            return firstTrack.1
+            let zeroCrossingIndex: AudioZeroCrossingIndex
+            if
+                let existingZeroCrossingIndex = firstTrack.zeroCrossingIndex,
+                existingZeroCrossingIndex.frameCount == firstBuffer.frameCount
+            {
+                zeroCrossingIndex = existingZeroCrossingIndex
+            } else {
+                zeroCrossingIndex = AudioZeroCrossingIndex.build(from: firstBuffer)
+            }
+
+            return ProjectMixResult(
+                buffer: firstBuffer,
+                zeroCrossingIndex: zeroCrossingIndex,
+                trackCount: decodedTracks.count
+            )
         }
 
-        let sampleRate = firstTrack.1.sampleRate
-        let channelCount = max(decodedTracks.map(\.1.channelCount).max() ?? 2, 2)
+        let sampleRate = firstBuffer.sampleRate
+        let channelCount = max(decodedTracks.map(\.decodedAudioBuffer.channelCount).max() ?? 2, 2)
         let frameCount = decodedTracks.reduce(0) { result, item in
-            max(result, item.1.frameCount)
+            max(result, item.decodedAudioBuffer.frameCount)
         }
         guard frameCount > 0 else {
             return nil
@@ -928,47 +1019,32 @@ final class WorkspaceView: NSView {
             [Float](repeating: 0, count: frameCount)
         }
 
-        for (track, buffer) in decodedTracks {
+        for track in decodedTracks {
+            let buffer = track.decodedAudioBuffer
             let gain = track.volume * track.volume
             for outputChannel in 0..<channelCount {
                 let sourceChannel = buffer.channelCount == 1 ? 0 : min(outputChannel, buffer.channelCount - 1)
                 let sourceSamples = buffer.samplesByChannel[sourceChannel]
                 for frameIndex in 0..<buffer.frameCount {
-                    samplesByChannel[outputChannel][frameIndex] = clampAudioSample(
+                    let mixedSample =
                         samplesByChannel[outputChannel][frameIndex] + sourceSamples[frameIndex] * gain
-                    )
+                    samplesByChannel[outputChannel][frameIndex] = min(max(mixedSample, -1), 1)
                 }
             }
         }
 
-        return DecodedAudioBuffer(
-            url: currentProjectURL ?? URL(fileURLWithPath: "Soundtime Project Mix.wav"),
+        let buffer = DecodedAudioBuffer(
+            url: outputURL,
             sampleRate: sampleRate,
             channelCount: channelCount,
             frameCount: frameCount,
             samplesByChannel: samplesByChannel
         )
-    }
-
-    private func projectMixZeroCrossingIndex(for mixBuffer: DecodedAudioBuffer) -> AudioZeroCrossingIndex {
-        let decodedTracks = audibleProjectTracks.compactMap { track -> (ProjectTrack, DecodedAudioBuffer)? in
-            guard let decodedAudioBuffer = track.decodedAudioBuffer else {
-                return nil
-            }
-            return (track, decodedAudioBuffer)
-        }
-
-        if
-            decodedTracks.count == 1,
-            abs(decodedTracks[0].0.volume - 1) <= Float.ulpOfOne,
-            decodedTracks[0].1.frameCount == mixBuffer.frameCount,
-            let zeroCrossingIndex = decodedTracks[0].0.zeroCrossingIndex,
-            zeroCrossingIndex.frameCount == mixBuffer.frameCount
-        {
-            return zeroCrossingIndex
-        }
-
-        return AudioZeroCrossingIndex.build(from: mixBuffer)
+        return ProjectMixResult(
+            buffer: buffer,
+            zeroCrossingIndex: AudioZeroCrossingIndex.build(from: buffer),
+            trackCount: decodedTracks.count
+        )
     }
 
     private var audibleProjectTracks: [ProjectTrack] {
