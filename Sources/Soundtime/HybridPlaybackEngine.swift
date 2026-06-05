@@ -185,6 +185,10 @@ final class HybridPlaybackEngine: PlaybackEngine {
         try currentEngine.seek(toProgress: progress)
     }
 
+    func seekExactly(toProgress progress: Float) throws {
+        try currentEngine.seekExactly(toProgress: progress)
+    }
+
     func snapshot() -> PlaybackSnapshot {
         currentEngine.snapshot()
     }

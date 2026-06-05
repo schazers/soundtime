@@ -57,6 +57,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         case trimEnd
     }
 
+    private enum ScrollGestureMode {
+        case pan
+        case zoom
+    }
+
     private var timelineRenderer: TimelineRenderer?
     private let timelineRenderQueue = DispatchQueue(
         label: "Soundtime.timeline.renderer",
@@ -76,6 +81,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var rightPanVelocityProgressPerSecond: Float = 0
     private var rightPanMomentumTimer: Timer?
     private var rightPanMomentumLastTime: TimeInterval?
+    private var scrollGestureMode: ScrollGestureMode?
     private var timelineDisplayLink: TimelineDisplayLink?
     private var transientRenderEndTime: CFTimeInterval?
     private var needsTimelineRender = false
@@ -254,6 +260,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             )
         }
         requestTimelineRender()
+    }
+
+    func displayedPlayheadProgress(at timestamp: CFTimeInterval = CACurrentMediaTime()) -> Float? {
+        timelineRenderer?.projectedPlayheadProgress(at: timestamp)
     }
 
     func displayPlaybackActive(_ isActive: Bool) {
@@ -682,11 +692,35 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         stopRightPanMomentum()
+        let hasGesturePhase = !event.phase.isEmpty || !event.momentumPhase.isEmpty
+        defer {
+            if
+                event.phase.contains(.ended) ||
+                event.phase.contains(.cancelled) ||
+                event.momentumPhase.contains(.ended) ||
+                event.momentumPhase.contains(.cancelled) ||
+                !hasGesturePhase
+            {
+                scrollGestureMode = nil
+            }
+        }
 
         let horizontalDelta = event.scrollingDeltaX
         let verticalDelta = event.scrollingDeltaY
+        guard horizontalDelta != 0 || verticalDelta != 0 else {
+            return
+        }
+        let proposedGestureMode: ScrollGestureMode =
+            abs(verticalDelta) >= abs(horizontalDelta) && verticalDelta != 0 ?
+            .zoom :
+            .pan
+        let gestureMode = scrollGestureMode ?? proposedGestureMode
+        scrollGestureMode = gestureMode
 
-        if abs(verticalDelta) >= abs(horizontalDelta), verticalDelta != 0 {
+        if gestureMode == .zoom {
+            guard verticalDelta != 0 else {
+                return
+            }
             let anchorProgress = progress(for: convert(event.locationInWindow, from: nil))
             let zoomFactor = exp(Float(verticalDelta) * scrollZoomSensitivity)
             setViewport(viewport.zoomed(by: zoomFactor, around: anchorProgress))
@@ -708,6 +742,23 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         stopRightPanMomentum()
+        let hasGesturePhase = !event.phase.isEmpty || !event.momentumPhase.isEmpty
+        defer {
+            if
+                event.phase.contains(.ended) ||
+                event.phase.contains(.cancelled) ||
+                !hasGesturePhase
+            {
+                scrollGestureMode = nil
+            }
+        }
+
+        if scrollGestureMode == nil {
+            scrollGestureMode = .zoom
+        }
+        guard scrollGestureMode == .zoom else {
+            return
+        }
 
         let anchorProgress = progress(for: convert(event.locationInWindow, from: nil))
         let zoomFactor = max(1 + Float(event.magnification), 0.1)

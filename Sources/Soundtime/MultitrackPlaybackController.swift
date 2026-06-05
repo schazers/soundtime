@@ -267,6 +267,14 @@ final class MultitrackPlaybackController: PlaybackEngine {
     }
 
     func seek(toProgress progress: Float) throws {
+        try seek(toProgress: progress, snapsToZeroCrossing: true)
+    }
+
+    func seekExactly(toProgress progress: Float) throws {
+        try seek(toProgress: progress, snapsToZeroCrossing: false)
+    }
+
+    private func seek(toProgress progress: Float, snapsToZeroCrossing: Bool) throws {
         guard hasSource else {
             throw PlaybackError.noAudioLoaded
         }
@@ -277,10 +285,12 @@ final class MultitrackPlaybackController: PlaybackEngine {
             max(Int((clampedProgress * Float(frameCount)).rounded(.down)), 0),
             frameCount
         )
-        let snappedTargetFrame = snappedProjectFrameToZeroCrossing(
-            targetFrame,
-            allowsEnd: targetFrame >= frameCount
-        )
+        let snappedTargetFrame = snapsToZeroCrossing ?
+            snappedProjectFrameToZeroCrossing(
+                targetFrame,
+                allowsEnd: targetFrame >= frameCount
+            ) :
+            targetFrame
         let shouldResumePlayback = isPlaying && snappedTargetFrame < frameCount
 
         scheduledDecodedBuffers.removeAll()

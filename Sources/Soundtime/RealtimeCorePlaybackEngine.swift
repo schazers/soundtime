@@ -251,15 +251,29 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             throw PlaybackError.noAudioLoaded
         }
 
+        try seek(toProgress: progress, snapsToZeroCrossing: true)
+    }
+
+    func seekExactly(toProgress progress: Float) throws {
+        guard hasSource else {
+            throw PlaybackError.noAudioLoaded
+        }
+
+        try seek(toProgress: progress, snapsToZeroCrossing: false)
+    }
+
+    private func seek(toProgress progress: Float, snapsToZeroCrossing: Bool) throws {
         let clampedProgress = min(max(progress, 0), 1)
         let targetFrame = min(
             max(Int((clampedProgress * Float(frameCount)).rounded(.down)), 0),
             frameCount
         )
-        let snappedTargetFrame = snappedFrameToZeroCrossing(
-            targetFrame,
-            allowsEnd: targetFrame >= frameCount
-        )
+        let snappedTargetFrame = snapsToZeroCrossing ?
+            snappedFrameToZeroCrossing(
+                targetFrame,
+                allowsEnd: targetFrame >= frameCount
+            ) :
+            targetFrame
         let detailedSnapshot = core.detailedSnapshot()
         mirroredFrameIndex = snappedTargetFrame
         mirroredFrameCount = frameCount

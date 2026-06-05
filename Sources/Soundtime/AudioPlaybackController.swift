@@ -189,10 +189,26 @@ final class AudioPlaybackController: PlaybackEngine {
     }
 
     func seek(toProgress progress: Float) throws {
-        try seek(toProgress: progress, shouldRampIfPlaying: true)
+        try seek(
+            toProgress: progress,
+            shouldRampIfPlaying: true,
+            snapsToZeroCrossing: true
+        )
     }
 
-    private func seek(toProgress progress: Float, shouldRampIfPlaying: Bool) throws {
+    func seekExactly(toProgress progress: Float) throws {
+        try seek(
+            toProgress: progress,
+            shouldRampIfPlaying: true,
+            snapsToZeroCrossing: false
+        )
+    }
+
+    private func seek(
+        toProgress progress: Float,
+        shouldRampIfPlaying: Bool,
+        snapsToZeroCrossing: Bool
+    ) throws {
         guard let playbackSource else {
             throw PlaybackError.noAudioLoaded
         }
@@ -203,11 +219,13 @@ final class AudioPlaybackController: PlaybackEngine {
             max(Int((clampedProgress * Float(sourceFrameCount)).rounded(.down)), 0),
             sourceFrameCount
         )
-        let snappedTargetFrame = snappedFrameToZeroCrossing(
-            targetFrame,
-            frameCount: sourceFrameCount,
-            allowsEnd: targetFrame >= sourceFrameCount
-        )
+        let snappedTargetFrame = snapsToZeroCrossing ?
+            snappedFrameToZeroCrossing(
+                targetFrame,
+                frameCount: sourceFrameCount,
+                allowsEnd: targetFrame >= sourceFrameCount
+            ) :
+            targetFrame
         let shouldResumePlayback = isPlaying && snappedTargetFrame < sourceFrameCount
 
         scheduledPlaybackBuffers.removeAll()

@@ -1934,17 +1934,22 @@ final class WorkspaceView: NSView {
 
         do {
             let wasPlaying = playbackController.isPlaying
+            let pauseTimestamp = CACurrentMediaTime()
             let pauseVisualProgress = wasPlaying && displayedDuration > 0 ?
-                projectedVisualPlayheadProgress(
-                    at: CACurrentMediaTime(),
-                    duration: displayedDuration
-                ) :
+                timelineSurface.displayedPlayheadProgress(at: pauseTimestamp) ??
+                projectedVisualPlayheadProgress(at: pauseTimestamp, duration: displayedDuration) :
                 nil
             let isPlaying = try playbackController.togglePlayback()
+            var didFreezePausedVisuals = false
             if wasPlaying, !isPlaying, let pauseVisualProgress {
-                try alignPausedTransportToVisiblePlayhead(pauseVisualProgress)
+                didFreezePausedVisuals = try alignPausedTransportToVisiblePlayhead(
+                    pauseVisualProgress,
+                    anchorTimestamp: pauseTimestamp
+                )
             }
-            refreshPlaybackProgress(syncPlayheadWhenPlaying: true)
+            if !didFreezePausedVisuals {
+                refreshPlaybackProgress(syncPlayheadWhenPlaying: true)
+            }
 
             if isPlaying {
                 startPlaybackTimer()
@@ -1959,23 +1964,39 @@ final class WorkspaceView: NSView {
         }
     }
 
-    private func alignPausedTransportToVisiblePlayhead(_ visibleProgress: Float) throws {
+    @discardableResult
+    private func alignPausedTransportToVisiblePlayhead(
+        _ visibleProgress: Float,
+        anchorTimestamp: TimeInterval
+    ) throws -> Bool {
         let snapshot = playbackController.snapshot()
         guard
             !snapshot.isPlaying,
             snapshot.frameCount > 0,
             displayedDuration > 0
         else {
-            return
+            return false
         }
 
         let clampedVisibleProgress = min(max(visibleProgress, 0), 1)
-        let backwardCorrectionSeconds = TimeInterval(clampedVisibleProgress - snapshot.progress) * displayedDuration
-        guard backwardCorrectionSeconds > visualAudioSyncDeadband else {
-            return
+        let frameProgress = 1 / Float(snapshot.frameCount)
+        guard clampedVisibleProgress > snapshot.progress + frameProgress else {
+            return false
         }
 
-        try playbackController.seek(toProgress: clampedVisibleProgress)
+        try playbackController.seekExactly(toProgress: clampedVisibleProgress)
+        currentPlayheadFrame = min(
+            max(Int((clampedVisibleProgress * Float(snapshot.frameCount)).rounded(.down)), 0),
+            snapshot.frameCount
+        )
+        displayPlaybackVisuals(
+            progress: clampedVisibleProgress,
+            isPlaying: false,
+            syncPlayhead: true,
+            anchorTimestamp: anchorTimestamp
+        )
+        updateTimeReadout()
+        return true
     }
 
     private func seek(to progress: Float) {
