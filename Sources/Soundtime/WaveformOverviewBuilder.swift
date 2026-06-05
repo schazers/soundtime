@@ -1,7 +1,7 @@
 import Foundation
 
 enum WaveformOverviewBuilder {
-    static let defaultTargetBinCount = 65_536
+    static let defaultTargetBinCount = 1_048_576
 
     static func build(
         from buffer: DecodedAudioBuffer,
