@@ -106,6 +106,10 @@ struct SoundtimeAudioCoreEngine {
     bool stopWhenTransportRampCompletes = false;
 };
 
+struct SoundtimeAudioCoreSource {
+    std::shared_ptr<const AudioSource> source;
+};
+
 namespace {
 
 void submit_command(SoundtimeAudioCoreEngine& engine, EngineCommand command) {
@@ -215,6 +219,41 @@ void publish_source(SoundtimeAudioCoreEngine& engine, std::shared_ptr<const Audi
     engine.config.gc(ez::gc);
 }
 
+std::shared_ptr<AudioSource> make_planar_source(
+    const float* const* channels,
+    uint64_t frameCount,
+    uint32_t channelCount,
+    double sampleRate
+) {
+    if (channelCount == 0) {
+        return nullptr;
+    }
+
+    if (frameCount > 0 && channels == nullptr) {
+        return nullptr;
+    }
+
+    auto source = std::make_shared<AudioSource>();
+    source->frameCount = frameCount;
+    source->channelCount = channelCount;
+    source->sampleRate = sampleRate;
+    source->interleavedSamples.resize(frameCount * channelCount);
+
+    for (uint32_t channelIndex = 0; channelIndex < channelCount; channelIndex++) {
+        const auto* channelSamples = channels[channelIndex];
+        if (frameCount > 0 && channelSamples == nullptr) {
+            return nullptr;
+        }
+
+        for (uint64_t frameIndex = 0; frameIndex < frameCount; frameIndex++) {
+            source->interleavedSamples[frameIndex * channelCount + channelIndex] =
+                channelSamples[frameIndex];
+        }
+    }
+
+    return source;
+}
+
 void publish_clock_sample(SoundtimeAudioCoreEngine& engine) {
     static_cast<void>(engine.clockSamples.push(ClockSample{
         .frameIndex = engine.frameIndex.load(std::memory_order_acquire),
@@ -232,6 +271,24 @@ SoundtimeAudioCoreEngine* soundtime_audio_core_create(void) {
 
 void soundtime_audio_core_destroy(SoundtimeAudioCoreEngine* engine) {
     delete engine;
+}
+
+SoundtimeAudioCoreSource* soundtime_audio_core_source_create_planar(
+    const float* const* channels,
+    uint64_t frameCount,
+    uint32_t channelCount,
+    double sampleRate
+) {
+    auto source = make_planar_source(channels, frameCount, channelCount, sampleRate);
+    if (!source) {
+        return nullptr;
+    }
+
+    return new SoundtimeAudioCoreSource{.source = source};
+}
+
+void soundtime_audio_core_source_destroy(SoundtimeAudioCoreSource* source) {
+    delete source;
 }
 
 void soundtime_audio_core_reset(SoundtimeAudioCoreEngine* engine) {
@@ -327,29 +384,24 @@ bool soundtime_audio_core_set_planar_source(
         return false;
     }
 
-    if (frameCount > 0 && channels == nullptr) {
+    auto source = make_planar_source(channels, frameCount, channelCount, sampleRate);
+    if (!source) {
         return false;
     }
 
-    auto source = std::make_shared<AudioSource>();
-    source->frameCount = frameCount;
-    source->channelCount = channelCount;
-    source->sampleRate = sampleRate;
-    source->interleavedSamples.resize(frameCount * channelCount);
+    publish_source(*engine, source);
+    return true;
+}
 
-    for (uint32_t channelIndex = 0; channelIndex < channelCount; channelIndex++) {
-        const auto* channelSamples = channels[channelIndex];
-        if (frameCount > 0 && channelSamples == nullptr) {
-            return false;
-        }
-
-        for (uint64_t frameIndex = 0; frameIndex < frameCount; frameIndex++) {
-            source->interleavedSamples[frameIndex * channelCount + channelIndex] =
-                channelSamples[frameIndex];
-        }
+bool soundtime_audio_core_set_prepared_source(
+    SoundtimeAudioCoreEngine* engine,
+    const SoundtimeAudioCoreSource* source
+) {
+    if (engine == nullptr || source == nullptr || !source->source) {
+        return false;
     }
 
-    publish_source(*engine, source);
+    publish_source(*engine, source->source);
     return true;
 }
 

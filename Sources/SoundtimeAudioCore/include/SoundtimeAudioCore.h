@@ -9,6 +9,7 @@ extern "C" {
 #endif
 
 typedef struct SoundtimeAudioCoreEngine SoundtimeAudioCoreEngine;
+typedef struct SoundtimeAudioCoreSource SoundtimeAudioCoreSource;
 
 typedef struct SoundtimeAudioCoreSnapshot {
     uint64_t frameIndex;
@@ -30,6 +31,13 @@ typedef struct SoundtimeAudioCoreClockSample {
 
 SoundtimeAudioCoreEngine* soundtime_audio_core_create(void);
 void soundtime_audio_core_destroy(SoundtimeAudioCoreEngine* engine);
+SoundtimeAudioCoreSource* soundtime_audio_core_source_create_planar(
+    const float* const* channels,
+    uint64_t frameCount,
+    uint32_t channelCount,
+    double sampleRate
+);
+void soundtime_audio_core_source_destroy(SoundtimeAudioCoreSource* source);
 void soundtime_audio_core_reset(SoundtimeAudioCoreEngine* engine);
 void soundtime_audio_core_set_source_info(
     SoundtimeAudioCoreEngine* engine,
@@ -50,6 +58,10 @@ bool soundtime_audio_core_set_planar_source(
     uint64_t frameCount,
     uint32_t channelCount,
     double sampleRate
+);
+bool soundtime_audio_core_set_prepared_source(
+    SoundtimeAudioCoreEngine* engine,
+    const SoundtimeAudioCoreSource* source
 );
 void soundtime_audio_core_play(SoundtimeAudioCoreEngine* engine);
 void soundtime_audio_core_pause(SoundtimeAudioCoreEngine* engine);

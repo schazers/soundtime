@@ -11,6 +11,8 @@ final class HybridPlaybackEngine: PlaybackEngine {
     private let realtimeEngine: RealtimeCorePlaybackEngine?
     private var activeEngine: ActiveEngine = .preview
     private var perceptualVolume: Float = 1
+    private var sourcePreparationTask: Task<Void, Never>?
+    private var sourcePreparationID = UUID()
 
     private var currentEngine: PlaybackEngine {
         switch activeEngine {
@@ -45,6 +47,7 @@ final class HybridPlaybackEngine: PlaybackEngine {
         _ decodedAudioBuffer: DecodedAudioBuffer,
         zeroCrossingIndex: AudioZeroCrossingIndex? = nil
     ) throws {
+        cancelSourcePreparation()
         if let realtimeEngine {
             previewEngine.clear()
             try realtimeEngine.load(decodedAudioBuffer, zeroCrossingIndex: zeroCrossingIndex)
@@ -57,6 +60,7 @@ final class HybridPlaybackEngine: PlaybackEngine {
     }
 
     func loadFile(at url: URL, zeroCrossingProbe: WAVZeroCrossingProbe? = nil) throws {
+        cancelSourcePreparation()
         realtimeEngine?.clear()
         try previewEngine.loadFile(at: url, zeroCrossingProbe: zeroCrossingProbe)
         previewEngine.setPerceptualVolume(perceptualVolume)
@@ -67,7 +71,7 @@ final class HybridPlaybackEngine: PlaybackEngine {
         _ decodedAudioBuffer: DecodedAudioBuffer,
         zeroCrossingIndex: AudioZeroCrossingIndex? = nil
     ) throws {
-        guard let realtimeEngine else {
+        guard realtimeEngine != nil else {
             try previewEngine.replaceWithDecodedSource(
                 decodedAudioBuffer,
                 zeroCrossingIndex: zeroCrossingIndex
@@ -76,21 +80,35 @@ final class HybridPlaybackEngine: PlaybackEngine {
             return
         }
 
-        let previousSnapshot = currentEngine.snapshot()
-        let shouldResume = previousSnapshot.isPlaying
-        previewEngine.pause()
-        try realtimeEngine.load(decodedAudioBuffer, zeroCrossingIndex: zeroCrossingIndex)
-        realtimeEngine.setPerceptualVolume(perceptualVolume)
-        try realtimeEngine.seek(toProgress: previousSnapshot.progress)
+        let preparationID = UUID()
+        sourcePreparationID = preparationID
+        sourcePreparationTask?.cancel()
+        sourcePreparationTask = Task { [weak self, decodedAudioBuffer, zeroCrossingIndex, preparationID] in
+            let preparedSource = await Task.detached(priority: .userInitiated) {
+                PreparedRealtimeAudioSource.make(from: decodedAudioBuffer)
+            }.value
 
-        if shouldResume {
-            try realtimeEngine.play()
+            guard !Task.isCancelled else {
+                return
+            }
+
+            guard let preparedSource else {
+                return
+            }
+
+            guard let self, self.sourcePreparationID == preparationID else {
+                return
+            }
+
+            self.activatePreparedRealtimeSource(
+                preparedSource,
+                zeroCrossingIndex: zeroCrossingIndex
+            )
         }
-
-        activeEngine = .realtime
     }
 
     func clear() {
+        cancelSourcePreparation()
         previewEngine.clear()
         realtimeEngine?.clear()
         activeEngine = .preview
@@ -120,5 +138,43 @@ final class HybridPlaybackEngine: PlaybackEngine {
 
     func snapshot() -> PlaybackSnapshot {
         currentEngine.snapshot()
+    }
+
+    private func activatePreparedRealtimeSource(
+        _ preparedSource: PreparedRealtimeAudioSource,
+        zeroCrossingIndex: AudioZeroCrossingIndex?
+    ) {
+        guard let realtimeEngine else {
+            return
+        }
+
+        let previousSnapshot = currentEngine.snapshot()
+        let shouldResume = previousSnapshot.isPlaying
+
+        do {
+            try realtimeEngine.loadPreparedSource(
+                preparedSource,
+                zeroCrossingIndex: zeroCrossingIndex
+            )
+            realtimeEngine.setPerceptualVolume(perceptualVolume)
+            try realtimeEngine.seek(toProgress: previousSnapshot.progress)
+
+            if shouldResume {
+                previewEngine.pause()
+                try realtimeEngine.play()
+            } else {
+                previewEngine.pause()
+            }
+
+            activeEngine = .realtime
+        } catch {
+            previewEngine.updateZeroCrossingIndex(zeroCrossingIndex)
+        }
+    }
+
+    private func cancelSourcePreparation() {
+        sourcePreparationTask?.cancel()
+        sourcePreparationTask = nil
+        sourcePreparationID = UUID()
     }
 }

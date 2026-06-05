@@ -48,15 +48,26 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         _ decodedAudioBuffer: DecodedAudioBuffer,
         zeroCrossingIndex: AudioZeroCrossingIndex? = nil
     ) throws {
-        let didLoad = core.setPlanarSource(from: decodedAudioBuffer)
+        guard let preparedSource = PreparedRealtimeAudioSource.make(from: decodedAudioBuffer) else {
+            throw PlaybackError.invalidFormat
+        }
+
+        try loadPreparedSource(preparedSource, zeroCrossingIndex: zeroCrossingIndex)
+    }
+
+    func loadPreparedSource(
+        _ preparedSource: PreparedRealtimeAudioSource,
+        zeroCrossingIndex: AudioZeroCrossingIndex? = nil
+    ) throws {
+        let didLoad = core.setPreparedSource(preparedSource)
         guard didLoad else {
             throw PlaybackError.invalidFormat
         }
 
-        frameCount = decodedAudioBuffer.frameCount
-        sampleRate = decodedAudioBuffer.sampleRate
+        frameCount = preparedSource.frameCount
+        sampleRate = preparedSource.sampleRate
         mirroredFrameIndex = 0
-        mirroredFrameCount = decodedAudioBuffer.frameCount
+        mirroredFrameCount = preparedSource.frameCount
         mirroredIsPlaying = false
         mirroredHostTimestamp = CACurrentMediaTime()
         pendingCommandRenderedFrameCount = nil
@@ -64,7 +75,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         zeroCrossingProbe = nil
         sourceLoaded = true
         core.setGain(masterGain)
-        try configureCallbackGraph(sampleRate: decodedAudioBuffer.sampleRate)
+        try configureCallbackGraph(sampleRate: preparedSource.sampleRate)
     }
 
     func loadFile(at url: URL, zeroCrossingProbe: WAVZeroCrossingProbe? = nil) throws {
