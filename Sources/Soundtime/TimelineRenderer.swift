@@ -1,5 +1,5 @@
 import Foundation
-import MetalKit
+import Metal
 import QuartzCore
 import simd
 
@@ -2100,23 +2100,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         )
     }
 
-    @MainActor
-    private func backingScale(for view: MTKView) -> Float {
-        if let windowScale = view.window?.backingScaleFactor, windowScale > 0 {
-            return Float(windowScale)
-        }
-
-        if let layerScale = view.layer?.contentsScale, layerScale > 0 {
-            return Float(layerScale)
-        }
-
-        if let screenScale = NSScreen.main?.backingScaleFactor, screenScale > 0 {
-            return Float(screenScale)
-        }
-
-        return 1
-    }
-
     private static let shaderSource = """
     #include <metal_stdlib>
     using namespace metal;
@@ -2155,25 +2138,4 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         return float4(in.color.rgb, in.color.a * opacity);
     }
     """
-}
-
-extension TimelineRenderer: MTKViewDelegate {
-    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
-
-    func draw(in view: MTKView) {
-        guard
-            let renderPassDescriptor = view.currentRenderPassDescriptor,
-            let drawable = view.currentDrawable
-        else {
-            return
-        }
-
-        render(to: TimelineRenderTarget(
-            renderPassDescriptor: renderPassDescriptor,
-            drawable: drawable,
-            viewportSize: view.bounds.size,
-            backingScale: backingScale(for: view),
-            displayTimestamp: CACurrentMediaTime()
-        ))
-    }
 }
