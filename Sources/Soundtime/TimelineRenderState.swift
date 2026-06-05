@@ -1,13 +1,21 @@
 import Foundation
 
 struct TimelineRenderState: Sendable {
+    struct Track: Sendable {
+        let id: UUID
+        let waveformOverview: WaveformOverview?
+        let volume: Float
+        let isMuted: Bool
+        let isSoloed: Bool
+    }
+
     struct GainPreview: Sendable {
         let selection: TimelineSelection
         let gain: Float
     }
 
     static let empty = TimelineRenderState(
-        waveformOverview: nil,
+        tracks: [],
         viewport: .full,
         playheadProgress: 0,
         playheadAnchorTimestamp: 0,
@@ -19,7 +27,7 @@ struct TimelineRenderState: Sendable {
         gainPreview: nil
     )
 
-    let waveformOverview: WaveformOverview?
+    let tracks: [Track]
     let viewport: TimelineViewport
     let playheadProgress: Float
     let playheadAnchorTimestamp: CFTimeInterval
@@ -30,9 +38,37 @@ struct TimelineRenderState: Sendable {
     let trimPreview: TimelineTrimRange?
     let gainPreview: GainPreview?
 
+    var waveformOverview: WaveformOverview? {
+        tracks.first?.waveformOverview
+    }
+
+    var hasWaveforms: Bool {
+        tracks.contains { $0.waveformOverview?.isEmpty == false }
+    }
+
+    var duration: TimeInterval? {
+        let duration = tracks.reduce(TimeInterval(0)) { result, track in
+            max(result, track.waveformOverview?.duration ?? 0)
+        }
+        return duration > 0 ? duration : nil
+    }
+
     func withWaveformOverview(_ waveformOverview: WaveformOverview?) -> TimelineRenderState {
+        let tracks = waveformOverview.map {
+            [Track(
+                id: UUID(uuidString: "00000000-0000-0000-0000-000000000001") ?? UUID(),
+                waveformOverview: $0,
+                volume: 1,
+                isMuted: false,
+                isSoloed: false
+            )]
+        } ?? []
+        return withTracks(tracks)
+    }
+
+    func withTracks(_ tracks: [Track]) -> TimelineRenderState {
         TimelineRenderState(
-            waveformOverview: waveformOverview,
+            tracks: tracks,
             viewport: viewport,
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
@@ -47,7 +83,7 @@ struct TimelineRenderState: Sendable {
 
     func withViewport(_ viewport: TimelineViewport) -> TimelineRenderState {
         TimelineRenderState(
-            waveformOverview: waveformOverview,
+            tracks: tracks,
             viewport: viewport,
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
@@ -65,7 +101,7 @@ struct TimelineRenderState: Sendable {
         anchorTimestamp: CFTimeInterval? = nil
     ) -> TimelineRenderState {
         TimelineRenderState(
-            waveformOverview: waveformOverview,
+            tracks: tracks,
             viewport: viewport,
             playheadProgress: min(max(playheadProgress, 0), 1),
             playheadAnchorTimestamp: anchorTimestamp ?? playheadAnchorTimestamp,
@@ -80,7 +116,7 @@ struct TimelineRenderState: Sendable {
 
     func withPlaybackActive(_ isPlaybackActive: Bool) -> TimelineRenderState {
         TimelineRenderState(
-            waveformOverview: waveformOverview,
+            tracks: tracks,
             viewport: viewport,
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
@@ -96,7 +132,7 @@ struct TimelineRenderState: Sendable {
     func withHover(progress: Float?, isArmed: Bool) -> TimelineRenderState {
         let clampedProgress = progress.map { min(max($0, 0), 1) }
         return TimelineRenderState(
-            waveformOverview: waveformOverview,
+            tracks: tracks,
             viewport: viewport,
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
@@ -111,7 +147,7 @@ struct TimelineRenderState: Sendable {
 
     func withSelection(_ selection: TimelineSelection?) -> TimelineRenderState {
         TimelineRenderState(
-            waveformOverview: waveformOverview,
+            tracks: tracks,
             viewport: viewport,
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
@@ -126,7 +162,7 @@ struct TimelineRenderState: Sendable {
 
     func withTrimPreview(_ trimPreview: TimelineTrimRange?) -> TimelineRenderState {
         TimelineRenderState(
-            waveformOverview: waveformOverview,
+            tracks: tracks,
             viewport: viewport,
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
@@ -141,7 +177,7 @@ struct TimelineRenderState: Sendable {
 
     func withGainPreview(_ gainPreview: GainPreview?) -> TimelineRenderState {
         TimelineRenderState(
-            waveformOverview: waveformOverview,
+            tracks: tracks,
             viewport: viewport,
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
