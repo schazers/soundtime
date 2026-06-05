@@ -90,6 +90,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var timelineDuration: TimeInterval = 0
     private var pagingPlayheadProgress: Float = 0
     private var pagingPlayheadAnchorTimestamp = CACurrentMediaTime()
+    private var latestSubmittedPresentationTimestamp = CACurrentMediaTime()
     private let selectionDragThreshold: CGFloat = 0.25
     private let trimHandleHitWidth: CGFloat = 18
     private let rightPanVelocitySmoothing: Float = 0.42
@@ -264,6 +265,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     func displayedPlayheadProgress(at timestamp: CFTimeInterval = CACurrentMediaTime()) -> Float? {
         timelineRenderer?.projectedPlayheadProgress(at: timestamp)
+    }
+
+    func pausePresentationPlayheadProgress() -> Float? {
+        let timestamp = max(CACurrentMediaTime(), latestSubmittedPresentationTimestamp)
+        return displayedPlayheadProgress(at: timestamp)
     }
 
     func displayPlaybackActive(_ isActive: Bool) {
@@ -463,6 +469,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return false
         }
 
+        latestSubmittedPresentationTimestamp = frame.targetPresentationTimestamp
         timelineRenderQueue.async { [weak self, timelineRenderer, renderTarget] in
             timelineRenderer.render(to: renderTarget)
             self?.renderFlightGate.finish()

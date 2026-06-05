@@ -235,15 +235,55 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
     func pause() {
         let pauseTimestamp = CACurrentMediaTime()
         let detailedSnapshot = core.detailedSnapshot()
-        mirroredFrameIndex = projectedFrameIndex(
-            from: detailedSnapshot,
-            at: pauseTimestamp
+        pause(
+            atFrame: projectedFrameIndex(
+                from: detailedSnapshot,
+                at: pauseTimestamp
+            ),
+            detailedSnapshot: detailedSnapshot,
+            timestamp: pauseTimestamp
         )
+    }
+
+    func pause(atProgress progress: Float) {
+        let pauseTimestamp = CACurrentMediaTime()
+        let targetFrame = frameIndex(forProgress: progress)
+        pause(
+            atFrame: targetFrame,
+            detailedSnapshot: core.detailedSnapshot(),
+            timestamp: pauseTimestamp
+        )
+    }
+
+    private func pause(
+        atFrame frameIndex: Int,
+        detailedSnapshot: RealtimeAudioCoreSnapshot,
+        timestamp: TimeInterval
+    ) {
+        mirroredFrameIndex = min(max(frameIndex, 0), frameCount)
         mirroredFrameCount = frameCount
         mirroredIsPlaying = false
-        mirroredHostTimestamp = pauseTimestamp
+        mirroredHostTimestamp = timestamp
         pendingCommandRenderedFrameCount = detailedSnapshot.renderedFrameCount
         core.pause(atFrame: mirroredFrameIndex)
+    }
+
+    private func frameIndex(forProgress progress: Float) -> Int {
+        let clampedProgress = min(max(progress, 0), 1)
+        return min(
+            max(Int((clampedProgress * Float(frameCount)).rounded(.down)), 0),
+            frameCount
+        )
+    }
+
+    private func snappedFrameIndex(forProgress progress: Float, snapsToZeroCrossing: Bool) -> Int {
+        let targetFrame = frameIndex(forProgress: progress)
+        return snapsToZeroCrossing ?
+            snappedFrameToZeroCrossing(
+                targetFrame,
+                allowsEnd: targetFrame >= frameCount
+            ) :
+            targetFrame
     }
 
     func seek(toProgress progress: Float) throws {
@@ -263,17 +303,10 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
     }
 
     private func seek(toProgress progress: Float, snapsToZeroCrossing: Bool) throws {
-        let clampedProgress = min(max(progress, 0), 1)
-        let targetFrame = min(
-            max(Int((clampedProgress * Float(frameCount)).rounded(.down)), 0),
-            frameCount
+        let snappedTargetFrame = snappedFrameIndex(
+            forProgress: progress,
+            snapsToZeroCrossing: snapsToZeroCrossing
         )
-        let snappedTargetFrame = snapsToZeroCrossing ?
-            snappedFrameToZeroCrossing(
-                targetFrame,
-                allowsEnd: targetFrame >= frameCount
-            ) :
-            targetFrame
         let detailedSnapshot = core.detailedSnapshot()
         mirroredFrameIndex = snappedTargetFrame
         mirroredFrameCount = frameCount

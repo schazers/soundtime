@@ -82,6 +82,7 @@ protocol PlaybackEngine: AnyObject {
     func togglePlayback() throws -> Bool
     func play() throws
     func pause()
+    func pause(atProgress progress: Float)
     func seek(toProgress progress: Float) throws
     func seekExactly(toProgress progress: Float) throws
     func snapshot() -> PlaybackSnapshot
@@ -104,6 +105,10 @@ extension PlaybackEngine {
     }
 
     func updateProjectTrackMix(_ tracks: [ProjectPlaybackTrack]) {}
+
+    func pause(atProgress progress: Float) {
+        pause()
+    }
 
     func seekExactly(toProgress progress: Float) throws {
         try seek(toProgress: progress)

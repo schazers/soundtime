@@ -188,6 +188,31 @@ final class AudioPlaybackController: PlaybackEngine {
         }
     }
 
+    func pause(atProgress progress: Float) {
+        guard let playbackSource else {
+            return
+        }
+
+        let timedFrame = currentTimedFrame(projectedTo: CACurrentMediaTime())
+        let targetFrame = min(
+            max(Int((min(max(progress, 0), 1) * Float(playbackSource.frameCount)).rounded(.down)), 0),
+            playbackSource.frameCount
+        )
+        pausedFrame = targetFrame
+        pausedFrameHostTimestamp = timedFrame.hostTimestamp
+        isPlayerRunning = false
+        isRestartPending = false
+        beginTransportRamp(to: 0) { [weak self] in
+            guard let self else {
+                return
+            }
+
+            playerNode.pause()
+            transportGain = 1
+            applyOutputVolume()
+        }
+    }
+
     func seek(toProgress progress: Float) throws {
         try seek(
             toProgress: progress,

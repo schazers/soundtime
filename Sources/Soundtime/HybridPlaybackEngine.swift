@@ -181,6 +181,10 @@ final class HybridPlaybackEngine: PlaybackEngine {
         currentEngine.pause()
     }
 
+    func pause(atProgress progress: Float) {
+        currentEngine.pause(atProgress: progress)
+    }
+
     func seek(toProgress progress: Float) throws {
         try currentEngine.seek(toProgress: progress)
     }
