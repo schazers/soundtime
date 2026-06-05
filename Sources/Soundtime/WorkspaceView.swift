@@ -35,7 +35,7 @@ final class WorkspaceView: NSView {
     private var displayedSampleRate: Double = 0
     private var currentPlaybackStatus = "idle"
     private var playbackTimer: Timer?
-    private let playbackController: PlaybackEngine = AudioPlaybackController()
+    private let playbackController: PlaybackEngine = PlaybackEngineFactory.makeDefault()
     private let playbackRefreshRate: TimeInterval = 30
     private var visualPlayheadProgress: Float = 0
     private var visualPlayheadAnchorTimestamp = CACurrentMediaTime()
