@@ -43,13 +43,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         _ decodedAudioBuffer: DecodedAudioBuffer,
         zeroCrossingIndex: AudioZeroCrossingIndex? = nil
     ) throws {
-        let interleavedSamples = Self.makeInterleavedSamples(from: decodedAudioBuffer)
-        let didLoad = core.setInterleavedSource(
-            interleavedSamples,
-            frameCount: decodedAudioBuffer.frameCount,
-            channelCount: decodedAudioBuffer.channelCount,
-            sampleRate: decodedAudioBuffer.sampleRate
-        )
+        let didLoad = core.setPlanarSource(from: decodedAudioBuffer)
         guard didLoad else {
             throw PlaybackError.invalidFormat
         }
@@ -233,24 +227,4 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         return boundedFrame
     }
 
-    private static func makeInterleavedSamples(from decodedAudioBuffer: DecodedAudioBuffer) -> [Float] {
-        guard decodedAudioBuffer.frameCount > 0, decodedAudioBuffer.channelCount > 0 else {
-            return []
-        }
-
-        var samples = [Float](
-            repeating: 0,
-            count: decodedAudioBuffer.frameCount * decodedAudioBuffer.channelCount
-        )
-
-        for channelIndex in 0..<decodedAudioBuffer.channelCount {
-            let channelSamples = decodedAudioBuffer.samplesByChannel[channelIndex]
-            for frameIndex in 0..<decodedAudioBuffer.frameCount {
-                samples[frameIndex * decodedAudioBuffer.channelCount + channelIndex] =
-                    channelSamples[frameIndex]
-            }
-        }
-
-        return samples
-    }
 }

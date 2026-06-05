@@ -183,6 +183,29 @@ void process_commands(SoundtimeAudioCoreEngine& engine, const EngineConfig& conf
     }
 }
 
+void publish_source(SoundtimeAudioCoreEngine& engine, std::shared_ptr<const AudioSource> source) {
+    engine.frameIndex.store(0, std::memory_order_release);
+    engine.renderedFrameCount.store(0, std::memory_order_release);
+    engine.hostTimestamp.store(0, std::memory_order_release);
+    engine.isPlaying.store(false, std::memory_order_release);
+    engine.underrunCount.store(0, std::memory_order_release);
+    engine.droppedCommandCount.store(0, std::memory_order_release);
+    engine.transportGain = 1;
+    engine.transportGainTarget = 1;
+    engine.transportGainStep = 0;
+    engine.transportRampFramesRemaining = 0;
+    engine.stopWhenTransportRampCompletes = false;
+    engine.commandQueue.clear();
+    engine.config.update_publish(ez::nort, [=](EngineConfig config) {
+        config.frameCount = source->frameCount;
+        config.channelCount = source->channelCount;
+        config.sampleRate = source->sampleRate;
+        config.source = source;
+        return config;
+    });
+    engine.config.gc(ez::gc);
+}
+
 } // namespace
 
 SoundtimeAudioCoreEngine* soundtime_audio_core_create(void) {
@@ -269,26 +292,44 @@ bool soundtime_audio_core_set_interleaved_source(
         source->interleavedSamples.assign(samples, samples + sampleCount);
     }
 
-    engine->frameIndex.store(0, std::memory_order_release);
-    engine->renderedFrameCount.store(0, std::memory_order_release);
-    engine->hostTimestamp.store(0, std::memory_order_release);
-    engine->isPlaying.store(false, std::memory_order_release);
-    engine->underrunCount.store(0, std::memory_order_release);
-    engine->droppedCommandCount.store(0, std::memory_order_release);
-    engine->transportGain = 1;
-    engine->transportGainTarget = 1;
-    engine->transportGainStep = 0;
-    engine->transportRampFramesRemaining = 0;
-    engine->stopWhenTransportRampCompletes = false;
-    engine->commandQueue.clear();
-    engine->config.update_publish(ez::nort, [=](EngineConfig config) {
-        config.frameCount = frameCount;
-        config.channelCount = channelCount;
-        config.sampleRate = sampleRate;
-        config.source = source;
-        return config;
-    });
-    engine->config.gc(ez::gc);
+    publish_source(*engine, source);
+    return true;
+}
+
+bool soundtime_audio_core_set_planar_source(
+    SoundtimeAudioCoreEngine* engine,
+    const float* const* channels,
+    uint64_t frameCount,
+    uint32_t channelCount,
+    double sampleRate
+) {
+    if (engine == nullptr || channelCount == 0) {
+        return false;
+    }
+
+    if (frameCount > 0 && channels == nullptr) {
+        return false;
+    }
+
+    auto source = std::make_shared<AudioSource>();
+    source->frameCount = frameCount;
+    source->channelCount = channelCount;
+    source->sampleRate = sampleRate;
+    source->interleavedSamples.resize(frameCount * channelCount);
+
+    for (uint32_t channelIndex = 0; channelIndex < channelCount; channelIndex++) {
+        const auto* channelSamples = channels[channelIndex];
+        if (frameCount > 0 && channelSamples == nullptr) {
+            return false;
+        }
+
+        for (uint64_t frameIndex = 0; frameIndex < frameCount; frameIndex++) {
+            source->interleavedSamples[frameIndex * channelCount + channelIndex] =
+                channelSamples[frameIndex];
+        }
+    }
+
+    publish_source(*engine, source);
     return true;
 }
 

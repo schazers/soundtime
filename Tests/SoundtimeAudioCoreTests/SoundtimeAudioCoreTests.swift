@@ -71,6 +71,42 @@ final class SoundtimeAudioCoreTests: XCTestCase {
         XCTAssertTrue(snapshot.isPlaying)
     }
 
+    func testPlanarSourceRendersWithoutCallerInterleave() throws {
+        let engine = try XCTUnwrap(soundtime_audio_core_create())
+        defer {
+            soundtime_audio_core_destroy(engine)
+        }
+
+        var left: [Float] = [0.25, 0.50, 0.75]
+        var right: [Float] = [-0.25, -0.50, -0.75]
+        let didLoad = left.withUnsafeMutableBufferPointer { leftSamples in
+            right.withUnsafeMutableBufferPointer { rightSamples in
+                var channels = [
+                    UnsafePointer(leftSamples.baseAddress),
+                    UnsafePointer(rightSamples.baseAddress),
+                ]
+                return channels.withUnsafeMutableBufferPointer { channelPointers in
+                    soundtime_audio_core_set_planar_source(
+                        engine,
+                        channelPointers.baseAddress,
+                        3,
+                        2,
+                        48_000
+                    )
+                }
+            }
+        }
+        XCTAssertTrue(didLoad)
+
+        soundtime_audio_core_set_transport_ramp_duration(engine, 0)
+        soundtime_audio_core_play(engine)
+
+        let output = render(engine: engine, channelCount: 2, frameCount: 3, hostTimestamp: 1.5)
+
+        XCTAssertEqual(output[0], [0.25, 0.50, 0.75])
+        XCTAssertEqual(output[1], [-0.25, -0.50, -0.75])
+    }
+
     func testTransportRampIsSampleAccurate() throws {
         let engine = try XCTUnwrap(soundtime_audio_core_create())
         defer {

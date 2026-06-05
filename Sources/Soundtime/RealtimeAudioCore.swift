@@ -51,6 +51,22 @@ final class RealtimeAudioCore {
         }
     }
 
+    func setPlanarSource(from decodedAudioBuffer: DecodedAudioBuffer) -> Bool {
+        guard let engine else {
+            return false
+        }
+
+        return Self.withPlanarSamplePointers(decodedAudioBuffer.samplesByChannel) { channelPointers in
+            soundtime_audio_core_set_planar_source(
+                engine,
+                channelPointers,
+                UInt64(max(decodedAudioBuffer.frameCount, 0)),
+                UInt32(max(decodedAudioBuffer.channelCount, 0)),
+                decodedAudioBuffer.sampleRate
+            )
+        }
+    }
+
     func play() {
         guard let engine else {
             return
@@ -111,5 +127,30 @@ final class RealtimeAudioCore {
             isPlaying: snapshot.isPlaying,
             hostTimestamp: snapshot.hostTimestamp
         )
+    }
+
+    private static func withPlanarSamplePointers<T>(
+        _ samplesByChannel: [[Float]],
+        _ body: (UnsafePointer<UnsafePointer<Float>?>?) -> T
+    ) -> T {
+        var channelPointers = [UnsafePointer<Float>?](
+            repeating: nil,
+            count: samplesByChannel.count
+        )
+
+        func bindChannel(at channelIndex: Int) -> T {
+            guard channelIndex < samplesByChannel.count else {
+                return channelPointers.withUnsafeBufferPointer { pointerBuffer in
+                    body(pointerBuffer.baseAddress)
+                }
+            }
+
+            return samplesByChannel[channelIndex].withUnsafeBufferPointer { sampleBuffer in
+                channelPointers[channelIndex] = sampleBuffer.baseAddress
+                return bindChannel(at: channelIndex + 1)
+            }
+        }
+
+        return bindChannel(at: 0)
     }
 }
