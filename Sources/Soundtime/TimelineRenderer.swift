@@ -558,9 +558,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var trackWaveformMipLevels: [UUID: [WaveformMipLevel]] = [:]
     private var previousTrackWaveformMipLevels: [UUID: [WaveformMipLevel]] = [:]
     private let waveformMipLevelStateLock = NSLock()
+    private var currentTrackWaveformMipKeys: [UUID: WaveformMipCacheKey] = [:]
+    private var currentPrimaryWaveformTrackID: UUID?
     private var previousTransitionTracks: [TimelineRenderState.Track] = []
     private var waveformMipLevelCache: [WaveformMipCacheKey: [WaveformMipLevel]] = [:]
     private var waveformMipLevelCacheOrder: [WaveformMipCacheKey] = []
+    private var waveformMipLevelBuildsInFlight: Set<WaveformMipCacheKey> = []
+    private let waveformMipLevelCacheLock = NSLock()
     private let waveformShaderBufferStore = WaveformShaderBufferStore()
     private var gridCache: GridCache?
     private var waveformTransitionStartTime: CFTimeInterval?
@@ -623,6 +627,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let transientParticleProfileSampleLimit = 2_048
     private let transientParticleMinimumSpacing: TimeInterval = 0.32
     private let transientParticleMaximumScanDuration: TimeInterval = 0.12
+    private let maximumSynchronousGeneratedWaveformMipBins = 8_192
+    private let maximumInFlightWaveformMipBuilds = 4
     private let maximumGeneratedWaveformMipBins = 65_536
     private let generatedWaveformMipSamplesPerBin = 4
     private let highResolutionWaveformVisibleDurationThreshold: TimeInterval = 30
@@ -737,11 +743,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     func displayTracks(_ tracks: [TimelineRenderState.Track]) {
         let previousTracks = renderState.tracks
         let hasNextWaveforms = tracks.contains { $0.waveformOverview?.isEmpty == false }
-        let nextTrackWaveformMipLevels = Dictionary(
-            uniqueKeysWithValues: tracks.map { track in
-                (track.id, cachedWaveformMipLevels(for: track))
+        var nextTrackWaveformMipLevels: [UUID: [WaveformMipLevel]] = [:]
+        var nextTrackWaveformMipKeys: [UUID: WaveformMipCacheKey] = [:]
+        for track in tracks {
+            let mipLevels = cachedWaveformMipLevels(for: track)
+            nextTrackWaveformMipLevels[track.id] = mipLevels
+            if let key = waveformMipCacheKey(for: track) {
+                nextTrackWaveformMipKeys[track.id] = key
             }
-        )
+        }
         let nextWaveformMipLevels = tracks.first.flatMap { nextTrackWaveformMipLevels[$0.id] } ?? []
         if renderState.hasWaveforms, hasNextWaveforms {
             waveformMipLevelStateLock.lock()
@@ -762,6 +772,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         waveformMipLevelStateLock.lock()
         waveformMipLevels = nextWaveformMipLevels
         trackWaveformMipLevels = nextTrackWaveformMipLevels
+        currentTrackWaveformMipKeys = nextTrackWaveformMipKeys
+        currentPrimaryWaveformTrackID = tracks.first?.id
         waveformMipLevelStateLock.unlock()
         prewarmInitialWaveformShaderBuffers(
             tracks: tracks,
@@ -1744,7 +1756,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             shaderBufferCount: waveformBufferDiagnostics.bufferCount,
             shaderBufferByteCount: waveformBufferDiagnostics.byteCount,
             shaderBufferUploadInFlightCount: waveformBufferDiagnostics.inFlightCount,
-            waveformMipCacheCount: waveformMipLevelCache.count
+            waveformMipCacheCount: waveformMipCacheDiagnostics().cacheCount
         )
 
         frameRateWindowStartTime = currentTime
@@ -1754,6 +1766,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         frameIntervalSquareSum = 0
         worstFrameInterval = 0
         onFrameStatsChanged?(frameStats)
+    }
+
+    private func waveformMipCacheDiagnostics() -> (cacheCount: Int, inFlightCount: Int) {
+        waveformMipLevelCacheLock.lock()
+        defer {
+            waveformMipLevelCacheLock.unlock()
+        }
+
+        return (waveformMipLevelCache.count, waveformMipLevelBuildsInFlight.count)
     }
 
     private func resetFrameDiagnosticsForNextFrame() {
@@ -4350,6 +4371,37 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         return levels
     }
 
+    private func makeInitialWaveformMipLevels(from waveformOverview: WaveformOverview?) -> [WaveformMipLevel] {
+        guard let waveformOverview, !waveformOverview.isEmpty else {
+            return []
+        }
+
+        let sourceBinCount = waveformOverview.bins.count
+        guard sourceBinCount > maximumSynchronousGeneratedWaveformMipBins else {
+            return makeWaveformMipLevels(from: waveformOverview)
+        }
+
+        var levels = [
+            WaveformMipLevel(overview: waveformOverview, binCount: sourceBinCount),
+        ]
+        var targetBinCount = min(sourceBinCount / 2, maximumSynchronousGeneratedWaveformMipBins)
+
+        while targetBinCount >= 256 {
+            let mipOverview = sampledWaveformOverview(
+                from: waveformOverview,
+                targetBinCount: targetBinCount,
+                samplesPerBin: generatedWaveformMipSamplesPerBin
+            )
+            levels.append(WaveformMipLevel(
+                overview: mipOverview,
+                binCount: mipOverview.bins.count
+            ))
+            targetBinCount /= 2
+        }
+
+        return levels
+    }
+
     private func sampledWaveformOverview(
         from waveformOverview: WaveformOverview,
         targetBinCount: Int,
@@ -4395,31 +4447,113 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return []
         }
 
-        let key = WaveformMipCacheKey(
+        let key = waveformMipCacheKey(for: track)
+        guard let key else {
+            return []
+        }
+
+        waveformMipLevelCacheLock.lock()
+        if let cachedLevels = waveformMipLevelCache[key] {
+            markWaveformMipCacheRecentlyUsedLocked(key)
+            waveformMipLevelCacheLock.unlock()
+            return cachedLevels
+        }
+        waveformMipLevelCacheLock.unlock()
+
+        let initialLevels = makeInitialWaveformMipLevels(from: waveformOverview)
+        publishWaveformMipLevelsToCache(initialLevels, for: key)
+        scheduleCompleteWaveformMipLevelBuild(for: key, waveformOverview: waveformOverview)
+
+        return initialLevels
+    }
+
+    private func waveformMipCacheKey(for track: TimelineRenderState.Track) -> WaveformMipCacheKey? {
+        guard let waveformOverview = track.waveformOverview, !waveformOverview.isEmpty else {
+            return nil
+        }
+
+        return WaveformMipCacheKey(
             trackID: track.id,
             waveformVersion: track.waveformVersion,
             binCount: waveformOverview.bins.count,
             duration: waveformOverview.duration
         )
-        if let cachedLevels = waveformMipLevelCache[key] {
-            markWaveformMipCacheRecentlyUsed(key)
-            return cachedLevels
+    }
+
+    private func scheduleCompleteWaveformMipLevelBuild(
+        for key: WaveformMipCacheKey,
+        waveformOverview: WaveformOverview
+    ) {
+        guard waveformOverview.bins.count > maximumSynchronousGeneratedWaveformMipBins else {
+            return
         }
 
+        waveformMipLevelCacheLock.lock()
+        guard
+            !waveformMipLevelBuildsInFlight.contains(key),
+            waveformMipLevelBuildsInFlight.count < maximumInFlightWaveformMipBuilds
+        else {
+            waveformMipLevelCacheLock.unlock()
+            return
+        }
+        waveformMipLevelBuildsInFlight.insert(key)
+        waveformMipLevelCacheLock.unlock()
+
+        waveformGeometryQueue.async { [weak self] in
+            guard let self else {
+                return
+            }
+
+            let levels = self.makeWaveformMipLevels(from: waveformOverview)
+            self.publishCompleteWaveformMipLevels(levels, for: key)
+        }
+    }
+
+    private func publishCompleteWaveformMipLevels(
+        _ levels: [WaveformMipLevel],
+        for key: WaveformMipCacheKey
+    ) {
+        publishWaveformMipLevelsToCache(levels, for: key)
+
+        var shouldNotify = false
+        waveformMipLevelStateLock.lock()
+        if currentTrackWaveformMipKeys[key.trackID] == key {
+            trackWaveformMipLevels[key.trackID] = levels
+            if currentPrimaryWaveformTrackID == key.trackID {
+                waveformMipLevels = levels
+            }
+            shouldNotify = true
+        }
+        waveformMipLevelStateLock.unlock()
+
+        waveformMipLevelCacheLock.lock()
+        waveformMipLevelBuildsInFlight.remove(key)
+        waveformMipLevelCacheLock.unlock()
+
+        if shouldNotify {
+            onRenderDataPrepared?()
+        }
+    }
+
+    private func publishWaveformMipLevelsToCache(
+        _ levels: [WaveformMipLevel],
+        for key: WaveformMipCacheKey
+    ) {
+        waveformMipLevelCacheLock.lock()
         while waveformMipLevelCache.count >= maximumCachedWaveformMipPyramids,
               let oldestKey = waveformMipLevelCacheOrder.first
         {
             waveformMipLevelCacheOrder.removeFirst()
             waveformMipLevelCache.removeValue(forKey: oldestKey)
+            waveformMipLevelBuildsInFlight.remove(oldestKey)
         }
 
-        let levels = makeWaveformMipLevels(from: waveformOverview)
         waveformMipLevelCache[key] = levels
-        markWaveformMipCacheRecentlyUsed(key)
-        return levels
+        markWaveformMipCacheRecentlyUsedLocked(key)
+        waveformMipLevelCacheLock.unlock()
     }
 
-    private func markWaveformMipCacheRecentlyUsed(_ key: WaveformMipCacheKey) {
+    private func markWaveformMipCacheRecentlyUsedLocked(_ key: WaveformMipCacheKey) {
         waveformMipLevelCacheOrder.removeAll { $0 == key }
         waveformMipLevelCacheOrder.append(key)
     }
