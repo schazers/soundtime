@@ -86,6 +86,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     private struct PlayheadContactEvent {
         let centerY: Float
+        let laneTop: Float
+        let laneBottom: Float
         let strength: Float
         let timestamp: CFTimeInterval
     }
@@ -366,7 +368,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let playheadKickTrailDuration: CFTimeInterval = 0.38
     private let playheadKickTrailLineCount = 10
     private let playheadContactFadeDuration: CFTimeInterval = 0.6
-    private let playheadContactMaximumEventCount = 160
+    private let playheadContactMaximumEventCount = 1_024
     private let maximumCachedWaveformMipPyramids = 12
 
     init(device: MTLDevice, pixelFormat: MTLPixelFormat) throws {
@@ -1468,27 +1470,27 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         playheadProgress: Float,
         renderState: TimelineRenderState
     ) -> [TimelineVertex] {
-        guard renderState.tracks.count <= 1 else {
-            return []
-        }
-
         guard
-            let mipLevel = waveformMipLevel(for: drawableSize, renderState: renderState),
-            !mipLevel.overview.isEmpty
+            renderState.hasWaveforms,
+            let projectDuration = renderState.duration,
+            projectDuration.isFinite,
+            projectDuration > 0
         else {
             return []
         }
 
-        let bins = mipLevel.overview.bins
-        let binCount = bins.count
-        let centerY: Float = 0.5
-        let amplitudeHeight: Float = 0.42
-        let minimumVisualHeight: Float = 0.004
+        let tracks = renderState.tracks
+        let trackCount = tracks.count
+        guard trackCount > 0 else {
+            return []
+        }
+
+        let laneHeight = Float(1) / Float(trackCount)
         let touchEnergy = currentPlayheadTouchEnergy(isPlaybackActive: renderState.isPlaybackActive)
         let clampedPlayhead = playheadProgress
-        let geometryAheadRadius = playheadTouchGeometryAheadRadiusProgress(forDuration: mipLevel.overview.duration)
-        let lightAheadRadius = playheadTouchLightAheadRadiusProgress(forDuration: mipLevel.overview.duration)
-        let trailRadius = playheadTouchTrailRadiusProgress(forDuration: mipLevel.overview.duration)
+        let geometryAheadRadius = playheadTouchGeometryAheadRadiusProgress(forDuration: projectDuration)
+        let lightAheadRadius = playheadTouchLightAheadRadiusProgress(forDuration: projectDuration)
+        let trailRadius = playheadTouchTrailRadiusProgress(forDuration: projectDuration)
         let viewport = renderState.viewport
         let playthroughTrailStart = playheadTouchPlayStartProgress.map {
             min(max($0, 0), clampedPlayhead)
@@ -1498,77 +1500,130 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             playthroughTrailStart ?? 0,
             viewport.startProgress
         )
-        let visibleTouchEnd = min(clampedPlayhead + max(geometryAheadRadius, lightAheadRadius), viewport.endProgress)
-        let startIndex = max(Int(floor(visibleTouchStart * Float(binCount))) - 1, 0)
-        let endIndex = min(Int(ceil(visibleTouchEnd * Float(binCount))) + 1, binCount)
+        let visibleTouchEnd = min(
+            clampedPlayhead + max(geometryAheadRadius, lightAheadRadius),
+            viewport.endProgress
+        )
 
-        guard startIndex < endIndex else {
+        guard visibleTouchStart < visibleTouchEnd else {
             return []
         }
 
         var vertices: [TimelineVertex] = []
-        vertices.reserveCapacity((endIndex - startIndex) * 6)
+        let anySolo = tracks.contains { $0.isSoloed }
 
-        for index in startIndex..<endIndex {
-            let bin = bins[index]
-            let timelineX0 = Float(index) / Float(binCount)
-            let timelineX1 = Float(index + 1) / Float(binCount)
-            let x0 = viewport.viewportProgress(forTimelineProgress: timelineX0)
-            let x1 = viewport.viewportProgress(forTimelineProgress: timelineX1)
-            guard x1 > 0, x0 < 1 else {
+        for (trackIndex, track) in tracks.enumerated() {
+            guard
+                let overview = track.waveformOverview,
+                !overview.isEmpty,
+                let mipLevels = trackWaveformMipLevels[track.id],
+                let mipLevel = waveformMipLevel(
+                    for: drawableSize,
+                    renderState: renderState,
+                    mipLevels: mipLevels
+                )
+            else {
                 continue
             }
 
-            let binCenter = (timelineX0 + timelineX1) * 0.5
-            if let playthroughTrailStart, binCenter < playthroughTrailStart {
+            let bins = mipLevel.overview.bins
+            let binCount = bins.count
+            let trackDurationProgress = min(max(Float(overview.duration / projectDuration), 0), 1)
+            guard binCount > 0, trackDurationProgress > 0 else {
                 continue
             }
 
-            let geometryInfluenceRaw = playheadTouchGeometryInfluence(
-                offsetFromPlayhead: binCenter - clampedPlayhead,
-                aheadRadius: geometryAheadRadius,
-                trailRadius: trailRadius
-            )
-            let lightInfluenceRaw = playheadTouchLightInfluence(
-                offsetFromPlayhead: binCenter - clampedPlayhead,
-                aheadRadius: lightAheadRadius,
-                trailRadius: trailRadius
-            )
-            guard max(geometryInfluenceRaw, lightInfluenceRaw) > 0.001 else {
+            let trackVisibleTouchStart = max(visibleTouchStart, 0)
+            let trackVisibleTouchEnd = min(visibleTouchEnd, trackDurationProgress)
+            guard trackVisibleTouchStart < trackVisibleTouchEnd else {
                 continue
             }
 
-            let geometryInfluence = geometryInfluenceRaw * touchEnergy
-            let expansion = 1 + 0.22 * geometryInfluence
-            var y0 = centerY - bin.maximumSample * amplitudeHeight * expansion
-            var y1 = centerY - bin.minimumSample * amplitudeHeight * expansion
-
-            if y1 - y0 < minimumVisualHeight {
-                let midpoint = (y0 + y1) * 0.5
-                let visualHeight = minimumVisualHeight + 0.014 * geometryInfluence
-                y0 = midpoint - visualHeight * 0.5
-                y1 = midpoint + visualHeight * 0.5
+            let laneTop = Float(trackIndex) * laneHeight
+            let laneBottom = laneTop + laneHeight
+            let centerY = laneTop + laneHeight * 0.5
+            let amplitudeHeight = laneHeight * 0.39 * min(max(track.volume, 0), 1.8)
+            let minimumVisualHeight = laneHeight * 0.004
+            let isAudible = !track.isMuted && (!anySolo || track.isSoloed)
+            let audibleEnergy = touchEnergy * (isAudible ? 1 : 0.22)
+            let startIndex = max(
+                Int(floor(trackVisibleTouchStart / trackDurationProgress * Float(binCount))) - 1,
+                0
+            )
+            let endIndex = min(
+                Int(ceil(trackVisibleTouchEnd / trackDurationProgress * Float(binCount))) + 1,
+                binCount
+            )
+            guard startIndex < endIndex else {
+                continue
             }
 
-            let baseColor = SIMD3<Float>(waveformBaseGray, waveformBaseGray, waveformBaseGray)
-            let whiteColor = SIMD3<Float>(1.0, 1.0, 1.0)
-            let colorInfluence = lightInfluenceRaw * touchEnergy
-            let blendedColor = baseColor + (whiteColor - baseColor) * colorInfluence
-            let color = SIMD4<Float>(
-                blendedColor.x,
-                blendedColor.y,
-                blendedColor.z,
-                (0.12 + 0.88 * colorInfluence) * touchEnergy
-            )
+            vertices.reserveCapacity(vertices.count + (endIndex - startIndex) * 6)
+            for index in startIndex..<endIndex {
+                let bin = bins[index]
+                let localX0 = Float(index) / Float(binCount)
+                let localX1 = Float(index + 1) / Float(binCount)
+                let timelineX0 = localX0 * trackDurationProgress
+                let timelineX1 = localX1 * trackDurationProgress
+                let x0 = viewport.viewportProgress(forTimelineProgress: timelineX0)
+                let x1 = viewport.viewportProgress(forTimelineProgress: timelineX1)
+                guard x1 > 0, x0 < 1 else {
+                    continue
+                }
 
-            appendRectangle(
-                to: &vertices,
-                left: max(x0, 0),
-                right: min(x1, 1),
-                top: max(y0, 0),
-                bottom: min(y1, 1),
-                color: color
-            )
+                let binCenter = (timelineX0 + timelineX1) * 0.5
+                if let playthroughTrailStart, binCenter < playthroughTrailStart {
+                    continue
+                }
+
+                let geometryInfluenceRaw = playheadTouchGeometryInfluence(
+                    offsetFromPlayhead: binCenter - clampedPlayhead,
+                    aheadRadius: geometryAheadRadius,
+                    trailRadius: trailRadius
+                )
+                let lightInfluenceRaw = playheadTouchLightInfluence(
+                    offsetFromPlayhead: binCenter - clampedPlayhead,
+                    aheadRadius: lightAheadRadius,
+                    trailRadius: trailRadius
+                )
+                guard max(geometryInfluenceRaw, lightInfluenceRaw) > 0.001 else {
+                    continue
+                }
+
+                let geometryInfluence = geometryInfluenceRaw * audibleEnergy
+                let expansion = 1 + 0.22 * geometryInfluence
+                let gain = previewGain(forBinStart: timelineX0, end: timelineX1, renderState: renderState)
+                var y0 = centerY - clampAudioSample(bin.maximumSample * gain) * amplitudeHeight * expansion
+                var y1 = centerY - clampAudioSample(bin.minimumSample * gain) * amplitudeHeight * expansion
+
+                if y1 - y0 < minimumVisualHeight {
+                    let midpoint = (y0 + y1) * 0.5
+                    let visualHeight = minimumVisualHeight + laneHeight * 0.014 * geometryInfluence
+                    y0 = midpoint - visualHeight * 0.5
+                    y1 = midpoint + visualHeight * 0.5
+                }
+
+                let baseGray = waveformBaseGray * (isAudible ? 1 : 0.68)
+                let baseColor = SIMD3<Float>(baseGray, baseGray, baseGray)
+                let whiteColor = SIMD3<Float>(1.0, 1.0, 1.0)
+                let colorInfluence = lightInfluenceRaw * audibleEnergy
+                let blendedColor = baseColor + (whiteColor - baseColor) * colorInfluence
+                let color = SIMD4<Float>(
+                    blendedColor.x,
+                    blendedColor.y,
+                    blendedColor.z,
+                    (0.12 + 0.88 * colorInfluence) * audibleEnergy
+                )
+
+                appendRectangle(
+                    to: &vertices,
+                    left: max(x0, 0),
+                    right: min(x1, 1),
+                    top: max(y0, laneTop),
+                    bottom: min(y1, laneBottom),
+                    color: color
+                )
+            }
         }
 
         return vertices
@@ -1999,6 +2054,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         playheadContactEvents.append(contentsOf: contacts.map { contact in
             PlayheadContactEvent(
                 centerY: contact.centerY,
+                laneTop: contact.laneTop,
+                laneBottom: contact.laneBottom,
                 strength: contact.strength,
                 timestamp: displayTimestamp
             )
@@ -2012,40 +2069,96 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private func playheadWaveformContacts(
         at playheadProgress: Float,
         renderState: TimelineRenderState
-    ) -> [(centerY: Float, strength: Float)]? {
-        guard let mipLevel = waveformMipLevels.first, !mipLevel.overview.isEmpty else {
+    ) -> [(centerY: Float, laneTop: Float, laneBottom: Float, strength: Float)]? {
+        guard
+            renderState.hasWaveforms,
+            let projectDuration = renderState.duration,
+            projectDuration.isFinite,
+            projectDuration > 0
+        else {
             return nil
         }
 
-        let bins = mipLevel.overview.bins
-        let binCount = bins.count
-        guard binCount > 0 else {
+        let tracks = renderState.tracks
+        let trackCount = tracks.count
+        guard trackCount > 0 else {
             return nil
         }
 
         let clampedProgress = min(max(playheadProgress, 0), 1)
-        let index = min(max(Int((clampedProgress * Float(binCount)).rounded(.down)), 0), binCount - 1)
-        let bin = bins[index]
-        let timelineX0 = Float(index) / Float(binCount)
-        let timelineX1 = Float(index + 1) / Float(binCount)
-        let gain = previewGain(forBinStart: timelineX0, end: timelineX1, renderState: renderState)
-        let minimumSample = clampAudioSample(bin.minimumSample * gain)
-        let maximumSample = clampAudioSample(bin.maximumSample * gain)
-        let centerY: Float = 0.5
-        let amplitudeHeight: Float = 0.42
-        let topY = centerY - maximumSample * amplitudeHeight
-        let bottomY = centerY - minimumSample * amplitudeHeight
-        let amplitude = max(abs(minimumSample), abs(maximumSample))
-        let strength = min(max(0.38 + amplitude * 0.62, 0), 1)
+        let laneHeight = Float(1) / Float(trackCount)
+        let anySolo = tracks.contains { $0.isSoloed }
+        var contacts: [(centerY: Float, laneTop: Float, laneBottom: Float, strength: Float)] = []
+        contacts.reserveCapacity(trackCount * 2)
 
-        if abs(bottomY - topY) < 0.012 {
-            return [(centerY: min(max((topY + bottomY) * 0.5, 0), 1), strength: strength)]
+        for (trackIndex, track) in tracks.enumerated() {
+            guard !track.isMuted, !anySolo || track.isSoloed else {
+                continue
+            }
+
+            guard
+                let overview = track.waveformOverview,
+                !overview.isEmpty,
+                let mipLevel = trackWaveformMipLevels[track.id]?.first,
+                !mipLevel.overview.isEmpty
+            else {
+                continue
+            }
+
+            let trackDurationProgress = min(max(Float(overview.duration / projectDuration), 0), 1)
+            guard clampedProgress <= trackDurationProgress, trackDurationProgress > 0 else {
+                continue
+            }
+
+            let bins = mipLevel.overview.bins
+            let binCount = bins.count
+            guard binCount > 0 else {
+                continue
+            }
+
+            let localProgress = min(max(clampedProgress / trackDurationProgress, 0), 1)
+            let index = min(max(Int((localProgress * Float(binCount)).rounded(.down)), 0), binCount - 1)
+            let bin = bins[index]
+            let localX0 = Float(index) / Float(binCount)
+            let localX1 = Float(index + 1) / Float(binCount)
+            let timelineX0 = localX0 * trackDurationProgress
+            let timelineX1 = localX1 * trackDurationProgress
+            let gain = previewGain(forBinStart: timelineX0, end: timelineX1, renderState: renderState)
+            let minimumSample = clampAudioSample(bin.minimumSample * gain)
+            let maximumSample = clampAudioSample(bin.maximumSample * gain)
+            let laneTop = Float(trackIndex) * laneHeight
+            let laneBottom = laneTop + laneHeight
+            let centerY = laneTop + laneHeight * 0.5
+            let amplitudeHeight = laneHeight * 0.39 * min(max(track.volume, 0), 1.8)
+            let topY = min(max(centerY - maximumSample * amplitudeHeight, laneTop), laneBottom)
+            let bottomY = min(max(centerY - minimumSample * amplitudeHeight, laneTop), laneBottom)
+            let amplitude = max(abs(minimumSample), abs(maximumSample))
+            let strength = min(max(0.38 + amplitude * 0.62, 0), 1)
+
+            if abs(bottomY - topY) < laneHeight * 0.012 {
+                contacts.append((
+                    centerY: min(max((topY + bottomY) * 0.5, laneTop), laneBottom),
+                    laneTop: laneTop,
+                    laneBottom: laneBottom,
+                    strength: strength
+                ))
+            } else {
+                contacts.append((
+                    centerY: topY,
+                    laneTop: laneTop,
+                    laneBottom: laneBottom,
+                    strength: strength
+                ))
+                contacts.append((
+                    centerY: bottomY,
+                    laneTop: laneTop,
+                    laneBottom: laneBottom,
+                    strength: strength
+                ))
+            }
         }
 
-        return [
-            (centerY: min(max(topY, 0), 1), strength: strength),
-            (centerY: min(max(bottomY, 0), 1), strength: strength),
-        ]
+        return contacts.isEmpty ? nil : contacts
     }
 
     private func appendPlayheadContactVertices(
@@ -2072,8 +2185,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 continue
             }
 
-            let centerY = event.centerY * drawableSize.y
-            let mirrorY = (1 - event.centerY) * drawableSize.y
+            let laneTop = min(max(event.laneTop * drawableSize.y, 0), drawableSize.y)
+            let laneBottom = min(max(event.laneBottom * drawableSize.y, laneTop), drawableSize.y)
+            guard laneBottom > laneTop else {
+                continue
+            }
+
+            let centerY = min(max(event.centerY * drawableSize.y, laneTop), laneBottom)
+            let mirrorY = min(max(laneTop + laneBottom - centerY, laneTop), laneBottom)
             let spanTop = min(centerY, mirrorY)
             let spanBottom = max(centerY, mirrorY)
             let haloAlpha = min(0.075 * easedEnergy * event.strength, 0.11)
@@ -2106,7 +2225,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 centerX: playheadX,
                 leftWidth: haloHalfWidth,
                 rightWidth: haloHalfWidth,
-                top: max(spanTop - haloFadeDistance, 0),
+                top: max(spanTop - haloFadeDistance, laneTop),
                 bottom: spanTop,
                 topColor: transparentContactColor,
                 bottomColor: haloColor,
@@ -2119,7 +2238,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 leftWidth: haloHalfWidth,
                 rightWidth: haloHalfWidth,
                 top: spanBottom,
-                bottom: min(spanBottom + haloFadeDistance, drawableSize.y),
+                bottom: min(spanBottom + haloFadeDistance, laneBottom),
                 topColor: haloColor,
                 bottomColor: transparentContactColor,
                 drawableSize: drawableSize,
@@ -2149,7 +2268,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 centerX: playheadX,
                 leftWidth: lineHalfWidth,
                 rightWidth: lineHalfWidth,
-                top: max(spanTop - coreFadeDistance, 0),
+                top: max(spanTop - coreFadeDistance, laneTop),
                 bottom: spanTop,
                 topColor: transparentContactColor,
                 bottomColor: coreColor,
@@ -2162,7 +2281,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 leftWidth: lineHalfWidth,
                 rightWidth: lineHalfWidth,
                 top: spanBottom,
-                bottom: min(spanBottom + coreFadeDistance, drawableSize.y),
+                bottom: min(spanBottom + coreFadeDistance, laneBottom),
                 topColor: coreColor,
                 bottomColor: transparentContactColor,
                 drawableSize: drawableSize,
