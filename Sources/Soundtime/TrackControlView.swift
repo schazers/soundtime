@@ -95,13 +95,13 @@ final class TrackControlView: NSView {
             titleLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
 
             volumeSlider.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 8),
-            volumeSlider.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            volumeSlider.leadingAnchor.constraint(equalTo: buttonStack.trailingAnchor, constant: 12),
             volumeSlider.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
             volumeSlider.widthAnchor.constraint(equalToConstant: 24),
 
             buttonStack.centerYAnchor.constraint(equalTo: volumeSlider.centerYAnchor),
-            buttonStack.leadingAnchor.constraint(equalTo: volumeSlider.trailingAnchor, constant: 12),
-            buttonStack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8),
+            buttonStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            volumeSlider.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8),
 
             soloButton.widthAnchor.constraint(equalToConstant: 34),
             soloButton.heightAnchor.constraint(equalToConstant: 28),
