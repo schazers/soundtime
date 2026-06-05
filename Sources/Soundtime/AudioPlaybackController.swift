@@ -3,7 +3,7 @@ import Foundation
 import QuartzCore
 
 @MainActor
-final class AudioPlaybackController {
+final class AudioPlaybackController: PlaybackEngine {
     private enum PlaybackSource {
         case decoded(DecodedAudioBuffer)
         case file(AVAudioFile)
@@ -23,42 +23,6 @@ final class AudioPlaybackController {
                 decodedAudioBuffer.sampleRate
             case let .file(audioFile):
                 audioFile.processingFormat.sampleRate
-            }
-        }
-    }
-
-    struct Snapshot {
-        let frameIndex: Int
-        let frameCount: Int
-        let isPlaying: Bool
-        let hostTimestamp: TimeInterval
-
-        var progress: Float {
-            guard frameCount > 0 else {
-                return 0
-            }
-
-            return min(max(Float(frameIndex) / Float(frameCount), 0), 1)
-        }
-
-        var isAtEnd: Bool {
-            frameCount > 0 && frameIndex >= frameCount
-        }
-    }
-
-    enum PlaybackError: LocalizedError {
-        case noAudioLoaded
-        case invalidFormat
-        case bufferCreationFailed
-
-        var errorDescription: String? {
-            switch self {
-            case .noAudioLoaded:
-                "No decoded WAV is loaded."
-            case .invalidFormat:
-                "The decoded WAV has an unsupported playback format."
-            case .bufferCreationFailed:
-                "Could not create the playback buffer."
             }
         }
     }
@@ -302,9 +266,9 @@ final class AudioPlaybackController {
         }
     }
 
-    func snapshot() -> Snapshot {
+    func snapshot() -> PlaybackSnapshot {
         guard let playbackSource else {
-            return Snapshot(
+            return PlaybackSnapshot(
                 frameIndex: 0,
                 frameCount: 0,
                 isPlaying: false,
@@ -326,7 +290,7 @@ final class AudioPlaybackController {
             }
         }
 
-        return Snapshot(
+        return PlaybackSnapshot(
             frameIndex: min(frameIndex, sourceFrameCount),
             frameCount: sourceFrameCount,
             isPlaying: isPlaying,
