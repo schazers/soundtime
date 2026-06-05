@@ -53,6 +53,7 @@ struct ProjectPlaybackTrack: Sendable {
 
     let id: UUID
     let source: Source
+    let sourceRevision: Int
     let volume: Float
     let isMuted: Bool
     let isSoloed: Bool

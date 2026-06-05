@@ -3,12 +3,24 @@ import QuartzCore
 
 @MainActor
 final class RealtimeCorePlaybackEngine: PlaybackEngine {
+    private struct PreparedProjectTrack {
+        let id: UUID
+        let sourceRevision: Int
+        let source: PreparedRealtimeAudioSource
+        let zeroCrossingIndex: AudioZeroCrossingIndex?
+        let zeroCrossingProbe: WAVZeroCrossingProbe?
+        var volume: Float
+        var isMuted: Bool
+        var isSoloed: Bool
+    }
+
     private let core: RealtimeAudioCore
     private let outputDevice: RealtimeAudioOutputDevice
     private var frameCount = 0
     private var sampleRate: Double = 0
     private var zeroCrossingIndex: AudioZeroCrossingIndex?
     private var zeroCrossingProbe: WAVZeroCrossingProbe?
+    private var preparedProjectTracks: [PreparedProjectTrack] = []
     private var sourceLoaded = false
     private var masterGain: Float = 1
     private var mirroredFrameIndex = 0
@@ -25,7 +37,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         frameCount > 0
     }
 
-    init?(outputDevice: RealtimeAudioOutputDevice = AVAudioSourceNodeOutputDevice()) {
+    init?(outputDevice: RealtimeAudioOutputDevice = AudioUnitOutputDevice()) {
         guard let core = RealtimeAudioCore() else {
             return nil
         }
@@ -71,6 +83,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         self.zeroCrossingIndex = zeroCrossingIndex
         zeroCrossingProbe = nil
         sourceLoaded = true
+        preparedProjectTracks.removeAll()
         core.setGain(masterGain)
         try configureOutputDevice(sampleRate: preparedSource.sampleRate)
     }
@@ -92,9 +105,56 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         pendingCommandRenderedFrameCount = nil
         zeroCrossingIndex = nil
         self.zeroCrossingProbe = zeroCrossingProbe
+        preparedProjectTracks.removeAll()
         sourceLoaded = false
         core.setGain(masterGain)
         try configureOutputDevice(sampleRate: fileInfo.sampleRate)
+    }
+
+    func loadProjectTracks(_ tracks: [ProjectPlaybackTrack]) throws {
+        guard !tracks.isEmpty else {
+            clear()
+            return
+        }
+
+        let preparedTracks = try tracks.map { track in
+            try preparedProjectTrack(from: track)
+        }
+
+        let sampleRate = preparedTracks[0].source.sampleRate
+        guard
+            sampleRate > 0,
+            preparedTracks.allSatisfy({ $0.source.sampleRate == sampleRate })
+        else {
+            throw PlaybackError.invalidFormat
+        }
+
+        let didLoad = core.setPreparedTracks(
+            preparedTracks.map { preparedTrack in
+                PreparedRealtimeAudioTrack(
+                    source: preparedTrack.source,
+                    gain: effectiveTrackGain(preparedTrack, in: preparedTracks)
+                )
+            }
+        )
+        guard didLoad else {
+            throw PlaybackError.invalidFormat
+        }
+
+        frameCount = preparedTracks.map { $0.source.frameCount }.max() ?? 0
+        self.sampleRate = sampleRate
+        mirroredFrameIndex = 0
+        mirroredFrameCount = frameCount
+        mirroredIsPlaying = false
+        mirroredHostTimestamp = CACurrentMediaTime()
+        pendingCommandRenderedFrameCount = nil
+        preparedProjectTracks = preparedTracks
+        let referenceTrack = zeroCrossingReferenceTrack(in: preparedTracks)
+        zeroCrossingIndex = referenceTrack?.zeroCrossingIndex
+        zeroCrossingProbe = referenceTrack?.zeroCrossingProbe
+        sourceLoaded = true
+        core.setGain(masterGain)
+        try configureOutputDevice(sampleRate: sampleRate)
     }
 
     func replaceWithDecodedSource(
@@ -126,6 +186,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         pendingCommandRenderedFrameCount = nil
         zeroCrossingIndex = nil
         zeroCrossingProbe = nil
+        preparedProjectTracks.removeAll()
         sourceLoaded = false
         outputDevice.stop()
     }
@@ -177,8 +238,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         mirroredIsPlaying = false
         mirroredHostTimestamp = pauseTimestamp
         pendingCommandRenderedFrameCount = detailedSnapshot.renderedFrameCount
-        core.seek(toFrame: mirroredFrameIndex)
-        core.pause()
+        core.pause(atFrame: mirroredFrameIndex)
     }
 
     func seek(toProgress progress: Float) throws {
@@ -201,6 +261,35 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         mirroredHostTimestamp = CACurrentMediaTime()
         pendingCommandRenderedFrameCount = detailedSnapshot.renderedFrameCount
         core.seek(toFrame: snappedTargetFrame)
+    }
+
+    func updateProjectTrackMix(_ tracks: [ProjectPlaybackTrack]) {
+        guard !preparedProjectTracks.isEmpty else {
+            return
+        }
+
+        var updatedPreparedTracks = preparedProjectTracks
+        for track in tracks {
+            guard let preparedTrackIndex = updatedPreparedTracks.firstIndex(where: { $0.id == track.id }) else {
+                continue
+            }
+
+            updatedPreparedTracks[preparedTrackIndex].volume = track.volume
+            updatedPreparedTracks[preparedTrackIndex].isMuted = track.isMuted
+            updatedPreparedTracks[preparedTrackIndex].isSoloed = track.isSoloed
+        }
+
+        let didPublish = core.updatePreparedTracks(
+            updatedPreparedTracks.map { preparedTrack in
+                PreparedRealtimeAudioTrack(
+                    source: preparedTrack.source,
+                    gain: effectiveTrackGain(preparedTrack, in: updatedPreparedTracks)
+                )
+            }
+        )
+        if didPublish {
+            preparedProjectTracks = updatedPreparedTracks
+        }
     }
 
     func snapshot() -> PlaybackSnapshot {
@@ -265,6 +354,71 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         }
 
         try outputDevice.configure(corePointer: corePointer, sampleRate: sampleRate)
+    }
+
+    private func preparedProjectTrack(from track: ProjectPlaybackTrack) throws -> PreparedProjectTrack {
+        let preparedSource: PreparedRealtimeAudioSource
+        let zeroCrossingIndex: AudioZeroCrossingIndex?
+        let zeroCrossingProbe: WAVZeroCrossingProbe?
+
+        switch track.source {
+        case let .decoded(decodedAudioBuffer, sourceZeroCrossingIndex):
+            if let existingPreparedTrack = preparedProjectTracks.first(where: { existingTrack in
+                existingTrack.id == track.id &&
+                    existingTrack.sourceRevision == track.sourceRevision &&
+                    existingTrack.source.frameCount == decodedAudioBuffer.frameCount &&
+                    existingTrack.source.channelCount == decodedAudioBuffer.channelCount &&
+                    existingTrack.source.sampleRate == decodedAudioBuffer.sampleRate
+            }) {
+                preparedSource = existingPreparedTrack.source
+                zeroCrossingIndex = sourceZeroCrossingIndex
+                zeroCrossingProbe = nil
+                break
+            }
+
+            guard let source = PreparedRealtimeAudioSource.make(from: decodedAudioBuffer) else {
+                throw PlaybackError.invalidFormat
+            }
+            preparedSource = source
+            zeroCrossingIndex = sourceZeroCrossingIndex
+            zeroCrossingProbe = nil
+        case .file:
+            throw PlaybackError.invalidFormat
+        }
+
+        return PreparedProjectTrack(
+            id: track.id,
+            sourceRevision: track.sourceRevision,
+            source: preparedSource,
+            zeroCrossingIndex: zeroCrossingIndex,
+            zeroCrossingProbe: zeroCrossingProbe,
+            volume: track.volume,
+            isMuted: track.isMuted,
+            isSoloed: track.isSoloed
+        )
+    }
+
+    private func effectiveTrackGain(
+        _ track: PreparedProjectTrack,
+        in tracks: [PreparedProjectTrack]
+    ) -> Float {
+        let anySoloedTrack = tracks.contains { $0.isSoloed }
+        guard
+            !track.isMuted,
+            !anySoloedTrack || track.isSoloed
+        else {
+            return 0
+        }
+
+        let clampedVolume = min(max(track.volume, 0), 1)
+        return clampedVolume * clampedVolume
+    }
+
+    private func zeroCrossingReferenceTrack(in tracks: [PreparedProjectTrack]) -> PreparedProjectTrack? {
+        let anySoloedTrack = tracks.contains { $0.isSoloed }
+        return tracks.first { track in
+            !track.isMuted && (!anySoloedTrack || track.isSoloed)
+        } ?? tracks.first
     }
 
     private func snappedFrameToZeroCrossing(

@@ -73,6 +73,11 @@ final class PreparedRealtimeAudioSource: @unchecked Sendable {
     }
 }
 
+struct PreparedRealtimeAudioTrack: Sendable {
+    let source: PreparedRealtimeAudioSource
+    let gain: Float
+}
+
 final class RealtimeAudioCore {
     private var engine: OpaquePointer?
 
@@ -150,6 +155,48 @@ final class RealtimeAudioCore {
         )
     }
 
+    func setPreparedTracks(_ tracks: [PreparedRealtimeAudioTrack]) -> Bool {
+        guard let engine, !tracks.isEmpty else {
+            return false
+        }
+
+        return withTrackConfigs(tracks) { trackConfigs in
+            soundtime_audio_core_set_prepared_tracks(
+                engine,
+                trackConfigs.baseAddress,
+                UInt32(trackConfigs.count)
+            )
+        }
+    }
+
+    func updatePreparedTracks(_ tracks: [PreparedRealtimeAudioTrack]) -> Bool {
+        guard let engine, !tracks.isEmpty else {
+            return false
+        }
+
+        return withTrackConfigs(tracks) { trackConfigs in
+            soundtime_audio_core_update_prepared_tracks(
+                engine,
+                trackConfigs.baseAddress,
+                UInt32(trackConfigs.count)
+            )
+        }
+    }
+
+    private func withTrackConfigs<T>(
+        _ tracks: [PreparedRealtimeAudioTrack],
+        _ body: (UnsafeBufferPointer<SoundtimeAudioCoreTrackConfig>) -> T
+    ) -> T {
+        let trackConfigs = tracks.map { track in
+            SoundtimeAudioCoreTrackConfig(
+                source: track.source.sourcePointer,
+                gain: max(track.gain, 0)
+            )
+        }
+
+        return trackConfigs.withUnsafeBufferPointer(body)
+    }
+
     func play() {
         guard let engine else {
             return
@@ -164,6 +211,14 @@ final class RealtimeAudioCore {
         }
 
         soundtime_audio_core_pause(engine)
+    }
+
+    func pause(atFrame frameIndex: Int) {
+        guard let engine else {
+            return
+        }
+
+        soundtime_audio_core_pause_at(engine, UInt64(max(frameIndex, 0)))
     }
 
     func seek(toFrame frameIndex: Int) {

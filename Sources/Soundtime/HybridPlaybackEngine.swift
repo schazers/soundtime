@@ -140,14 +140,32 @@ final class HybridPlaybackEngine: PlaybackEngine {
     func loadProjectTracks(_ tracks: [ProjectPlaybackTrack]) throws {
         cancelSourcePreparation()
         previewEngine.clear()
-        realtimeEngine?.clear()
+        if let realtimeEngine {
+            multitrackEngine.clear()
+            do {
+                try realtimeEngine.loadProjectTracks(tracks)
+                realtimeEngine.setPerceptualVolume(perceptualVolume)
+                activeEngine = .realtime
+                return
+            } catch {
+                realtimeEngine.clear()
+            }
+        }
+
         try multitrackEngine.loadProjectTracks(tracks)
         multitrackEngine.setPerceptualVolume(perceptualVolume)
         activeEngine = .multitrack
     }
 
     func updateProjectTrackMix(_ tracks: [ProjectPlaybackTrack]) {
-        multitrackEngine.updateProjectTrackMix(tracks)
+        switch activeEngine {
+        case .realtime:
+            realtimeEngine?.updateProjectTrackMix(tracks)
+        case .multitrack:
+            multitrackEngine.updateProjectTrackMix(tracks)
+        case .preview:
+            break
+        }
     }
 
     @discardableResult
