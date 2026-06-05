@@ -172,7 +172,7 @@ final class AudioPlaybackController: PlaybackEngine {
             return
         }
 
-        let timedFrame = currentTimedFrame()
+        let timedFrame = currentTimedFrame(projectedTo: CACurrentMediaTime())
         pausedFrame = min(max(timedFrame.frameIndex, 0), playbackSource.frameCount)
         pausedFrameHostTimestamp = timedFrame.hostTimestamp
         isPlayerRunning = false
@@ -289,7 +289,7 @@ final class AudioPlaybackController: PlaybackEngine {
         }
 
         let sourceFrameCount = playbackSource.frameCount
-        let timedFrame = currentTimedFrame()
+        let timedFrame = currentTimedFrame(projectedTo: CACurrentMediaTime())
         let frameIndex = timedFrame.frameIndex
         if isPlayerRunning, frameIndex >= sourceFrameCount {
             finishAtEnd()
@@ -310,11 +310,11 @@ final class AudioPlaybackController: PlaybackEngine {
         )
     }
 
-    private func currentTimedFrame() -> (frameIndex: Int, hostTimestamp: TimeInterval) {
+    private func currentTimedFrame(projectedTo timestamp: TimeInterval? = nil) -> (frameIndex: Int, hostTimestamp: TimeInterval) {
         guard let playbackSource else {
             return (0, CACurrentMediaTime())
         }
-        let currentHostTimestamp = CACurrentMediaTime()
+        let currentHostTimestamp = timestamp ?? CACurrentMediaTime()
         guard isPlayerRunning else {
             return (pausedFrame, pausedFrameHostTimestamp)
         }
@@ -326,8 +326,16 @@ final class AudioPlaybackController: PlaybackEngine {
         }
 
         let elapsedFrames = max(Int(playerTime.sampleTime), 0)
-        let frameIndex = min(scheduledStartFrame + elapsedFrames, playbackSource.frameCount)
-        return (frameIndex, AVAudioTime.seconds(forHostTime: nodeTime.hostTime))
+        let renderHostTimestamp = AVAudioTime.seconds(forHostTime: nodeTime.hostTime)
+        let projectedElapsedFrames = max(
+            Int(((currentHostTimestamp - renderHostTimestamp) * playbackSource.sampleRate).rounded(.down)),
+            0
+        )
+        let frameIndex = min(
+            scheduledStartFrame + elapsedFrames + projectedElapsedFrames,
+            playbackSource.frameCount
+        )
+        return (frameIndex, currentHostTimestamp)
     }
 
     private func finishAtEnd() {

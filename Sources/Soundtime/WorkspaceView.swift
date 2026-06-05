@@ -1933,7 +1933,17 @@ final class WorkspaceView: NSView {
         }
 
         do {
+            let wasPlaying = playbackController.isPlaying
+            let pauseVisualProgress = wasPlaying && displayedDuration > 0 ?
+                projectedVisualPlayheadProgress(
+                    at: CACurrentMediaTime(),
+                    duration: displayedDuration
+                ) :
+                nil
             let isPlaying = try playbackController.togglePlayback()
+            if wasPlaying, !isPlaying, let pauseVisualProgress {
+                try alignPausedTransportToVisiblePlayhead(pauseVisualProgress)
+            }
             refreshPlaybackProgress(syncPlayheadWhenPlaying: true)
 
             if isPlaying {
@@ -1947,6 +1957,25 @@ final class WorkspaceView: NSView {
             stopPlaybackTimer()
             updateStatus("playback failed: \(error.localizedDescription)")
         }
+    }
+
+    private func alignPausedTransportToVisiblePlayhead(_ visibleProgress: Float) throws {
+        let snapshot = playbackController.snapshot()
+        guard
+            !snapshot.isPlaying,
+            snapshot.frameCount > 0,
+            displayedDuration > 0
+        else {
+            return
+        }
+
+        let clampedVisibleProgress = min(max(visibleProgress, 0), 1)
+        let backwardCorrectionSeconds = TimeInterval(clampedVisibleProgress - snapshot.progress) * displayedDuration
+        guard backwardCorrectionSeconds > visualAudioSyncDeadband else {
+            return
+        }
+
+        try playbackController.seek(toProgress: clampedVisibleProgress)
     }
 
     private func seek(to progress: Float) {

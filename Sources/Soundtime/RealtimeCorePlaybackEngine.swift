@@ -211,8 +211,6 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             throw PlaybackError.noAudioLoaded
         }
 
-        try outputDevice.start()
-
         let detailedSnapshot = core.detailedSnapshot()
         if mirroredFrameIndex >= frameCount {
             mirroredFrameIndex = 0
@@ -225,6 +223,13 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         pendingCommandRenderedFrameCount = detailedSnapshot.renderedFrameCount
         core.seek(toFrame: mirroredFrameIndex)
         core.play()
+        do {
+            try outputDevice.start()
+        } catch {
+            mirroredIsPlaying = false
+            core.pause(atFrame: mirroredFrameIndex)
+            throw error
+        }
     }
 
     func pause() {
