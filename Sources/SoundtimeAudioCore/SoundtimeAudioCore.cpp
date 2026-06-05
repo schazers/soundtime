@@ -18,6 +18,18 @@ struct AudioSource {
     double sampleRate = 0;
 };
 
+struct RenderSegment {
+    uint64_t outputStartFrame = 0;
+    uint64_t sourceStartFrame = 0;
+    uint64_t frameCount = 0;
+    float gain = 1;
+};
+
+struct RenderGraph {
+    uint64_t frameCount = 0;
+    std::vector<RenderSegment> segments;
+};
+
 struct EngineConfig {
     uint64_t frameCount = 0;
     uint32_t channelCount = 0;
@@ -25,6 +37,7 @@ struct EngineConfig {
     float gain = 1;
     double transportRampDurationSeconds = 0.018;
     std::shared_ptr<const AudioSource> source;
+    std::shared_ptr<const RenderGraph> graph;
 };
 
 enum class EngineCommandType : uint8_t {
@@ -196,6 +209,17 @@ void process_commands(SoundtimeAudioCoreEngine& engine, const EngineConfig& conf
 }
 
 void publish_source(SoundtimeAudioCoreEngine& engine, std::shared_ptr<const AudioSource> source) {
+    auto graph = std::make_shared<RenderGraph>();
+    graph->frameCount = source->frameCount;
+    if (source->frameCount > 0) {
+        graph->segments.push_back(RenderSegment{
+            .outputStartFrame = 0,
+            .sourceStartFrame = 0,
+            .frameCount = source->frameCount,
+            .gain = 1,
+        });
+    }
+
     engine.frameIndex.store(0, std::memory_order_release);
     engine.renderedFrameCount.store(0, std::memory_order_release);
     engine.hostTimestamp.store(0, std::memory_order_release);
@@ -214,6 +238,7 @@ void publish_source(SoundtimeAudioCoreEngine& engine, std::shared_ptr<const Audi
         config.channelCount = source->channelCount;
         config.sampleRate = source->sampleRate;
         config.source = source;
+        config.graph = graph;
         return config;
     });
     engine.config.gc(ez::gc);
@@ -340,6 +365,8 @@ void soundtime_audio_core_set_source_info(
         config.frameCount = frameCount;
         config.channelCount = channelCount;
         config.sampleRate = sampleRate;
+        config.source = nullptr;
+        config.graph = nullptr;
         return config;
     });
     engine->config.gc(ez::gc);
@@ -589,11 +616,53 @@ void soundtime_audio_core_render_at_host_time(
         std::min<uint64_t>(frameCount, sourceFrameCount - currentFrameIndex) :
         0;
     uint64_t advancedFrameCount = 0;
-    if (const auto& source = config->source) {
+    if (const auto& source = config->source; source && config->graph) {
         const auto sourceChannelCount = source->channelCount;
+        const auto& segments = config->graph->segments;
+        size_t segmentIndex = 0;
+        while (
+            segmentIndex < segments.size() &&
+            currentFrameIndex >= segments[segmentIndex].outputStartFrame + segments[segmentIndex].frameCount
+        ) {
+            segmentIndex++;
+        }
+
         for (uint64_t frameOffset = 0; frameOffset < renderableFrameCount; frameOffset++) {
-            const auto outputGain = config->gain * next_transport_gain(*engine);
-            const auto sourceFrameIndex = currentFrameIndex + frameOffset;
+            const auto transportGain = next_transport_gain(*engine);
+            const auto outputFrameIndex = currentFrameIndex + frameOffset;
+            while (
+                segmentIndex < segments.size() &&
+                outputFrameIndex >= segments[segmentIndex].outputStartFrame + segments[segmentIndex].frameCount
+            ) {
+                segmentIndex++;
+            }
+
+            advancedFrameCount++;
+            if (segmentIndex >= segments.size()) {
+                if (!engine->isPlaying.load(std::memory_order_acquire)) {
+                    break;
+                }
+                continue;
+            }
+
+            const auto& segment = segments[segmentIndex];
+            if (outputFrameIndex < segment.outputStartFrame) {
+                if (!engine->isPlaying.load(std::memory_order_acquire)) {
+                    break;
+                }
+                continue;
+            }
+
+            const auto segmentFrameOffset = outputFrameIndex - segment.outputStartFrame;
+            const auto segmentSourceFrameIndex = segment.sourceStartFrame + segmentFrameOffset;
+            if (segmentSourceFrameIndex >= source->frameCount) {
+                if (!engine->isPlaying.load(std::memory_order_acquire)) {
+                    break;
+                }
+                continue;
+            }
+
+            const auto outputGain = config->gain * segment.gain * transportGain;
             for (uint32_t outputChannel = 0; outputChannel < channelCount; outputChannel++) {
                 auto* output = outputs[outputChannel];
                 if (output == nullptr) {
@@ -607,10 +676,9 @@ void soundtime_audio_core_render_at_host_time(
                     continue;
                 }
 
-                const auto sampleIndex = sourceFrameIndex * sourceChannelCount + sourceChannel;
+                const auto sampleIndex = segmentSourceFrameIndex * sourceChannelCount + sourceChannel;
                 output[frameOffset] = source->interleavedSamples[sampleIndex] * outputGain;
             }
-            advancedFrameCount++;
             if (!engine->isPlaying.load(std::memory_order_acquire)) {
                 break;
             }
