@@ -71,6 +71,7 @@ final class MultitrackPlaybackController: PlaybackEngine {
     private var masterVolume: Float = 1
     private var transportGain: Float = 1
     private let transportRampDuration: TimeInterval = 0.018
+    private let synchronizedStartDelay: TimeInterval = 0.02
     private let playbackChunkDuration: TimeInterval = 0.25
     private let playbackInitialScheduleAheadDuration: TimeInterval = 0.4
     private let playbackScheduleAheadDuration: TimeInterval = 1.4
@@ -229,18 +230,12 @@ final class MultitrackPlaybackController: PlaybackEngine {
             aheadDuration: playbackInitialScheduleAheadDuration
         )
 
-        if !engine.isRunning {
-            try engine.start()
-        }
-
         transportGain = 0
         applyOutputVolume()
-        for trackID in trackOrder {
-            trackPlayers[trackID]?.playerNode.play()
-        }
+        let startHostTimestamp = try startAllPlayerNodesSynchronously()
 
         playbackStartProjectFrame = pausedProjectFrame
-        playbackStartHostTimestamp = CACurrentMediaTime()
+        playbackStartHostTimestamp = startHostTimestamp
         isPlayerRunning = true
         isRestartPending = false
         beginTransportRamp(to: 1)
@@ -317,18 +312,12 @@ final class MultitrackPlaybackController: PlaybackEngine {
                     aheadDuration: playbackInitialScheduleAheadDuration
                 )
 
-                if !engine.isRunning {
-                    try engine.start()
-                }
-
                 transportGain = 0
                 applyOutputVolume()
-                for trackID in trackOrder {
-                    trackPlayers[trackID]?.playerNode.play()
-                }
+                let startHostTimestamp = try startAllPlayerNodesSynchronously()
 
                 playbackStartProjectFrame = snappedTargetFrame
-                playbackStartHostTimestamp = CACurrentMediaTime()
+                playbackStartHostTimestamp = startHostTimestamp
                 isPlayerRunning = true
                 isRestartPending = false
                 beginTransportRamp(to: 1)
@@ -403,6 +392,19 @@ final class MultitrackPlaybackController: PlaybackEngine {
             zeroCrossingIndex: zeroCrossingIndex,
             zeroCrossingProbe: zeroCrossingProbe
         )
+    }
+
+    private func startAllPlayerNodesSynchronously() throws -> TimeInterval {
+        if !engine.isRunning {
+            try engine.start()
+        }
+
+        let startHostTime = mach_absolute_time() + AVAudioTime.hostTime(forSeconds: synchronizedStartDelay)
+        let startTime = AVAudioTime(hostTime: startHostTime)
+        for trackID in trackOrder {
+            trackPlayers[trackID]?.playerNode.play(at: startTime)
+        }
+        return AVAudioTime.seconds(forHostTime: startHostTime)
     }
 
     private func currentTimedProjectFrame() -> (frameIndex: Int, hostTimestamp: TimeInterval) {
