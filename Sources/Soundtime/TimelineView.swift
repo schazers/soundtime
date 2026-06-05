@@ -40,6 +40,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onClearRecentProjectsRequested: (() -> Void)?
     var onSaveProjectRequested: (() -> Void)?
     var onSaveProjectAsRequested: (() -> Void)?
+    var onToggleDebugTools: (() -> Void)?
     var onGainRequested: (() -> Void)?
     var onFadeInRequested: (() -> Void)?
     var onFadeOutRequested: (() -> Void)?
@@ -53,6 +54,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var canApplyGainEffect = false
     var canApplyFadeEffect = false
     var canReapplyLastEffect = false
+    var isDebugToolsVisible = false
 
     private enum TimelineDragMode {
         case selection
@@ -718,6 +720,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onSaveProjectAsRequested?()
     }
 
+    @objc func toggleDebugTools(_ sender: Any?) {
+        onToggleDebugTools?()
+    }
+
     @objc func undoTimelineEdit(_ sender: Any?) {
         onUndo?()
     }
@@ -758,6 +764,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return canApplyFadeEffect
         case #selector(reapplyLastEffect(_:)):
             return canReapplyLastEffect
+        case #selector(toggleDebugTools(_:)):
+            menuItem.state = isDebugToolsVisible ? .on : .off
+            return true
         default:
             return true
         }
