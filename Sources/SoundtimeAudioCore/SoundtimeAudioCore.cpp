@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -13,7 +15,19 @@
 namespace {
 
 struct AudioSource {
+    enum class Storage {
+        interleavedFloat,
+        wavBytes,
+    };
+
+    Storage storage = Storage::interleavedFloat;
     std::vector<float> interleavedSamples;
+    const uint8_t* wavBytes = nullptr;
+    uint64_t wavByteCount = 0;
+    uint64_t wavDataOffset = 0;
+    uint32_t wavBlockAlign = 0;
+    uint16_t wavFormatTag = 0;
+    uint16_t wavBitsPerSample = 0;
     uint64_t frameCount = 0;
     uint32_t channelCount = 0;
     double sampleRate = 0;
@@ -45,8 +59,17 @@ struct EngineConfig {
     double sampleRate = 0;
     float gain = 1;
     double transportRampDurationSeconds = 0.018;
+    double trackGainRampDurationSeconds = 0.003;
     std::shared_ptr<const AudioSource> source;
     std::shared_ptr<const RenderGraph> graph;
+};
+
+struct TrackGainRamp {
+    std::shared_ptr<const AudioSource> source;
+    float currentGain = 0;
+    float targetGain = 0;
+    float gainStep = 0;
+    uint64_t rampFramesRemaining = 0;
 };
 
 enum class EngineCommandType : uint8_t {
@@ -66,6 +89,20 @@ struct ClockSample {
     uint64_t renderedFrameCount = 0;
     double hostTimestamp = 0;
     bool isPlaying = false;
+};
+
+struct MeterSample {
+    uint64_t startFrameIndex = 0;
+    uint64_t frameCount = 0;
+    uint64_t renderedFrameCount = 0;
+    double hostTimestamp = 0;
+    bool isPlaying = false;
+    float leftRMS = 0;
+    float rightRMS = 0;
+    float leftPeak = 0;
+    float rightPeak = 0;
+    float leftClipPeak = 0;
+    float rightClipPeak = 0;
 };
 
 template <typename T, size_t Capacity>
@@ -113,6 +150,10 @@ private:
 } // namespace
 
 struct SoundtimeAudioCoreEngine {
+    SoundtimeAudioCoreEngine() {
+        trackGainRamps.reserve(64);
+    }
+
     std::atomic<uint64_t> frameIndex{0};
     std::atomic<uint64_t> renderedFrameCount{0};
     std::atomic<double> hostTimestamp{0};
@@ -122,6 +163,7 @@ struct SoundtimeAudioCoreEngine {
     ez::sync<EngineConfig> config;
     SPSCQueue<EngineCommand, 256> commandQueue;
     SPSCQueue<ClockSample, 1024> clockSamples;
+    SPSCQueue<MeterSample, 1024> meterSamples;
     float transportGain = 1;
     float transportGainTarget = 1;
     float transportGainStep = 0;
@@ -129,6 +171,8 @@ struct SoundtimeAudioCoreEngine {
     bool stopWhenTransportRampCompletes = false;
     uint64_t transportPauseFrameIndex = 0;
     bool hasTransportPauseFrameIndex = false;
+    std::shared_ptr<const RenderGraph> trackGainRampGraph;
+    std::vector<TrackGainRamp> trackGainRamps;
 };
 
 struct SoundtimeAudioCoreSource {
@@ -198,6 +242,191 @@ float next_transport_gain(SoundtimeAudioCoreEngine& engine, bool& completedTrans
     return engine.transportGain;
 }
 
+uint64_t track_gain_ramp_frame_count(const EngineConfig& config) {
+    return config.trackGainRampDurationSeconds > 0 && config.sampleRate > 0 ?
+        static_cast<uint64_t>(config.trackGainRampDurationSeconds * config.sampleRate + 0.5) :
+        uint64_t{0};
+}
+
+void begin_track_gain_ramp(
+    TrackGainRamp& ramp,
+    float targetGain,
+    uint64_t rampFrames
+) {
+    ramp.targetGain = std::max(targetGain, 0.0f);
+    if (rampFrames == 0) {
+        ramp.currentGain = ramp.targetGain;
+        ramp.gainStep = 0;
+        ramp.rampFramesRemaining = 0;
+        return;
+    }
+
+    ramp.rampFramesRemaining = rampFrames;
+    ramp.gainStep = (ramp.targetGain - ramp.currentGain) / static_cast<float>(rampFrames);
+}
+
+float next_track_gain(TrackGainRamp& ramp) {
+    if (ramp.rampFramesRemaining == 0) {
+        return ramp.currentGain;
+    }
+
+    ramp.currentGain += ramp.gainStep;
+    ramp.rampFramesRemaining--;
+    if (ramp.rampFramesRemaining == 0) {
+        ramp.currentGain = ramp.targetGain;
+        ramp.gainStep = 0;
+    }
+
+    return ramp.currentGain;
+}
+
+float clamp_audio_sample(float sample) {
+    if (sample > 1.0f) {
+        return 1.0f;
+    }
+    if (sample < -1.0f) {
+        return -1.0f;
+    }
+    return sample;
+}
+
+uint16_t read_u16_le(const uint8_t* bytes) {
+    return static_cast<uint16_t>(bytes[0]) |
+        static_cast<uint16_t>(static_cast<uint16_t>(bytes[1]) << 8);
+}
+
+uint32_t read_u32_le(const uint8_t* bytes) {
+    return static_cast<uint32_t>(bytes[0]) |
+        (static_cast<uint32_t>(bytes[1]) << 8) |
+        (static_cast<uint32_t>(bytes[2]) << 16) |
+        (static_cast<uint32_t>(bytes[3]) << 24);
+}
+
+uint64_t read_u64_le(const uint8_t* bytes) {
+    return static_cast<uint64_t>(read_u32_le(bytes)) |
+        (static_cast<uint64_t>(read_u32_le(bytes + 4)) << 32);
+}
+
+int32_t read_i24_le(const uint8_t* bytes) {
+    auto value = static_cast<int32_t>(
+        static_cast<uint32_t>(bytes[0]) |
+        (static_cast<uint32_t>(bytes[1]) << 8) |
+        (static_cast<uint32_t>(bytes[2]) << 16)
+    );
+    if ((value & 0x0080'0000) != 0) {
+        value |= static_cast<int32_t>(0xFF00'0000);
+    }
+    return value;
+}
+
+float decode_wav_sample_at(const AudioSource& source, uint64_t frameIndex, uint32_t channelIndex) {
+    const auto bytesPerSample = source.wavBitsPerSample / 8;
+    if (
+        source.wavBytes == nullptr ||
+        bytesPerSample == 0 ||
+        frameIndex >= source.frameCount ||
+        channelIndex >= source.channelCount
+    ) {
+        return 0.0f;
+    }
+
+    const auto byteOffset = source.wavDataOffset +
+        frameIndex * source.wavBlockAlign +
+        static_cast<uint64_t>(channelIndex) * bytesPerSample;
+    if (byteOffset + bytesPerSample > source.wavByteCount) {
+        return 0.0f;
+    }
+
+    const auto* sampleBytes = source.wavBytes + byteOffset;
+    switch (source.wavFormatTag) {
+    case 1:
+        switch (source.wavBitsPerSample) {
+        case 8:
+            return clamp_audio_sample((static_cast<float>(sampleBytes[0]) - 128.0f) / 128.0f);
+        case 16: {
+            const auto sample = static_cast<int16_t>(read_u16_le(sampleBytes));
+            return clamp_audio_sample(static_cast<float>(sample) / 32'768.0f);
+        }
+        case 24:
+            return clamp_audio_sample(static_cast<float>(read_i24_le(sampleBytes)) / 8'388'608.0f);
+        case 32: {
+            const auto sample = static_cast<int32_t>(read_u32_le(sampleBytes));
+            return clamp_audio_sample(static_cast<float>(sample) / 2'147'483'648.0f);
+        }
+        default:
+            return 0.0f;
+        }
+    case 3:
+        switch (source.wavBitsPerSample) {
+        case 32: {
+            const auto bits = read_u32_le(sampleBytes);
+            auto sample = float{};
+            std::memcpy(&sample, &bits, sizeof(sample));
+            return clamp_audio_sample(sample);
+        }
+        case 64: {
+            const auto bits = read_u64_le(sampleBytes);
+            auto sample = double{};
+            std::memcpy(&sample, &bits, sizeof(sample));
+            return clamp_audio_sample(static_cast<float>(sample));
+        }
+        default:
+            return 0.0f;
+        }
+    default:
+        return 0.0f;
+    }
+}
+
+float sample_at(const AudioSource& source, uint64_t frameIndex, uint32_t channelIndex) {
+    if (frameIndex >= source.frameCount || channelIndex >= source.channelCount) {
+        return 0.0f;
+    }
+
+    if (source.storage == AudioSource::Storage::wavBytes) {
+        return decode_wav_sample_at(source, frameIndex, channelIndex);
+    }
+
+    const auto sampleIndex = frameIndex * source.channelCount + channelIndex;
+    if (sampleIndex >= source.interleavedSamples.size()) {
+        return 0.0f;
+    }
+
+    return source.interleavedSamples[sampleIndex];
+}
+
+void reconcile_track_gain_ramps(
+    SoundtimeAudioCoreEngine& engine,
+    const EngineConfig& config,
+    const RenderGraph& graph
+) {
+    if (engine.trackGainRampGraph == config.graph &&
+        engine.trackGainRamps.size() == graph.tracks.size()) {
+        return;
+    }
+
+    const auto rampFrames = track_gain_ramp_frame_count(config);
+    const auto previousRampCount = engine.trackGainRamps.size();
+    engine.trackGainRamps.resize(graph.tracks.size());
+    for (size_t trackIndex = 0; trackIndex < graph.tracks.size(); trackIndex++) {
+        const auto& track = graph.tracks[trackIndex];
+        auto& ramp = engine.trackGainRamps[trackIndex];
+        const auto targetGain = std::max(track.gain, 0.0f);
+
+        if (trackIndex < previousRampCount && ramp.source == track.source) {
+            begin_track_gain_ramp(ramp, targetGain, rampFrames);
+        } else {
+            ramp.source = track.source;
+            ramp.currentGain = targetGain;
+            ramp.targetGain = targetGain;
+            ramp.gainStep = 0;
+            ramp.rampFramesRemaining = 0;
+        }
+    }
+
+    engine.trackGainRampGraph = config.graph;
+}
+
 void process_commands(SoundtimeAudioCoreEngine& engine, const EngineConfig& config) {
     auto command = EngineCommand{};
     while (engine.commandQueue.pop(command)) {
@@ -254,8 +483,11 @@ void reset_engine_runtime(SoundtimeAudioCoreEngine& engine) {
     engine.stopWhenTransportRampCompletes = false;
     engine.transportPauseFrameIndex = 0;
     engine.hasTransportPauseFrameIndex = false;
+    engine.trackGainRampGraph.reset();
+    engine.trackGainRamps.clear();
     engine.commandQueue.clear();
     engine.clockSamples.clear();
+    engine.meterSamples.clear();
 }
 
 void publish_graph(
@@ -402,6 +634,71 @@ void publish_clock_sample(SoundtimeAudioCoreEngine& engine) {
     }));
 }
 
+void publish_meter_sample(
+    SoundtimeAudioCoreEngine& engine,
+    float* const* outputs,
+    uint32_t channelCount,
+    uint32_t frameCount,
+    uint64_t startFrameIndex,
+    double hostTimestamp,
+    bool isPlaying
+) {
+    if (outputs == nullptr || channelCount == 0 || frameCount == 0) {
+        static_cast<void>(engine.meterSamples.push(MeterSample{
+            .startFrameIndex = startFrameIndex,
+            .frameCount = frameCount,
+            .renderedFrameCount = engine.renderedFrameCount.load(std::memory_order_acquire),
+            .hostTimestamp = hostTimestamp,
+            .isPlaying = isPlaying,
+        }));
+        return;
+    }
+
+    const auto* leftOutput = outputs[0];
+    const auto* rightOutput = channelCount > 1 ? outputs[1] : outputs[0];
+    auto leftSquareSum = double{0};
+    auto rightSquareSum = double{0};
+    auto leftPeak = float{0};
+    auto rightPeak = float{0};
+    auto leftClipPeak = float{0};
+    auto rightClipPeak = float{0};
+    auto measuredFrameCount = uint32_t{0};
+
+    for (uint32_t frameIndex = 0; frameIndex < frameCount; frameIndex++) {
+        const auto leftSample = leftOutput != nullptr ? leftOutput[frameIndex] : 0.0f;
+        const auto rightSample = rightOutput != nullptr ? rightOutput[frameIndex] : leftSample;
+        const auto leftMagnitude = std::fabs(leftSample);
+        const auto rightMagnitude = std::fabs(rightSample);
+
+        leftSquareSum += static_cast<double>(leftSample) * static_cast<double>(leftSample);
+        rightSquareSum += static_cast<double>(rightSample) * static_cast<double>(rightSample);
+        leftPeak = std::max(leftPeak, leftMagnitude);
+        rightPeak = std::max(rightPeak, rightMagnitude);
+        if (leftMagnitude > 1.0f) {
+            leftClipPeak = std::max(leftClipPeak, leftMagnitude);
+        }
+        if (rightMagnitude > 1.0f) {
+            rightClipPeak = std::max(rightClipPeak, rightMagnitude);
+        }
+        measuredFrameCount++;
+    }
+
+    const auto denominator = measuredFrameCount > 0 ? static_cast<double>(measuredFrameCount) : 1.0;
+    static_cast<void>(engine.meterSamples.push(MeterSample{
+        .startFrameIndex = startFrameIndex,
+        .frameCount = frameCount,
+        .renderedFrameCount = engine.renderedFrameCount.load(std::memory_order_acquire),
+        .hostTimestamp = hostTimestamp,
+        .isPlaying = isPlaying,
+        .leftRMS = static_cast<float>(std::sqrt(leftSquareSum / denominator)),
+        .rightRMS = static_cast<float>(std::sqrt(rightSquareSum / denominator)),
+        .leftPeak = leftPeak,
+        .rightPeak = rightPeak,
+        .leftClipPeak = leftClipPeak,
+        .rightClipPeak = rightClipPeak,
+    }));
+}
+
 } // namespace
 
 SoundtimeAudioCoreEngine* soundtime_audio_core_create(void) {
@@ -422,6 +719,56 @@ SoundtimeAudioCoreSource* soundtime_audio_core_source_create_planar(
     if (!source) {
         return nullptr;
     }
+
+    return new SoundtimeAudioCoreSource{.source = source};
+}
+
+SoundtimeAudioCoreSource* soundtime_audio_core_source_create_wav_bytes(
+    const uint8_t* bytes,
+    uint64_t byteCount,
+    uint64_t dataOffset,
+    uint64_t frameCount,
+    uint32_t channelCount,
+    double sampleRate,
+    uint32_t blockAlign,
+    uint16_t formatTag,
+    uint16_t bitsPerSample
+) {
+    const auto bytesPerSample = bitsPerSample / 8;
+    if (
+        bytes == nullptr ||
+        byteCount == 0 ||
+        channelCount == 0 ||
+        sampleRate <= 0 ||
+        bytesPerSample == 0 ||
+        blockAlign < bytesPerSample * channelCount ||
+        dataOffset > byteCount ||
+        dataOffset + frameCount * static_cast<uint64_t>(blockAlign) > byteCount
+    ) {
+        return nullptr;
+    }
+
+    const auto supportedPCM =
+        formatTag == 1 &&
+        (bitsPerSample == 8 || bitsPerSample == 16 || bitsPerSample == 24 || bitsPerSample == 32);
+    const auto supportedFloat =
+        formatTag == 3 &&
+        (bitsPerSample == 32 || bitsPerSample == 64);
+    if (!supportedPCM && !supportedFloat) {
+        return nullptr;
+    }
+
+    auto source = std::make_shared<AudioSource>();
+    source->storage = AudioSource::Storage::wavBytes;
+    source->wavBytes = bytes;
+    source->wavByteCount = byteCount;
+    source->wavDataOffset = dataOffset;
+    source->wavBlockAlign = blockAlign;
+    source->wavFormatTag = formatTag;
+    source->wavBitsPerSample = bitsPerSample;
+    source->frameCount = frameCount;
+    source->channelCount = channelCount;
+    source->sampleRate = sampleRate;
 
     return new SoundtimeAudioCoreSource{.source = source};
 }
@@ -661,6 +1008,33 @@ bool soundtime_audio_core_pop_clock_sample(
     return true;
 }
 
+bool soundtime_audio_core_pop_meter_sample(
+    SoundtimeAudioCoreEngine* engine,
+    SoundtimeAudioCoreMeterSample* sample
+) {
+    if (engine == nullptr || sample == nullptr) {
+        return false;
+    }
+
+    auto meterSample = MeterSample{};
+    if (!engine->meterSamples.pop(meterSample)) {
+        return false;
+    }
+
+    sample->startFrameIndex = meterSample.startFrameIndex;
+    sample->frameCount = meterSample.frameCount;
+    sample->renderedFrameCount = meterSample.renderedFrameCount;
+    sample->hostTimestamp = meterSample.hostTimestamp;
+    sample->isPlaying = meterSample.isPlaying;
+    sample->leftRMS = meterSample.leftRMS;
+    sample->rightRMS = meterSample.rightRMS;
+    sample->leftPeak = meterSample.leftPeak;
+    sample->rightPeak = meterSample.rightPeak;
+    sample->leftClipPeak = meterSample.leftClipPeak;
+    sample->rightClipPeak = meterSample.rightClipPeak;
+    return true;
+}
+
 void soundtime_audio_core_render_silence(
     SoundtimeAudioCoreEngine* engine,
     float* const* outputs,
@@ -722,10 +1096,12 @@ void soundtime_audio_core_render_at_host_time(
     }
 
     auto config = ez::immutable<EngineConfig>{};
+    auto blockStartFrameIndex = uint64_t{0};
     if (engine != nullptr) {
         engine->renderedFrameCount.fetch_add(frameCount, std::memory_order_acq_rel);
         config = engine->config.read(ez::audio);
         process_commands(*engine, *config);
+        blockStartFrameIndex = engine->frameIndex.load(std::memory_order_acquire);
     }
 
     for (uint32_t channelIndex = 0; channelIndex < channelCount; channelIndex++) {
@@ -742,27 +1118,39 @@ void soundtime_audio_core_render_at_host_time(
     }
 
     if (!engine->isPlaying.load(std::memory_order_acquire)) {
+        publish_meter_sample(
+            *engine,
+            outputs,
+            channelCount,
+            frameCount,
+            blockStartFrameIndex,
+            hostTimestamp,
+            false
+        );
         publish_clock_sample(*engine);
         return;
     }
 
     const auto sourceFrameCount = config->frameCount;
-    const auto currentFrameIndex = engine->frameIndex.load(std::memory_order_acquire);
+    const auto currentFrameIndex = blockStartFrameIndex;
     const auto renderableFrameCount = sourceFrameCount > currentFrameIndex ?
         std::min<uint64_t>(frameCount, sourceFrameCount - currentFrameIndex) :
         0;
     uint64_t advancedFrameCount = 0;
     bool completedTransportStop = false;
     if (const auto& graph = config->graph; graph && !graph->tracks.empty()) {
+        reconcile_track_gain_ramps(*engine, *config, *graph);
         for (uint64_t frameOffset = 0; frameOffset < renderableFrameCount; frameOffset++) {
             const auto transportGain = next_transport_gain(*engine, completedTransportStop);
             const auto outputFrameIndex = currentFrameIndex + frameOffset;
             const auto outputGainBase = config->gain * transportGain;
 
             advancedFrameCount++;
-            for (const auto& track : graph->tracks) {
+            for (size_t trackIndex = 0; trackIndex < graph->tracks.size(); trackIndex++) {
+                const auto& track = graph->tracks[trackIndex];
                 const auto& source = track.source;
-                if (!source || track.gain <= 0) {
+                const auto trackGain = next_track_gain(engine->trackGainRamps[trackIndex]);
+                if (!source || trackGain <= 0) {
                     continue;
                 }
 
@@ -781,7 +1169,7 @@ void soundtime_audio_core_render_at_host_time(
                     }
 
                     const auto sourceChannelCount = source->channelCount;
-                    const auto outputGain = outputGainBase * track.gain * segment.gain;
+                    const auto outputGain = outputGainBase * trackGain * segment.gain;
                     for (uint32_t outputChannel = 0; outputChannel < channelCount; outputChannel++) {
                         auto* output = outputs[outputChannel];
                         if (output == nullptr) {
@@ -795,8 +1183,11 @@ void soundtime_audio_core_render_at_host_time(
                             continue;
                         }
 
-                        const auto sampleIndex = segmentSourceFrameIndex * sourceChannelCount + sourceChannel;
-                        output[frameOffset] += source->interleavedSamples[sampleIndex] * outputGain;
+                        output[frameOffset] += sample_at(
+                            *source,
+                            segmentSourceFrameIndex,
+                            sourceChannel
+                        ) * outputGain;
                     }
                     break;
                 }
@@ -824,11 +1215,22 @@ void soundtime_audio_core_render_at_host_time(
     if (nextFrameIndex >= sourceFrameCount) {
         engine->isPlaying.store(false, std::memory_order_release);
     }
+    auto finalHostTimestamp = hostTimestamp;
     if (hostTimestamp > 0 && config->sampleRate > 0) {
         const auto renderedDuration = static_cast<double>(advancedFrameCount) / config->sampleRate;
-        engine->hostTimestamp.store(hostTimestamp + renderedDuration, std::memory_order_release);
+        finalHostTimestamp = hostTimestamp + renderedDuration;
+        engine->hostTimestamp.store(finalHostTimestamp, std::memory_order_release);
     } else {
-        engine->hostTimestamp.store(hostTimestamp, std::memory_order_release);
+        engine->hostTimestamp.store(finalHostTimestamp, std::memory_order_release);
     }
+    publish_meter_sample(
+        *engine,
+        outputs,
+        channelCount,
+        frameCount,
+        currentFrameIndex,
+        finalHostTimestamp,
+        engine->isPlaying.load(std::memory_order_acquire)
+    );
     publish_clock_sample(*engine);
 }

@@ -47,11 +47,13 @@ enum AudioImportPipeline {
         samplesPerBin: Int
     ) async throws -> (WAVFileInfo, WaveformOverview) {
         try await Task.detached(priority: .utility) {
-            try WAVAudioDecoder.buildSparsePreview(
-                url: url,
-                targetBinCount: targetBinCount,
-                samplesPerBin: samplesPerBin
-            )
+            try ImportWorkBudget.shared.performExclusiveHeavyWork {
+                try WAVAudioDecoder.buildSparsePreview(
+                    url: url,
+                    targetBinCount: targetBinCount,
+                    samplesPerBin: samplesPerBin
+                )
+            }
         }.value
     }
 
@@ -61,10 +63,12 @@ enum AudioImportPipeline {
         AudioZeroCrossingIndex
     ) {
         try await Task.detached(priority: .background) {
-            let decodedAudioBuffer = try WAVAudioDecoder.decode(url: url)
-            let waveformOverview = WaveformOverviewBuilder.build(from: decodedAudioBuffer)
-            let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: decodedAudioBuffer)
-            return (decodedAudioBuffer, waveformOverview, zeroCrossingIndex)
+            try ImportWorkBudget.shared.performExclusiveHeavyWork {
+                let decodedAudioBuffer = try WAVAudioDecoder.decode(url: url)
+                let waveformOverview = WaveformOverviewBuilder.build(from: decodedAudioBuffer)
+                let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: decodedAudioBuffer)
+                return (decodedAudioBuffer, waveformOverview, zeroCrossingIndex)
+            }
         }.value
     }
 
@@ -77,9 +81,13 @@ enum AudioImportPipeline {
             }
 
             do {
-                let decodedAudioBuffer = try WAVAudioDecoder.decode(url: url)
-                let waveformOverview = WaveformOverviewBuilder.build(from: decodedAudioBuffer)
-                let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: decodedAudioBuffer)
+                let (decodedAudioBuffer, waveformOverview, zeroCrossingIndex) =
+                    try ImportWorkBudget.shared.performExclusiveHeavyWork {
+                        let decodedAudioBuffer = try WAVAudioDecoder.decode(url: url)
+                        let waveformOverview = WaveformOverviewBuilder.build(from: decodedAudioBuffer)
+                        let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: decodedAudioBuffer)
+                        return (decodedAudioBuffer, waveformOverview, zeroCrossingIndex)
+                    }
                 return AudioImportResult(
                     metadata: metadata,
                     decodeStatus: .decoded(decodedAudioBuffer, waveformOverview, zeroCrossingIndex)

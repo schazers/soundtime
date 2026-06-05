@@ -1,6 +1,6 @@
 import AppKit
 
-final class MainWindowController: NSWindowController {
+final class MainWindowController: NSWindowController, NSWindowDelegate {
     private static let fallbackContentSize = NSSize(width: 1104, height: 460)
     private static let launchAspectRatio: CGFloat = 2.4
     private static let launchScreenAreaFraction: CGFloat = 0.245
@@ -33,6 +33,15 @@ final class MainWindowController: NSWindowController {
         }
 
         self.init(window: window)
+        window.delegate = self
+    }
+
+    func persistOpenProjectWindowLayout() {
+        (window?.contentViewController?.view as? WorkspaceView)?.persistCurrentProjectWindowLayout()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        persistOpenProjectWindowLayout()
     }
 
     private static func launchWindowFrame() -> NSRect? {

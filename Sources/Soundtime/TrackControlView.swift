@@ -5,12 +5,19 @@ final class TrackControlView: NSView {
     var onSoloChanged: ((Bool) -> Void)?
     var onVolumeChanged: ((Float) -> Void)?
     var onVolumeEditingEnded: (() -> Void)?
+    var onTrackSelected: (() -> Void)?
 
     private let titleLabel = NSTextField(labelWithString: "")
     private let volumeSlider = VerticalTrackVolumeSliderView()
     private let muteButton = TrackToggleButton(title: "M")
     private let soloButton = TrackToggleButton(title: "S")
     private let buttonStack = NSStackView()
+
+    var isTrackSelected = false {
+        didSet {
+            updateAppearance()
+        }
+    }
 
     var isMuted = false {
         didSet {
@@ -47,11 +54,26 @@ final class TrackControlView: NSView {
         false
     }
 
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let hitView = super.hitTest(point) else {
+            return nil
+        }
+
+        if hitView === titleLabel || hitView === buttonStack {
+            return self
+        }
+
+        return hitView
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        onTrackSelected?()
+    }
+
     private func configure() {
         wantsLayer = true
-        layer?.backgroundColor = NSColor(white: 0.075, alpha: 1).cgColor
-        layer?.borderColor = NSColor(white: 0.17, alpha: 1).cgColor
-        layer?.borderWidth = 1
+        updateAppearance()
 
         titleLabel.font = .systemFont(ofSize: 10, weight: .medium)
         titleLabel.textColor = NSColor(white: 0.78, alpha: 1)
@@ -108,6 +130,12 @@ final class TrackControlView: NSView {
             muteButton.widthAnchor.constraint(equalToConstant: 34),
             muteButton.heightAnchor.constraint(equalToConstant: 28),
         ])
+    }
+
+    private func updateAppearance() {
+        layer?.backgroundColor = NSColor(white: isTrackSelected ? 0.16 : 0.075, alpha: 1).cgColor
+        layer?.borderColor = NSColor(white: isTrackSelected ? 0.46 : 0.17, alpha: 1).cgColor
+        layer?.borderWidth = 1
     }
 }
 

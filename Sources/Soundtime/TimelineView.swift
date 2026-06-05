@@ -36,6 +36,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onUndo: (() -> Void)?
     var onExportRequested: (() -> Void)?
     var onOpenProjectRequested: (() -> Void)?
+    var onOpenRecentProjectRequested: ((URL) -> Void)?
+    var onClearRecentProjectsRequested: (() -> Void)?
     var onSaveProjectRequested: (() -> Void)?
     var onSaveProjectAsRequested: (() -> Void)?
     var onGainRequested: (() -> Void)?
@@ -47,6 +49,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onSelectionChanged: ((TimelineSelection?) -> Void)?
     var onTrimRequested: ((TimelineTrimRange) -> Void)?
     var onFrameStatsChanged: ((TimelineFrameStats) -> Void)?
+    var onTimelineInteractionBegan: (() -> Void)?
     var canApplyGainEffect = false
     var canApplyFadeEffect = false
     var canReapplyLastEffect = false
@@ -63,6 +66,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     private var timelineRenderer: TimelineRenderer?
+    private var currentTrackIDs: [UUID] = []
     private let timelineRenderQueue = DispatchQueue(
         label: "Soundtime.timeline.renderer",
         qos: .userInteractive
@@ -71,6 +75,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var isSelectionEnabled = false
     private var selectionAnchorProgress: Float?
     private var selectionAnchorPoint: CGPoint?
+    private var selectionAnchorTrackID: UUID?
     private var activeDragMode: TimelineDragMode?
     private var hoverTrackingArea: NSTrackingArea?
     private var isDraggingSelection = false
@@ -100,6 +105,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private let rightPanMomentumReleaseWindow: TimeInterval = 0.12
     private let rightPanMovementThreshold: CGFloat = 0.25
     private let transientRenderPulseDuration: CFTimeInterval = 0.18
+    private let playbackStopTouchTrailRenderPulseDuration: CFTimeInterval = 1.25
     private let waveformTransitionRenderPulseDuration: CFTimeInterval = 0.24
     private let targetFramesPerSecond = 144
     private let scrollZoomSensitivity: Float = 0.01
@@ -144,6 +150,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     func displayWaveform(_ waveformOverview: WaveformOverview?) {
+        let trackID = UUID(uuidString: "00000000-0000-0000-0000-000000000001") ?? UUID()
+        currentTrackIDs = waveformOverview.map { _ in [trackID] } ?? []
         timelineDuration = waveformOverview?.duration ?? 0
         let wasSelectionEnabled = isSelectionEnabled
         isSelectionEnabled = waveformOverview?.isEmpty == false
@@ -165,6 +173,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         if !isSelectionEnabled {
             selectionAnchorProgress = nil
             selectionAnchorPoint = nil
+            selectionAnchorTrackID = nil
             activeDragMode = nil
             isDraggingSelection = false
             isDraggingTrim = false
@@ -179,6 +188,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     func displayTracks(_ tracks: [TimelineRenderState.Track]) {
+        currentTrackIDs = tracks.map(\.id)
         timelineDuration = tracks.reduce(TimeInterval(0)) { result, track in
             max(result, track.waveformOverview?.duration ?? 0)
         }
@@ -202,6 +212,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         if !isSelectionEnabled {
             selectionAnchorProgress = nil
             selectionAnchorPoint = nil
+            selectionAnchorTrackID = nil
             activeDragMode = nil
             isDraggingSelection = false
             isDraggingTrim = false
@@ -216,6 +227,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     func displayTrackMixSettings(_ tracks: [TimelineRenderState.Track]) {
+        currentTrackIDs = tracks.map(\.id)
         let wasSelectionEnabled = isSelectionEnabled
         isSelectionEnabled = tracks.contains { $0.waveformOverview?.isEmpty == false }
 
@@ -244,10 +256,34 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         requestTimelineRender()
     }
 
+    func updateWaveformFisheyeTuning(
+        radius: Float,
+        exponent: Float,
+        minimumVisibleDuration: TimeInterval,
+        maximumVisibleDuration: TimeInterval,
+        fadeCurve: Float,
+        activationDuration: TimeInterval
+    ) {
+        updateTimelineRenderer { renderer in
+            renderer.updateWaveformFisheyeTuning(
+                radius: radius,
+                exponent: exponent,
+                minimumVisibleDuration: minimumVisibleDuration,
+                maximumVisibleDuration: maximumVisibleDuration,
+                fadeCurve: fadeCurve,
+                activationDuration: activationDuration
+            )
+        }
+        requestTimelineRender()
+    }
+
     func displayPlayheadProgress(
         _ progress: Float,
         syncRenderer: Bool = true,
-        anchorTimestamp: CFTimeInterval? = nil
+        anchorTimestamp: CFTimeInterval? = nil,
+        resetsTouchStart: Bool = true,
+        restartsFisheyeActivation: Bool = false,
+        restartsPlayheadKick: Bool = false
     ) {
         let clampedProgress = min(max(progress, 0), 1)
         pagingPlayheadProgress = clampedProgress
@@ -257,7 +293,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             renderer.displayPlayheadProgress(
                 clampedProgress,
                 force: syncRenderer,
-                anchorTimestamp: anchorTimestamp
+                anchorTimestamp: anchorTimestamp,
+                resetsTouchStart: resetsTouchStart,
+                restartsFisheyeActivation: restartsFisheyeActivation,
+                restartsPlayheadKick: restartsPlayheadKick
             )
         }
         requestTimelineRender()
@@ -279,13 +318,20 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
         requestTimelineRender()
         if !isActive {
-            startTransientRenderPulse()
+            startTransientRenderPulse(duration: playbackStopTouchTrailRenderPulseDuration)
         }
     }
 
     func displaySelection(_ selection: TimelineSelection?) {
         updateTimelineRenderer { renderer in
             renderer.displaySelection(selection)
+        }
+        requestTimelineRender()
+    }
+
+    func displaySelectedTrack(_ trackID: UUID?) {
+        updateTimelineRenderer { renderer in
+            renderer.displaySelectedTrack(trackID)
         }
         requestTimelineRender()
     }
@@ -377,7 +423,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             }
             requestTimelineRender()
         } catch {
-            Swift.print("Soundtime could not create the timeline renderer: \\(error)")
+            Swift.print("Soundtime could not create the timeline renderer: \(error)")
         }
     }
 
@@ -627,6 +673,21 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onOpenProjectRequested?()
     }
 
+    @objc func openRecentProject(_ sender: Any?) {
+        guard
+            let menuItem = sender as? NSMenuItem,
+            let url = menuItem.representedObject as? URL
+        else {
+            return
+        }
+
+        onOpenRecentProjectRequested?(url)
+    }
+
+    @objc func clearRecentProjects(_ sender: Any?) {
+        onClearRecentProjectsRequested?()
+    }
+
     @objc func saveProject(_ sender: Any?) {
         onSaveProjectRequested?()
     }
@@ -796,6 +857,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         window?.makeFirstResponder(self)
         stopRightPanMomentum()
+        onTimelineInteractionBegan?()
         let point = currentDragPoint(for: event)
         let progress = progress(for: point)
         if event.clickCount >= 2 {
@@ -804,6 +866,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             onSelectionChanged?(nil)
             selectionAnchorProgress = nil
             selectionAnchorPoint = nil
+            selectionAnchorTrackID = nil
             activeDragMode = nil
             isDraggingSelection = false
             isDraggingTrim = false
@@ -816,6 +879,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             activeDragMode = trimDragMode
             selectionAnchorProgress = progress
             selectionAnchorPoint = point
+            selectionAnchorTrackID = nil
             isDraggingSelection = false
             isDraggingTrim = false
             displaySelection(nil)
@@ -826,6 +890,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         activeDragMode = .selection
         selectionAnchorProgress = progress
         selectionAnchorPoint = point
+        selectionAnchorTrackID = trackID(at: point)
         isDraggingSelection = false
         isDraggingTrim = false
         displayHoverProgress(progress, isArmed: true)
@@ -895,6 +960,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         self.selectionAnchorProgress = nil
         selectionAnchorPoint = nil
+        selectionAnchorTrackID = nil
         activeDragMode = nil
         isDraggingSelection = false
         isDraggingTrim = false
@@ -909,12 +975,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         window?.makeFirstResponder(self)
         stopRightPanMomentum()
+        onTimelineInteractionBegan?()
         rightPanPreviousPoint = currentDragPoint(for: event)
         rightPanPreviousTime = event.timestamp
         rightPanLastMovementTime = nil
         rightPanVelocityProgressPerSecond = 0
         selectionAnchorProgress = nil
         selectionAnchorPoint = nil
+        selectionAnchorTrackID = nil
         activeDragMode = nil
         isDraggingSelection = false
         isDraggingTrim = false
@@ -1170,7 +1238,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private func updateSelection(from startProgress: Float, to endProgress: Float, notifyChange: Bool) {
         let selection = TimelineSelection(
             startProgress: startProgress,
-            endProgress: endProgress
+            endProgress: endProgress,
+            trackID: selectionAnchorTrackID
         )
         let visibleSelection = selection.durationProgress > 0.001 ? selection : nil
 
@@ -1231,5 +1300,21 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         return abs(point.x - selectionAnchorPoint.x) >= selectionDragThreshold ||
             abs(point.y - selectionAnchorPoint.y) >= selectionDragThreshold
+    }
+
+    private func trackID(at point: CGPoint) -> UUID? {
+        guard
+            bounds.height > 0,
+            !currentTrackIDs.isEmpty
+        else {
+            return nil
+        }
+
+        let normalizedYFromTop = min(max(1 - Float(point.y / bounds.height), 0), 0.999_999)
+        let trackIndex = min(
+            max(Int((normalizedYFromTop * Float(currentTrackIDs.count)).rounded(.down)), 0),
+            currentTrackIDs.count - 1
+        )
+        return currentTrackIDs[trackIndex]
     }
 }

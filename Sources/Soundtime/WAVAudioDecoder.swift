@@ -216,8 +216,7 @@ enum WAVAudioDecoder {
             let endFrame = max((binIndex + 1) * fileInfo.frameCount / binCount, startFrame + 1)
             let frameSpan = endFrame - startFrame
             let binSampleCount = min(sampledFrameCount, frameSpan)
-            var minimumSample: Float = 1
-            var maximumSample: Float = -1
+            var accumulator = WaveformBinAccumulator()
 
             for sampleIndex in 0..<binSampleCount {
                 let frameOffset: Int
@@ -238,20 +237,11 @@ enum WAVAudioDecoder {
                         formatTag: fileInfo.formatTag,
                         bitsPerSample: fileInfo.bitsPerSample
                     )
-                    minimumSample = min(minimumSample, sample)
-                    maximumSample = max(maximumSample, sample)
+                    accumulator.addSample(sample)
                 }
             }
 
-            if minimumSample > maximumSample {
-                minimumSample = 0
-                maximumSample = 0
-            }
-
-            bins.append(WaveformOverview.Bin(
-                minimumSample: minimumSample,
-                maximumSample: maximumSample
-            ))
+            bins.append(accumulator.makeBin())
         }
 
         return WaveformOverview(duration: fileInfo.duration, bins: bins)
