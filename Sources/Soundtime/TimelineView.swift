@@ -7,6 +7,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onDeleteSelection: (() -> Void)?
     var onUndo: (() -> Void)?
     var onExportRequested: (() -> Void)?
+    var onOpenProjectRequested: (() -> Void)?
+    var onSaveProjectRequested: (() -> Void)?
+    var onSaveProjectAsRequested: (() -> Void)?
     var onGainRequested: (() -> Void)?
     var onFadeInRequested: (() -> Void)?
     var onFadeOutRequested: (() -> Void)?
@@ -111,6 +114,40 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         updateTimelineRenderer { renderer in
             renderer.displayWaveform(waveformOverview)
+        }
+        displayTrimPreview(nil)
+
+        if wasSelectionEnabled != isSelectionEnabled {
+            window?.invalidateCursorRects(for: self)
+        }
+
+        startTransientRenderPulse(duration: waveformTransitionRenderPulseDuration)
+
+        if !isSelectionEnabled {
+            selectionAnchorProgress = nil
+            selectionAnchorPoint = nil
+            activeDragMode = nil
+            isDraggingSelection = false
+            isDraggingTrim = false
+            rightPanPreviousPoint = nil
+            rightPanPreviousTime = nil
+            rightPanLastMovementTime = nil
+            stopRightPanMomentum()
+            displaySelection(nil)
+            displayHoverProgress(nil)
+            onSelectionChanged?(nil)
+        }
+    }
+
+    func displayTracks(_ tracks: [TimelineRenderState.Track]) {
+        let wasSelectionEnabled = isSelectionEnabled
+        isSelectionEnabled = tracks.contains { $0.waveformOverview?.isEmpty == false }
+        if !wasSelectionEnabled || !isSelectionEnabled {
+            setViewport(.full)
+        }
+
+        updateTimelineRenderer { renderer in
+            renderer.displayTracks(tracks)
         }
         displayTrimPreview(nil)
 
@@ -429,6 +466,20 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        if event.keyCode == 1, event.modifierFlags.contains(.command) {
+            if event.modifierFlags.contains(.shift) {
+                onSaveProjectAsRequested?()
+            } else {
+                onSaveProjectRequested?()
+            }
+            return
+        }
+
+        if event.keyCode == 31, event.modifierFlags.contains(.command) {
+            onOpenProjectRequested?()
+            return
+        }
+
         if event.keyCode == 15, event.modifierFlags.contains(.command) {
             onReapplyLastEffect?()
             return
@@ -477,6 +528,18 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     @objc func exportAudio(_ sender: Any?) {
         onExportRequested?()
+    }
+
+    @objc func openProject(_ sender: Any?) {
+        onOpenProjectRequested?()
+    }
+
+    @objc func saveProject(_ sender: Any?) {
+        onSaveProjectRequested?()
+    }
+
+    @objc func saveProjectAs(_ sender: Any?) {
+        onSaveProjectAsRequested?()
     }
 
     @objc func undoTimelineEdit(_ sender: Any?) {

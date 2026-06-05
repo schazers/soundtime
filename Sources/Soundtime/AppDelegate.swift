@@ -39,6 +39,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu(title: "Soundtime")
 
         menu.addItem(NSMenuItem(
+            title: "Open Project...",
+            action: #selector(TimelineView.openProject(_:)),
+            keyEquivalent: "o"
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Save",
+            action: #selector(TimelineView.saveProject(_:)),
+            keyEquivalent: "s"
+        ))
+        let saveAsItem = NSMenuItem(
+            title: "Save Project As...",
+            action: #selector(TimelineView.saveProjectAs(_:)),
+            keyEquivalent: "s"
+        )
+        saveAsItem.keyEquivalentModifierMask = [.command, .shift]
+        menu.addItem(saveAsItem)
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(
             title: "Export...",
             action: #selector(TimelineView.exportAudio(_:)),
             keyEquivalent: "e"

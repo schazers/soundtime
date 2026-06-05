@@ -22,6 +22,25 @@ final class WorkspaceView: NSView {
         case fade(FadeEffect)
     }
 
+    private struct ProjectTrack {
+        var id: UUID
+        var name: String
+        var sourceURL: URL
+        var waveformOverview: WaveformOverview?
+        var decodedAudioBuffer: DecodedAudioBuffer?
+        var zeroCrossingIndex: AudioZeroCrossingIndex?
+        var audioTimeline: AudioEditTimeline?
+        var volume: Float
+        var isMuted: Bool
+        var isSoloed: Bool
+        var importID: UUID
+    }
+
+    private var projectTracks: [ProjectTrack] = []
+    private var activeTrackID: UUID?
+    private var currentProjectURL: URL?
+    private var hasRestoredLastProject = false
+    private var isLoadingProject = false
     private var activeImportID = UUID()
     private var selectedAudioFile: AudioFileMetadata?
     private var decodedAudioBuffer: DecodedAudioBuffer?
@@ -153,6 +172,15 @@ final class WorkspaceView: NSView {
         stackView.translatesAutoresizingMaskIntoConstraints = false
         return stackView
     }()
+    private let trackControlsStack: NSStackView = {
+        let stackView = NSStackView()
+        stackView.orientation = .vertical
+        stackView.alignment = .width
+        stackView.distribution = .fillEqually
+        stackView.spacing = 0
+        stackView.translatesAutoresizingMaskIntoConstraints = false
+        return stackView
+    }()
     private let timelineSurface = TimelineView()
     private let exportProgressOverlay = ExportProgressOverlayView()
     private let gainEffectOverlay = GainEffectOverlayView()
@@ -186,6 +214,15 @@ final class WorkspaceView: NSView {
         }
         timelineSurface.onExportRequested = { [weak self] in
             self?.exportCurrentAudio()
+        }
+        timelineSurface.onOpenProjectRequested = { [weak self] in
+            self?.openProject()
+        }
+        timelineSurface.onSaveProjectRequested = { [weak self] in
+            self?.saveProject()
+        }
+        timelineSurface.onSaveProjectAsRequested = { [weak self] in
+            self?.saveProjectAs()
         }
         timelineSurface.onGainRequested = { [weak self] in
             self?.showGainEffect()
@@ -246,6 +283,7 @@ final class WorkspaceView: NSView {
         addSubview(volumeControl)
         addSubview(timeReadoutLabel)
         addSubview(tuningControlsStack)
+        addSubview(trackControlsStack)
         addSubview(timelineSurface)
         addSubview(exportProgressOverlay)
         addSubview(gainEffectOverlay)
@@ -279,10 +317,15 @@ final class WorkspaceView: NSView {
             touchTrailCurveSlider.widthAnchor.constraint(equalToConstant: 220),
             waveformGraySlider.widthAnchor.constraint(equalToConstant: 220),
 
-            timelineSurface.topAnchor.constraint(equalTo: tuningControlsStack.bottomAnchor, constant: 14),
-            timelineSurface.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 22),
+            trackControlsStack.topAnchor.constraint(equalTo: tuningControlsStack.bottomAnchor, constant: 14),
+            trackControlsStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 22),
+            trackControlsStack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -22),
+            trackControlsStack.widthAnchor.constraint(equalToConstant: 118),
+
+            timelineSurface.topAnchor.constraint(equalTo: trackControlsStack.topAnchor),
+            timelineSurface.leadingAnchor.constraint(equalTo: trackControlsStack.trailingAnchor, constant: 10),
             timelineSurface.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -22),
-            timelineSurface.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -22),
+            timelineSurface.bottomAnchor.constraint(equalTo: trackControlsStack.bottomAnchor),
 
             exportProgressOverlay.topAnchor.constraint(equalTo: topAnchor),
             exportProgressOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -299,7 +342,75 @@ final class WorkspaceView: NSView {
         updateEffectCommandState()
     }
 
+    func restoreLastProjectIfNeeded() {
+        guard !hasRestoredLastProject else {
+            return
+        }
+        hasRestoredLastProject = true
+
+        guard let lastProjectURL = SoundtimeProjectStore.lastProjectURL() else {
+            return
+        }
+
+        loadProject(from: lastProjectURL)
+    }
+
+    private func refreshProjectTimelineDisplay() {
+        timelineSurface.displayTracks(projectTracks.map { track in
+            TimelineRenderState.Track(
+                id: track.id,
+                waveformOverview: track.waveformOverview,
+                volume: track.volume,
+                isMuted: track.isMuted,
+                isSoloed: track.isSoloed
+            )
+        })
+        refreshTrackControls()
+    }
+
+    private func refreshTrackControls() {
+        let existingSubviews = trackControlsStack.arrangedSubviews
+        for subview in existingSubviews {
+            trackControlsStack.removeArrangedSubview(subview)
+            subview.removeFromSuperview()
+        }
+
+        for track in projectTracks {
+            let controlView = TrackControlView(title: track.name)
+            controlView.isMuted = track.isMuted
+            controlView.isSoloed = track.isSoloed
+            controlView.volume = track.volume
+            controlView.onMuteChanged = { [weak self, trackID = track.id] isMuted in
+                self?.updateTrack(trackID) { $0.isMuted = isMuted }
+            }
+            controlView.onSoloChanged = { [weak self, trackID = track.id] isSoloed in
+                self?.updateTrack(trackID) { $0.isSoloed = isSoloed }
+            }
+            controlView.onVolumeChanged = { [weak self, trackID = track.id] volume in
+                self?.updateTrack(trackID) { $0.volume = volume }
+            }
+            trackControlsStack.addArrangedSubview(controlView)
+        }
+    }
+
+    private func updateTrack(_ trackID: UUID, update: (inout ProjectTrack) -> Void) {
+        guard let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }) else {
+            return
+        }
+
+        update(&projectTracks[trackIndex])
+        activeTrackID = trackID
+        refreshProjectTimelineDisplay()
+        reloadPlaybackFromProjectMix(preserveProgress: true)
+        updateStatus(currentPlaybackStatus)
+    }
+
     private func loadDroppedAudioFile(at url: URL) {
+        if WAVAudioDecoder.canDecode(url) {
+            addDroppedWAVTrack(at: url)
+            return
+        }
+
         let importID = UUID()
         activeImportID = importID
         selectedAudioFile = nil
@@ -416,6 +527,363 @@ final class WorkspaceView: NSView {
                 self.metadataLabel.stringValue = "\(url.lastPathComponent) - could not load audio"
             }
         }
+    }
+
+    private func addDroppedWAVTrack(at url: URL, settings: SoundtimeProject.Track? = nil) {
+        let trackID = settings?.id ?? UUID()
+        let importID = UUID()
+        let trackName = settings?.name ?? url.deletingPathExtension().lastPathComponent
+        let track = ProjectTrack(
+            id: trackID,
+            name: trackName,
+            sourceURL: url,
+            waveformOverview: nil,
+            decodedAudioBuffer: nil,
+            zeroCrossingIndex: nil,
+            audioTimeline: nil,
+            volume: settings?.volume ?? 1,
+            isMuted: settings?.isMuted ?? false,
+            isSoloed: settings?.isSoloed ?? false,
+            importID: importID
+        )
+
+        projectTracks.append(track)
+        activeTrackID = trackID
+        selectedTimelineRange = nil
+        updateEffectCommandState()
+        refreshProjectTimelineDisplay()
+        updateProjectDisplayTiming()
+        updateStatus("\(trackName) loading")
+
+        let wavPreviewLevels = wavPreviewLevels
+        Task { [weak self, trackID, importID, url, wavPreviewLevels] in
+            do {
+                guard let initialPreviewLevel = wavPreviewLevels.first else {
+                    return
+                }
+
+                let previewResult = try await AudioImportPipeline.loadWAVPreview(
+                    at: url,
+                    targetBinCount: initialPreviewLevel.targetBinCount,
+                    samplesPerBin: initialPreviewLevel.samplesPerBin
+                )
+
+                guard let self, self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
+                    return
+                }
+
+                self.applyTrackPreview(trackID: trackID, previewResult: previewResult)
+                var latestPreviewBinCount = previewResult.waveformOverview.bins.count
+
+                for previewLevel in wavPreviewLevels.dropFirst() {
+                    guard self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
+                        return
+                    }
+
+                    let nextBinCount = min(previewLevel.targetBinCount, previewResult.fileInfo.frameCount)
+                    guard nextBinCount > latestPreviewBinCount else {
+                        continue
+                    }
+
+                    do {
+                        let (fileInfo, waveformOverview) = try await AudioImportPipeline.loadWAVPreviewOverview(
+                            at: url,
+                            targetBinCount: previewLevel.targetBinCount,
+                            samplesPerBin: previewLevel.samplesPerBin
+                        )
+
+                        guard self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
+                            return
+                        }
+
+                        latestPreviewBinCount = waveformOverview.bins.count
+                        self.applyTrackPreviewRefinement(
+                            trackID: trackID,
+                            fileInfo: fileInfo,
+                            waveformOverview: waveformOverview
+                        )
+                    } catch {
+                        break
+                    }
+                }
+
+                do {
+                    let (decodedAudioBuffer, waveformOverview, zeroCrossingIndex) =
+                        try await AudioImportPipeline.loadDecodedWAV(at: url)
+
+                    guard self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
+                        return
+                    }
+
+                    self.applyTrackDecodedWAV(
+                        trackID: trackID,
+                        decodedAudioBuffer: decodedAudioBuffer,
+                        waveformOverview: waveformOverview,
+                        zeroCrossingIndex: zeroCrossingIndex
+                    )
+                } catch {
+                    guard self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
+                        return
+                    }
+
+                    self.updateStatus("track decode failed: \(error.localizedDescription)")
+                }
+            } catch {
+                guard let self, self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
+                    return
+                }
+
+                self.removeProjectTrack(trackID)
+                self.updateStatus("\(url.lastPathComponent) preview failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func isTrackImportCurrent(trackID: UUID, importID: UUID) -> Bool {
+        projectTracks.contains { $0.id == trackID && $0.importID == importID }
+    }
+
+    private func removeProjectTrack(_ trackID: UUID) {
+        projectTracks.removeAll { $0.id == trackID }
+        if activeTrackID == trackID {
+            activeTrackID = projectTracks.last?.id
+        }
+        syncActiveTrackFields()
+        refreshProjectTimelineDisplay()
+        updateProjectDisplayTiming()
+        reloadPlaybackFromProjectMix(preserveProgress: false)
+    }
+
+    private func applyTrackPreview(trackID: UUID, previewResult: WAVPreviewImportResult) {
+        guard let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }) else {
+            return
+        }
+
+        projectTracks[trackIndex].name = previewResult.metadata.displayName
+        projectTracks[trackIndex].waveformOverview = previewResult.waveformOverview
+        activeTrackID = trackID
+        window?.title = projectWindowTitle()
+        refreshProjectTimelineDisplay()
+        updateProjectDisplayTiming()
+        syncActiveTrackFields()
+        if projectTracks.count == 1, projectMixBuffer() == nil {
+            do {
+                try playbackController.loadFile(
+                    at: previewResult.metadata.url,
+                    zeroCrossingProbe: previewResult.zeroCrossingProbe
+                )
+            } catch {
+                updateStatus("preview ready - playback failed: \(error.localizedDescription)")
+                return
+            }
+        }
+        updateStatus("preview ready - resolving waveform")
+    }
+
+    private func applyTrackPreviewRefinement(
+        trackID: UUID,
+        fileInfo: WAVFileInfo,
+        waveformOverview: WaveformOverview
+    ) {
+        guard let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }) else {
+            return
+        }
+
+        projectTracks[trackIndex].waveformOverview = waveformOverview
+        refreshProjectTimelineDisplay()
+        updateProjectDisplayTiming(sampleRateHint: fileInfo.sampleRate)
+        updateTimeReadout()
+    }
+
+    private func applyTrackDecodedWAV(
+        trackID: UUID,
+        decodedAudioBuffer: DecodedAudioBuffer,
+        waveformOverview: WaveformOverview,
+        zeroCrossingIndex: AudioZeroCrossingIndex
+    ) {
+        guard let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }) else {
+            return
+        }
+
+        projectTracks[trackIndex].decodedAudioBuffer = decodedAudioBuffer
+        projectTracks[trackIndex].waveformOverview = waveformOverview
+        projectTracks[trackIndex].zeroCrossingIndex = zeroCrossingIndex
+        projectTracks[trackIndex].audioTimeline = AudioEditTimeline(sourceBuffer: decodedAudioBuffer)
+        activeTrackID = trackID
+        syncActiveTrackFields()
+        refreshProjectTimelineDisplay()
+        updateProjectDisplayTiming(sampleRateHint: decodedAudioBuffer.sampleRate)
+        reloadPlaybackFromProjectMix(preserveProgress: true)
+        updateEffectCommandState()
+        updateStatus("track ready")
+    }
+
+    private func syncActiveTrackFields() {
+        guard let activeTrack = activeProjectTrack else {
+            decodedAudioBuffer = projectMixBuffer()
+            audioTimeline = nil
+            selectedAudioFile = nil
+            return
+        }
+
+        decodedAudioBuffer = activeTrack.decodedAudioBuffer ?? projectMixBuffer()
+        audioTimeline = activeTrack.audioTimeline
+        if let duration = activeTrack.waveformOverview?.duration {
+            selectedAudioFile = AudioFileMetadata(
+                url: activeTrack.sourceURL,
+                displayName: activeTrack.name,
+                duration: duration,
+                fileSize: nil
+            )
+        } else {
+            selectedAudioFile = nil
+        }
+    }
+
+    private var activeProjectTrack: ProjectTrack? {
+        guard let activeTrackID else {
+            return projectTracks.last
+        }
+
+        return projectTracks.first { $0.id == activeTrackID } ?? projectTracks.last
+    }
+
+    private func updateProjectDisplayTiming(sampleRateHint: Double? = nil) {
+        let projectDuration = projectTracks.reduce(TimeInterval(0)) { result, track in
+            max(result, track.waveformOverview?.duration ?? track.decodedAudioBuffer?.duration ?? 0)
+        }
+        let sampleRate = sampleRateHint ??
+            projectTracks.compactMap { $0.decodedAudioBuffer?.sampleRate }.first ??
+            displayedSampleRate
+
+        if projectDuration > 0, sampleRate > 0 {
+            displayedSampleRate = sampleRate
+            displayedFrameCount = Int((projectDuration * sampleRate).rounded(.up))
+        } else {
+            displayedSampleRate = 0
+            displayedFrameCount = 0
+        }
+
+        updateLoadedProjectSummary()
+        updateTimeReadout()
+    }
+
+    private func updateLoadedProjectSummary() {
+        if projectTracks.isEmpty {
+            loadedAudioSummary = nil
+        } else {
+            let trackText = projectTracks.count == 1 ? "1 track" : "\(projectTracks.count) tracks"
+            if let currentProjectURL {
+                loadedAudioSummary = "\(currentProjectURL.deletingPathExtension().lastPathComponent) - \(trackText)"
+            } else {
+                loadedAudioSummary = "Untitled Project - \(trackText)"
+            }
+        }
+    }
+
+    private func projectWindowTitle() -> String {
+        if let currentProjectURL {
+            return "Soundtime - \(currentProjectURL.deletingPathExtension().lastPathComponent)"
+        }
+
+        if projectTracks.isEmpty {
+            return "Soundtime"
+        }
+
+        return "Soundtime - Untitled Project"
+    }
+
+    private func reloadPlaybackFromProjectMix(preserveProgress: Bool) {
+        let previousSnapshot = playbackController.snapshot()
+        let previousProgress = previousSnapshot.progress
+        let wasPlaying = previousSnapshot.isPlaying
+
+        guard let mixBuffer = projectMixBuffer() else {
+            playbackController.clear()
+            currentPlayheadFrame = 0
+            displayPlaybackVisuals(progress: 0, isPlaying: false)
+            updateTimeReadout()
+            return
+        }
+
+        decodedAudioBuffer = mixBuffer
+        displayedFrameCount = mixBuffer.frameCount
+        displayedSampleRate = mixBuffer.sampleRate
+        do {
+            let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: mixBuffer)
+            playbackController.clear()
+            try playbackController.load(mixBuffer, zeroCrossingIndex: zeroCrossingIndex)
+            if preserveProgress {
+                try playbackController.seek(toProgress: previousProgress)
+            }
+            if preserveProgress, wasPlaying {
+                try playbackController.play()
+            }
+
+            let snapshot = playbackController.snapshot()
+            displayPlaybackVisuals(
+                progress: snapshot.progress,
+                isPlaying: snapshot.isPlaying,
+                syncPlayhead: true,
+                anchorTimestamp: snapshot.hostTimestamp
+            )
+        } catch {
+            updateStatus("project playback failed: \(error.localizedDescription)")
+        }
+        updateTimeReadout()
+    }
+
+    private func projectMixBuffer() -> DecodedAudioBuffer? {
+        let decodedTracks = audibleProjectTracks.compactMap { track -> (ProjectTrack, DecodedAudioBuffer)? in
+            guard let decodedAudioBuffer = track.decodedAudioBuffer else {
+                return nil
+            }
+            return (track, decodedAudioBuffer)
+        }
+
+        guard let firstTrack = decodedTracks.first else {
+            return nil
+        }
+
+        let sampleRate = firstTrack.1.sampleRate
+        let channelCount = max(decodedTracks.map(\.1.channelCount).max() ?? 2, 2)
+        let frameCount = decodedTracks.reduce(0) { result, item in
+            max(result, item.1.frameCount)
+        }
+        guard frameCount > 0 else {
+            return nil
+        }
+
+        var samplesByChannel = (0..<channelCount).map { _ in
+            [Float](repeating: 0, count: frameCount)
+        }
+
+        for (track, buffer) in decodedTracks {
+            let gain = track.volume * track.volume
+            for outputChannel in 0..<channelCount {
+                let sourceChannel = buffer.channelCount == 1 ? 0 : min(outputChannel, buffer.channelCount - 1)
+                let sourceSamples = buffer.samplesByChannel[sourceChannel]
+                for frameIndex in 0..<buffer.frameCount {
+                    samplesByChannel[outputChannel][frameIndex] = clampAudioSample(
+                        samplesByChannel[outputChannel][frameIndex] + sourceSamples[frameIndex] * gain
+                    )
+                }
+            }
+        }
+
+        return DecodedAudioBuffer(
+            url: currentProjectURL ?? URL(fileURLWithPath: "Soundtime Project Mix.wav"),
+            sampleRate: sampleRate,
+            channelCount: channelCount,
+            frameCount: frameCount,
+            samplesByChannel: samplesByChannel
+        )
+    }
+
+    private var audibleProjectTracks: [ProjectTrack] {
+        let soloedTracks = projectTracks.filter { $0.isSoloed }
+        let candidateTracks = soloedTracks.isEmpty ? projectTracks : soloedTracks
+        return candidateTracks.filter { !$0.isMuted && $0.volume > 0 }
     }
 
     private func loadDroppedWAVFile(at url: URL, importID: UUID) {
@@ -874,7 +1342,8 @@ final class WorkspaceView: NSView {
     }
 
     private func exportCurrentAudio() {
-        guard let decodedAudioBuffer, decodedAudioBuffer.frameCount > 0 else {
+        let exportBuffer = projectMixBuffer() ?? decodedAudioBuffer
+        guard let exportBuffer, exportBuffer.frameCount > 0 else {
             return
         }
 
@@ -885,7 +1354,7 @@ final class WorkspaceView: NSView {
         savePanel.isExtensionHidden = false
         savePanel.allowedContentTypes = [.wav]
 
-        let completion: (NSApplication.ModalResponse) -> Void = { [weak self, decodedAudioBuffer] response in
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self, exportBuffer] response in
             guard
                 response == .OK,
                 let destinationURL = savePanel.url
@@ -893,14 +1362,142 @@ final class WorkspaceView: NSView {
                 return
             }
 
-            self?.writeExport(decodedAudioBuffer, to: destinationURL)
+            self?.writeExport(exportBuffer, to: destinationURL)
         }
 
         if let window {
             savePanel.beginSheetModal(for: window, completionHandler: completion)
         } else if savePanel.runModal() == .OK, let destinationURL = savePanel.url {
-            writeExport(decodedAudioBuffer, to: destinationURL)
+            writeExport(exportBuffer, to: destinationURL)
         }
+    }
+
+    private func openProject() {
+        let openPanel = NSOpenPanel()
+        openPanel.title = "Open Soundtime Project"
+        openPanel.canChooseFiles = true
+        openPanel.canChooseDirectories = false
+        openPanel.allowsMultipleSelection = false
+        openPanel.allowedContentTypes = [UTType(filenameExtension: SoundtimeProjectStore.fileExtension) ?? .json]
+
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .OK, let url = openPanel.url else {
+                return
+            }
+
+            self?.loadProject(from: url)
+        }
+
+        if let window {
+            openPanel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(openPanel.runModal())
+        }
+    }
+
+    private func saveProject() {
+        if let currentProjectURL {
+            writeProject(to: currentProjectURL)
+        } else {
+            saveProjectAs()
+        }
+    }
+
+    private func saveProjectAs() {
+        let savePanel = NSSavePanel()
+        savePanel.title = "Save Soundtime Project"
+        savePanel.nameFieldStringValue = suggestedProjectFilename()
+        savePanel.canCreateDirectories = true
+        savePanel.isExtensionHidden = false
+        savePanel.allowedContentTypes = [UTType(filenameExtension: SoundtimeProjectStore.fileExtension) ?? .json]
+
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .OK, let url = savePanel.url else {
+                return
+            }
+
+            self?.writeProject(to: url)
+        }
+
+        if let window {
+            savePanel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(savePanel.runModal())
+        }
+    }
+
+    private func writeProject(to url: URL) {
+        do {
+            try SoundtimeProjectStore.save(currentProject(), to: url)
+            currentProjectURL = url
+            SoundtimeProjectStore.rememberLastProjectURL(url)
+            window?.title = projectWindowTitle()
+            updateLoadedProjectSummary()
+            updateStatus("saved")
+        } catch {
+            updateStatus("project save failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func loadProject(from url: URL) {
+        do {
+            let project = try SoundtimeProjectStore.load(from: url)
+            clearProjectForLoad()
+            currentProjectURL = url
+            SoundtimeProjectStore.rememberLastProjectURL(url)
+            isLoadingProject = true
+            for track in project.tracks {
+                addDroppedWAVTrack(
+                    at: URL(fileURLWithPath: track.filePath),
+                    settings: track
+                )
+            }
+            isLoadingProject = false
+            window?.title = projectWindowTitle()
+            updateLoadedProjectSummary()
+            updateStatus("project loading")
+        } catch {
+            isLoadingProject = false
+            updateStatus("project open failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func clearProjectForLoad() {
+        playbackController.clear()
+        projectTracks.removeAll()
+        activeTrackID = nil
+        decodedAudioBuffer = nil
+        audioTimeline = nil
+        editUndoStack.removeAll()
+        selectedAudioFile = nil
+        selectedTimelineRange = nil
+        loadedAudioSummary = nil
+        currentPlayheadFrame = 0
+        displayedFrameCount = 0
+        displayedSampleRate = 0
+        currentPlaybackStatus = "idle"
+        stopPlaybackTimer()
+        timelineSurface.displaySelection(nil)
+        timelineSurface.displayGainPreview(selection: nil, gain: 1)
+        refreshProjectTimelineDisplay()
+        displayPlaybackVisuals(progress: 0, isPlaying: false)
+        updateTimeReadout()
+        updateEffectCommandState()
+    }
+
+    private func currentProject() -> SoundtimeProject {
+        SoundtimeProject(
+            tracks: projectTracks.map { track in
+                SoundtimeProject.Track(
+                    id: track.id,
+                    name: track.name,
+                    filePath: track.sourceURL.path,
+                    volume: track.volume,
+                    isMuted: track.isMuted,
+                    isSoloed: track.isSoloed
+                )
+            }
+        )
     }
 
     private func writeExport(_ decodedAudioBuffer: DecodedAudioBuffer, to destinationURL: URL) {
@@ -1124,8 +1721,8 @@ final class WorkspaceView: NSView {
 
     private var canApplyGainEffect: Bool {
         guard
-            audioTimeline != nil,
-            decodedAudioBuffer != nil,
+            activeProjectTrack?.audioTimeline != nil,
+            activeProjectTrack?.decodedAudioBuffer != nil,
             let selectedTimelineRange
         else {
             return false
@@ -1188,6 +1785,18 @@ final class WorkspaceView: NSView {
         return "\(baseName)-edited.wav"
     }
 
+    private func suggestedProjectFilename() -> String {
+        if let currentProjectURL {
+            return currentProjectURL.lastPathComponent
+        }
+
+        if let firstTrack = projectTracks.first {
+            return "\(firstTrack.name).\(SoundtimeProjectStore.fileExtension)"
+        }
+
+        return "Untitled.\(SoundtimeProjectStore.fileExtension)"
+    }
+
     private func applyTimeline(_ audioTimeline: AudioEditTimeline) {
         self.audioTimeline = audioTimeline
         selectedTimelineRange = nil
@@ -1202,19 +1811,21 @@ final class WorkspaceView: NSView {
         displayedSampleRate = renderedBuffer.sampleRate
         timelineSurface.displaySelection(nil)
         displayPlaybackVisuals(progress: 0, isPlaying: false)
-        playbackController.clear()
-
-        if renderedBuffer.frameCount > 0 {
-            do {
-                let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: renderedBuffer)
-                try playbackController.load(renderedBuffer, zeroCrossingIndex: zeroCrossingIndex)
-            } catch {
-                updateStatus("playback failed: \(error.localizedDescription)")
-            }
-        }
 
         let waveformOverview = WaveformOverviewBuilder.build(from: renderedBuffer)
-        timelineSurface.displayWaveform(waveformOverview)
+        let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: renderedBuffer)
+        if
+            let activeTrackID,
+            let trackIndex = projectTracks.firstIndex(where: { $0.id == activeTrackID })
+        {
+            projectTracks[trackIndex].decodedAudioBuffer = renderedBuffer
+            projectTracks[trackIndex].audioTimeline = audioTimeline
+            projectTracks[trackIndex].waveformOverview = waveformOverview
+            projectTracks[trackIndex].zeroCrossingIndex = zeroCrossingIndex
+        }
+
+        refreshProjectTimelineDisplay()
+        reloadPlaybackFromProjectMix(preserveProgress: false)
         updateLoadedAudioSummary(for: renderedBuffer)
         updateTimeReadout()
     }

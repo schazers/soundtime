@@ -46,6 +46,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let backingScale: Float
         let viewportStart: Float
         let viewportDuration: Float
+        let trackCount: Int
     }
 
     private struct GridCache {
@@ -61,6 +62,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let gainSelectionStart: Float
         let gainSelectionEnd: Float
         let gain: Float
+        let trackSignature: Int
     }
 
     private struct WaveformCache {
@@ -184,6 +186,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
     private var waveformMipLevels: [WaveformMipLevel] = []
     private var previousWaveformMipLevels: [WaveformMipLevel] = []
+    private var trackWaveformMipLevels: [UUID: [WaveformMipLevel]] = [:]
     private var gridCache: GridCache?
     private var waveformCache: WaveformCache?
     private var previousWaveformCache: WaveformCache?
@@ -260,8 +263,23 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
 
     func displayWaveform(_ waveformOverview: WaveformOverview?) {
-        let nextWaveformMipLevels = makeWaveformMipLevels(from: waveformOverview)
-        if !waveformMipLevels.isEmpty, !nextWaveformMipLevels.isEmpty {
+        let trackID = UUID(uuidString: "00000000-0000-0000-0000-000000000001") ?? UUID()
+        let tracks = waveformOverview.map {
+            [TimelineRenderState.Track(
+                id: trackID,
+                waveformOverview: $0,
+                volume: 1,
+                isMuted: false,
+                isSoloed: false
+            )]
+        } ?? []
+        displayTracks(tracks)
+    }
+
+    func displayTracks(_ tracks: [TimelineRenderState.Track]) {
+        let firstOverview = tracks.first?.waveformOverview
+        let nextWaveformMipLevels = makeWaveformMipLevels(from: firstOverview)
+        if !waveformMipLevels.isEmpty, !nextWaveformMipLevels.isEmpty, tracks.count == 1 {
             previousWaveformMipLevels = waveformMipLevels
             previousWaveformCache = waveformCache
             waveformTransitionStartTime = CACurrentMediaTime()
@@ -272,12 +290,17 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         waveformMipLevels = nextWaveformMipLevels
+        trackWaveformMipLevels = Dictionary(
+            uniqueKeysWithValues: tracks.map { track in
+                (track.id, makeWaveformMipLevels(from: track.waveformOverview))
+            }
+        )
         gridCache = nil
         waveformCache = nil
         playheadContactEvents.removeAll()
         previousRenderedPlayheadX = nil
         previousRenderedPlayheadTime = nil
-        renderState = renderState.withWaveformOverview(waveformOverview)
+        renderState = renderState.withTracks(tracks)
     }
 
     func updateWaveformTouchTuning(
@@ -320,7 +343,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             renderState.isPlaybackActive,
             anchorTimestamp == nil,
             let projectedProgress = projectedPlayheadProgress(at: currentTime),
-            let duration = renderState.waveformOverview?.duration,
+            let duration = renderState.duration,
             duration.isFinite,
             duration > 0
         {
@@ -690,7 +713,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             height: height,
             backingScale: backingScale,
             viewportStart: renderState.viewport.startProgress,
-            viewportDuration: renderState.viewport.durationProgress
+            viewportDuration: renderState.viewport.durationProgress,
+            trackCount: max(renderState.tracks.count, 1)
         )
         if let gridCache, gridCache.key == key {
             return gridCache.vertices
@@ -742,6 +766,31 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         mipLevels: [WaveformMipLevel],
         cache: inout WaveformCache?
     ) -> CachedVertexBuffer? {
+        if renderState.hasWaveforms {
+            let key = waveformCacheKey(
+                drawableSize: drawableSize,
+                mipBinCount: selectedTrackMipBinSignature(drawableSize: drawableSize, renderState: renderState),
+                renderState: renderState
+            )
+            if let cache, cache.key == key {
+                return cache.vertices
+            }
+
+            guard let vertices = makeCachedBuffer(
+                vertices: makeTrackWaveformVertices(
+                    drawableSize: drawableSize,
+                    renderState: renderState
+                )
+            ) else {
+                cache = nil
+                return nil
+            }
+
+            let nextCache = WaveformCache(key: key, vertices: vertices)
+            cache = nextCache
+            return nextCache.vertices
+        }
+
         guard
             let mipLevel = waveformMipLevel(
                 for: drawableSize,
@@ -784,6 +833,18 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         mipLevel: WaveformMipLevel,
         renderState: TimelineRenderState
     ) -> WaveformCacheKey {
+        waveformCacheKey(
+            drawableSize: drawableSize,
+            mipBinCount: mipLevel.binCount,
+            renderState: renderState
+        )
+    }
+
+    private func waveformCacheKey(
+        drawableSize: CGSize,
+        mipBinCount: Int,
+        renderState: TimelineRenderState
+    ) -> WaveformCacheKey {
         let gainSelectionStart: Float
         let gainSelectionEnd: Float
         let gain: Float
@@ -801,11 +862,25 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             width: Float(drawableSize.width),
             viewportStart: renderState.viewport.startProgress,
             viewportDuration: renderState.viewport.durationProgress,
-            mipBinCount: mipLevel.binCount,
+            mipBinCount: mipBinCount,
             gainSelectionStart: gainSelectionStart,
             gainSelectionEnd: gainSelectionEnd,
-            gain: gain
+            gain: gain,
+            trackSignature: trackSignature(renderState: renderState)
         )
+    }
+
+    private func trackSignature(renderState: TimelineRenderState) -> Int {
+        var hasher = Hasher()
+        for track in renderState.tracks {
+            hasher.combine(track.id)
+            hasher.combine(track.waveformOverview?.bins.count ?? 0)
+            hasher.combine(track.waveformOverview?.duration ?? 0)
+            hasher.combine(track.volume)
+            hasher.combine(track.isMuted)
+            hasher.combine(track.isSoloed)
+        }
+        return hasher.finalize()
     }
 
     private func makeGridVertices(
@@ -856,16 +931,34 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             gridProgress += progressStep
         }
 
-        let centerY = pixelAligned(height * 0.5, backingScale: backingScale)
-        appendRectangle(
-            to: &vertices,
-            left: 0,
-            right: width,
-            top: centerY,
-            bottom: min(centerY + lineWidth, height),
-            color: centerColor,
-            drawableSize: size
-        )
+        let trackCount = max(renderState.tracks.count, 1)
+        let laneHeight = height / Float(trackCount)
+        for trackIndex in 0..<trackCount {
+            let laneTop = Float(trackIndex) * laneHeight
+            if trackIndex > 0 {
+                let separatorY = pixelAligned(laneTop, backingScale: backingScale)
+                appendRectangle(
+                    to: &vertices,
+                    left: 0,
+                    right: width,
+                    top: separatorY,
+                    bottom: min(separatorY + lineWidth, height),
+                    color: SIMD4<Float>(0.18, 0.19, 0.20, 1.0),
+                    drawableSize: size
+                )
+            }
+
+            let centerY = pixelAligned(laneTop + laneHeight * 0.5, backingScale: backingScale)
+            appendRectangle(
+                to: &vertices,
+                left: 0,
+                right: width,
+                top: centerY,
+                bottom: min(centerY + lineWidth, height),
+                color: centerColor,
+                drawableSize: size
+            )
+        }
 
         return vertices
     }
@@ -873,7 +966,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private func makeSelectionVertices(renderState: TimelineRenderState) -> [TimelineVertex] {
         guard
             let selection = renderState.selection,
-            renderState.waveformOverview != nil,
+            renderState.hasWaveforms,
             selection.durationProgress > 0.001
         else {
             return []
@@ -956,6 +1049,119 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         return vertices
     }
 
+    private func makeTrackWaveformVertices(
+        drawableSize: CGSize,
+        renderState: TimelineRenderState
+    ) -> [TimelineVertex] {
+        let tracks = renderState.tracks
+        let trackCount = tracks.count
+        guard
+            trackCount > 0,
+            let projectDuration = renderState.duration,
+            projectDuration.isFinite,
+            projectDuration > 0
+        else {
+            return []
+        }
+
+        let laneHeight = Float(1) / Float(trackCount)
+        let minimumVisualHeight = laneHeight * 0.006
+        let anySolo = tracks.contains { $0.isSoloed }
+        var vertices: [TimelineVertex] = []
+
+        for (trackIndex, track) in tracks.enumerated() {
+            guard
+                let overview = track.waveformOverview,
+                !overview.isEmpty,
+                let mipLevels = trackWaveformMipLevels[track.id],
+                let mipLevel = waveformMipLevel(
+                    for: drawableSize,
+                    renderState: renderState,
+                    mipLevels: mipLevels
+                )
+            else {
+                continue
+            }
+
+            let bins = mipLevel.overview.bins
+            let binCount = bins.count
+            let trackDurationProgress = min(max(Float(overview.duration / projectDuration), 0), 1)
+            guard binCount > 0, trackDurationProgress > 0 else {
+                continue
+            }
+
+            let laneTop = Float(trackIndex) * laneHeight
+            let laneBottom = laneTop + laneHeight
+            let centerY = laneTop + laneHeight * 0.5
+            let amplitudeHeight = laneHeight * 0.39 * min(max(track.volume, 0), 1.8)
+            let isAudible = !track.isMuted && (!anySolo || track.isSoloed)
+            let alpha: Float = isAudible ? 1.0 : 0.26
+            let gray = waveformBaseGray * (isAudible ? 1.0 : 0.68)
+            let color = SIMD4<Float>(gray, gray, gray, alpha)
+            let startIndex = max(Int(floor(renderState.viewport.startProgress / trackDurationProgress * Float(binCount))) - 1, 0)
+            let endIndex = min(Int(ceil(renderState.viewport.endProgress / trackDurationProgress * Float(binCount))) + 1, binCount)
+            guard startIndex < endIndex else {
+                continue
+            }
+
+            vertices.reserveCapacity(vertices.count + (endIndex - startIndex) * 6)
+            for index in startIndex..<endIndex {
+                let bin = bins[index]
+                let localX0 = Float(index) / Float(binCount)
+                let localX1 = Float(index + 1) / Float(binCount)
+                let timelineX0 = localX0 * trackDurationProgress
+                let timelineX1 = localX1 * trackDurationProgress
+                let x0 = renderState.viewport.viewportProgress(forTimelineProgress: timelineX0)
+                let x1 = renderState.viewport.viewportProgress(forTimelineProgress: timelineX1)
+                guard x1 > 0, x0 < 1 else {
+                    continue
+                }
+
+                let gain = previewGain(forBinStart: timelineX0, end: timelineX1, renderState: renderState)
+                var y0 = centerY - clampAudioSample(bin.maximumSample * gain) * amplitudeHeight
+                var y1 = centerY - clampAudioSample(bin.minimumSample * gain) * amplitudeHeight
+
+                if y1 - y0 < minimumVisualHeight {
+                    let midpoint = (y0 + y1) * 0.5
+                    y0 = midpoint - minimumVisualHeight * 0.5
+                    y1 = midpoint + minimumVisualHeight * 0.5
+                }
+
+                appendRectangle(
+                    to: &vertices,
+                    left: max(x0, 0),
+                    right: min(x1, 1),
+                    top: max(y0, laneTop),
+                    bottom: min(y1, laneBottom),
+                    color: color
+                )
+            }
+        }
+
+        return vertices
+    }
+
+    private func selectedTrackMipBinSignature(
+        drawableSize: CGSize,
+        renderState: TimelineRenderState
+    ) -> Int {
+        var hasher = Hasher()
+        for track in renderState.tracks {
+            hasher.combine(track.id)
+            hasher.combine(trackWaveformMipLevels[track.id]?.count ?? 0)
+            if let mipLevels = trackWaveformMipLevels[track.id],
+               let mipLevel = waveformMipLevel(
+                for: drawableSize,
+                renderState: renderState,
+                mipLevels: mipLevels
+               )
+            {
+                hasher.combine(mipLevel.binCount)
+            }
+        }
+        return hasher.finalize()
+    }
+
     private func previewGain(forBinStart binStart: Float, end binEnd: Float, renderState: TimelineRenderState) -> Float {
         guard let gainPreview = renderState.gainPreview else {
             return 1
@@ -978,6 +1184,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         playheadProgress: Float,
         renderState: TimelineRenderState
     ) -> [TimelineVertex] {
+        guard renderState.tracks.count <= 1 else {
+            return []
+        }
+
         guard
             let mipLevel = waveformMipLevel(for: drawableSize, renderState: renderState),
             !mipLevel.overview.isEmpty
@@ -1112,7 +1322,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let clampedProgress = min(max(renderState.playheadProgress, 0), 1)
         guard
             renderState.isPlaybackActive,
-            let duration = renderState.waveformOverview?.duration,
+            let duration = renderState.duration,
             duration.isFinite,
             duration > 0
         else {
@@ -1174,7 +1384,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         backingScale: Float,
         renderState: TimelineRenderState
     ) -> [TimelineVertex] {
-        guard let waveformOverview = renderState.waveformOverview, !waveformOverview.isEmpty else {
+        guard renderState.hasWaveforms else {
             return []
         }
 
@@ -1249,7 +1459,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     ) -> [TimelineVertex] {
         guard
             let hoverProgress = renderState.hoverProgress,
-            renderState.waveformOverview != nil
+            renderState.hasWaveforms
         else {
             return []
         }
@@ -1303,7 +1513,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         let playheadX: Float
-        if renderState.waveformOverview == nil {
+        if !renderState.hasWaveforms {
             playheadX = min(max(80, 0), width)
         } else {
             let playheadViewportProgress =
@@ -1363,7 +1573,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             renderState.isPlaybackActive,
             kickEnergy > 0.001,
             let playheadKickOriginProgress,
-            renderState.waveformOverview != nil
+            renderState.hasWaveforms
         {
             let originViewportProgress =
                 renderState.viewport.viewportProgress(forTimelineProgress: playheadKickOriginProgress)
