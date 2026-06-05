@@ -73,6 +73,8 @@ private:
 
 struct SoundtimeAudioCoreEngine {
     std::atomic<uint64_t> frameIndex{0};
+    std::atomic<uint64_t> renderedFrameCount{0};
+    std::atomic<double> hostTimestamp{0};
     std::atomic<bool> isPlaying{false};
     std::atomic<uint64_t> underrunCount{0};
     std::atomic<uint64_t> droppedCommandCount{0};
@@ -130,6 +132,8 @@ void soundtime_audio_core_reset(SoundtimeAudioCoreEngine* engine) {
     }
 
     engine->frameIndex.store(0, std::memory_order_release);
+    engine->renderedFrameCount.store(0, std::memory_order_release);
+    engine->hostTimestamp.store(0, std::memory_order_release);
     engine->isPlaying.store(false, std::memory_order_release);
     engine->underrunCount.store(0, std::memory_order_release);
     engine->droppedCommandCount.store(0, std::memory_order_release);
@@ -149,6 +153,8 @@ void soundtime_audio_core_set_source_info(
     }
 
     engine->frameIndex.store(0, std::memory_order_release);
+    engine->renderedFrameCount.store(0, std::memory_order_release);
+    engine->hostTimestamp.store(0, std::memory_order_release);
     engine->isPlaying.store(false, std::memory_order_release);
     engine->underrunCount.store(0, std::memory_order_release);
     engine->droppedCommandCount.store(0, std::memory_order_release);
@@ -211,7 +217,9 @@ SoundtimeAudioCoreSnapshot soundtime_audio_core_snapshot(const SoundtimeAudioCor
         .frameIndex = engine->frameIndex.load(std::memory_order_acquire),
         .frameCount = config.frameCount,
         .sampleRate = config.sampleRate,
+        .hostTimestamp = engine->hostTimestamp.load(std::memory_order_acquire),
         .isPlaying = engine->isPlaying.load(std::memory_order_acquire),
+        .renderedFrameCount = engine->renderedFrameCount.load(std::memory_order_acquire),
         .underrunCount = engine->underrunCount.load(std::memory_order_acquire),
         .droppedCommandCount = engine->droppedCommandCount.load(std::memory_order_acquire),
     };
@@ -223,6 +231,22 @@ void soundtime_audio_core_render_silence(
     uint32_t channelCount,
     uint32_t frameCount
 ) {
+    soundtime_audio_core_render_silence_at_host_time(
+        engine,
+        outputs,
+        channelCount,
+        frameCount,
+        0
+    );
+}
+
+void soundtime_audio_core_render_silence_at_host_time(
+    SoundtimeAudioCoreEngine* engine,
+    float* const* outputs,
+    uint32_t channelCount,
+    uint32_t frameCount,
+    double hostTimestamp
+) {
     if (outputs == nullptr) {
         if (engine != nullptr) {
             engine->underrunCount.fetch_add(1, std::memory_order_acq_rel);
@@ -232,6 +256,8 @@ void soundtime_audio_core_render_silence(
 
     auto config = ez::immutable<EngineConfig>{};
     if (engine != nullptr) {
+        engine->hostTimestamp.store(hostTimestamp, std::memory_order_release);
+        engine->renderedFrameCount.fetch_add(frameCount, std::memory_order_acq_rel);
         config = engine->config.read(ez::audio);
         process_commands(*engine, *config);
     }

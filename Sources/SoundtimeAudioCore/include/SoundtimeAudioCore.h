@@ -14,7 +14,9 @@ typedef struct SoundtimeAudioCoreSnapshot {
     uint64_t frameIndex;
     uint64_t frameCount;
     double sampleRate;
+    double hostTimestamp;
     bool isPlaying;
+    uint64_t renderedFrameCount;
     uint64_t underrunCount;
     uint64_t droppedCommandCount;
 } SoundtimeAudioCoreSnapshot;
@@ -38,6 +40,13 @@ void soundtime_audio_core_render_silence(
     float* const* outputs,
     uint32_t channelCount,
     uint32_t frameCount
+);
+void soundtime_audio_core_render_silence_at_host_time(
+    SoundtimeAudioCoreEngine* engine,
+    float* const* outputs,
+    uint32_t channelCount,
+    uint32_t frameCount,
+    double hostTimestamp
 );
 
 #ifdef __cplusplus

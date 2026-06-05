@@ -81,7 +81,7 @@ final class RealtimeAudioCore {
             frameIndex: Int(min(snapshot.frameIndex, UInt64(Int.max))),
             frameCount: Int(min(snapshot.frameCount, UInt64(Int.max))),
             isPlaying: snapshot.isPlaying,
-            hostTimestamp: 0
+            hostTimestamp: snapshot.hostTimestamp
         )
     }
 }
