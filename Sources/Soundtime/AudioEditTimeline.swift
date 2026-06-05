@@ -6,6 +6,7 @@ struct AudioEditTimeline: Sendable {
     private struct Segment: Sendable {
         let sourceStartFrame: Int
         let frameCount: Int
+        let gain: Float
 
         var sourceEndFrame: Int {
             sourceStartFrame + frameCount
@@ -18,7 +19,7 @@ struct AudioEditTimeline: Sendable {
     init(sourceBuffer: DecodedAudioBuffer) {
         self.sourceBuffer = sourceBuffer
         if sourceBuffer.frameCount > 0 {
-            segments = [Segment(sourceStartFrame: 0, frameCount: sourceBuffer.frameCount)]
+            segments = [Segment(sourceStartFrame: 0, frameCount: sourceBuffer.frameCount, gain: 1)]
         } else {
             segments = []
         }
@@ -46,6 +47,10 @@ struct AudioEditTimeline: Sendable {
 
     mutating func delete(_ selection: TimelineSelection) -> Int {
         deleteFrames(in: frameRange(for: selection))
+    }
+
+    mutating func applyGain(_ gain: Float, to selection: TimelineSelection) -> Int {
+        applyGain(gain, toFramesIn: frameRange(for: selection))
     }
 
     mutating func trim(to trimRange: TimelineTrimRange) -> Int {
@@ -121,7 +126,8 @@ struct AudioEditTimeline: Sendable {
                     sourceSamples: sourceSamples,
                     sourceStartFrame: sourceStartFrame,
                     sourceEndFrame: boundedSourceEndFrame,
-                    fadeInFrameCount: isFirstRenderedSegment ? 0 : spliceFadeFrameCount
+                    fadeInFrameCount: isFirstRenderedSegment ? 0 : spliceFadeFrameCount,
+                    gain: segment.gain
                 )
             }
 
@@ -159,7 +165,8 @@ struct AudioEditTimeline: Sendable {
         sourceSamples: [Float],
         sourceStartFrame: Int,
         sourceEndFrame: Int,
-        fadeInFrameCount: Int
+        fadeInFrameCount: Int,
+        gain: Float
     ) {
         guard sourceStartFrame < sourceEndFrame else {
             return
@@ -167,18 +174,30 @@ struct AudioEditTimeline: Sendable {
 
         let fadeFrameCount = min(fadeInFrameCount, sourceEndFrame - sourceStartFrame)
         guard fadeFrameCount > 1 else {
-            outputSamples.append(contentsOf: sourceSamples[sourceStartFrame..<sourceEndFrame])
+            if gain == 1 {
+                outputSamples.append(contentsOf: sourceSamples[sourceStartFrame..<sourceEndFrame])
+            } else {
+                for frameIndex in sourceStartFrame..<sourceEndFrame {
+                    outputSamples.append(clampAudioSample(sourceSamples[frameIndex] * gain))
+                }
+            }
             return
         }
 
         for offset in 0..<fadeFrameCount {
             let progress = Float(offset) / Float(fadeFrameCount - 1)
-            outputSamples.append(sourceSamples[sourceStartFrame + offset] * smoothstep(progress))
+            outputSamples.append(clampAudioSample(sourceSamples[sourceStartFrame + offset] * gain) * smoothstep(progress))
         }
 
         let remainingStartFrame = sourceStartFrame + fadeFrameCount
         if remainingStartFrame < sourceEndFrame {
-            outputSamples.append(contentsOf: sourceSamples[remainingStartFrame..<sourceEndFrame])
+            if gain == 1 {
+                outputSamples.append(contentsOf: sourceSamples[remainingStartFrame..<sourceEndFrame])
+            } else {
+                for frameIndex in remainingStartFrame..<sourceEndFrame {
+                    outputSamples.append(clampAudioSample(sourceSamples[frameIndex] * gain))
+                }
+            }
         }
     }
 
@@ -217,7 +236,8 @@ struct AudioEditTimeline: Sendable {
             if beforeCount > 0 {
                 nextSegments.append(Segment(
                     sourceStartFrame: segment.sourceStartFrame,
-                    frameCount: beforeCount
+                    frameCount: beforeCount,
+                    gain: segment.gain
                 ))
             }
 
@@ -225,7 +245,8 @@ struct AudioEditTimeline: Sendable {
             if afterCount > 0 {
                 nextSegments.append(Segment(
                     sourceStartFrame: segment.sourceStartFrame + (overlapEndFrame - segmentStartFrame),
-                    frameCount: afterCount
+                    frameCount: afterCount,
+                    gain: segment.gain
                 ))
             }
         }
@@ -236,5 +257,69 @@ struct AudioEditTimeline: Sendable {
 
         segments = nextSegments
         return deletedFrameCount
+    }
+
+    private mutating func applyGain(_ gain: Float, toFramesIn frameRange: Range<Int>) -> Int {
+        guard
+            frameRange.lowerBound < frameRange.upperBound,
+            frameRange.lowerBound < frameCount,
+            frameRange.upperBound > 0,
+            gain >= 0,
+            gain.isFinite
+        else {
+            return 0
+        }
+
+        let clampedRange = max(frameRange.lowerBound, 0)..<min(frameRange.upperBound, frameCount)
+        var nextSegments: [Segment] = []
+        var timelineFrame = 0
+        var affectedFrameCount = 0
+
+        for segment in segments {
+            let segmentStartFrame = timelineFrame
+            let segmentEndFrame = timelineFrame + segment.frameCount
+            timelineFrame = segmentEndFrame
+
+            let overlapStartFrame = max(segmentStartFrame, clampedRange.lowerBound)
+            let overlapEndFrame = min(segmentEndFrame, clampedRange.upperBound)
+
+            guard overlapStartFrame < overlapEndFrame else {
+                nextSegments.append(segment)
+                continue
+            }
+
+            let beforeCount = overlapStartFrame - segmentStartFrame
+            if beforeCount > 0 {
+                nextSegments.append(Segment(
+                    sourceStartFrame: segment.sourceStartFrame,
+                    frameCount: beforeCount,
+                    gain: segment.gain
+                ))
+            }
+
+            let selectedCount = overlapEndFrame - overlapStartFrame
+            nextSegments.append(Segment(
+                sourceStartFrame: segment.sourceStartFrame + (overlapStartFrame - segmentStartFrame),
+                frameCount: selectedCount,
+                gain: segment.gain * gain
+            ))
+            affectedFrameCount += selectedCount
+
+            let afterCount = segmentEndFrame - overlapEndFrame
+            if afterCount > 0 {
+                nextSegments.append(Segment(
+                    sourceStartFrame: segment.sourceStartFrame + (overlapEndFrame - segmentStartFrame),
+                    frameCount: afterCount,
+                    gain: segment.gain
+                ))
+            }
+        }
+
+        segments = nextSegments
+        return affectedFrameCount
+    }
+
+    private func clampAudioSample(_ sample: Float) -> Float {
+        min(max(sample, -1), 1)
     }
 }

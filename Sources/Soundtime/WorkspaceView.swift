@@ -831,14 +831,16 @@ final class WorkspaceView: NSView {
         displayedFrameCount = mixBuffer.frameCount
         displayedSampleRate = mixBuffer.sampleRate
         do {
-            let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: mixBuffer)
-            playbackController.clear()
-            try playbackController.load(mixBuffer, zeroCrossingIndex: zeroCrossingIndex)
+            let zeroCrossingIndex = projectMixZeroCrossingIndex(for: mixBuffer)
+            try playbackController.replaceWithDecodedSource(mixBuffer, zeroCrossingIndex: zeroCrossingIndex)
             if preserveProgress {
                 try playbackController.seek(toProgress: previousProgress)
-            }
-            if preserveProgress, wasPlaying {
-                try playbackController.play()
+                if wasPlaying {
+                    try playbackController.play()
+                }
+            } else if playbackController.hasSource {
+                playbackController.pause()
+                try playbackController.seek(toProgress: 0)
             }
 
             let snapshot = playbackController.snapshot()
@@ -864,6 +866,14 @@ final class WorkspaceView: NSView {
 
         guard let firstTrack = decodedTracks.first else {
             return nil
+        }
+
+        if
+            decodedTracks.count == 1,
+            abs(firstTrack.0.volume - 1) <= Float.ulpOfOne,
+            !firstTrack.0.isMuted
+        {
+            return firstTrack.1
         }
 
         let sampleRate = firstTrack.1.sampleRate
@@ -901,6 +911,27 @@ final class WorkspaceView: NSView {
         )
     }
 
+    private func projectMixZeroCrossingIndex(for mixBuffer: DecodedAudioBuffer) -> AudioZeroCrossingIndex {
+        let decodedTracks = audibleProjectTracks.compactMap { track -> (ProjectTrack, DecodedAudioBuffer)? in
+            guard let decodedAudioBuffer = track.decodedAudioBuffer else {
+                return nil
+            }
+            return (track, decodedAudioBuffer)
+        }
+
+        if
+            decodedTracks.count == 1,
+            abs(decodedTracks[0].0.volume - 1) <= Float.ulpOfOne,
+            decodedTracks[0].1.frameCount == mixBuffer.frameCount,
+            let zeroCrossingIndex = decodedTracks[0].0.zeroCrossingIndex,
+            zeroCrossingIndex.frameCount == mixBuffer.frameCount
+        {
+            return zeroCrossingIndex
+        }
+
+        return AudioZeroCrossingIndex.build(from: mixBuffer)
+    }
+
     private var audibleProjectTracks: [ProjectTrack] {
         let soloedTracks = projectTracks.filter { $0.isSoloed }
         let candidateTracks = soloedTracks.isEmpty ? projectTracks : soloedTracks
@@ -925,9 +956,10 @@ final class WorkspaceView: NSView {
         trackID: UUID,
         timeline: AudioEditTimeline,
         editRevision: Int,
-        status: String
+        status: String,
+        preservePlaybackProgress: Bool = false
     ) {
-        Task { [weak self, trackID, timeline, editRevision, status] in
+        Task { [weak self, trackID, timeline, editRevision, status, preservePlaybackProgress] in
             let materialized = await Task.detached(priority: .userInitiated) {
                 Self.materializeTimeline(timeline)
             }.value
@@ -940,7 +972,8 @@ final class WorkspaceView: NSView {
                 trackID: trackID,
                 editRevision: editRevision,
                 materialized: materialized,
-                status: status
+                status: status,
+                preservePlaybackProgress: preservePlaybackProgress
             )
         }
     }
@@ -954,7 +987,8 @@ final class WorkspaceView: NSView {
             waveformOverview: WaveformOverview,
             zeroCrossingIndex: AudioZeroCrossingIndex
         ),
-        status: String
+        status: String,
+        preservePlaybackProgress: Bool = false
     ) {
         guard
             let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }),
@@ -971,7 +1005,7 @@ final class WorkspaceView: NSView {
         syncActiveTrackFields()
         refreshProjectTimelineDisplay(rebuildControls: false)
         updateProjectDisplayTiming(sampleRateHint: materialized.buffer.sampleRate)
-        reloadPlaybackFromProjectMix(preserveProgress: false)
+        reloadPlaybackFromProjectMix(preserveProgress: preservePlaybackProgress)
         updateEffectCommandState()
         updateStatus(status)
     }
@@ -1088,6 +1122,39 @@ final class WorkspaceView: NSView {
         let removedDuration = sourceOverview.duration * TimeInterval(selection.durationProgress)
         let nextDuration = max(sourceOverview.duration - removedDuration + (replacementOverview?.duration ?? 0), 0)
         return WaveformOverview(duration: nextDuration, bins: bins)
+    }
+
+    private func optimisticWaveformOverview(
+        _ overview: WaveformOverview?,
+        applyingGain gain: Float,
+        to selection: TimelineSelection
+    ) -> WaveformOverview? {
+        guard let overview else {
+            return nil
+        }
+
+        let sourceOverview = overviewForOptimisticEdit(overview)
+        let binCount = sourceOverview.bins.count
+        guard binCount > 0 else {
+            return sourceOverview
+        }
+
+        let startIndex = min(max(Int((selection.startProgress * Float(binCount)).rounded(.down)), 0), binCount)
+        let endIndex = min(max(Int((selection.endProgress * Float(binCount)).rounded(.up)), startIndex), binCount)
+        guard startIndex < endIndex else {
+            return sourceOverview
+        }
+
+        var bins = sourceOverview.bins
+        for index in startIndex..<endIndex {
+            let bin = bins[index]
+            bins[index] = WaveformOverview.Bin(
+                minimumSample: clampAudioSample(bin.minimumSample * gain),
+                maximumSample: clampAudioSample(bin.maximumSample * gain)
+            )
+        }
+
+        return WaveformOverview(duration: sourceOverview.duration, bins: bins)
     }
 
     private func overviewForOptimisticEdit(_ overview: WaveformOverview) -> WaveformOverview {
@@ -1556,50 +1623,49 @@ final class WorkspaceView: NSView {
 
     private func applyGainEffect(decibels: Double, gain: Float) {
         guard
-            let currentTimeline = audioTimeline,
-            let selectedTimelineRange,
-            selectedTimelineRange.durationProgress > 0
+            let trackIndex = activeProjectTrackIndex(),
+            let selectionToApply = selectedTimelineRange,
+            selectionToApply.durationProgress > 0,
+            let currentTimeline = projectTracks[trackIndex].audioTimeline
         else {
             return
         }
 
-        let renderedBuffer = currentTimeline.render()
-        let startFrame = min(
-            max(Int((selectedTimelineRange.startProgress * Float(renderedBuffer.frameCount)).rounded(.down)), 0),
-            renderedBuffer.frameCount
-        )
-        let endFrame = min(
-            max(Int((selectedTimelineRange.endProgress * Float(renderedBuffer.frameCount)).rounded(.up)), startFrame),
-            renderedBuffer.frameCount
-        )
-        guard startFrame < endFrame else {
+        var editedTimeline = currentTimeline
+        let affectedFrameCount = editedTimeline.applyGain(gain, to: selectionToApply)
+        guard affectedFrameCount > 0 else {
             return
         }
 
-        var samplesByChannel = renderedBuffer.samplesByChannel
-        for channelIndex in samplesByChannel.indices {
-            guard startFrame < samplesByChannel[channelIndex].count else {
-                continue
-            }
-
-            let clampedEndFrame = min(endFrame, samplesByChannel[channelIndex].count)
-            for frameIndex in startFrame..<clampedEndFrame {
-                samplesByChannel[channelIndex][frameIndex] = clampAudioSample(samplesByChannel[channelIndex][frameIndex] * gain)
-            }
-        }
-
-        let editedBuffer = DecodedAudioBuffer(
-            url: renderedBuffer.url,
-            sampleRate: renderedBuffer.sampleRate,
-            channelCount: renderedBuffer.channelCount,
-            frameCount: renderedBuffer.frameCount,
-            samplesByChannel: samplesByChannel
-        )
-        let editedTimeline = AudioEditTimeline(sourceBuffer: editedBuffer)
         editUndoStack.append(currentTimeline)
+        let trackID = projectTracks[trackIndex].id
+        projectTracks[trackIndex].editRevision += 1
+        let editRevision = projectTracks[trackIndex].editRevision
+        projectTracks[trackIndex].audioTimeline = editedTimeline
+        projectTracks[trackIndex].decodedAudioBuffer = nil
+        projectTracks[trackIndex].zeroCrossingIndex = nil
+        projectTracks[trackIndex].waveformOverview = optimisticWaveformOverview(
+            projectTracks[trackIndex].waveformOverview,
+            applyingGain: gain,
+            to: selectionToApply
+        )
         lastEffect = .gain(decibels: decibels)
-        applyTimeline(editedTimeline)
+        selectedTimelineRange = nil
+        timelineSurface.displaySelection(nil)
+        timelineSurface.displayGainPreview(selection: nil, gain: 1)
+        syncActiveTrackFields()
+        refreshProjectTimelineDisplay(rebuildControls: false)
+        updateProjectDisplayTiming()
+        updateEffectCommandState()
         updateStatus(String(format: "gain %+.1f dB", decibels))
+
+        materializeEditedTimeline(
+            trackID: trackID,
+            timeline: editedTimeline,
+            editRevision: editRevision,
+            status: String(format: "gain %+.1f dB", decibels),
+            preservePlaybackProgress: true
+        )
     }
 
     private func applyFadeEffect(_ fadeEffect: FadeEffect) {

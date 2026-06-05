@@ -56,7 +56,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var needsTimelineRender = false
     private var isTimelineRenderInFlight = false
     private var isTimelinePlaybackActive = false
-    private let selectionDragThreshold: CGFloat = 3
+    private let selectionDragThreshold: CGFloat = 0.25
     private let trimHandleHitWidth: CGFloat = 18
     private let rightPanVelocitySmoothing: Float = 0.42
     private let rightPanMomentumDecayRate: Double = 5.2
