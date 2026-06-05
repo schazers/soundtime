@@ -480,7 +480,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return nil
         }
 
-        let elapsedTime = max(timestamp - pagingPlayheadAnchorTimestamp, 0)
+        let elapsedTime = timestamp - pagingPlayheadAnchorTimestamp
         let projectedProgress = pagingPlayheadProgress + Float(elapsedTime / timelineDuration)
         return min(max(projectedProgress, 0), 1)
     }

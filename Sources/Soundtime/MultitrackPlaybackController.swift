@@ -425,12 +425,12 @@ final class MultitrackPlaybackController: PlaybackEngine {
             return (pausedProjectFrame, pausedFrameHostTimestamp)
         }
 
-        let elapsedTime = max(currentHostTimestamp - playbackStartHostTimestamp, 0)
+        let elapsedTime = currentHostTimestamp - playbackStartHostTimestamp
         let frameIndex = min(
-            playbackStartProjectFrame + Int(elapsedTime * projectSampleRate()),
+            max(playbackStartProjectFrame + Int((elapsedTime * projectSampleRate()).rounded(.towardZero)), 0),
             projectFrameCount()
         )
-        return (frameIndex, max(currentHostTimestamp, playbackStartHostTimestamp))
+        return (frameIndex, currentHostTimestamp)
     }
 
     private func finishAtEnd() {
