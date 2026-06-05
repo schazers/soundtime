@@ -15,9 +15,14 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
     private var zeroCrossingProbe: WAVZeroCrossingProbe?
     private var sourceLoaded = false
     private var masterGain: Float = 1
+    private var mirroredFrameIndex = 0
+    private var mirroredFrameCount = 0
+    private var mirroredIsPlaying = false
+    private var mirroredHostTimestamp = CACurrentMediaTime()
+    private var pendingCommandRenderedFrameCount: Int?
 
     var isPlaying: Bool {
-        core.snapshot().isPlaying
+        snapshot().isPlaying
     }
 
     var hasSource: Bool {
@@ -50,6 +55,11 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
 
         frameCount = decodedAudioBuffer.frameCount
         sampleRate = decodedAudioBuffer.sampleRate
+        mirroredFrameIndex = 0
+        mirroredFrameCount = decodedAudioBuffer.frameCount
+        mirroredIsPlaying = false
+        mirroredHostTimestamp = CACurrentMediaTime()
+        pendingCommandRenderedFrameCount = nil
         self.zeroCrossingIndex = zeroCrossingIndex
         zeroCrossingProbe = nil
         sourceLoaded = true
@@ -67,6 +77,11 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
 
         frameCount = fileInfo.frameCount
         sampleRate = fileInfo.sampleRate
+        mirroredFrameIndex = 0
+        mirroredFrameCount = fileInfo.frameCount
+        mirroredIsPlaying = false
+        mirroredHostTimestamp = CACurrentMediaTime()
+        pendingCommandRenderedFrameCount = nil
         zeroCrossingIndex = nil
         self.zeroCrossingProbe = zeroCrossingProbe
         sourceLoaded = false
@@ -96,6 +111,11 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         core.reset()
         frameCount = 0
         sampleRate = 0
+        mirroredFrameIndex = 0
+        mirroredFrameCount = 0
+        mirroredIsPlaying = false
+        mirroredHostTimestamp = CACurrentMediaTime()
+        pendingCommandRenderedFrameCount = nil
         zeroCrossingIndex = nil
         zeroCrossingProbe = nil
         sourceLoaded = false
@@ -125,10 +145,26 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             try engine.start()
         }
 
+        let detailedSnapshot = core.detailedSnapshot()
+        if mirroredFrameIndex >= frameCount {
+            mirroredFrameIndex = 0
+        }
+        mirroredFrameCount = frameCount
+        mirroredIsPlaying = true
+        mirroredHostTimestamp = CACurrentMediaTime()
+        pendingCommandRenderedFrameCount = detailedSnapshot.renderedFrameCount
         core.play()
     }
 
     func pause() {
+        let detailedSnapshot = core.detailedSnapshot()
+        mirroredFrameIndex = min(max(detailedSnapshot.frameIndex, 0), frameCount)
+        mirroredFrameCount = frameCount
+        mirroredIsPlaying = false
+        mirroredHostTimestamp = detailedSnapshot.hostTimestamp > 0 ?
+            detailedSnapshot.hostTimestamp :
+            CACurrentMediaTime()
+        pendingCommandRenderedFrameCount = detailedSnapshot.renderedFrameCount
         core.pause()
     }
 
@@ -146,11 +182,34 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             targetFrame,
             allowsEnd: targetFrame >= frameCount
         )
+        let detailedSnapshot = core.detailedSnapshot()
+        mirroredFrameIndex = snappedTargetFrame
+        mirroredFrameCount = frameCount
+        mirroredHostTimestamp = CACurrentMediaTime()
+        pendingCommandRenderedFrameCount = detailedSnapshot.renderedFrameCount
         core.seek(toFrame: snappedTargetFrame)
     }
 
     func snapshot() -> PlaybackSnapshot {
-        core.snapshot()
+        let detailedSnapshot = core.detailedSnapshot()
+        if
+            let pendingCommandRenderedFrameCount,
+            detailedSnapshot.renderedFrameCount <= pendingCommandRenderedFrameCount
+        {
+            return PlaybackSnapshot(
+                frameIndex: mirroredFrameIndex,
+                frameCount: mirroredFrameCount,
+                isPlaying: mirroredIsPlaying,
+                hostTimestamp: mirroredHostTimestamp
+            )
+        }
+
+        pendingCommandRenderedFrameCount = nil
+        mirroredFrameIndex = detailedSnapshot.frameIndex
+        mirroredFrameCount = detailedSnapshot.frameCount
+        mirroredIsPlaying = detailedSnapshot.isPlaying
+        mirroredHostTimestamp = detailedSnapshot.hostTimestamp
+        return detailedSnapshot.playbackSnapshot
     }
 
     private func configureCallbackGraph(sampleRate: Double) throws {
