@@ -17,7 +17,7 @@ final class SoundtimeAudioCoreTests: XCTestCase {
         XCTAssertEqual(snapshot.frameIndex, 16)
         XCTAssertEqual(snapshot.frameCount, 100)
         XCTAssertEqual(snapshot.sampleRate, 48_000)
-        XCTAssertEqual(snapshot.hostTimestamp, 12.5)
+        XCTAssertTimestamp(snapshot.hostTimestamp, 12.5 + Double(16) / 48_000)
         XCTAssertTrue(snapshot.isPlaying)
         XCTAssertEqual(snapshot.renderedFrameCount, 16)
         XCTAssertEqual(snapshot.underrunCount, 0)
@@ -28,7 +28,7 @@ final class SoundtimeAudioCoreTests: XCTestCase {
 
         snapshot = soundtime_audio_core_snapshot(engine)
         XCTAssertEqual(snapshot.frameIndex, 100)
-        XCTAssertEqual(snapshot.hostTimestamp, 12.75)
+        XCTAssertTimestamp(snapshot.hostTimestamp, 12.75 + Double(10) / 48_000)
         XCTAssertEqual(snapshot.renderedFrameCount, 36)
         XCTAssertFalse(snapshot.isPlaying)
     }
@@ -67,7 +67,7 @@ final class SoundtimeAudioCoreTests: XCTestCase {
         let snapshot = soundtime_audio_core_snapshot(engine)
         XCTAssertEqual(snapshot.frameIndex, 2)
         XCTAssertEqual(snapshot.frameCount, 3)
-        XCTAssertEqual(snapshot.hostTimestamp, 3.25)
+        XCTAssertTimestamp(snapshot.hostTimestamp, 3.25 + Double(2) / 48_000)
         XCTAssertTrue(snapshot.isPlaying)
     }
 
@@ -379,13 +379,22 @@ final class SoundtimeAudioCoreTests: XCTestCase {
 
         XCTAssertEqual(firstSample.frameIndex, 2)
         XCTAssertEqual(firstSample.renderedFrameCount, 2)
-        XCTAssertEqual(firstSample.hostTimestamp, 2.0)
+        XCTAssertTimestamp(firstSample.hostTimestamp, 2.0 + Double(2) / 48_000)
         XCTAssertTrue(firstSample.isPlaying)
 
         XCTAssertEqual(secondSample.frameIndex, 4)
         XCTAssertEqual(secondSample.renderedFrameCount, 4)
-        XCTAssertEqual(secondSample.hostTimestamp, 2.5)
+        XCTAssertTimestamp(secondSample.hostTimestamp, 2.5 + Double(2) / 48_000)
         XCTAssertFalse(secondSample.isPlaying)
+    }
+
+    private func XCTAssertTimestamp(
+        _ actual: Double,
+        _ expected: Double,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(actual, expected, accuracy: 1e-12, file: file, line: line)
     }
 
     private func renderSilence(

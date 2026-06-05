@@ -724,7 +724,6 @@ void soundtime_audio_core_render_at_host_time(
 
     auto config = ez::immutable<EngineConfig>{};
     if (engine != nullptr) {
-        engine->hostTimestamp.store(hostTimestamp, std::memory_order_release);
         engine->renderedFrameCount.fetch_add(frameCount, std::memory_order_acq_rel);
         config = engine->config.read(ez::audio);
         process_commands(*engine, *config);
@@ -825,6 +824,12 @@ void soundtime_audio_core_render_at_host_time(
     }
     if (nextFrameIndex >= sourceFrameCount) {
         engine->isPlaying.store(false, std::memory_order_release);
+    }
+    if (hostTimestamp > 0 && config->sampleRate > 0) {
+        const auto renderedDuration = static_cast<double>(advancedFrameCount) / config->sampleRate;
+        engine->hostTimestamp.store(hostTimestamp + renderedDuration, std::memory_order_release);
+    } else {
+        engine->hostTimestamp.store(hostTimestamp, std::memory_order_release);
     }
     publish_clock_sample(*engine);
 }

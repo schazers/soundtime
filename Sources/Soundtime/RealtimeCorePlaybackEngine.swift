@@ -294,6 +294,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
 
     func snapshot() -> PlaybackSnapshot {
         let detailedSnapshot = core.detailedSnapshot()
+        let snapshotTimestamp = CACurrentMediaTime()
         if
             let pendingCommandRenderedFrameCount,
             detailedSnapshot.renderedFrameCount <= pendingCommandRenderedFrameCount
@@ -307,11 +308,25 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         }
 
         pendingCommandRenderedFrameCount = nil
-        mirroredFrameIndex = detailedSnapshot.frameIndex
         mirroredFrameCount = detailedSnapshot.frameCount
         mirroredIsPlaying = detailedSnapshot.isPlaying
-        mirroredHostTimestamp = detailedSnapshot.hostTimestamp
-        return detailedSnapshot.playbackSnapshot
+        if detailedSnapshot.isPlaying {
+            mirroredFrameIndex = projectedFrameIndex(
+                from: detailedSnapshot,
+                at: snapshotTimestamp
+            )
+            mirroredHostTimestamp = snapshotTimestamp
+        } else {
+            mirroredFrameIndex = detailedSnapshot.frameIndex
+            mirroredHostTimestamp = detailedSnapshot.hostTimestamp
+        }
+
+        return PlaybackSnapshot(
+            frameIndex: mirroredFrameIndex,
+            frameCount: mirroredFrameCount,
+            isPlaying: mirroredIsPlaying,
+            hostTimestamp: mirroredHostTimestamp
+        )
     }
 
     private func projectedFrameIndex(
