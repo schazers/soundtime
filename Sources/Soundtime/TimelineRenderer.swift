@@ -522,8 +522,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let wasPlaybackActive = renderState.isPlaybackActive
 
         if wasPlaybackActive != isActive {
-            let anchoredProgress = isActive ?
-                (projectedPlayheadProgress(at: currentTime) ?? renderState.playheadProgress) :
+            let anchoredProgress = projectedPlayheadProgress(at: currentTime) ??
                 renderState.playheadProgress
             renderState = renderState
                 .withPlayheadProgress(anchoredProgress, anchorTimestamp: currentTime)
