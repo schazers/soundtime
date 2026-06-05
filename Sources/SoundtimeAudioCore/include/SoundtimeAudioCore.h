@@ -37,6 +37,13 @@ bool soundtime_audio_core_set_interleaved_source(
     uint32_t channelCount,
     double sampleRate
 );
+bool soundtime_audio_core_set_planar_source(
+    SoundtimeAudioCoreEngine* engine,
+    const float* const* channels,
+    uint64_t frameCount,
+    uint32_t channelCount,
+    double sampleRate
+);
 void soundtime_audio_core_play(SoundtimeAudioCoreEngine* engine);
 void soundtime_audio_core_pause(SoundtimeAudioCoreEngine* engine);
 void soundtime_audio_core_seek(SoundtimeAudioCoreEngine* engine, uint64_t frameIndex);
