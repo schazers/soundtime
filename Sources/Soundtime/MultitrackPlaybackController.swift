@@ -618,7 +618,7 @@ final class MultitrackPlaybackController: PlaybackEngine {
             return clampedFrame
         }
 
-        guard let referencePlayer = zeroCrossingReferencePlayer() else {
+        guard let referencePlayer = zeroCrossingReferencePlayer(containingProjectFrame: clampedFrame) else {
             return clampedFrame
         }
 
@@ -650,7 +650,13 @@ final class MultitrackPlaybackController: PlaybackEngine {
         return boundedFrame
     }
 
-    private func zeroCrossingReferencePlayer() -> TrackPlayer? {
+    private func zeroCrossingReferencePlayer(containingProjectFrame projectFrame: Int) -> TrackPlayer? {
+        let sampleRate = projectSampleRate()
+        guard sampleRate.isFinite, sampleRate > 0 else {
+            return nil
+        }
+
+        let projectTime = TimeInterval(projectFrame) / sampleRate
         let anySoloedTrack = trackPlayers.values.contains { $0.track.isSoloed }
         for trackID in trackOrder {
             guard let player = trackPlayers[trackID] else {
@@ -661,10 +667,13 @@ final class MultitrackPlaybackController: PlaybackEngine {
                 continue
             }
 
-            return player
+            let sourceFrame = Int((projectTime * player.sampleRate).rounded(.down))
+            if sourceFrame > 0, sourceFrame < player.frameCount {
+                return player
+            }
         }
 
-        return trackOrder.compactMap { trackPlayers[$0] }.first
+        return nil
     }
 
     private func isTrackAudible(
