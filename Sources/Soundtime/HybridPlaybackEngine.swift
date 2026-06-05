@@ -80,6 +80,12 @@ final class HybridPlaybackEngine: PlaybackEngine {
             return
         }
 
+        if !currentEngine.hasSource {
+            try previewEngine.load(decodedAudioBuffer, zeroCrossingIndex: zeroCrossingIndex)
+            previewEngine.setPerceptualVolume(perceptualVolume)
+            activeEngine = .preview
+        }
+
         let preparationID = UUID()
         sourcePreparationID = preparationID
         sourcePreparationTask?.cancel()
