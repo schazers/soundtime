@@ -752,13 +752,16 @@ final class WorkspaceView: NSView {
         projectTracks[trackIndex].decodedAudioBuffer = decodedAudioBuffer
         projectTracks[trackIndex].waveformOverview = waveformOverview
         projectTracks[trackIndex].zeroCrossingIndex = zeroCrossingIndex
-        projectTracks[trackIndex].zeroCrossingProbe = nil
         projectTracks[trackIndex].audioTimeline = AudioEditTimeline(sourceBuffer: decodedAudioBuffer)
         activeTrackID = trackID
         syncActiveTrackFields()
         refreshProjectTimelineDisplay(rebuildControls: false)
         updateProjectDisplayTiming(sampleRateHint: decodedAudioBuffer.sampleRate)
-        reloadPlaybackFromProjectTracks(preserveProgress: true)
+        if playbackController.hasSource {
+            updateProjectPlaybackTrackMix()
+        } else {
+            reloadPlaybackFromProjectTracks(preserveProgress: true)
+        }
         updateEffectCommandState()
         updateStatus("track ready")
     }
@@ -891,15 +894,15 @@ final class WorkspaceView: NSView {
     private func projectPlaybackTracks() -> [ProjectPlaybackTrack] {
         projectTracks.compactMap { track in
             let source: ProjectPlaybackTrack.Source
-            if let decodedAudioBuffer = track.decodedAudioBuffer {
-                source = .decoded(
-                    decodedAudioBuffer: decodedAudioBuffer,
-                    zeroCrossingIndex: track.zeroCrossingIndex
-                )
-            } else if track.waveformOverview != nil {
+            if track.editRevision == 0, track.waveformOverview != nil {
                 source = .file(
                     url: track.sourceURL,
                     zeroCrossingProbe: track.zeroCrossingProbe
+                )
+            } else if let decodedAudioBuffer = track.decodedAudioBuffer {
+                source = .decoded(
+                    decodedAudioBuffer: decodedAudioBuffer,
+                    zeroCrossingIndex: track.zeroCrossingIndex
                 )
             } else {
                 return nil
