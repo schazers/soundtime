@@ -6,14 +6,24 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <memory>
+#include <vector>
 
 namespace {
+
+struct AudioSource {
+    std::vector<float> interleavedSamples;
+    uint64_t frameCount = 0;
+    uint32_t channelCount = 0;
+    double sampleRate = 0;
+};
 
 struct EngineConfig {
     uint64_t frameCount = 0;
     uint32_t channelCount = 0;
     double sampleRate = 0;
     float gain = 1;
+    std::shared_ptr<const AudioSource> source;
 };
 
 enum class EngineCommandType : uint8_t {
@@ -168,6 +178,48 @@ void soundtime_audio_core_set_source_info(
     engine->config.gc(ez::gc);
 }
 
+bool soundtime_audio_core_set_interleaved_source(
+    SoundtimeAudioCoreEngine* engine,
+    const float* samples,
+    uint64_t frameCount,
+    uint32_t channelCount,
+    double sampleRate
+) {
+    if (engine == nullptr || channelCount == 0) {
+        return false;
+    }
+
+    const auto sampleCount = frameCount * channelCount;
+    if (sampleCount > 0 && samples == nullptr) {
+        return false;
+    }
+
+    auto source = std::make_shared<AudioSource>();
+    source->frameCount = frameCount;
+    source->channelCount = channelCount;
+    source->sampleRate = sampleRate;
+    if (sampleCount > 0) {
+        source->interleavedSamples.assign(samples, samples + sampleCount);
+    }
+
+    engine->frameIndex.store(0, std::memory_order_release);
+    engine->renderedFrameCount.store(0, std::memory_order_release);
+    engine->hostTimestamp.store(0, std::memory_order_release);
+    engine->isPlaying.store(false, std::memory_order_release);
+    engine->underrunCount.store(0, std::memory_order_release);
+    engine->droppedCommandCount.store(0, std::memory_order_release);
+    engine->commandQueue.clear();
+    engine->config.update_publish(ez::nort, [=](EngineConfig config) {
+        config.frameCount = frameCount;
+        config.channelCount = channelCount;
+        config.sampleRate = sampleRate;
+        config.source = source;
+        return config;
+    });
+    engine->config.gc(ez::gc);
+    return true;
+}
+
 void soundtime_audio_core_play(SoundtimeAudioCoreEngine* engine) {
     if (engine == nullptr) {
         return;
@@ -247,6 +299,37 @@ void soundtime_audio_core_render_silence_at_host_time(
     uint32_t frameCount,
     double hostTimestamp
 ) {
+    soundtime_audio_core_render_at_host_time(
+        engine,
+        outputs,
+        channelCount,
+        frameCount,
+        hostTimestamp
+    );
+}
+
+void soundtime_audio_core_render(
+    SoundtimeAudioCoreEngine* engine,
+    float* const* outputs,
+    uint32_t channelCount,
+    uint32_t frameCount
+) {
+    soundtime_audio_core_render_at_host_time(
+        engine,
+        outputs,
+        channelCount,
+        frameCount,
+        0
+    );
+}
+
+void soundtime_audio_core_render_at_host_time(
+    SoundtimeAudioCoreEngine* engine,
+    float* const* outputs,
+    uint32_t channelCount,
+    uint32_t frameCount,
+    double hostTimestamp
+) {
     if (outputs == nullptr) {
         if (engine != nullptr) {
             engine->underrunCount.fetch_add(1, std::memory_order_acq_rel);
@@ -276,8 +359,35 @@ void soundtime_audio_core_render_silence_at_host_time(
     }
 
     const auto sourceFrameCount = config->frameCount;
-    auto nextFrameIndex = engine->frameIndex.load(std::memory_order_acquire);
-    nextFrameIndex = std::min<uint64_t>(nextFrameIndex + frameCount, sourceFrameCount);
+    const auto currentFrameIndex = engine->frameIndex.load(std::memory_order_acquire);
+    const auto renderableFrameCount = sourceFrameCount > currentFrameIndex ?
+        std::min<uint64_t>(frameCount, sourceFrameCount - currentFrameIndex) :
+        0;
+    if (const auto& source = config->source) {
+        const auto sourceChannelCount = source->channelCount;
+        const auto gain = config->gain;
+        for (uint64_t frameOffset = 0; frameOffset < renderableFrameCount; frameOffset++) {
+            const auto sourceFrameIndex = currentFrameIndex + frameOffset;
+            for (uint32_t outputChannel = 0; outputChannel < channelCount; outputChannel++) {
+                auto* output = outputs[outputChannel];
+                if (output == nullptr) {
+                    continue;
+                }
+
+                const auto sourceChannel = sourceChannelCount == 1 ?
+                    uint32_t{0} :
+                    outputChannel;
+                if (sourceChannel >= sourceChannelCount) {
+                    continue;
+                }
+
+                const auto sampleIndex = sourceFrameIndex * sourceChannelCount + sourceChannel;
+                output[frameOffset] = source->interleavedSamples[sampleIndex] * gain;
+            }
+        }
+    }
+
+    auto nextFrameIndex = std::min<uint64_t>(currentFrameIndex + frameCount, sourceFrameCount);
     engine->frameIndex.store(nextFrameIndex, std::memory_order_release);
     if (nextFrameIndex >= sourceFrameCount) {
         engine->isPlaying.store(false, std::memory_order_release);
