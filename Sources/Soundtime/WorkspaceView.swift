@@ -36,7 +36,7 @@ final class WorkspaceView: NSView {
     private var currentPlaybackStatus = "idle"
     private var playbackTimer: Timer?
     private let playbackController = AudioPlaybackController()
-    private let playbackRefreshRate: TimeInterval = 144
+    private let playbackRefreshRate: TimeInterval = 30
     private var visualPlayheadProgress: Float = 0
     private var visualPlayheadAnchorTimestamp = CACurrentMediaTime()
     private var visualPlaybackActive = false
@@ -940,11 +940,11 @@ final class WorkspaceView: NSView {
         playbackTimer?.invalidate()
 
         let timer = Timer(timeInterval: 1 / playbackRefreshRate, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
+            MainActor.assumeIsolated {
                 self?.refreshPlaybackProgress(syncPlayheadWhenPlaying: false)
             }
         }
-        timer.tolerance = 0
+        timer.tolerance = 1 / playbackRefreshRate * 0.2
 
         playbackTimer = timer
         RunLoop.main.add(timer, forMode: .common)
