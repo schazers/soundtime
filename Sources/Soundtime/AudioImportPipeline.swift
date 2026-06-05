@@ -46,7 +46,7 @@ enum AudioImportPipeline {
         targetBinCount: Int,
         samplesPerBin: Int
     ) async throws -> (WAVFileInfo, WaveformOverview) {
-        try await Task.detached(priority: .userInitiated) {
+        try await Task.detached(priority: .utility) {
             try WAVAudioDecoder.buildSparsePreview(
                 url: url,
                 targetBinCount: targetBinCount,
@@ -60,7 +60,7 @@ enum AudioImportPipeline {
         WaveformOverview,
         AudioZeroCrossingIndex
     ) {
-        try await Task.detached(priority: .utility) {
+        try await Task.detached(priority: .background) {
             let decodedAudioBuffer = try WAVAudioDecoder.decode(url: url)
             let waveformOverview = WaveformOverviewBuilder.build(from: decodedAudioBuffer)
             let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: decodedAudioBuffer)
