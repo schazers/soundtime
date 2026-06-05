@@ -586,6 +586,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var previousTransientScanProgress: Float?
     private var lastTransientParticleBins: [UUID: Int] = [:]
     private var transientParticleScoreProfiles: [WaveformMipCacheKey: TransientParticleScoreProfile] = [:]
+    private var transientParticleScoreProfileBuildsInFlight: Set<WaveformMipCacheKey> = []
+    private let transientParticleScoreProfileLock = NSLock()
     private var frameRateWindowStartTime = CFAbsoluteTimeGetCurrent()
     private var previousFrameTime: CFTimeInterval?
     private var frameRateFrameCount = 0
@@ -629,6 +631,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let transientParticleProfileSampleLimit = 2_048
     private let transientParticleMinimumSpacing: TimeInterval = 0.32
     private let transientParticleMaximumScanDuration: TimeInterval = 0.12
+    private let maximumInFlightTransientParticleScoreProfileBuilds = 4
     private let maximumSynchronousGeneratedWaveformMipBins = 8_192
     private let maximumInFlightWaveformMipBuilds = 4
     private let maximumGeneratedWaveformMipBins = 65_536
@@ -2393,10 +2396,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             guard binCount > 0, trackDurationProgress > 0 else {
                 continue
             }
-            let scoreProfile = transientParticleScoreProfile(
+            guard let scoreProfile = transientParticleScoreProfile(
                 for: track,
                 mipLevel: highResolutionMip
-            )
+            ) else {
+                continue
+            }
 
             let scanStart = max(previousProgress, 0)
             let scanEnd = min(clampedProgress, trackDurationProgress)
@@ -2525,21 +2530,51 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private func transientParticleScoreProfile(
         for track: TimelineRenderState.Track,
         mipLevel: WaveformMipLevel
-    ) -> TransientParticleScoreProfile {
+    ) -> TransientParticleScoreProfile? {
         let key = WaveformMipCacheKey(
             trackID: track.id,
             waveformVersion: track.waveformVersion,
             binCount: mipLevel.binCount,
             duration: mipLevel.overview.duration
         )
+
+        transientParticleScoreProfileLock.lock()
         if let cachedProfile = transientParticleScoreProfiles[key] {
+            transientParticleScoreProfileLock.unlock()
             return cachedProfile
         }
+        guard
+            !transientParticleScoreProfileBuildsInFlight.contains(key),
+            transientParticleScoreProfileBuildsInFlight.count < maximumInFlightTransientParticleScoreProfileBuilds
+        else {
+            transientParticleScoreProfileLock.unlock()
+            return nil
+        }
+        transientParticleScoreProfileBuildsInFlight.insert(key)
+        transientParticleScoreProfileLock.unlock()
 
-        if transientParticleScoreProfiles.count >= maximumCachedTransientParticleScoreProfiles {
-            transientParticleScoreProfiles.removeAll(keepingCapacity: true)
+        waveformGeometryQueue.async { [weak self] in
+            guard let self else {
+                return
+            }
+
+            let profile = self.buildTransientParticleScoreProfile(mipLevel: mipLevel)
+            self.transientParticleScoreProfileLock.lock()
+            if self.transientParticleScoreProfiles.count >= self.maximumCachedTransientParticleScoreProfiles {
+                self.transientParticleScoreProfiles.removeAll(keepingCapacity: true)
+            }
+            self.transientParticleScoreProfiles[key] = profile
+            self.transientParticleScoreProfileBuildsInFlight.remove(key)
+            self.transientParticleScoreProfileLock.unlock()
+            self.onRenderDataPrepared?()
         }
 
+        return nil
+    }
+
+    private func buildTransientParticleScoreProfile(
+        mipLevel: WaveformMipLevel
+    ) -> TransientParticleScoreProfile {
         let histogramBucketCount = 128
         var histogram = Array(repeating: 0, count: histogramBucketCount)
         var scoreSum: Double = 0
@@ -2580,9 +2615,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         guard sampledBinCount > 0, loudestScore > 0.0001 else {
-            let profile = TransientParticleScoreProfile(threshold: 1, loudestScore: 0)
-            transientParticleScoreProfiles[key] = profile
-            return profile
+            return TransientParticleScoreProfile(threshold: 1, loudestScore: 0)
         }
 
         let count = Double(sampledBinCount)
@@ -2613,12 +2646,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             max(max(percentileThreshold, statisticalThreshold), loudnessFloor),
             max(relativeCeiling, 0.0001)
         )
-        let profile = TransientParticleScoreProfile(
+        return TransientParticleScoreProfile(
             threshold: min(max(threshold, 0), 1),
             loudestScore: loudestScore
         )
-        transientParticleScoreProfiles[key] = profile
-        return profile
     }
 
     private func spawnTransientParticleBurst(
