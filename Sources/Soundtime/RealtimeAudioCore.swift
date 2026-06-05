@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import SoundtimeAudioCore
 
 struct RealtimeAudioClockSample {
@@ -6,6 +7,36 @@ struct RealtimeAudioClockSample {
     let renderedFrameCount: Int
     let hostTimestamp: TimeInterval
     let isPlaying: Bool
+}
+
+struct RealtimeAudioMeterSample {
+    let startFrameIndex: Int
+    let frameCount: Int
+    let renderedFrameCount: Int
+    let hostTimestamp: TimeInterval
+    let isPlaying: Bool
+    let leftRMS: Float
+    let rightRMS: Float
+    let leftPeak: Float
+    let rightPeak: Float
+    let leftClipPeak: Float
+    let rightClipPeak: Float
+
+    var playbackMeterSample: PlaybackMeterSample {
+        PlaybackMeterSample(
+            startFrameIndex: startFrameIndex,
+            frameCount: frameCount,
+            renderedFrameCount: renderedFrameCount,
+            hostTimestamp: hostTimestamp,
+            isPlaying: isPlaying,
+            leftRMS: leftRMS,
+            rightRMS: rightRMS,
+            leftPeak: leftPeak,
+            rightPeak: rightPeak,
+            leftClipPeak: leftClipPeak,
+            rightClipPeak: rightClipPeak
+        )
+    }
 }
 
 struct RealtimeAudioCoreSnapshot {
@@ -33,17 +64,20 @@ final class PreparedRealtimeAudioSource: @unchecked Sendable {
     let frameCount: Int
     let channelCount: Int
     let sampleRate: Double
+    private let mappedAudioFile: MappedAudioFile?
 
     private init(
         sourcePointer: OpaquePointer,
         frameCount: Int,
         channelCount: Int,
-        sampleRate: Double
+        sampleRate: Double,
+        mappedAudioFile: MappedAudioFile? = nil
     ) {
         self.sourcePointer = sourcePointer
         self.frameCount = frameCount
         self.channelCount = channelCount
         self.sampleRate = sampleRate
+        self.mappedAudioFile = mappedAudioFile
     }
 
     deinit {
@@ -70,6 +104,41 @@ final class PreparedRealtimeAudioSource: @unchecked Sendable {
                 sampleRate: decodedAudioBuffer.sampleRate
             )
         }
+    }
+
+    static func makeMappedWAV(url: URL) throws -> PreparedRealtimeAudioSource? {
+        let fileInfo = try WAVAudioDecoder.inspect(url: url)
+        guard fileInfo.supportsDecoding else {
+            return nil
+        }
+
+        guard let mappedAudioFile = MappedAudioFile(url: url) else {
+            return nil
+        }
+
+        let sourcePointer = soundtime_audio_core_source_create_wav_bytes(
+            mappedAudioFile.pointer.assumingMemoryBound(to: UInt8.self),
+            UInt64(max(mappedAudioFile.byteCount, 0)),
+            UInt64(max(fileInfo.dataRange.lowerBound, 0)),
+            UInt64(max(fileInfo.frameCount, 0)),
+            UInt32(max(fileInfo.channelCount, 0)),
+            fileInfo.sampleRate,
+            UInt32(max(fileInfo.blockAlign, 0)),
+            fileInfo.formatTag,
+            UInt16(max(fileInfo.bitsPerSample, 0))
+        )
+
+        guard let sourcePointer else {
+            return nil
+        }
+
+        return PreparedRealtimeAudioSource(
+            sourcePointer: sourcePointer,
+            frameCount: fileInfo.frameCount,
+            channelCount: fileInfo.channelCount,
+            sampleRate: fileInfo.sampleRate,
+            mappedAudioFile: mappedAudioFile
+        )
     }
 }
 
@@ -302,6 +371,81 @@ final class RealtimeAudioCore {
         )
     }
 
+    func popMeterSample() -> RealtimeAudioMeterSample? {
+        guard let engine else {
+            return nil
+        }
+
+        var sample = SoundtimeAudioCoreMeterSample()
+        guard soundtime_audio_core_pop_meter_sample(engine, &sample) else {
+            return nil
+        }
+
+        return RealtimeAudioMeterSample(
+            startFrameIndex: Int(min(sample.startFrameIndex, UInt64(Int.max))),
+            frameCount: Int(min(sample.frameCount, UInt64(Int.max))),
+            renderedFrameCount: Int(min(sample.renderedFrameCount, UInt64(Int.max))),
+            hostTimestamp: sample.hostTimestamp,
+            isPlaying: sample.isPlaying,
+            leftRMS: sample.leftRMS,
+            rightRMS: sample.rightRMS,
+            leftPeak: sample.leftPeak,
+            rightPeak: sample.rightPeak,
+            leftClipPeak: sample.leftClipPeak,
+            rightClipPeak: sample.rightClipPeak
+        )
+    }
+
+}
+
+private final class MappedAudioFile: @unchecked Sendable {
+    let pointer: UnsafeRawPointer
+    let byteCount: Int
+
+    init?(url: URL) {
+        let fileDescriptor = url.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else {
+                return -1
+            }
+
+            return Darwin.open(path, O_RDONLY)
+        }
+        guard fileDescriptor >= 0 else {
+            return nil
+        }
+        defer {
+            Darwin.close(fileDescriptor)
+        }
+
+        var fileStat = stat()
+        guard Darwin.fstat(fileDescriptor, &fileStat) == 0 else {
+            return nil
+        }
+
+        let size = Int(fileStat.st_size)
+        guard size > 0 else {
+            return nil
+        }
+
+        let mappedPointer = Darwin.mmap(
+            nil,
+            size,
+            PROT_READ,
+            MAP_PRIVATE,
+            fileDescriptor,
+            0
+        )
+        guard let mappedPointer, mappedPointer != MAP_FAILED else {
+            return nil
+        }
+
+        pointer = UnsafeRawPointer(mappedPointer)
+        byteCount = size
+    }
+
+    deinit {
+        Darwin.munmap(UnsafeMutableRawPointer(mutating: pointer), byteCount)
+    }
 }
 
 private func withPlanarSamplePointers<T>(

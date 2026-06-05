@@ -3,6 +3,7 @@ import AppKit
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var mainWindowController: MainWindowController?
+    private weak var openRecentMenu: NSMenu?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureMainMenu()
@@ -15,6 +16,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        mainWindowController?.persistOpenProjectWindowLayout()
     }
 
     private func configureMainMenu() {
@@ -43,6 +48,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             action: #selector(TimelineView.openProject(_:)),
             keyEquivalent: "o"
         ))
+        menu.addItem(makeOpenRecentMenuItem())
         menu.addItem(NSMenuItem(
             title: "Save",
             action: #selector(TimelineView.saveProject(_:)),
@@ -71,6 +77,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quitItem)
 
         return menu
+    }
+
+    private func makeOpenRecentMenuItem() -> NSMenuItem {
+        let menuItem = NSMenuItem(title: "Open Recent", action: nil, keyEquivalent: "")
+        let submenu = NSMenu(title: "Open Recent")
+        submenu.delegate = self
+        menuItem.submenu = submenu
+        openRecentMenu = submenu
+        rebuildOpenRecentMenu(submenu)
+        return menuItem
+    }
+
+    private func rebuildOpenRecentMenu(_ menu: NSMenu) {
+        menu.removeAllItems()
+
+        let recentURLs = SoundtimeProjectStore.recentProjectURLs()
+        if recentURLs.isEmpty {
+            let emptyItem = NSMenuItem(title: "No Recent Projects", action: nil, keyEquivalent: "")
+            emptyItem.isEnabled = false
+            menu.addItem(emptyItem)
+        } else {
+            for url in recentURLs.prefix(SoundtimeProjectStore.maximumRecentProjectCount) {
+                let item = NSMenuItem(
+                    title: url.deletingPathExtension().lastPathComponent,
+                    action: #selector(TimelineView.openRecentProject(_:)),
+                    keyEquivalent: ""
+                )
+                item.representedObject = url
+                menu.addItem(item)
+            }
+        }
+
+        menu.addItem(.separator())
+        let clearItem = NSMenuItem(
+            title: "Clear Recents",
+            action: #selector(TimelineView.clearRecentProjects(_:)),
+            keyEquivalent: ""
+        )
+        clearItem.isEnabled = !recentURLs.isEmpty
+        menu.addItem(clearItem)
     }
 
     private func makeEditMenu() -> NSMenu {
@@ -127,5 +173,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ))
 
         return menu
+    }
+}
+
+extension AppDelegate: NSMenuDelegate {
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        if menu === openRecentMenu {
+            rebuildOpenRecentMenu(menu)
+        }
     }
 }

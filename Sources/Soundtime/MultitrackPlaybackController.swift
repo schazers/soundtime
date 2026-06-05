@@ -601,9 +601,7 @@ final class MultitrackPlaybackController: PlaybackEngine {
     private func applyTrackVolumes() {
         let anySoloedTrack = trackPlayers.values.contains { $0.track.isSoloed }
         for player in trackPlayers.values {
-            let shouldPlayTrack =
-                !player.track.isMuted &&
-                (!anySoloedTrack || player.track.isSoloed)
+            let shouldPlayTrack = isTrackAudible(player.track, anySoloedTrack: anySoloedTrack)
             let clampedTrackVolume = min(max(player.track.volume, 0), 1)
             player.playerNode.volume = shouldPlayTrack ? clampedTrackVolume * clampedTrackVolume : 0
         }
@@ -659,10 +657,7 @@ final class MultitrackPlaybackController: PlaybackEngine {
                 continue
             }
 
-            guard
-                !player.track.isMuted,
-                !anySoloedTrack || player.track.isSoloed
-            else {
+            guard isTrackAudible(player.track, anySoloedTrack: anySoloedTrack) else {
                 continue
             }
 
@@ -670,6 +665,13 @@ final class MultitrackPlaybackController: PlaybackEngine {
         }
 
         return trackOrder.compactMap { trackPlayers[$0] }.first
+    }
+
+    private func isTrackAudible(
+        _ track: ProjectPlaybackTrack,
+        anySoloedTrack: Bool
+    ) -> Bool {
+        anySoloedTrack ? track.isSoloed : !track.isMuted
     }
 
     private func projectSampleRate() -> Double {

@@ -5,6 +5,7 @@ struct TimelineRenderState: Sendable {
         let id: UUID
         let waveformVersion: Int
         let waveformOverview: WaveformOverview?
+        let durationHint: TimeInterval?
         let volume: Float
         let isMuted: Bool
         let isSoloed: Bool
@@ -24,6 +25,7 @@ struct TimelineRenderState: Sendable {
         hoverProgress: nil,
         isHoverGuideArmed: false,
         selection: nil,
+        selectedTrackID: nil,
         trimPreview: nil,
         gainPreview: nil
     )
@@ -36,6 +38,7 @@ struct TimelineRenderState: Sendable {
     let hoverProgress: Float?
     let isHoverGuideArmed: Bool
     let selection: TimelineSelection?
+    let selectedTrackID: UUID?
     let trimPreview: TimelineTrimRange?
     let gainPreview: GainPreview?
 
@@ -49,7 +52,7 @@ struct TimelineRenderState: Sendable {
 
     var duration: TimeInterval? {
         let duration = tracks.reduce(TimeInterval(0)) { result, track in
-            max(result, track.waveformOverview?.duration ?? 0)
+            max(result, track.waveformOverview?.duration ?? track.durationHint ?? 0)
         }
         return duration > 0 ? duration : nil
     }
@@ -60,6 +63,7 @@ struct TimelineRenderState: Sendable {
                 id: UUID(uuidString: "00000000-0000-0000-0000-000000000001") ?? UUID(),
                 waveformVersion: 0,
                 waveformOverview: $0,
+                durationHint: $0.duration,
                 volume: 1,
                 isMuted: false,
                 isSoloed: false
@@ -78,6 +82,7 @@ struct TimelineRenderState: Sendable {
             hoverProgress: hoverProgress,
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
+            selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
             gainPreview: nil
         )
@@ -93,6 +98,7 @@ struct TimelineRenderState: Sendable {
             hoverProgress: hoverProgress,
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
+            selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
             gainPreview: gainPreview
         )
@@ -108,6 +114,7 @@ struct TimelineRenderState: Sendable {
             hoverProgress: hoverProgress,
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
+            selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
             gainPreview: gainPreview
         )
@@ -126,6 +133,7 @@ struct TimelineRenderState: Sendable {
             hoverProgress: hoverProgress,
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
+            selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
             gainPreview: gainPreview
         )
@@ -141,6 +149,7 @@ struct TimelineRenderState: Sendable {
             hoverProgress: hoverProgress,
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
+            selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
             gainPreview: gainPreview
         )
@@ -157,6 +166,7 @@ struct TimelineRenderState: Sendable {
             hoverProgress: clampedProgress,
             isHoverGuideArmed: clampedProgress != nil && isArmed,
             selection: selection,
+            selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
             gainPreview: gainPreview
         )
@@ -172,6 +182,23 @@ struct TimelineRenderState: Sendable {
             hoverProgress: hoverProgress,
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
+            selectedTrackID: selectedTrackID,
+            trimPreview: trimPreview,
+            gainPreview: gainPreview
+        )
+    }
+
+    func withSelectedTrackID(_ selectedTrackID: UUID?) -> TimelineRenderState {
+        TimelineRenderState(
+            tracks: tracks,
+            viewport: viewport,
+            playheadProgress: playheadProgress,
+            playheadAnchorTimestamp: playheadAnchorTimestamp,
+            isPlaybackActive: isPlaybackActive,
+            hoverProgress: hoverProgress,
+            isHoverGuideArmed: isHoverGuideArmed,
+            selection: selection,
+            selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
             gainPreview: gainPreview
         )
@@ -187,6 +214,7 @@ struct TimelineRenderState: Sendable {
             hoverProgress: hoverProgress,
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
+            selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
             gainPreview: gainPreview
         )
@@ -202,6 +230,7 @@ struct TimelineRenderState: Sendable {
             hoverProgress: hoverProgress,
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
+            selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
             gainPreview: gainPreview
         )

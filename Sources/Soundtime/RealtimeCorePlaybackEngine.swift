@@ -381,6 +381,20 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         )
     }
 
+    func drainMeterSamples() -> [PlaybackMeterSample] {
+        var latestSample: PlaybackMeterSample?
+
+        while let sample = core.popMeterSample() {
+            latestSample = sample.playbackMeterSample
+        }
+
+        if let latestSample {
+            return [latestSample]
+        }
+
+        return []
+    }
+
     private func projectedFrameIndex(
         from detailedSnapshot: RealtimeAudioCoreSnapshot,
         at timestamp: TimeInterval
@@ -449,8 +463,24 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             preparedSource = source
             zeroCrossingIndex = sourceZeroCrossingIndex
             zeroCrossingProbe = nil
-        case .file:
-            throw PlaybackError.invalidFormat
+        case let .file(url, sourceZeroCrossingProbe):
+            if let existingPreparedTrack = preparedProjectTracks.first(where: { existingTrack in
+                existingTrack.id == track.id &&
+                    existingTrack.sourceRevision == track.sourceRevision &&
+                    existingTrack.source.frameCount > 0
+            }) {
+                preparedSource = existingPreparedTrack.source
+                zeroCrossingIndex = nil
+                zeroCrossingProbe = sourceZeroCrossingProbe
+                break
+            }
+
+            guard let source = try PreparedRealtimeAudioSource.makeMappedWAV(url: url) else {
+                throw PlaybackError.invalidFormat
+            }
+            preparedSource = source
+            zeroCrossingIndex = nil
+            zeroCrossingProbe = sourceZeroCrossingProbe
         }
 
         return PreparedProjectTrack(
@@ -470,10 +500,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         in tracks: [PreparedProjectTrack]
     ) -> Float {
         let anySoloedTrack = tracks.contains { $0.isSoloed }
-        guard
-            !track.isMuted,
-            !anySoloedTrack || track.isSoloed
-        else {
+        guard isTrackAudible(track, anySoloedTrack: anySoloedTrack) else {
             return 0
         }
 
@@ -484,8 +511,15 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
     private func zeroCrossingReferenceTrack(in tracks: [PreparedProjectTrack]) -> PreparedProjectTrack? {
         let anySoloedTrack = tracks.contains { $0.isSoloed }
         return tracks.first { track in
-            !track.isMuted && (!anySoloedTrack || track.isSoloed)
+            isTrackAudible(track, anySoloedTrack: anySoloedTrack)
         } ?? tracks.first
+    }
+
+    private func isTrackAudible(
+        _ track: PreparedProjectTrack,
+        anySoloedTrack: Bool
+    ) -> Bool {
+        anySoloedTrack ? track.isSoloed : !track.isMuted
     }
 
     private func snappedFrameToZeroCrossing(

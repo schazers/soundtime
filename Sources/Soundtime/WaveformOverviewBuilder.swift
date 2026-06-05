@@ -22,8 +22,7 @@ enum WaveformOverviewBuilder {
 
             let startFrame = binIndex * buffer.frameCount / binCount
             let endFrame = max((binIndex + 1) * buffer.frameCount / binCount, startFrame + 1)
-            var minimumSample: Float = 1
-            var maximumSample: Float = -1
+            var accumulator = WaveformBinAccumulator()
 
             for channelSamples in buffer.samplesByChannel {
                 guard startFrame < channelSamples.count else {
@@ -32,21 +31,11 @@ enum WaveformOverviewBuilder {
 
                 let clampedEndFrame = min(endFrame, channelSamples.count)
                 for frameIndex in startFrame..<clampedEndFrame {
-                    let sample = channelSamples[frameIndex]
-                    minimumSample = min(minimumSample, sample)
-                    maximumSample = max(maximumSample, sample)
+                    accumulator.addSample(channelSamples[frameIndex])
                 }
             }
 
-            if minimumSample > maximumSample {
-                minimumSample = 0
-                maximumSample = 0
-            }
-
-            bins.append(WaveformOverview.Bin(
-                minimumSample: minimumSample,
-                maximumSample: maximumSample
-            ))
+            bins.append(accumulator.makeBin())
         }
 
         return WaveformOverview(duration: buffer.duration, bins: bins)

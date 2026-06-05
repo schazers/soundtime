@@ -29,6 +29,20 @@ typedef struct SoundtimeAudioCoreClockSample {
     bool isPlaying;
 } SoundtimeAudioCoreClockSample;
 
+typedef struct SoundtimeAudioCoreMeterSample {
+    uint64_t startFrameIndex;
+    uint64_t frameCount;
+    uint64_t renderedFrameCount;
+    double hostTimestamp;
+    bool isPlaying;
+    float leftRMS;
+    float rightRMS;
+    float leftPeak;
+    float rightPeak;
+    float leftClipPeak;
+    float rightClipPeak;
+} SoundtimeAudioCoreMeterSample;
+
 typedef struct SoundtimeAudioCoreTrackConfig {
     const SoundtimeAudioCoreSource* source;
     float gain;
@@ -41,6 +55,17 @@ SoundtimeAudioCoreSource* soundtime_audio_core_source_create_planar(
     uint64_t frameCount,
     uint32_t channelCount,
     double sampleRate
+);
+SoundtimeAudioCoreSource* soundtime_audio_core_source_create_wav_bytes(
+    const uint8_t* bytes,
+    uint64_t byteCount,
+    uint64_t dataOffset,
+    uint64_t frameCount,
+    uint32_t channelCount,
+    double sampleRate,
+    uint32_t blockAlign,
+    uint16_t formatTag,
+    uint16_t bitsPerSample
 );
 void soundtime_audio_core_source_destroy(SoundtimeAudioCoreSource* source);
 void soundtime_audio_core_reset(SoundtimeAudioCoreEngine* engine);
@@ -91,6 +116,10 @@ SoundtimeAudioCoreSnapshot soundtime_audio_core_snapshot(const SoundtimeAudioCor
 bool soundtime_audio_core_pop_clock_sample(
     SoundtimeAudioCoreEngine* engine,
     SoundtimeAudioCoreClockSample* sample
+);
+bool soundtime_audio_core_pop_meter_sample(
+    SoundtimeAudioCoreEngine* engine,
+    SoundtimeAudioCoreMeterSample* sample
 );
 void soundtime_audio_core_render_silence(
     SoundtimeAudioCoreEngine* engine,

@@ -19,6 +19,20 @@ struct PlaybackSnapshot {
     }
 }
 
+struct PlaybackMeterSample: Sendable {
+    let startFrameIndex: Int
+    let frameCount: Int
+    let renderedFrameCount: Int
+    let hostTimestamp: TimeInterval
+    let isPlaying: Bool
+    let leftRMS: Float
+    let rightRMS: Float
+    let leftPeak: Float
+    let rightPeak: Float
+    let leftClipPeak: Float
+    let rightClipPeak: Float
+}
+
 enum PlaybackError: LocalizedError {
     case noAudioLoaded
     case invalidFormat
@@ -86,6 +100,7 @@ protocol PlaybackEngine: AnyObject {
     func seek(toProgress progress: Float) throws
     func seekExactly(toProgress progress: Float) throws
     func snapshot() -> PlaybackSnapshot
+    func drainMeterSamples() -> [PlaybackMeterSample]
 }
 
 @MainActor
@@ -112,5 +127,9 @@ extension PlaybackEngine {
 
     func seekExactly(toProgress progress: Float) throws {
         try seek(toProgress: progress)
+    }
+
+    func drainMeterSamples() -> [PlaybackMeterSample] {
+        []
     }
 }
