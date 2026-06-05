@@ -340,6 +340,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var previousRenderedPlayheadTime: CFTimeInterval?
     private var playheadTouchEnergy: Float = 0
     private var lastPlayheadTouchEnergyUpdateTime = CFAbsoluteTimeGetCurrent()
+    private var playheadTouchPlayStartProgress: Float?
     private var playheadKickEnergy: Float = 0
     private var playheadKickOriginProgress: Float?
     private var playheadKickStartTime = CFAbsoluteTimeGetCurrent()
@@ -507,6 +508,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         renderState = renderState.withPlayheadProgress(anchoredProgress, anchorTimestamp: currentTime)
+        if force {
+            playheadTouchPlayStartProgress = anchoredProgress
+        }
         previousRenderedPlayheadX = nil
         previousRenderedPlayheadTime = nil
     }
@@ -527,6 +531,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             previousRenderedPlayheadX = nil
             previousRenderedPlayheadTime = nil
             if isActive {
+                playheadTouchPlayStartProgress = anchoredProgress
                 playheadContactEvents.removeAll()
             }
         } else {
@@ -1486,7 +1491,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let lightAheadRadius = playheadTouchLightAheadRadiusProgress(forDuration: mipLevel.overview.duration)
         let trailRadius = playheadTouchTrailRadiusProgress(forDuration: mipLevel.overview.duration)
         let viewport = renderState.viewport
-        let visibleTouchStart = max(clampedPlayhead - trailRadius, viewport.startProgress)
+        let playthroughTrailStart = playheadTouchPlayStartProgress.map {
+            min(max($0, 0), clampedPlayhead)
+        }
+        let visibleTouchStart = max(
+            clampedPlayhead - trailRadius,
+            playthroughTrailStart ?? 0,
+            viewport.startProgress
+        )
         let visibleTouchEnd = min(clampedPlayhead + max(geometryAheadRadius, lightAheadRadius), viewport.endProgress)
         let startIndex = max(Int(floor(visibleTouchStart * Float(binCount))) - 1, 0)
         let endIndex = min(Int(ceil(visibleTouchEnd * Float(binCount))) + 1, binCount)
@@ -1509,6 +1521,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             }
 
             let binCenter = (timelineX0 + timelineX1) * 0.5
+            if let playthroughTrailStart, binCenter < playthroughTrailStart {
+                continue
+            }
+
             let geometryInfluenceRaw = playheadTouchGeometryInfluence(
                 offsetFromPlayhead: binCenter - clampedPlayhead,
                 aheadRadius: geometryAheadRadius,
@@ -1637,6 +1653,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         let decayAmount = Float(elapsedTime / playheadTouchDecayDuration)
         playheadTouchEnergy = max(playheadTouchEnergy - decayAmount, 0)
+        if playheadTouchEnergy == 0 {
+            playheadTouchPlayStartProgress = nil
+        }
     }
 
     private func currentPlayheadKickEnergy() -> Float {
