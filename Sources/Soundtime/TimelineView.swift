@@ -90,6 +90,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var timelineDisplayLink: TimelineDisplayLink?
     private var transientRenderEndTime: CFTimeInterval?
     private var needsTimelineRender = false
+    private var isRenderDataPreparedRenderPending = false
     private let renderFlightGate = RenderFlightGate()
     private var isTimelinePlaybackActive = false
     private var timelineDuration: TimeInterval = 0
@@ -189,9 +190,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     func displayTracks(_ tracks: [TimelineRenderState.Track]) {
         currentTrackIDs = tracks.map(\.id)
-        timelineDuration = tracks.reduce(TimeInterval(0)) { result, track in
-            max(result, track.waveformOverview?.duration ?? 0)
-        }
+        timelineDuration = Self.timelineDuration(for: tracks)
         let wasSelectionEnabled = isSelectionEnabled
         isSelectionEnabled = tracks.contains { $0.waveformOverview?.isEmpty == false }
         if !wasSelectionEnabled || !isSelectionEnabled {
@@ -228,6 +227,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     func displayTrackMixSettings(_ tracks: [TimelineRenderState.Track]) {
         currentTrackIDs = tracks.map(\.id)
+        timelineDuration = Self.timelineDuration(for: tracks)
         let wasSelectionEnabled = isSelectionEnabled
         isSelectionEnabled = tracks.contains { $0.waveformOverview?.isEmpty == false }
 
@@ -238,6 +238,12 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         if wasSelectionEnabled != isSelectionEnabled {
             window?.invalidateCursorRects(for: self)
+        }
+    }
+
+    private static func timelineDuration(for tracks: [TimelineRenderState.Track]) -> TimeInterval {
+        tracks.reduce(TimeInterval(0)) { result, track in
+            max(result, track.waveformOverview?.duration ?? track.durationHint ?? 0)
         }
     }
 
@@ -414,7 +420,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             }
             renderer.onRenderDataPrepared = { [weak self] in
                 Task { @MainActor [weak self] in
-                    self?.requestTimelineRender()
+                    self?.scheduleRenderDataPreparedRender()
                 }
             }
             let initialViewport = viewport
@@ -445,6 +451,22 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private func requestTimelineRender() {
         needsTimelineRender = true
         startTimelineDisplayLink()
+    }
+
+    private func scheduleRenderDataPreparedRender() {
+        guard !isRenderDataPreparedRenderPending else {
+            return
+        }
+
+        isRenderDataPreparedRenderPending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else {
+                return
+            }
+
+            isRenderDataPreparedRenderPending = false
+            requestTimelineRender()
+        }
     }
 
     private func configureDisplayLinkIfNeeded() {
