@@ -5,9 +5,11 @@ final class HybridPlaybackEngine: PlaybackEngine {
     private enum ActiveEngine {
         case preview
         case realtime
+        case multitrack
     }
 
     private let previewEngine = AudioPlaybackController()
+    private let multitrackEngine = MultitrackPlaybackController()
     private let realtimeEngine: RealtimeCorePlaybackEngine?
     private var activeEngine: ActiveEngine = .preview
     private var perceptualVolume: Float = 1
@@ -20,6 +22,8 @@ final class HybridPlaybackEngine: PlaybackEngine {
             return previewEngine
         case .realtime:
             return realtimeEngine ?? previewEngine
+        case .multitrack:
+            return multitrackEngine
         }
     }
 
@@ -35,12 +39,14 @@ final class HybridPlaybackEngine: PlaybackEngine {
         self.realtimeEngine = realtimeEngine
         self.realtimeEngine?.setPerceptualVolume(perceptualVolume)
         previewEngine.setPerceptualVolume(perceptualVolume)
+        multitrackEngine.setPerceptualVolume(perceptualVolume)
     }
 
     func setPerceptualVolume(_ volume: Float) {
         perceptualVolume = min(max(volume, 0), 1)
         previewEngine.setPerceptualVolume(perceptualVolume)
         realtimeEngine?.setPerceptualVolume(perceptualVolume)
+        multitrackEngine.setPerceptualVolume(perceptualVolume)
     }
 
     func load(
@@ -48,6 +54,7 @@ final class HybridPlaybackEngine: PlaybackEngine {
         zeroCrossingIndex: AudioZeroCrossingIndex? = nil
     ) throws {
         cancelSourcePreparation()
+        multitrackEngine.clear()
         if let realtimeEngine {
             previewEngine.clear()
             try realtimeEngine.load(decodedAudioBuffer, zeroCrossingIndex: zeroCrossingIndex)
@@ -61,6 +68,7 @@ final class HybridPlaybackEngine: PlaybackEngine {
 
     func loadFile(at url: URL, zeroCrossingProbe: WAVZeroCrossingProbe? = nil) throws {
         cancelSourcePreparation()
+        multitrackEngine.clear()
         realtimeEngine?.clear()
         try previewEngine.loadFile(at: url, zeroCrossingProbe: zeroCrossingProbe)
         previewEngine.setPerceptualVolume(perceptualVolume)
@@ -72,6 +80,7 @@ final class HybridPlaybackEngine: PlaybackEngine {
         zeroCrossingIndex: AudioZeroCrossingIndex? = nil
     ) throws {
         guard realtimeEngine != nil else {
+            multitrackEngine.clear()
             try previewEngine.replaceWithDecodedSource(
                 decodedAudioBuffer,
                 zeroCrossingIndex: zeroCrossingIndex
@@ -81,6 +90,7 @@ final class HybridPlaybackEngine: PlaybackEngine {
         }
 
         if !currentEngine.hasSource {
+            multitrackEngine.clear()
             try previewEngine.load(decodedAudioBuffer, zeroCrossingIndex: zeroCrossingIndex)
             previewEngine.setPerceptualVolume(perceptualVolume)
             activeEngine = .preview
@@ -116,13 +126,28 @@ final class HybridPlaybackEngine: PlaybackEngine {
     func clear() {
         cancelSourcePreparation()
         previewEngine.clear()
+        multitrackEngine.clear()
         realtimeEngine?.clear()
         activeEngine = .preview
     }
 
     func updateZeroCrossingIndex(_ zeroCrossingIndex: AudioZeroCrossingIndex?) {
         previewEngine.updateZeroCrossingIndex(zeroCrossingIndex)
+        multitrackEngine.updateZeroCrossingIndex(zeroCrossingIndex)
         realtimeEngine?.updateZeroCrossingIndex(zeroCrossingIndex)
+    }
+
+    func loadProjectTracks(_ tracks: [ProjectPlaybackTrack]) throws {
+        cancelSourcePreparation()
+        previewEngine.clear()
+        realtimeEngine?.clear()
+        try multitrackEngine.loadProjectTracks(tracks)
+        multitrackEngine.setPerceptualVolume(perceptualVolume)
+        activeEngine = .multitrack
+    }
+
+    func updateProjectTrackMix(_ tracks: [ProjectPlaybackTrack]) {
+        multitrackEngine.updateProjectTrackMix(tracks)
     }
 
     @discardableResult
