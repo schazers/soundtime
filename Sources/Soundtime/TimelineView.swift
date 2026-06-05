@@ -54,6 +54,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private let rightPanMomentumReleaseWindow: TimeInterval = 0.12
     private let rightPanMovementThreshold: CGFloat = 0.25
     private let transientRenderPulseDuration: CFTimeInterval = 0.18
+    private let waveformTransitionRenderPulseDuration: CFTimeInterval = 0.24
     private let targetFramesPerSecond = 144
     private let scrollZoomSensitivity: Float = 0.01
     private let supportedAudioExtensions: Set<String> = [
@@ -110,6 +111,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             window?.invalidateCursorRects(for: self)
         }
 
+        startTransientRenderPulse(duration: waveformTransitionRenderPulseDuration)
+
         if !isSelectionEnabled {
             selectionAnchorProgress = nil
             selectionAnchorPoint = nil
@@ -124,6 +127,19 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             displayHoverProgress(nil)
             onSelectionChanged?(nil)
         }
+    }
+
+    func updateWaveformTouchTuning(
+        trailDuration: TimeInterval,
+        trailFalloffSteepness: Float,
+        waveformGray: Float
+    ) {
+        timelineRenderer?.updateWaveformTouchTuning(
+            trailDuration: trailDuration,
+            trailFalloffSteepness: trailFalloffSteepness,
+            waveformGray: waveformGray
+        )
+        requestTimelineRender()
     }
 
     func displayPlayheadProgress(
@@ -296,8 +312,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         stopTimelineDisplayLinkIfIdle()
     }
 
-    private func startTransientRenderPulse() {
-        transientRenderEndTime = CFAbsoluteTimeGetCurrent() + transientRenderPulseDuration
+    private func startTransientRenderPulse(duration: CFTimeInterval? = nil) {
+        transientRenderEndTime = CFAbsoluteTimeGetCurrent() + (duration ?? transientRenderPulseDuration)
         startTimelineDisplayLink()
     }
 

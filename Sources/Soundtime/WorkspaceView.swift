@@ -37,10 +37,29 @@ final class WorkspaceView: NSView {
     private let playbackController = AudioPlaybackController()
     private let playbackRefreshRate: TimeInterval = 144
     private let wavPreviewLevels = [
-        WAVPreviewLevel(targetBinCount: 512, samplesPerBin: 8),
-        WAVPreviewLevel(targetBinCount: 1_024, samplesPerBin: 8),
-        WAVPreviewLevel(targetBinCount: 2_048, samplesPerBin: 10),
-        WAVPreviewLevel(targetBinCount: 4_096, samplesPerBin: 12),
+        WAVPreviewLevel(targetBinCount: 512, samplesPerBin: 6),
+        WAVPreviewLevel(targetBinCount: 768, samplesPerBin: 6),
+        WAVPreviewLevel(targetBinCount: 1_024, samplesPerBin: 6),
+        WAVPreviewLevel(targetBinCount: 1_536, samplesPerBin: 6),
+        WAVPreviewLevel(targetBinCount: 2_048, samplesPerBin: 8),
+        WAVPreviewLevel(targetBinCount: 3_072, samplesPerBin: 8),
+        WAVPreviewLevel(targetBinCount: 4_096, samplesPerBin: 8),
+        WAVPreviewLevel(targetBinCount: 6_144, samplesPerBin: 10),
+        WAVPreviewLevel(targetBinCount: 8_192, samplesPerBin: 10),
+        WAVPreviewLevel(targetBinCount: 12_288, samplesPerBin: 12),
+        WAVPreviewLevel(targetBinCount: 16_384, samplesPerBin: 12),
+        WAVPreviewLevel(targetBinCount: 24_576, samplesPerBin: 12),
+        WAVPreviewLevel(targetBinCount: 32_768, samplesPerBin: 14),
+        WAVPreviewLevel(targetBinCount: 49_152, samplesPerBin: 14),
+        WAVPreviewLevel(targetBinCount: 65_536, samplesPerBin: 16),
+        WAVPreviewLevel(targetBinCount: 98_304, samplesPerBin: 10),
+        WAVPreviewLevel(targetBinCount: 131_072, samplesPerBin: 10),
+        WAVPreviewLevel(targetBinCount: 196_608, samplesPerBin: 8),
+        WAVPreviewLevel(targetBinCount: 262_144, samplesPerBin: 8),
+        WAVPreviewLevel(targetBinCount: 393_216, samplesPerBin: 6),
+        WAVPreviewLevel(targetBinCount: 524_288, samplesPerBin: 6),
+        WAVPreviewLevel(targetBinCount: 786_432, samplesPerBin: 4),
+        WAVPreviewLevel(targetBinCount: 1_048_576, samplesPerBin: 4),
     ]
 
     private struct WAVPreviewLevel {
@@ -95,6 +114,35 @@ final class WorkspaceView: NSView {
     }()
 
     private let volumeControl = VolumeControlView()
+    private let touchTrailDurationSlider = EffectTuningSliderView(
+        title: "Trail",
+        minimumValue: 80,
+        maximumValue: 700,
+        value: 440,
+        valueFormatter: { String(format: "%.0f ms", $0) }
+    )
+    private let touchTrailCurveSlider = EffectTuningSliderView(
+        title: "Curve",
+        minimumValue: 0.35,
+        maximumValue: 2.5,
+        value: 2.11,
+        valueFormatter: { String(format: "%.2f", $0) }
+    )
+    private let waveformGraySlider = EffectTuningSliderView(
+        title: "Gray",
+        minimumValue: 0.55,
+        maximumValue: 0.95,
+        value: 0.88,
+        valueFormatter: { String(format: "%.2f", $0) }
+    )
+    private let tuningControlsStack: NSStackView = {
+        let stackView = NSStackView()
+        stackView.orientation = .horizontal
+        stackView.alignment = .centerY
+        stackView.spacing = 16
+        stackView.translatesAutoresizingMaskIntoConstraints = false
+        return stackView
+    }()
     private let timelineSurface = TimelineView()
     private let exportProgressOverlay = ExportProgressOverlayView()
     private let gainEffectOverlay = GainEffectOverlayView()
@@ -159,6 +207,15 @@ final class WorkspaceView: NSView {
         volumeControl.onVolumeChanged = { [weak self] volume in
             self?.playbackController.setPerceptualVolume(volume)
         }
+        touchTrailDurationSlider.onValueChanged = { [weak self] _ in
+            self?.updateWaveformTouchTuning()
+        }
+        touchTrailCurveSlider.onValueChanged = { [weak self] _ in
+            self?.updateWaveformTouchTuning()
+        }
+        waveformGraySlider.onValueChanged = { [weak self] _ in
+            self?.updateWaveformTouchTuning()
+        }
         gainEffectOverlay.onGainChanged = { [weak self] _, gain in
             self?.previewSelectedGain(gain)
         }
@@ -169,11 +226,16 @@ final class WorkspaceView: NSView {
             self?.cancelSelectedGainPreview()
         }
 
+        tuningControlsStack.addArrangedSubview(touchTrailDurationSlider)
+        tuningControlsStack.addArrangedSubview(touchTrailCurveSlider)
+        tuningControlsStack.addArrangedSubview(waveformGraySlider)
+
         addSubview(titleLabel)
         addSubview(metadataLabel)
         addSubview(framesPerSecondLabel)
         addSubview(volumeControl)
         addSubview(timeReadoutLabel)
+        addSubview(tuningControlsStack)
         addSubview(timelineSurface)
         addSubview(exportProgressOverlay)
         addSubview(gainEffectOverlay)
@@ -198,7 +260,16 @@ final class WorkspaceView: NSView {
             timeReadoutLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
             timeReadoutLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -22),
 
-            timelineSurface.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 18),
+            tuningControlsStack.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 10),
+            tuningControlsStack.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            tuningControlsStack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -22),
+            tuningControlsStack.heightAnchor.constraint(equalToConstant: 28),
+
+            touchTrailDurationSlider.widthAnchor.constraint(equalToConstant: 238),
+            touchTrailCurveSlider.widthAnchor.constraint(equalToConstant: 220),
+            waveformGraySlider.widthAnchor.constraint(equalToConstant: 220),
+
+            timelineSurface.topAnchor.constraint(equalTo: tuningControlsStack.bottomAnchor, constant: 14),
             timelineSurface.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 22),
             timelineSurface.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -22),
             timelineSurface.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -22),
@@ -214,6 +285,7 @@ final class WorkspaceView: NSView {
             gainEffectOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
 
+        updateWaveformTouchTuning()
         updateEffectCommandState()
     }
 
@@ -356,15 +428,20 @@ final class WorkspaceView: NSView {
                 }
 
                 self.applyPreview(previewResult)
-                async let decodedWAV = AudioImportPipeline.loadDecodedWAV(at: url)
+                var latestPreviewBinCount = previewResult.waveformOverview.bins.count
 
                 for previewLevel in wavPreviewLevels.dropFirst() {
                     guard self.activeImportID == importID else {
                         return
                     }
 
+                    let nextBinCount = min(previewLevel.targetBinCount, previewResult.fileInfo.frameCount)
+                    guard nextBinCount > latestPreviewBinCount else {
+                        continue
+                    }
+
                     do {
-                        let refinedPreview = try await AudioImportPipeline.loadWAVPreview(
+                        let (fileInfo, waveformOverview) = try await AudioImportPipeline.loadWAVPreviewOverview(
                             at: url,
                             targetBinCount: previewLevel.targetBinCount,
                             samplesPerBin: previewLevel.samplesPerBin
@@ -374,14 +451,19 @@ final class WorkspaceView: NSView {
                             return
                         }
 
-                        self.applyPreviewRefinement(refinedPreview)
+                        latestPreviewBinCount = waveformOverview.bins.count
+                        self.applyPreviewRefinement(
+                            fileInfo: fileInfo,
+                            waveformOverview: waveformOverview
+                        )
                     } catch {
                         break
                     }
                 }
 
                 do {
-                    let (decodedAudioBuffer, waveformOverview, zeroCrossingIndex) = try await decodedWAV
+                    let (decodedAudioBuffer, waveformOverview, zeroCrossingIndex) =
+                        try await AudioImportPipeline.loadDecodedWAV(at: url)
 
                     guard self.activeImportID == importID else {
                         return
@@ -457,14 +539,17 @@ final class WorkspaceView: NSView {
         updateStatus(currentPlaybackStatus)
     }
 
-    private func applyPreviewRefinement(_ previewResult: WAVPreviewImportResult) {
+    private func applyPreviewRefinement(
+        fileInfo: WAVFileInfo,
+        waveformOverview: WaveformOverview
+    ) {
         guard decodedAudioBuffer == nil else {
             return
         }
 
-        displayedFrameCount = previewResult.fileInfo.frameCount
-        displayedSampleRate = previewResult.fileInfo.sampleRate
-        timelineSurface.displayWaveform(previewResult.waveformOverview)
+        displayedFrameCount = fileInfo.frameCount
+        displayedSampleRate = fileInfo.sampleRate
+        timelineSurface.displayWaveform(waveformOverview)
         let snapshot = playbackController.snapshot()
         displayPlaybackVisuals(
             progress: snapshot.progress,
@@ -907,6 +992,14 @@ final class WorkspaceView: NSView {
         )
     }
 
+    private func updateWaveformTouchTuning() {
+        timelineSurface.updateWaveformTouchTuning(
+            trailDuration: touchTrailDurationSlider.value / 1_000,
+            trailFalloffSteepness: Float(touchTrailCurveSlider.value),
+            waveformGray: Float(waveformGraySlider.value)
+        )
+    }
+
     private var canApplyGainEffect: Bool {
         guard
             audioTimeline != nil,
@@ -1053,5 +1146,82 @@ final class WorkspaceView: NSView {
     private func smoothstep(_ progress: Float) -> Float {
         let clampedProgress = min(max(progress, 0), 1)
         return clampedProgress * clampedProgress * (3 - 2 * clampedProgress)
+    }
+}
+
+private final class EffectTuningSliderView: NSView {
+    var value: Double {
+        slider.doubleValue
+    }
+
+    var onValueChanged: ((Double) -> Void)?
+
+    private let titleLabel: NSTextField
+    private let valueLabel: NSTextField
+    private let slider: NSSlider
+    private let valueFormatter: (Double) -> String
+
+    init(
+        title: String,
+        minimumValue: Double,
+        maximumValue: Double,
+        value: Double,
+        valueFormatter: @escaping (Double) -> String
+    ) {
+        titleLabel = NSTextField(labelWithString: title)
+        valueLabel = NSTextField(labelWithString: valueFormatter(value))
+        slider = NSSlider(value: value, minValue: minimumValue, maxValue: maximumValue, target: nil, action: nil)
+        self.valueFormatter = valueFormatter
+        super.init(frame: .zero)
+        configure()
+    }
+
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    private func configure() {
+        translatesAutoresizingMaskIntoConstraints = false
+
+        titleLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        titleLabel.textColor = NSColor.secondaryLabelColor
+        titleLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        titleLabel.setContentHuggingPriority(.required, for: .horizontal)
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        valueLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        valueLabel.textColor = NSColor.secondaryLabelColor
+        valueLabel.alignment = .right
+        valueLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        valueLabel.setContentHuggingPriority(.required, for: .horizontal)
+        valueLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        slider.isContinuous = true
+        slider.target = self
+        slider.action = #selector(sliderChanged(_:))
+        slider.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(titleLabel)
+        addSubview(slider)
+        addSubview(valueLabel)
+
+        NSLayoutConstraint.activate([
+            titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor),
+            titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            titleLabel.widthAnchor.constraint(equalToConstant: 36),
+
+            slider.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 8),
+            slider.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            valueLabel.leadingAnchor.constraint(equalTo: slider.trailingAnchor, constant: 8),
+            valueLabel.trailingAnchor.constraint(equalTo: trailingAnchor),
+            valueLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            valueLabel.widthAnchor.constraint(equalToConstant: 58),
+        ])
+    }
+
+    @objc private func sliderChanged(_ sender: NSSlider) {
+        valueLabel.stringValue = valueFormatter(sender.doubleValue)
+        onValueChanged?(sender.doubleValue)
     }
 }

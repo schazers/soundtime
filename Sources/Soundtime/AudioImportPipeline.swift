@@ -41,6 +41,20 @@ enum AudioImportPipeline {
         }.value
     }
 
+    static func loadWAVPreviewOverview(
+        at url: URL,
+        targetBinCount: Int,
+        samplesPerBin: Int
+    ) async throws -> (WAVFileInfo, WaveformOverview) {
+        try await Task.detached(priority: .userInitiated) {
+            try WAVAudioDecoder.buildSparsePreview(
+                url: url,
+                targetBinCount: targetBinCount,
+                samplesPerBin: samplesPerBin
+            )
+        }.value
+    }
+
     static func loadDecodedWAV(at url: URL) async throws -> (
         DecodedAudioBuffer,
         WaveformOverview,
