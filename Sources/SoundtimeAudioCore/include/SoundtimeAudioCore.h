@@ -30,6 +30,13 @@ void soundtime_audio_core_set_source_info(
     uint32_t channelCount,
     double sampleRate
 );
+bool soundtime_audio_core_set_interleaved_source(
+    SoundtimeAudioCoreEngine* engine,
+    const float* samples,
+    uint64_t frameCount,
+    uint32_t channelCount,
+    double sampleRate
+);
 void soundtime_audio_core_play(SoundtimeAudioCoreEngine* engine);
 void soundtime_audio_core_pause(SoundtimeAudioCoreEngine* engine);
 void soundtime_audio_core_seek(SoundtimeAudioCoreEngine* engine, uint64_t frameIndex);
@@ -42,6 +49,19 @@ void soundtime_audio_core_render_silence(
     uint32_t frameCount
 );
 void soundtime_audio_core_render_silence_at_host_time(
+    SoundtimeAudioCoreEngine* engine,
+    float* const* outputs,
+    uint32_t channelCount,
+    uint32_t frameCount,
+    double hostTimestamp
+);
+void soundtime_audio_core_render(
+    SoundtimeAudioCoreEngine* engine,
+    float* const* outputs,
+    uint32_t channelCount,
+    uint32_t frameCount
+);
+void soundtime_audio_core_render_at_host_time(
     SoundtimeAudioCoreEngine* engine,
     float* const* outputs,
     uint32_t channelCount,
