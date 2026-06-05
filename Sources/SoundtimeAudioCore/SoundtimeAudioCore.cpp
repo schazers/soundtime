@@ -227,7 +227,6 @@ void process_commands(SoundtimeAudioCoreEngine& engine, const EngineConfig& conf
         case EngineCommandType::pauseAt:
             engine.transportPauseFrameIndex = std::min(command.frameIndex, config.frameCount);
             engine.hasTransportPauseFrameIndex = true;
-            engine.frameIndex.store(engine.transportPauseFrameIndex, std::memory_order_release);
             begin_transport_ramp(engine, 0, config, true);
             break;
         case EngineCommandType::seek:

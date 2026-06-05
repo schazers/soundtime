@@ -345,12 +345,12 @@ final class AudioPlaybackController: PlaybackEngine {
 
         let elapsedFrames = max(Int(playerTime.sampleTime), 0)
         let renderHostTimestamp = AVAudioTime.seconds(forHostTime: nodeTime.hostTime)
-        let projectedElapsedFrames = max(
-            Int(((currentHostTimestamp - renderHostTimestamp) * playbackSource.sampleRate).rounded(.down)),
-            0
+        let projectedElapsedFrames = Int(
+            ((currentHostTimestamp - renderHostTimestamp) * playbackSource.sampleRate)
+                .rounded(.towardZero)
         )
         let frameIndex = min(
-            scheduledStartFrame + elapsedFrames + projectedElapsedFrames,
+            max(scheduledStartFrame + elapsedFrames + projectedElapsedFrames, 0),
             playbackSource.frameCount
         )
         return (frameIndex, currentHostTimestamp)

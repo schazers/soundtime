@@ -342,6 +342,46 @@ final class SoundtimeAudioCoreTests: XCTestCase {
         XCTAssertFalse(snapshot.isPlaying)
     }
 
+    func testPauseAtFrameDoesNotJumpRenderCursorDuringRamp() throws {
+        let engine = try XCTUnwrap(soundtime_audio_core_create())
+        defer {
+            soundtime_audio_core_destroy(engine)
+        }
+
+        var samples: [Float] = [
+            1, 1,
+            2, 2,
+            3, 3,
+            4, 4,
+            5, 5,
+            6, 6,
+        ]
+        let didLoad = samples.withUnsafeMutableBufferPointer { sampleBuffer in
+            soundtime_audio_core_set_interleaved_source(
+                engine,
+                sampleBuffer.baseAddress,
+                6,
+                2,
+                10
+            )
+        }
+        XCTAssertTrue(didLoad)
+
+        soundtime_audio_core_set_transport_ramp_duration(engine, 0)
+        soundtime_audio_core_play(engine)
+        _ = render(engine: engine, channelCount: 2, frameCount: 4, hostTimestamp: 0)
+
+        soundtime_audio_core_set_transport_ramp_duration(engine, 0.2)
+        soundtime_audio_core_pause_at(engine, 2)
+        let output = render(engine: engine, channelCount: 2, frameCount: 3, hostTimestamp: 0.4)
+        XCTAssertEqual(output[0], [2.5, 0, 0])
+        XCTAssertEqual(output[1], [2.5, 0, 0])
+
+        let snapshot = soundtime_audio_core_snapshot(engine)
+        XCTAssertEqual(snapshot.frameIndex, 2)
+        XCTAssertFalse(snapshot.isPlaying)
+    }
+
     func testRenderPublishesClockSamples() throws {
         let engine = try XCTUnwrap(soundtime_audio_core_create())
         defer {

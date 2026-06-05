@@ -1772,7 +1772,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return clampedProgress
         }
 
-        let elapsedTime = max(displayTimestamp - renderState.playheadAnchorTimestamp, 0)
+        let elapsedTime = displayTimestamp - renderState.playheadAnchorTimestamp
         let progress = clampedProgress + Float(elapsedTime / duration)
         return min(max(progress, 0), 1)
     }

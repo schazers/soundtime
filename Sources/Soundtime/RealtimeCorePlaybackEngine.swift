@@ -377,8 +377,8 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             return min(max(baseFrameIndex, 0), frameCount)
         }
 
-        let elapsedTime = max(timestamp - baseHostTimestamp, 0)
-        let elapsedFrames = Int((elapsedTime * sampleRate).rounded(.down))
+        let elapsedTime = timestamp - baseHostTimestamp
+        let elapsedFrames = Int((elapsedTime * sampleRate).rounded(.towardZero))
         return min(max(baseFrameIndex + elapsedFrames, 0), frameCount)
     }
 
