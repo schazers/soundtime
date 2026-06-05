@@ -83,6 +83,21 @@ struct TimelineRenderState: Sendable {
         )
     }
 
+    func replacingTracks(_ tracks: [Track]) -> TimelineRenderState {
+        TimelineRenderState(
+            tracks: tracks,
+            viewport: viewport,
+            playheadProgress: playheadProgress,
+            playheadAnchorTimestamp: playheadAnchorTimestamp,
+            isPlaybackActive: isPlaybackActive,
+            hoverProgress: hoverProgress,
+            isHoverGuideArmed: isHoverGuideArmed,
+            selection: selection,
+            trimPreview: trimPreview,
+            gainPreview: gainPreview
+        )
+    }
+
     func withViewport(_ viewport: TimelineViewport) -> TimelineRenderState {
         TimelineRenderState(
             tracks: tracks,
