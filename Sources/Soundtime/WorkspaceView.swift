@@ -726,7 +726,7 @@ final class WorkspaceView: NSView {
         refreshProjectTimelineDisplay()
         updateProjectDisplayTiming()
         syncActiveTrackFields()
-        if projectTracks.count == 1, projectMixBuffer() == nil {
+        if !playbackController.hasSource, projectMixBuffer() == nil {
             do {
                 try playbackController.loadFile(
                     at: previewResult.metadata.url,
