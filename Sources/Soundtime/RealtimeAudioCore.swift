@@ -4,6 +4,10 @@ import SoundtimeAudioCore
 final class RealtimeAudioCore {
     private var engine: OpaquePointer?
 
+    var enginePointer: OpaquePointer? {
+        engine
+    }
+
     init?() {
         guard let engine = soundtime_audio_core_create() else {
             return nil
@@ -29,6 +33,22 @@ final class RealtimeAudioCore {
             UInt32(max(channelCount, 0)),
             sampleRate
         )
+    }
+
+    func setInterleavedSource(_ samples: [Float], frameCount: Int, channelCount: Int, sampleRate: Double) -> Bool {
+        guard let engine else {
+            return false
+        }
+
+        return samples.withUnsafeBufferPointer { sampleBuffer in
+            soundtime_audio_core_set_interleaved_source(
+                engine,
+                sampleBuffer.baseAddress,
+                UInt64(max(frameCount, 0)),
+                UInt32(max(channelCount, 0)),
+                sampleRate
+            )
+        }
     }
 
     func play() {
@@ -61,6 +81,14 @@ final class RealtimeAudioCore {
         }
 
         soundtime_audio_core_set_gain(engine, gain)
+    }
+
+    func setTransportRampDuration(_ duration: TimeInterval) {
+        guard let engine else {
+            return
+        }
+
+        soundtime_audio_core_set_transport_ramp_duration(engine, max(duration, 0))
     }
 
     func reset() {
