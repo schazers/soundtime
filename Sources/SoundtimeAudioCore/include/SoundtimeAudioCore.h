@@ -16,6 +16,7 @@ typedef struct SoundtimeAudioCoreSnapshot {
     double sampleRate;
     bool isPlaying;
     uint64_t underrunCount;
+    uint64_t droppedCommandCount;
 } SoundtimeAudioCoreSnapshot;
 
 SoundtimeAudioCoreEngine* soundtime_audio_core_create(void);
