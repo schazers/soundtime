@@ -747,7 +747,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     func displayTracks(_ tracks: [TimelineRenderState.Track]) {
         let previousTracks = renderState.tracks
-        let hasNextWaveforms = tracks.contains { $0.waveformOverview?.isEmpty == false }
+        let renderTracks = tracks.map { lightweightRenderTrack(from: $0) }
+        let hasNextWaveforms = renderTracks.contains { $0.hasWaveform }
         var nextTrackWaveformMipLevels: [UUID: [WaveformMipLevel]] = [:]
         var nextTrackWaveformMipKeys: [UUID: WaveformMipCacheKey] = [:]
         for track in tracks {
@@ -778,10 +779,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         waveformMipLevels = nextWaveformMipLevels
         trackWaveformMipLevels = nextTrackWaveformMipLevels
         currentTrackWaveformMipKeys = nextTrackWaveformMipKeys
-        currentPrimaryWaveformTrackID = tracks.first?.id
+        currentPrimaryWaveformTrackID = renderTracks.first?.id
         waveformMipLevelStateLock.unlock()
         prewarmInitialWaveformShaderBuffers(
-            tracks: tracks,
+            tracks: renderTracks,
             trackWaveformMipLevels: nextTrackWaveformMipLevels
         )
         gridCache = nil
@@ -796,13 +797,30 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         lastTransientParticleBins.removeAll()
         previousRenderedPlayheadX = nil
         previousRenderedPlayheadTime = nil
-        resetTrackFisheyeAudibility(for: tracks, at: CACurrentMediaTime())
-        renderState = renderState.withTracks(tracks)
+        resetTrackFisheyeAudibility(for: renderTracks, at: CACurrentMediaTime())
+        renderState = renderState.withTracks(renderTracks)
     }
 
     func displayTrackMixSettings(_ tracks: [TimelineRenderState.Track]) {
-        updateTrackFisheyeAudibility(for: tracks, at: CACurrentMediaTime())
-        renderState = renderState.withTracks(tracks)
+        let renderTracks = tracks.map { lightweightRenderTrack(from: $0) }
+        updateTrackFisheyeAudibility(for: renderTracks, at: CACurrentMediaTime())
+        renderState = renderState.withTracks(renderTracks)
+    }
+
+    private func lightweightRenderTrack(from track: TimelineRenderState.Track) -> TimelineRenderState.Track {
+        let currentTrack = renderState.tracks.first { $0.id == track.id }
+        let durationHint = track.waveformOverview?.duration ?? track.durationHint ?? currentTrack?.durationHint
+        let hasWaveform = track.waveformOverview?.isEmpty == false || currentTrack?.hasWaveform == true
+        return TimelineRenderState.Track(
+            id: track.id,
+            waveformVersion: track.waveformVersion,
+            waveformOverview: nil,
+            durationHint: durationHint,
+            volume: track.volume,
+            isMuted: track.isMuted,
+            isSoloed: track.isSoloed,
+            hasWaveform: hasWaveform
+        )
     }
 
     func updateWaveformTouchTuning(
@@ -1258,13 +1276,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return false
         }
 
-        return renderState.tracks.contains { track in
-            guard let overview = track.waveformOverview else {
-                return false
-            }
-
-            return !overview.isEmpty
-        }
+        return renderState.tracks.contains { $0.hasWaveform }
     }
 
     private func drawShaderWaveforms(
@@ -1298,10 +1310,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         for (trackIndex, track) in renderState.tracks.enumerated() {
             guard
-                let overview = track.waveformOverview,
-                !overview.isEmpty,
-                overview.duration.isFinite,
-                overview.duration > 0,
+                track.hasWaveform,
+                let trackDuration = track.durationHint,
+                trackDuration.isFinite,
+                trackDuration > 0,
                 let mipLevels = trackWaveformMipLevels[track.id],
                 let shaderDrawable = waveformShaderDrawable(
                     track: track,
@@ -1313,7 +1325,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 continue
             }
 
-            let trackDurationProgress = min(max(Float(overview.duration / projectDuration), 0), 1)
+            let trackDurationProgress = min(max(Float(trackDuration / projectDuration), 0), 1)
             guard trackDurationProgress > 0 else {
                 continue
             }
@@ -1924,7 +1936,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 durationHint: previousTrack.durationHint,
                 volume: currentTrack?.volume ?? previousTrack.volume,
                 isMuted: currentTrack?.isMuted ?? previousTrack.isMuted,
-                isSoloed: currentTrack?.isSoloed ?? previousTrack.isSoloed
+                isSoloed: currentTrack?.isSoloed ?? previousTrack.isSoloed,
+                hasWaveform: previousTrack.hasWaveform
             )
         }
     }
@@ -2195,8 +2208,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         for track in renderState.tracks {
             hasher.combine(track.id)
             hasher.combine(track.waveformVersion)
-            hasher.combine(track.waveformOverview?.bins.count ?? 0)
-            hasher.combine(track.waveformOverview?.duration ?? 0)
+            hasher.combine(track.hasWaveform)
+            hasher.combine(track.durationHint ?? 0)
         }
         return hasher.finalize()
     }
@@ -2228,8 +2241,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         for track in renderState.tracks {
             hasher.combine(track.id)
             hasher.combine(track.waveformVersion)
-            hasher.combine(track.waveformOverview?.bins.count ?? 0)
-            hasher.combine(track.waveformOverview?.duration ?? 0)
+            hasher.combine(track.hasWaveform)
+            hasher.combine(track.durationHint ?? 0)
             hasher.combine(track.volume)
             hasher.combine(track.isMuted)
             hasher.combine(track.isSoloed)
@@ -2380,10 +2393,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 continue
             }
             guard
-                let overview = track.waveformOverview,
-                !overview.isEmpty,
-                overview.duration.isFinite,
-                overview.duration > 0,
+                track.hasWaveform,
+                let trackDuration = track.durationHint,
+                trackDuration.isFinite,
+                trackDuration > 0,
                 let highResolutionMip = mipLevelSnapshot.currentByTrack[track.id]?.first,
                 !highResolutionMip.overview.isEmpty
             else {
@@ -2392,7 +2405,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
             let bins = highResolutionMip.overview.bins
             let binCount = bins.count
-            let trackDurationProgress = min(max(Float(overview.duration / projectDuration), 0), 1)
+            let trackDurationProgress = min(max(Float(trackDuration / projectDuration), 0), 1)
             guard binCount > 0, trackDurationProgress > 0 else {
                 continue
             }
@@ -2415,7 +2428,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 continue
             }
 
-            let binsPerSecond = Double(binCount) / overview.duration
+            let binsPerSecond = Double(binCount) / trackDuration
             let minimumSpacingBins = max(Int((binsPerSecond * transientParticleMinimumSpacing).rounded(.up)), 1)
             let previousTriggeredBin = lastTransientParticleBins[track.id] ?? -minimumSpacingBins * 2
             var latestTriggeredBin = previousTriggeredBin
@@ -2924,8 +2937,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         for (trackIndex, track) in tracks.enumerated() {
             guard
-                let overview = track.waveformOverview,
-                !overview.isEmpty,
+                track.hasWaveform,
+                let trackDuration = track.durationHint,
+                trackDuration.isFinite,
+                trackDuration > 0,
                 let mipLevels = trackWaveformMipLevels[track.id],
                 let mipLevel = waveformMipLevel(
                     for: drawableSize,
@@ -2938,7 +2953,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
             let bins = mipLevel.overview.bins
             let binCount = bins.count
-            let trackDurationProgress = min(max(Float(overview.duration / projectDuration), 0), 1)
+            let trackDurationProgress = min(max(Float(trackDuration / projectDuration), 0), 1)
             guard binCount > 0, trackDurationProgress > 0 else {
                 continue
             }
@@ -3298,13 +3313,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         renderState: TimelineRenderState,
         displayTimestamp: CFTimeInterval
     ) -> SIMD4<Float> {
-        let tracksWithWaveforms = renderState.tracks.filter { track in
-            guard let overview = track.waveformOverview else {
-                return false
-            }
-
-            return !overview.isEmpty
-        }
+        let tracksWithWaveforms = renderState.tracks.filter(\.hasWaveform)
         guard !tracksWithWaveforms.isEmpty else {
             return .zero
         }
@@ -3689,8 +3698,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         for (trackIndex, track) in tracks.enumerated() {
             guard
-                let overview = track.waveformOverview,
-                !overview.isEmpty,
+                track.hasWaveform,
+                let trackDuration = track.durationHint,
+                trackDuration.isFinite,
+                trackDuration > 0,
                 let mipLevels = mipLevelSnapshot.currentByTrack[track.id],
                 let mipLevel = waveformMipLevel(
                     for: drawableSize,
@@ -3703,7 +3714,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
             let bins = mipLevel.overview.bins
             let binCount = bins.count
-            let trackDurationProgress = min(max(Float(overview.duration / projectDuration), 0), 1)
+            let trackDurationProgress = min(max(Float(trackDuration / projectDuration), 0), 1)
             guard binCount > 0, trackDurationProgress > 0 else {
                 continue
             }
@@ -4315,15 +4326,17 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             }
 
             guard
-                let overview = track.waveformOverview,
-                !overview.isEmpty,
+                track.hasWaveform,
+                let trackDuration = track.durationHint,
+                trackDuration.isFinite,
+                trackDuration > 0,
                 let mipLevel = mipLevelSnapshot.currentByTrack[track.id]?.first,
                 !mipLevel.overview.isEmpty
             else {
                 continue
             }
 
-            let trackDurationProgress = min(max(Float(overview.duration / projectDuration), 0), 1)
+            let trackDurationProgress = min(max(Float(trackDuration / projectDuration), 0), 1)
             guard clampedProgress <= trackDurationProgress, trackDurationProgress > 0 else {
                 continue
             }

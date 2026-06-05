@@ -6,9 +6,30 @@ struct TimelineRenderState: Sendable {
         let waveformVersion: Int
         let waveformOverview: WaveformOverview?
         let durationHint: TimeInterval?
+        let hasWaveform: Bool
         let volume: Float
         let isMuted: Bool
         let isSoloed: Bool
+
+        init(
+            id: UUID,
+            waveformVersion: Int,
+            waveformOverview: WaveformOverview?,
+            durationHint: TimeInterval?,
+            volume: Float,
+            isMuted: Bool,
+            isSoloed: Bool,
+            hasWaveform: Bool? = nil
+        ) {
+            self.id = id
+            self.waveformVersion = waveformVersion
+            self.waveformOverview = waveformOverview
+            self.durationHint = durationHint
+            self.volume = volume
+            self.isMuted = isMuted
+            self.isSoloed = isSoloed
+            self.hasWaveform = hasWaveform ?? (waveformOverview?.isEmpty == false)
+        }
     }
 
     struct GainPreview: Sendable {
@@ -47,12 +68,12 @@ struct TimelineRenderState: Sendable {
     }
 
     var hasWaveforms: Bool {
-        tracks.contains { $0.waveformOverview?.isEmpty == false }
+        tracks.contains { $0.hasWaveform }
     }
 
     var duration: TimeInterval? {
         let duration = tracks.reduce(TimeInterval(0)) { result, track in
-            max(result, track.waveformOverview?.duration ?? track.durationHint ?? 0)
+            max(result, track.durationHint ?? track.waveformOverview?.duration ?? 0)
         }
         return duration > 0 ? duration : nil
     }
