@@ -76,6 +76,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private struct WaveformCache: @unchecked Sendable {
         let key: WaveformCacheKey
         let contentSignature: Int
+        let visualSignature: Int
         let vertices: CachedVertexBuffer
     }
 
@@ -209,7 +210,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             }
         }
 
-        func fallback(contentSignature: Int, target: WaveformGeometryTarget) -> WaveformCache? {
+        func fallback(
+            contentSignature: Int,
+            visualSignature: Int,
+            target: WaveformGeometryTarget
+        ) -> WaveformCache? {
             lock.lock()
             defer {
                 lock.unlock()
@@ -217,12 +222,18 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
             switch target {
             case .current:
-                guard currentCache?.contentSignature == contentSignature else {
+                guard
+                    currentCache?.contentSignature == contentSignature,
+                    currentCache?.visualSignature == visualSignature
+                else {
                     return nil
                 }
                 return currentCache
             case .previous:
-                guard previousCache?.contentSignature == contentSignature else {
+                guard
+                    previousCache?.contentSignature == contentSignature,
+                    previousCache?.visualSignature == visualSignature
+                else {
                     return nil
                 }
                 return previousCache
@@ -333,8 +344,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
     }
     private var waveformMipLevels: [WaveformMipLevel] = []
-    private var previousWaveformMipLevels: [WaveformMipLevel] = []
     private var trackWaveformMipLevels: [UUID: [WaveformMipLevel]] = [:]
+    private var previousTrackWaveformMipLevels: [UUID: [WaveformMipLevel]] = [:]
+    private var previousTransitionTracks: [TimelineRenderState.Track] = []
     private var waveformMipLevelCache: [WaveformMipCacheKey: [WaveformMipLevel]] = [:]
     private var gridCache: GridCache?
     private var waveformTransitionStartTime: CFTimeInterval?
@@ -428,18 +440,21 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
 
     func displayTracks(_ tracks: [TimelineRenderState.Track]) {
+        let previousTracks = renderState.tracks
         let nextTrackWaveformMipLevels = Dictionary(
             uniqueKeysWithValues: tracks.map { track in
                 (track.id, cachedWaveformMipLevels(for: track))
             }
         )
         let nextWaveformMipLevels = tracks.first.flatMap { nextTrackWaveformMipLevels[$0.id] } ?? []
-        if !waveformMipLevels.isEmpty, !nextWaveformMipLevels.isEmpty, tracks.count == 1 {
-            previousWaveformMipLevels = waveformMipLevels
+        if renderState.hasWaveforms, tracks.contains(where: { $0.waveformOverview?.isEmpty == false }) {
+            previousTrackWaveformMipLevels = trackWaveformMipLevels
+            previousTransitionTracks = previousTracks
             waveformGeometryStore.promoteCurrentToPrevious()
-            waveformTransitionStartTime = CACurrentMediaTime()
+            waveformTransitionStartTime = nil
         } else {
-            previousWaveformMipLevels = []
+            previousTrackWaveformMipLevels = [:]
+            previousTransitionTracks = []
             waveformGeometryStore.clearPrevious()
             waveformTransitionStartTime = nil
         }
@@ -456,6 +471,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     func displayTrackMixSettings(_ tracks: [TimelineRenderState.Track]) {
         renderState = renderState.withTracks(tracks)
+        waveformGeometryStore.clearCurrent()
+        waveformGeometryStore.clearPrevious()
+        previousTrackWaveformMipLevels = [:]
+        previousTransitionTracks = []
+        waveformTransitionStartTime = nil
     }
 
     func updateWaveformTouchTuning(
@@ -616,11 +636,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             displayTimestamp: displayTimestamp
         )
         let selectionVertices = makeSelectionVertices(renderState: renderState)
-        let waveformTransitionOpacities = waveformTransitionOpacities(at: displayTimestamp)
         let waveformVertices = cachedWaveformVertices(drawableSize: viewportSize, renderState: renderState)
-        let previousWaveformVertices = waveformTransitionOpacities.previous > 0 ?
+        let previousWaveformVertices = hasPreviousWaveformTransition ?
             cachedPreviousWaveformVertices(drawableSize: viewportSize, renderState: renderState) :
             nil
+        let waveformTransitionOpacities = waveformTransitionOpacities(
+            at: displayTimestamp,
+            hasCurrent: waveformVertices != nil,
+            hasPrevious: previousWaveformVertices != nil
+        )
         let trimPreviewVertices = makeTrimPreviewVertices(
             drawableSize: viewportSize,
             backingScale: backingScale,
@@ -723,15 +747,30 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
     }
 
-    private func waveformTransitionOpacities(at displayTimestamp: CFTimeInterval) -> (
+    private var hasPreviousWaveformTransition: Bool {
+        !previousTrackWaveformMipLevels.isEmpty && !previousTransitionTracks.isEmpty
+    }
+
+    private func waveformTransitionOpacities(
+        at displayTimestamp: CFTimeInterval,
+        hasCurrent: Bool,
+        hasPrevious: Bool
+    ) -> (
         current: Float,
         previous: Float
     ) {
-        guard
-            let waveformTransitionStartTime,
-            !previousWaveformMipLevels.isEmpty
-        else {
+        guard hasPreviousWaveformTransition, hasPrevious else {
             return (current: 1, previous: 0)
+        }
+        guard hasCurrent else {
+            return (current: 0, previous: 1)
+        }
+
+        if waveformTransitionStartTime == nil {
+            waveformTransitionStartTime = displayTimestamp
+        }
+        guard let waveformTransitionStartTime else {
+            return (current: 0, previous: 1)
         }
 
         let rawProgress = min(
@@ -739,7 +778,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             1
         )
         guard rawProgress < 1 else {
-            previousWaveformMipLevels = []
+            previousTrackWaveformMipLevels = [:]
+            previousTransitionTracks = []
             waveformGeometryStore.clearPrevious()
             self.waveformTransitionStartTime = nil
             return (current: 1, previous: 0)
@@ -913,14 +953,37 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         drawableSize: CGSize,
         renderState: TimelineRenderState
     ) -> CachedVertexBuffer? {
-        cachedWaveformVertices(
+        let previousTracks = previousTransitionTracks(withCurrentMixFrom: renderState.tracks)
+        guard !previousTracks.isEmpty else {
+            return nil
+        }
+
+        let previousRenderState = renderState.replacingTracks(previousTracks)
+        return cachedWaveformVertices(
             drawableSize: drawableSize,
-            renderState: renderState,
-            mipLevels: previousWaveformMipLevels,
-            trackWaveformMipLevels: [:],
+            renderState: previousRenderState,
+            mipLevels: [],
+            trackWaveformMipLevels: previousTrackWaveformMipLevels,
             target: .previous,
-            usesTrackLanes: false
+            usesTrackLanes: true
         )
+    }
+
+    private func previousTransitionTracks(
+        withCurrentMixFrom currentTracks: [TimelineRenderState.Track]
+    ) -> [TimelineRenderState.Track] {
+        let currentMixByID = Dictionary(uniqueKeysWithValues: currentTracks.map { ($0.id, $0) })
+        return previousTransitionTracks.map { previousTrack in
+            let currentTrack = currentMixByID[previousTrack.id]
+            return TimelineRenderState.Track(
+                id: previousTrack.id,
+                waveformVersion: previousTrack.waveformVersion,
+                waveformOverview: previousTrack.waveformOverview,
+                volume: currentTrack?.volume ?? previousTrack.volume,
+                isMuted: currentTrack?.isMuted ?? previousTrack.isMuted,
+                isSoloed: currentTrack?.isSoloed ?? previousTrack.isSoloed
+            )
+        }
     }
 
     private func cachedWaveformVertices(
@@ -948,9 +1011,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             }
 
             let contentSignature = waveformContentSignature(renderState: renderState)
+            let visualSignature = waveformVisualSignature(renderState: renderState)
             prepareWaveformGeometry(
                 key: key,
                 contentSignature: contentSignature,
+                visualSignature: visualSignature,
                 target: target,
                 drawableSize: drawableSize,
                 renderState: renderState,
@@ -960,6 +1025,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             )
             return waveformGeometryStore.fallback(
                 contentSignature: contentSignature,
+                visualSignature: visualSignature,
                 target: target
             )?.vertices
         }
@@ -986,9 +1052,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         let contentSignature = waveformContentSignature(renderState: renderState)
+        let visualSignature = waveformVisualSignature(renderState: renderState)
         prepareWaveformGeometry(
             key: key,
             contentSignature: contentSignature,
+            visualSignature: visualSignature,
             target: target,
             drawableSize: drawableSize,
             renderState: renderState,
@@ -998,6 +1066,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         )
         return waveformGeometryStore.fallback(
             contentSignature: contentSignature,
+            visualSignature: visualSignature,
             target: target
         )?.vertices
     }
@@ -1005,6 +1074,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private func prepareWaveformGeometry(
         key: WaveformCacheKey,
         contentSignature: Int,
+        visualSignature: Int,
         target: WaveformGeometryTarget,
         drawableSize: CGSize,
         renderState: TimelineRenderState,
@@ -1046,6 +1116,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 WaveformCache(
                     key: key,
                     contentSignature: contentSignature,
+                    visualSignature: visualSignature,
                     vertices: $0
                 )
             }
@@ -1111,6 +1182,28 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             hasher.combine(track.waveformVersion)
             hasher.combine(track.waveformOverview?.bins.count ?? 0)
             hasher.combine(track.waveformOverview?.duration ?? 0)
+        }
+        return hasher.finalize()
+    }
+
+    private func waveformVisualSignature(renderState: TimelineRenderState) -> Int {
+        var hasher = Hasher()
+        hasher.combine(waveformBaseGray)
+        if let gainPreview = renderState.gainPreview {
+            hasher.combine(gainPreview.selection.startProgress)
+            hasher.combine(gainPreview.selection.endProgress)
+            hasher.combine(gainPreview.gain)
+        } else {
+            hasher.combine(-1 as Float)
+            hasher.combine(-1 as Float)
+            hasher.combine(1 as Float)
+        }
+
+        for track in renderState.tracks {
+            hasher.combine(track.id)
+            hasher.combine(track.volume)
+            hasher.combine(track.isMuted)
+            hasher.combine(track.isSoloed)
         }
         return hasher.finalize()
     }
