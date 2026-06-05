@@ -1,4 +1,5 @@
 import AppKit
+import QuartzCore
 import UniformTypeIdentifiers
 
 final class WorkspaceView: NSView {
@@ -36,6 +37,15 @@ final class WorkspaceView: NSView {
     private var playbackTimer: Timer?
     private let playbackController = AudioPlaybackController()
     private let playbackRefreshRate: TimeInterval = 144
+    private var visualPlayheadProgress: Float = 0
+    private var visualPlayheadAnchorTimestamp = CACurrentMediaTime()
+    private var visualPlaybackActive = false
+    private var displayedPlaybackActive: Bool?
+    private var lastVisualAudioCorrectionTimestamp = CACurrentMediaTime()
+    private let visualAudioSyncDeadband: TimeInterval = 0.006
+    private let visualAudioSyncHardCorrectionThreshold: TimeInterval = 0.075
+    private let visualAudioSyncResponseDuration: TimeInterval = 0.12
+    private let visualAudioSyncMinimumCorrectionInterval: TimeInterval = 1.0 / 30.0
     private let wavPreviewLevels = [
         WAVPreviewLevel(targetBinCount: 512, samplesPerBin: 6),
         WAVPreviewLevel(targetBinCount: 768, samplesPerBin: 6),
@@ -554,6 +564,7 @@ final class WorkspaceView: NSView {
         displayPlaybackVisuals(
             progress: snapshot.progress,
             isPlaying: snapshot.isPlaying,
+            syncPlayhead: !snapshot.isPlaying,
             anchorTimestamp: snapshot.hostTimestamp
         )
         updateTimeReadout()
@@ -582,6 +593,7 @@ final class WorkspaceView: NSView {
         displayPlaybackVisuals(
             progress: snapshot.progress,
             isPlaying: snapshot.isPlaying,
+            syncPlayhead: !snapshot.isPlaying,
             anchorTimestamp: snapshot.hostTimestamp
         )
         updateLoadedAudioSummary(for: decodedAudioBuffer)
@@ -949,11 +961,118 @@ final class WorkspaceView: NSView {
         syncPlayhead: Bool = true,
         anchorTimestamp: TimeInterval? = nil
     ) {
+        let timestamp = anchorTimestamp ?? CACurrentMediaTime()
+        let clampedProgress = min(max(progress, 0), 1)
+
+        guard isPlaying, !syncPlayhead, visualPlaybackActive else {
+            hardSyncPlaybackVisuals(
+                progress: clampedProgress,
+                isPlaying: isPlaying,
+                anchorTimestamp: timestamp
+            )
+            return
+        }
+
+        gentlySyncPlaybackVisuals(
+            progress: clampedProgress,
+            anchorTimestamp: timestamp
+        )
+        displayPlaybackActiveIfNeeded(isPlaying)
+    }
+
+    private func hardSyncPlaybackVisuals(
+        progress: Float,
+        isPlaying: Bool,
+        anchorTimestamp: TimeInterval
+    ) {
+        visualPlayheadProgress = min(max(progress, 0), 1)
+        visualPlayheadAnchorTimestamp = anchorTimestamp
+        visualPlaybackActive = isPlaying
+        lastVisualAudioCorrectionTimestamp = anchorTimestamp
+
         timelineSurface.displayPlayheadProgress(
-            progress,
-            syncRenderer: syncPlayhead,
+            visualPlayheadProgress,
+            syncRenderer: true,
             anchorTimestamp: anchorTimestamp
         )
+        displayPlaybackActiveIfNeeded(isPlaying)
+    }
+
+    private func gentlySyncPlaybackVisuals(
+        progress audioProgress: Float,
+        anchorTimestamp audioTimestamp: TimeInterval
+    ) {
+        guard displayedDuration > 0 else {
+            hardSyncPlaybackVisuals(
+                progress: audioProgress,
+                isPlaying: true,
+                anchorTimestamp: audioTimestamp
+            )
+            return
+        }
+
+        let projectedProgress = projectedVisualPlayheadProgress(
+            at: audioTimestamp,
+            duration: displayedDuration
+        )
+        let correctionProgress = audioProgress - projectedProgress
+        let correctionSeconds = TimeInterval(correctionProgress) * displayedDuration
+        let absoluteCorrectionSeconds = abs(correctionSeconds)
+
+        guard absoluteCorrectionSeconds > visualAudioSyncDeadband else {
+            return
+        }
+
+        guard absoluteCorrectionSeconds < visualAudioSyncHardCorrectionThreshold else {
+            hardSyncPlaybackVisuals(
+                progress: audioProgress,
+                isPlaying: true,
+                anchorTimestamp: audioTimestamp
+            )
+            return
+        }
+
+        guard audioTimestamp - lastVisualAudioCorrectionTimestamp >= visualAudioSyncMinimumCorrectionInterval else {
+            return
+        }
+
+        let correctionWeight = min(
+            max(absoluteCorrectionSeconds / visualAudioSyncResponseDuration, 0.06),
+            0.28
+        )
+        let correctedProgress = projectedProgress + correctionProgress * Float(correctionWeight)
+        visualPlayheadProgress = min(max(correctedProgress, 0), 1)
+        visualPlayheadAnchorTimestamp = audioTimestamp
+        visualPlaybackActive = true
+        lastVisualAudioCorrectionTimestamp = audioTimestamp
+
+        timelineSurface.displayPlayheadProgress(
+            visualPlayheadProgress,
+            syncRenderer: false,
+            anchorTimestamp: audioTimestamp
+        )
+    }
+
+    private func projectedVisualPlayheadProgress(
+        at timestamp: TimeInterval,
+        duration: TimeInterval
+    ) -> Float {
+        guard visualPlaybackActive, duration.isFinite, duration > 0 else {
+            return visualPlayheadProgress
+        }
+
+        let elapsedTime = max(timestamp - visualPlayheadAnchorTimestamp, 0)
+        let projectedProgress = visualPlayheadProgress + Float(elapsedTime / duration)
+        return min(max(projectedProgress, 0), 1)
+    }
+
+    private func displayPlaybackActiveIfNeeded(_ isPlaying: Bool) {
+        visualPlaybackActive = isPlaying
+        guard displayedPlaybackActive != isPlaying else {
+            return
+        }
+
+        displayedPlaybackActive = isPlaying
         timelineSurface.displayPlaybackActive(isPlaying)
     }
 
