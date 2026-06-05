@@ -37,6 +37,8 @@ struct RenderSegment {
     uint64_t outputStartFrame = 0;
     uint64_t sourceStartFrame = 0;
     uint64_t frameCount = 0;
+    double sourceFrameScale = 1;
+    bool usesExactSourceFrames = true;
     float gain = 1;
 };
 
@@ -395,6 +397,48 @@ float sample_at(const AudioSource& source, uint64_t frameIndex, uint32_t channel
     return source.interleavedSamples[sampleIndex];
 }
 
+float sample_at_linear(const AudioSource& source, double framePosition, uint32_t channelIndex) {
+    if (
+        !std::isfinite(framePosition) ||
+        framePosition < 0 ||
+        channelIndex >= source.channelCount ||
+        source.frameCount == 0
+    ) {
+        return 0.0f;
+    }
+
+    const auto lowerFrameDouble = std::floor(framePosition);
+    if (lowerFrameDouble >= static_cast<double>(source.frameCount)) {
+        return 0.0f;
+    }
+
+    const auto lowerFrame = static_cast<uint64_t>(lowerFrameDouble);
+    const auto upperFrame = lowerFrame + 1;
+    const auto lowerSample = sample_at(source, lowerFrame, channelIndex);
+    if (upperFrame >= source.frameCount) {
+        return lowerSample;
+    }
+
+    const auto upperSample = sample_at(source, upperFrame, channelIndex);
+    const auto fraction = static_cast<float>(framePosition - lowerFrameDouble);
+    return lowerSample + (upperSample - lowerSample) * fraction;
+}
+
+uint64_t output_frame_count_for_source(const AudioSource& source, double outputSampleRate) {
+    if (source.frameCount == 0 || source.sampleRate <= 0 || outputSampleRate <= 0) {
+        return 0;
+    }
+
+    const auto outputFrameCount = std::ceil(
+        static_cast<double>(source.frameCount) * outputSampleRate / source.sampleRate
+    );
+    if (!std::isfinite(outputFrameCount) || outputFrameCount <= 0) {
+        return 0;
+    }
+
+    return static_cast<uint64_t>(outputFrameCount);
+}
+
 void reconcile_track_gain_ramps(
     SoundtimeAudioCoreEngine& engine,
     const EngineConfig& config,
@@ -537,11 +581,12 @@ std::shared_ptr<RenderGraph> make_graph_from_track_configs(
         }
 
         const auto source = trackConfig.source->source;
-        if (source->sampleRate != sampleRate || source->channelCount == 0) {
+        if (source->sampleRate <= 0 || source->channelCount == 0) {
             return nullptr;
         }
 
-        graph->frameCount = std::max(graph->frameCount, source->frameCount);
+        const auto outputFrameCount = output_frame_count_for_source(*source, sampleRate);
+        graph->frameCount = std::max(graph->frameCount, outputFrameCount);
         graph->channelCount = std::max(graph->channelCount, source->channelCount);
 
         auto track = RenderTrack{
@@ -549,11 +594,14 @@ std::shared_ptr<RenderGraph> make_graph_from_track_configs(
             .segments = {},
             .gain = std::max(trackConfig.gain, 0.0f),
         };
-        if (source->frameCount > 0) {
+        if (outputFrameCount > 0) {
+            const auto sourceFrameScale = source->sampleRate / sampleRate;
             track.segments.push_back(RenderSegment{
                 .outputStartFrame = 0,
                 .sourceStartFrame = 0,
-                .frameCount = source->frameCount,
+                .frameCount = outputFrameCount,
+                .sourceFrameScale = sourceFrameScale,
+                .usesExactSourceFrames = std::fabs(sourceFrameScale - 1.0) <= 0.000'000'001,
                 .gain = 1,
             });
         }
@@ -582,6 +630,8 @@ void publish_source(SoundtimeAudioCoreEngine& engine, std::shared_ptr<const Audi
             .outputStartFrame = 0,
             .sourceStartFrame = 0,
             .frameCount = source->frameCount,
+            .sourceFrameScale = 1,
+            .usesExactSourceFrames = true,
             .gain = 1,
         });
     }
@@ -1163,10 +1213,6 @@ void soundtime_audio_core_render_at_host_time(
                     }
 
                     const auto segmentFrameOffset = outputFrameIndex - segment.outputStartFrame;
-                    const auto segmentSourceFrameIndex = segment.sourceStartFrame + segmentFrameOffset;
-                    if (segmentSourceFrameIndex >= source->frameCount) {
-                        continue;
-                    }
 
                     const auto sourceChannelCount = source->channelCount;
                     const auto outputGain = outputGainBase * trackGain * segment.gain;
@@ -1183,11 +1229,19 @@ void soundtime_audio_core_render_at_host_time(
                             continue;
                         }
 
-                        output[frameOffset] += sample_at(
-                            *source,
-                            segmentSourceFrameIndex,
-                            sourceChannel
-                        ) * outputGain;
+                        const auto sourceSample = segment.usesExactSourceFrames ?
+                            sample_at(
+                                *source,
+                                segment.sourceStartFrame + segmentFrameOffset,
+                                sourceChannel
+                            ) :
+                            sample_at_linear(
+                                *source,
+                                static_cast<double>(segment.sourceStartFrame) +
+                                    static_cast<double>(segmentFrameOffset) * segment.sourceFrameScale,
+                                sourceChannel
+                            );
+                        output[frameOffset] += sourceSample * outputGain;
                     }
                     break;
                 }

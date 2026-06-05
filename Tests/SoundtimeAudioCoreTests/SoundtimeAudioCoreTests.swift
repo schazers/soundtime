@@ -392,6 +392,69 @@ final class SoundtimeAudioCoreTests: XCTestCase {
         XCTAssertEqual(output[1], [0.80, -1.00, 1.20, -1.40])
     }
 
+    func testPreparedTracksWithMixedSampleRatesRenderOnProjectTimeline() throws {
+        let engine = try XCTUnwrap(soundtime_audio_core_create())
+        defer {
+            soundtime_audio_core_destroy(engine)
+        }
+
+        var lowRateSamples: [Float] = [1, 2, 3, 4]
+        var highRateSamples: [Float] = [10, 20, 30, 40, 50, 60, 70, 80]
+
+        let lowRateSource = lowRateSamples.withUnsafeMutableBufferPointer { samples in
+            var channels = [UnsafePointer(samples.baseAddress)]
+            return channels.withUnsafeMutableBufferPointer { channelPointers in
+                soundtime_audio_core_source_create_planar(
+                    channelPointers.baseAddress,
+                    UInt64(samples.count),
+                    1,
+                    4
+                )
+            }
+        }
+        let highRateSource = highRateSamples.withUnsafeMutableBufferPointer { samples in
+            var channels = [UnsafePointer(samples.baseAddress)]
+            return channels.withUnsafeMutableBufferPointer { channelPointers in
+                soundtime_audio_core_source_create_planar(
+                    channelPointers.baseAddress,
+                    UInt64(samples.count),
+                    1,
+                    8
+                )
+            }
+        }
+        let sourceA = try XCTUnwrap(lowRateSource)
+        let sourceB = try XCTUnwrap(highRateSource)
+        defer {
+            soundtime_audio_core_source_destroy(sourceA)
+            soundtime_audio_core_source_destroy(sourceB)
+        }
+
+        var tracks = [
+            SoundtimeAudioCoreTrackConfig(source: sourceA, gain: 1),
+            SoundtimeAudioCoreTrackConfig(source: sourceB, gain: 1),
+        ]
+        let didLoad = tracks.withUnsafeMutableBufferPointer { trackBuffer in
+            soundtime_audio_core_set_prepared_tracks(
+                engine,
+                trackBuffer.baseAddress,
+                UInt32(trackBuffer.count)
+            )
+        }
+        XCTAssertTrue(didLoad)
+
+        let snapshot = soundtime_audio_core_snapshot(engine)
+        XCTAssertEqual(snapshot.frameCount, 4)
+        XCTAssertEqual(snapshot.sampleRate, 4)
+
+        soundtime_audio_core_set_transport_ramp_duration(engine, 0)
+        soundtime_audio_core_play(engine)
+
+        let output = render(engine: engine, channelCount: 2, frameCount: 4, hostTimestamp: 8)
+        XCTAssertEqual(output[0], [11, 32, 53, 74])
+        XCTAssertEqual(output[1], [11, 32, 53, 74])
+    }
+
     func testPreparedTrackUpdateDoesNotResetTransport() throws {
         let engine = try XCTUnwrap(soundtime_audio_core_create())
         defer {
