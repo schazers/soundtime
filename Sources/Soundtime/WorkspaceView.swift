@@ -861,11 +861,7 @@ final class WorkspaceView: NSView {
         syncActiveTrackFields()
         refreshProjectTimelineDisplay(rebuildControls: false)
         updateProjectDisplayTiming(sampleRateHint: decodedAudioBuffer.sampleRate)
-        if playbackController.hasSource {
-            updateProjectPlaybackTrackMix()
-        } else {
-            reloadPlaybackFromProjectTracks(preserveProgress: true)
-        }
+        reloadPlaybackFromProjectTracks(preserveProgress: true)
         updateEffectCommandState()
         updateStatus("track ready")
     }
@@ -998,15 +994,15 @@ final class WorkspaceView: NSView {
     private func projectPlaybackTracks() -> [ProjectPlaybackTrack] {
         projectTracks.compactMap { track in
             let source: ProjectPlaybackTrack.Source
-            if track.editRevision == 0, track.waveformOverview != nil {
-                source = .file(
-                    url: track.sourceURL,
-                    zeroCrossingProbe: track.zeroCrossingProbe
-                )
-            } else if let decodedAudioBuffer = track.decodedAudioBuffer {
+            if let decodedAudioBuffer = track.decodedAudioBuffer {
                 source = .decoded(
                     decodedAudioBuffer: decodedAudioBuffer,
                     zeroCrossingIndex: track.zeroCrossingIndex
+                )
+            } else if track.editRevision == 0, track.waveformOverview != nil {
+                source = .file(
+                    url: track.sourceURL,
+                    zeroCrossingProbe: track.zeroCrossingProbe
                 )
             } else {
                 return nil
@@ -1015,6 +1011,7 @@ final class WorkspaceView: NSView {
             return ProjectPlaybackTrack(
                 id: track.id,
                 source: source,
+                sourceRevision: track.editRevision,
                 volume: track.volume,
                 isMuted: track.isMuted,
                 isSoloed: track.isSoloed

@@ -29,6 +29,11 @@ typedef struct SoundtimeAudioCoreClockSample {
     bool isPlaying;
 } SoundtimeAudioCoreClockSample;
 
+typedef struct SoundtimeAudioCoreTrackConfig {
+    const SoundtimeAudioCoreSource* source;
+    float gain;
+} SoundtimeAudioCoreTrackConfig;
+
 SoundtimeAudioCoreEngine* soundtime_audio_core_create(void);
 void soundtime_audio_core_destroy(SoundtimeAudioCoreEngine* engine);
 SoundtimeAudioCoreSource* soundtime_audio_core_source_create_planar(
@@ -63,8 +68,19 @@ bool soundtime_audio_core_set_prepared_source(
     SoundtimeAudioCoreEngine* engine,
     const SoundtimeAudioCoreSource* source
 );
+bool soundtime_audio_core_set_prepared_tracks(
+    SoundtimeAudioCoreEngine* engine,
+    const SoundtimeAudioCoreTrackConfig* tracks,
+    uint32_t trackCount
+);
+bool soundtime_audio_core_update_prepared_tracks(
+    SoundtimeAudioCoreEngine* engine,
+    const SoundtimeAudioCoreTrackConfig* tracks,
+    uint32_t trackCount
+);
 void soundtime_audio_core_play(SoundtimeAudioCoreEngine* engine);
 void soundtime_audio_core_pause(SoundtimeAudioCoreEngine* engine);
+void soundtime_audio_core_pause_at(SoundtimeAudioCoreEngine* engine, uint64_t frameIndex);
 void soundtime_audio_core_seek(SoundtimeAudioCoreEngine* engine, uint64_t frameIndex);
 void soundtime_audio_core_set_gain(SoundtimeAudioCoreEngine* engine, float gain);
 void soundtime_audio_core_set_transport_ramp_duration(

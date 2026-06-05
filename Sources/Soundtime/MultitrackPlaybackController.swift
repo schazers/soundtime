@@ -101,6 +101,7 @@ final class MultitrackPlaybackController: PlaybackEngine {
                     decodedAudioBuffer: decodedAudioBuffer,
                     zeroCrossingIndex: zeroCrossingIndex
                 ),
+                sourceRevision: 0,
                 volume: 1,
                 isMuted: false,
                 isSoloed: false
@@ -113,6 +114,7 @@ final class MultitrackPlaybackController: PlaybackEngine {
             ProjectPlaybackTrack(
                 id: UUID(),
                 source: .file(url: url, zeroCrossingProbe: zeroCrossingProbe),
+                sourceRevision: 0,
                 volume: 1,
                 isMuted: false,
                 isSoloed: false
