@@ -45,6 +45,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         var style2: SIMD4<Float>
         var gainPreview: SIMD4<Float>
         var fisheye: SIMD4<Float>
+        var touch: SIMD4<Float>
+        var touch2: SIMD4<Float>
     }
 
     private struct WaveformShaderBin {
@@ -1035,6 +1037,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 renderState: $0
             )
         } ?? false
+        let waveformTouchParameters = (usesWaveformShader || usesPreviousWaveformShader) ?
+            makeWaveformTouchShaderParameters(
+                renderState: renderState,
+                playheadProgress: renderedPlayheadProgress,
+                displayTimestamp: displayTimestamp
+            ) :
+            emptyWaveformTouchShaderParameters()
         let waveformVertices = usesWaveformShader ?
             nil :
             cachedWaveformVertices(
@@ -1059,13 +1068,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             backingScale: backingScale,
             renderState: renderState
         )
-        let playheadTouchVertices = makePlayheadTouchVertices(
-            drawableSize: viewportSize,
-            playheadProgress: renderedPlayheadProgress,
-            renderState: renderState,
-            mipLevelSnapshot: mipLevelSnapshot,
-            displayTimestamp: displayTimestamp
-        )
+        let playheadTouchVertices = usesWaveformShader ? [] :
+            makePlayheadTouchVertices(
+                drawableSize: viewportSize,
+                playheadProgress: renderedPlayheadProgress,
+                renderState: renderState,
+                mipLevelSnapshot: mipLevelSnapshot,
+                displayTimestamp: displayTimestamp
+            )
         updateTransientParticles(
             drawableSize: viewportSize,
             playheadProgress: renderedPlayheadProgress,
@@ -1110,6 +1120,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 renderState: previousShaderRenderState,
                 trackWaveformMipLevels: mipLevelSnapshot.previousByTrack,
                 fisheye: waveformFisheye,
+                touchParameters: waveformTouchParameters,
                 opacity: waveformTransitionOpacities.previous,
                 displayTimestamp: displayTimestamp,
                 encoder: encoder
@@ -1140,6 +1151,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 renderState: renderState,
                 trackWaveformMipLevels: mipLevelSnapshot.currentByTrack,
                 fisheye: waveformFisheye,
+                touchParameters: waveformTouchParameters,
                 opacity: waveformTransitionOpacities.current,
                 displayTimestamp: displayTimestamp,
                 encoder: encoder
@@ -1258,6 +1270,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         renderState: TimelineRenderState,
         trackWaveformMipLevels: [UUID: [WaveformMipLevel]],
         fisheye: SIMD4<Float>,
+        touchParameters: (touch: SIMD4<Float>, touch2: SIMD4<Float>),
         opacity: Float,
         displayTimestamp: CFTimeInterval,
         encoder: MTLRenderCommandEncoder
@@ -1309,6 +1322,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             let isAudible = isTrackAudible(track, anySolo: anySolo)
             let trackAlpha = (isAudible ? Float(1) : Float(0.26)) * min(max(opacity, 0), 1)
             let gray = waveformBaseGray * (isAudible ? 1.0 : 0.68)
+            let trackTouch = isAudible ?
+                touchParameters.touch :
+                SIMD4<Float>(
+                    touchParameters.touch.x,
+                    touchParameters.touch.y,
+                    touchParameters.touch.z,
+                    0
+                )
             let trackFisheye = scaledWaveformFisheye(
                 fisheye,
                 by: trackFisheyeEnergy(for: track.id, at: displayTimestamp)
@@ -1325,6 +1346,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 style: style,
                 backingScale: backingScale,
                 fisheye: trackFisheye,
+                touch: trackTouch,
+                touch2: touchParameters.touch2,
                 renderState: renderState
             )
 
@@ -1360,6 +1383,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         style: WaveformVisualStyle,
         backingScale: Float,
         fisheye: SIMD4<Float>,
+        touch: SIMD4<Float>,
+        touch2: SIMD4<Float>,
         renderState: TimelineRenderState
     ) -> WaveformShaderUniform {
         let baseColor = SIMD4<Float>(baseGray, baseGray, baseGray, alpha)
@@ -1403,7 +1428,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             style: commonStyle,
             style2: commonStyle2,
             gainPreview: gainPreview,
-            fisheye: fisheye
+            fisheye: fisheye,
+            touch: touch,
+            touch2: touch2
         )
     }
 
@@ -3452,6 +3479,100 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
     }
 
+    private func emptyWaveformTouchShaderParameters() -> (touch: SIMD4<Float>, touch2: SIMD4<Float>) {
+        (
+            touch: SIMD4<Float>(0, 0, 0, 0),
+            touch2: SIMD4<Float>(0, 0, 0, playheadTouchTrailFalloffSteepness)
+        )
+    }
+
+    private func makeWaveformTouchShaderParameters(
+        renderState: TimelineRenderState,
+        playheadProgress: Float,
+        displayTimestamp: CFTimeInterval
+    ) -> (touch: SIMD4<Float>, touch2: SIMD4<Float>) {
+        guard
+            renderState.hasWaveforms,
+            let projectDuration = renderState.duration,
+            projectDuration.isFinite,
+            projectDuration > 0
+        else {
+            return emptyWaveformTouchShaderParameters()
+        }
+
+        let clampedPlayhead = min(max(playheadProgress, 0), 1)
+        let geometryAheadRadius = playheadTouchGeometryAheadRadiusProgress(forDuration: projectDuration)
+        let lightAheadRadius = playheadTouchLightAheadRadiusProgress(forDuration: projectDuration)
+        let trailDecayRadius = playheadTouchTrailRadiusProgress(forDuration: projectDuration)
+        let trailRenderRadius = playheadTouchTrailRenderRadiusProgress(forDuration: projectDuration)
+        let viewport = renderState.viewport
+        let touchHeadProgress: Float
+        let touchRegionEnd: Float
+        let touchEnergy: Float
+
+        if renderState.isPlaybackActive {
+            touchEnergy = currentPlayheadTouchEnergy(isPlaybackActive: true)
+            touchHeadProgress = clampedPlayhead
+            touchRegionEnd = min(
+                clampedPlayhead + max(geometryAheadRadius, lightAheadRadius),
+                viewport.endProgress
+            )
+        } else if
+            let pauseProgress = playheadTouchPauseProgress,
+            let pauseTimestamp = playheadTouchPauseTimestamp
+        {
+            let elapsedTime = max(displayTimestamp - pauseTimestamp, 0)
+            guard elapsedTime < playheadTouchTrailRenderDuration else {
+                playheadTouchEnergy = 0
+                playheadTouchPauseProgress = nil
+                playheadTouchPauseTimestamp = nil
+                playheadTouchPlayStartProgress = nil
+                return emptyWaveformTouchShaderParameters()
+            }
+
+            touchEnergy = 1
+            touchHeadProgress = min(max(pauseProgress + Float(elapsedTime / projectDuration), 0), 1)
+            touchRegionEnd = min(max(pauseProgress, 0), viewport.endProgress)
+        } else {
+            touchEnergy = currentPlayheadTouchEnergy(isPlaybackActive: false)
+            touchHeadProgress = clampedPlayhead
+            touchRegionEnd = min(clampedPlayhead, viewport.endProgress)
+        }
+
+        guard touchEnergy > 0.001 else {
+            return emptyWaveformTouchShaderParameters()
+        }
+
+        let playthroughTrailStart = playheadTouchPlayStartProgress.map {
+            min(max($0, 0), min(touchHeadProgress, touchRegionEnd))
+        }
+        let visibleTouchStart = max(
+            touchHeadProgress - trailRenderRadius,
+            playthroughTrailStart ?? 0,
+            viewport.startProgress
+        )
+        let visibleTouchEnd = touchRegionEnd
+
+        guard visibleTouchStart < visibleTouchEnd else {
+            return emptyWaveformTouchShaderParameters()
+        }
+
+        return (
+            touch: SIMD4<Float>(
+                touchHeadProgress,
+                visibleTouchEnd,
+                visibleTouchStart,
+                touchEnergy
+            ),
+            touch2: SIMD4<Float>(
+                geometryAheadRadius,
+                lightAheadRadius,
+                trailDecayRadius,
+                playheadTouchTrailFalloffSteepness
+            )
+        )
+    }
+
     private func makePlayheadTouchVertices(
         drawableSize: CGSize,
         playheadProgress: Float,
@@ -5109,6 +5230,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float4 style2;
         float4 gainPreview;
         float4 fisheye;
+        float4 touch;
+        float4 touch2;
     };
 
     struct WaveformShaderBin {
@@ -5138,6 +5261,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float4 style2;
         float4 gainPreview;
         float4 fisheye;
+        float4 touch;
+        float4 touch2;
     };
 
     float fisheye_focus_weight(float normalizedDistance) {
@@ -5250,6 +5375,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         out.style2 = uniforms.style2;
         out.gainPreview = uniforms.gainPreview;
         out.fisheye = uniforms.fisheye;
+        out.touch = uniforms.touch;
+        out.touch2 = uniforms.touch2;
         return out;
     }
 
@@ -5314,6 +5441,34 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float normalizedDistance = clamp(distance / radius, 0.0, 1.0);
         float localAmount = fisheye_focus_weight(normalizedDistance);
         return clamp(localAmount * energy, 0.0, 1.0);
+    }
+
+    static float touch_trail_falloff(float distanceRatio, float exponent) {
+        float clampedDistance = max(distanceRatio, 0.0);
+        float safeExponent = max(exponent, 0.25);
+        float referenceInfluence = 0.015;
+        float referenceScale = pow(-log(referenceInfluence), 1.0 / safeExponent);
+        return exp(-pow(clampedDistance * referenceScale, safeExponent));
+    }
+
+    static float touch_geometry_influence(float offsetFromPlayhead, float aheadRadius, float trailRadius, float exponent) {
+        if (offsetFromPlayhead >= 0.0) {
+            float proximity = 1.0 - min(offsetFromPlayhead / max(aheadRadius, 0.0000001), 1.0);
+            proximity = clamp(proximity, 0.0, 1.0);
+            return proximity * proximity * proximity * proximity;
+        }
+
+        return touch_trail_falloff(abs(offsetFromPlayhead) / max(trailRadius, 0.0000001), exponent);
+    }
+
+    static float touch_light_influence(float offsetFromPlayhead, float aheadRadius, float trailRadius, float exponent) {
+        if (offsetFromPlayhead >= 0.0) {
+            float proximity = 1.0 - min(offsetFromPlayhead / max(aheadRadius, 0.0000001), 1.0);
+            proximity = clamp(proximity, 0.0, 1.0);
+            return proximity * proximity;
+        }
+
+        return touch_trail_falloff(abs(offsetFromPlayhead) / max(trailRadius, 0.0000001), exponent);
     }
 
     static float waveform_gain(float timelineProgress, float4 gainPreview) {
@@ -5430,9 +5585,30 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float minimumSample = clamp(bin.minimumSample * gain, -1.0, 1.0);
         float maximumSample = clamp(bin.maximumSample * gain, -1.0, 1.0);
         float rmsSample = clamp(bin.rmsSample * gain, 0.0, 1.0);
+        float touchEnergy = clamp(in.touch.w, 0.0, 1.0);
+        float geometryInfluence = 0.0;
+        float lightInfluence = 0.0;
+        if (touchEnergy > 0.001 &&
+            timelineProgress >= in.touch.z &&
+            timelineProgress <= in.touch.y) {
+            float offsetFromPlayhead = timelineProgress - in.touch.x;
+            geometryInfluence = touch_geometry_influence(
+                offsetFromPlayhead,
+                in.touch2.x,
+                in.touch2.z,
+                in.touch2.w
+            ) * touchEnergy;
+            lightInfluence = touch_light_influence(
+                offsetFromPlayhead,
+                in.touch2.y,
+                in.touch2.z,
+                in.touch2.w
+            ) * touchEnergy;
+        }
+        float expansion = 1.0 + 0.22 * geometryInfluence;
 
-        float peakTop = centerY - maximumSample * amplitudeHeight;
-        float peakBottom = centerY - minimumSample * amplitudeHeight;
+        float peakTop = centerY - maximumSample * amplitudeHeight * expansion;
+        float peakBottom = centerY - minimumSample * amplitudeHeight * expansion;
         float minimumVisualHeight = (laneBottom - laneTop) * 0.006;
         if (peakBottom - peakTop < minimumVisualHeight) {
             float midpoint = (peakTop + peakBottom) * 0.5;
@@ -5449,6 +5625,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float yAA = max(fwidth(y) * 0.75, 0.000001);
         float alphaScale = clamp(in.baseColor.a * opacity, 0.0, 1.0);
         float4 baseColor = waveform_base_color(bin, in.baseColor.r, alphaScale, in.style.x);
+        if (lightInfluence > 0.001) {
+            baseColor = lightened_color(baseColor, min(lightInfluence * 0.72, 1.0), alphaScale);
+        }
         float4 color = float4(0.0);
 
         if (in.style.w > 0.001) {
