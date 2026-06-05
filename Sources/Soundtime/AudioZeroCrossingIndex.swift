@@ -50,6 +50,10 @@ struct AudioZeroCrossingIndex: Sendable {
         var previousSample = mixedSample(in: buffer, at: 0)
 
         for frameIndex in 1..<buffer.frameCount {
+            if frameIndex.isMultiple(of: 8_192) {
+                try? ImportWorkBudget.shared.waitIfPlaybackActive()
+            }
+
             let sample = mixedSample(in: buffer, at: frameIndex)
             if let crossingFrame = crossingFrame(
                 previousSample: previousSample,

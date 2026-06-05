@@ -16,6 +16,10 @@ enum WaveformOverviewBuilder {
         bins.reserveCapacity(binCount)
 
         for binIndex in 0..<binCount {
+            if binIndex.isMultiple(of: 512) {
+                try? ImportWorkBudget.shared.waitIfPlaybackActive()
+            }
+
             let startFrame = binIndex * buffer.frameCount / binCount
             let endFrame = max((binIndex + 1) * buffer.frameCount / binCount, startFrame + 1)
             var minimumSample: Float = 1

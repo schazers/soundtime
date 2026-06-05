@@ -208,6 +208,10 @@ enum WAVAudioDecoder {
         bins.reserveCapacity(binCount)
 
         for binIndex in 0..<binCount {
+            if binIndex.isMultiple(of: 256) {
+                try ImportWorkBudget.shared.waitIfPlaybackActive()
+            }
+
             let startFrame = binIndex * fileInfo.frameCount / binCount
             let endFrame = max((binIndex + 1) * fileInfo.frameCount / binCount, startFrame + 1)
             let frameSpan = endFrame - startFrame
@@ -267,6 +271,10 @@ enum WAVAudioDecoder {
         }
 
         for frameIndex in 0..<frameCount {
+            if frameIndex.isMultiple(of: 4_096) {
+                try ImportWorkBudget.shared.waitIfPlaybackActive()
+            }
+
             let frameOffset = fileInfo.dataRange.lowerBound + frameIndex * fileInfo.blockAlign
 
             for channelIndex in 0..<fileInfo.channelCount {

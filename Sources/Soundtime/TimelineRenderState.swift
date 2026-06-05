@@ -3,6 +3,7 @@ import Foundation
 struct TimelineRenderState: Sendable {
     struct Track: Sendable {
         let id: UUID
+        let waveformVersion: Int
         let waveformOverview: WaveformOverview?
         let volume: Float
         let isMuted: Bool
@@ -57,6 +58,7 @@ struct TimelineRenderState: Sendable {
         let tracks = waveformOverview.map {
             [Track(
                 id: UUID(uuidString: "00000000-0000-0000-0000-000000000001") ?? UUID(),
+                waveformVersion: 0,
                 waveformOverview: $0,
                 volume: 1,
                 isMuted: false,
