@@ -3,7 +3,6 @@ import CoreAudio
 import Foundation
 import SoundtimeAudioCore
 
-@MainActor
 final class AudioUnitOutputDevice: RealtimeAudioOutputDevice {
     private var audioUnit: AudioUnit?
     private var configuredSampleRate: Double?
