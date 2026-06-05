@@ -48,6 +48,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var timelineDisplayLink: TimelineDisplayLink?
     private var transientRenderEndTime: CFTimeInterval?
     private var needsTimelineRender = false
+    private var isTimelineRenderInFlight = false
     private var isTimelinePlaybackActive = false
     private let selectionDragThreshold: CGFloat = 3
     private let trimHandleHitWidth: CGFloat = 18
@@ -340,22 +341,35 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             pageViewportIfNeeded(forPlayheadProgress: playheadProgress)
         }
 
-        needsTimelineRender = false
-        submitTimelineRender(frame: frame)
+        let didSubmitRender = submitTimelineRender(frame: frame)
+        if didSubmitRender {
+            needsTimelineRender = false
+        }
         stopTimelineDisplayLinkIfIdle()
     }
 
-    private func submitTimelineRender(frame: TimelineDisplayLinkFrame) {
+    private func submitTimelineRender(frame: TimelineDisplayLinkFrame) -> Bool {
+        guard !isTimelineRenderInFlight else {
+            return false
+        }
+
         guard
             let timelineRenderer,
             let renderTarget = makeTimelineRenderTarget(frame: frame)
         else {
-            return
+            return false
         }
 
-        timelineRenderQueue.async { [timelineRenderer, renderTarget] in
+        isTimelineRenderInFlight = true
+        timelineRenderQueue.async { [weak self, timelineRenderer, renderTarget] in
             timelineRenderer.render(to: renderTarget)
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated {
+                    self?.isTimelineRenderInFlight = false
+                }
+            }
         }
+        return true
     }
 
     private func startTransientRenderPulse(duration: CFTimeInterval? = nil) {
