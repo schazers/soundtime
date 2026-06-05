@@ -1979,7 +1979,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let size = SIMD2<Float>(width, height)
         var vertices: [TimelineVertex] = []
         vertices.reserveCapacity(90)
-        let baseWidth = pixelLength(3.5, backingScale: backingScale)
+        let baseWidth = pixelLength(4.0, backingScale: backingScale)
         let halfBaseWidth = baseWidth * 0.5
         updatePlayheadContactEvents(
             playheadProgress: playheadProgress,
