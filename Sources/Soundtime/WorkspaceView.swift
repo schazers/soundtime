@@ -190,6 +190,7 @@ final class WorkspaceView: NSView {
         return label
     }()
 
+    private let frameRateHistoryView = FrameRateHistoryView()
     private let volumeControl = VolumeControlView()
     private let loudnessMeter = LoudnessMeterView()
     private let fisheyeRadiusControl = TimelineTuningSliderView(
@@ -266,6 +267,7 @@ final class WorkspaceView: NSView {
         installTransportKeyMonitor()
 
         timelineSurface.translatesAutoresizingMaskIntoConstraints = false
+        frameRateHistoryView.translatesAutoresizingMaskIntoConstraints = false
         timelineSurface.onAudioFileDropped = { [weak self] url in
             self?.loadDroppedAudioFile(at: url)
         }
@@ -355,6 +357,7 @@ final class WorkspaceView: NSView {
         addSubview(titleLabel)
         addSubview(metadataLabel)
         addSubview(framesPerSecondLabel)
+        addSubview(frameRateHistoryView)
         addSubview(volumeControl)
         addSubview(timeReadoutLabel)
         addSubview(loudnessMeter)
@@ -379,8 +382,13 @@ final class WorkspaceView: NSView {
             metadataLabel.trailingAnchor.constraint(equalTo: framesPerSecondLabel.leadingAnchor, constant: -14),
 
             framesPerSecondLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
-            framesPerSecondLabel.trailingAnchor.constraint(equalTo: volumeControl.leadingAnchor, constant: -12),
+            framesPerSecondLabel.trailingAnchor.constraint(equalTo: frameRateHistoryView.leadingAnchor, constant: -10),
             framesPerSecondLabel.widthAnchor.constraint(equalToConstant: 330),
+
+            frameRateHistoryView.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
+            frameRateHistoryView.trailingAnchor.constraint(equalTo: volumeControl.leadingAnchor, constant: -12),
+            frameRateHistoryView.widthAnchor.constraint(equalToConstant: 132),
+            frameRateHistoryView.heightAnchor.constraint(equalToConstant: 24),
 
             volumeControl.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
             volumeControl.trailingAnchor.constraint(equalTo: timeReadoutLabel.leadingAnchor, constant: -18),
@@ -2906,6 +2914,7 @@ final class WorkspaceView: NSView {
     }
 
     private func updateFrameStats(_ frameStats: TimelineFrameStats) {
+        frameRateHistoryView.display(frameStats: frameStats)
         let shaderBufferMegabytes = Int((Double(frameStats.shaderBufferByteCount) / 1_048_576).rounded())
         framesPerSecondLabel.stringValue = String(
             format: "%d fps %@ c%d g%d b%d/%dMB u%d/%d m%d +/-%.1f max %.1f",
