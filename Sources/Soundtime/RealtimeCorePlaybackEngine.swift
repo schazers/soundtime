@@ -74,6 +74,24 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         try configureCallbackGraph(sampleRate: fileInfo.sampleRate)
     }
 
+    func replaceWithDecodedSource(
+        _ decodedAudioBuffer: DecodedAudioBuffer,
+        zeroCrossingIndex: AudioZeroCrossingIndex? = nil
+    ) throws {
+        guard hasSource else {
+            try load(decodedAudioBuffer, zeroCrossingIndex: zeroCrossingIndex)
+            return
+        }
+
+        let previousSnapshot = snapshot()
+        try load(decodedAudioBuffer, zeroCrossingIndex: zeroCrossingIndex)
+        try seek(toProgress: previousSnapshot.progress)
+
+        if previousSnapshot.isPlaying {
+            try play()
+        }
+    }
+
     func clear() {
         core.reset()
         frameCount = 0

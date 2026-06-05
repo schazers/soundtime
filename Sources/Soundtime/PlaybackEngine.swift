@@ -47,6 +47,10 @@ protocol PlaybackEngine: AnyObject {
         zeroCrossingIndex: AudioZeroCrossingIndex?
     ) throws
     func loadFile(at url: URL, zeroCrossingProbe: WAVZeroCrossingProbe?) throws
+    func replaceWithDecodedSource(
+        _ decodedAudioBuffer: DecodedAudioBuffer,
+        zeroCrossingIndex: AudioZeroCrossingIndex?
+    ) throws
     func clear()
     func updateZeroCrossingIndex(_ zeroCrossingIndex: AudioZeroCrossingIndex?)
     @discardableResult

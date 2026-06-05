@@ -585,7 +585,10 @@ final class WorkspaceView: NSView {
         if !playbackController.hasSource {
             try? playbackController.load(decodedAudioBuffer, zeroCrossingIndex: zeroCrossingIndex)
         } else {
-            playbackController.updateZeroCrossingIndex(zeroCrossingIndex)
+            try? playbackController.replaceWithDecodedSource(
+                decodedAudioBuffer,
+                zeroCrossingIndex: zeroCrossingIndex
+            )
         }
 
         timelineSurface.displayWaveform(waveformOverview)
