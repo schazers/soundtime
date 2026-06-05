@@ -1,14 +1,10 @@
-import AVFoundation
 import Foundation
 import QuartzCore
-import SoundtimeAudioCore
 
 @MainActor
 final class RealtimeCorePlaybackEngine: PlaybackEngine {
     private let core: RealtimeAudioCore
-    private let engine = AVAudioEngine()
-    private var sourceNode: AVAudioSourceNode?
-    private var configuredSampleRate: Double?
+    private let outputDevice: RealtimeAudioOutputDevice
     private var frameCount = 0
     private var sampleRate: Double = 0
     private var zeroCrossingIndex: AudioZeroCrossingIndex?
@@ -29,12 +25,13 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         frameCount > 0
     }
 
-    init?() {
+    init?(outputDevice: RealtimeAudioOutputDevice = AVAudioSourceNodeOutputDevice()) {
         guard let core = RealtimeAudioCore() else {
             return nil
         }
 
         self.core = core
+        self.outputDevice = outputDevice
         self.core.setTransportRampDuration(0.018)
     }
 
@@ -75,7 +72,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         zeroCrossingProbe = nil
         sourceLoaded = true
         core.setGain(masterGain)
-        try configureCallbackGraph(sampleRate: preparedSource.sampleRate)
+        try configureOutputDevice(sampleRate: preparedSource.sampleRate)
     }
 
     func loadFile(at url: URL, zeroCrossingProbe: WAVZeroCrossingProbe? = nil) throws {
@@ -97,7 +94,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         self.zeroCrossingProbe = zeroCrossingProbe
         sourceLoaded = false
         core.setGain(masterGain)
-        try configureCallbackGraph(sampleRate: fileInfo.sampleRate)
+        try configureOutputDevice(sampleRate: fileInfo.sampleRate)
     }
 
     func replaceWithDecodedSource(
@@ -130,6 +127,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         zeroCrossingIndex = nil
         zeroCrossingProbe = nil
         sourceLoaded = false
+        outputDevice.stop()
     }
 
     func updateZeroCrossingIndex(_ zeroCrossingIndex: AudioZeroCrossingIndex?) {
@@ -152,9 +150,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             throw PlaybackError.noAudioLoaded
         }
 
-        if !engine.isRunning {
-            try engine.start()
-        }
+        try outputDevice.start()
 
         let detailedSnapshot = core.detailedSnapshot()
         if mirroredFrameIndex >= frameCount {
@@ -223,70 +219,12 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         return detailedSnapshot.playbackSnapshot
     }
 
-    private func configureCallbackGraph(sampleRate: Double) throws {
-        guard sampleRate > 0 else {
-            throw PlaybackError.invalidFormat
-        }
-        guard
-            let format = AVAudioFormat(
-                commonFormat: .pcmFormatFloat32,
-                sampleRate: sampleRate,
-                channels: 2,
-                interleaved: false
-            )
-        else {
+    private func configureOutputDevice(sampleRate: Double) throws {
+        guard let corePointer = core.enginePointer else {
             throw PlaybackError.invalidFormat
         }
 
-        if sourceNode == nil {
-            guard let corePointer = core.enginePointer else {
-                throw PlaybackError.invalidFormat
-            }
-
-            let sourceNode = AVAudioSourceNode { _, timestamp, frameCount, audioBufferList in
-                let hostTimestamp = AVAudioTime.seconds(forHostTime: timestamp.pointee.mHostTime)
-                let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
-                let leftOutput = buffers.count > 0 ?
-                    buffers[0].mData?.assumingMemoryBound(to: Float.self) :
-                    nil
-                let rightOutput = buffers.count > 1 ?
-                    buffers[1].mData?.assumingMemoryBound(to: Float.self) :
-                    nil
-                var outputPointers = (leftOutput, rightOutput)
-
-                withUnsafeMutablePointer(to: &outputPointers) { pointer in
-                    pointer.withMemoryRebound(
-                        to: Optional<UnsafeMutablePointer<Float>>.self,
-                        capacity: 2
-                    ) { outputs in
-                        soundtime_audio_core_render_at_host_time(
-                            corePointer,
-                            outputs,
-                            2,
-                            frameCount,
-                            hostTimestamp
-                        )
-                    }
-                }
-
-                return noErr
-            }
-
-            engine.attach(sourceNode)
-            self.sourceNode = sourceNode
-        }
-
-        if configuredSampleRate != sampleRate {
-            engine.stop()
-            if let sourceNode {
-                engine.disconnectNodeOutput(sourceNode)
-                engine.connect(sourceNode, to: engine.mainMixerNode, format: format)
-            }
-            configuredSampleRate = sampleRate
-        }
-
-        engine.mainMixerNode.outputVolume = 1
-        engine.prepare()
+        try outputDevice.configure(corePointer: corePointer, sampleRate: sampleRate)
     }
 
     private func snappedFrameToZeroCrossing(
