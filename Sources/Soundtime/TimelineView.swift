@@ -350,6 +350,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                     self?.onFrameStatsChanged?(frameStats)
                 }
             }
+            renderer.onRenderDataPrepared = { [weak self] in
+                Task { @MainActor [weak self] in
+                    self?.requestTimelineRender()
+                }
+            }
             let initialViewport = viewport
             updateTimelineRenderer { renderer in
                 renderer.displayViewport(initialViewport)
