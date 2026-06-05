@@ -8,6 +8,26 @@ struct RealtimeAudioClockSample {
     let isPlaying: Bool
 }
 
+struct RealtimeAudioCoreSnapshot {
+    let frameIndex: Int
+    let frameCount: Int
+    let sampleRate: Double
+    let hostTimestamp: TimeInterval
+    let isPlaying: Bool
+    let renderedFrameCount: Int
+    let underrunCount: Int
+    let droppedCommandCount: Int
+
+    var playbackSnapshot: PlaybackSnapshot {
+        PlaybackSnapshot(
+            frameIndex: frameIndex,
+            frameCount: frameCount,
+            isPlaying: isPlaying,
+            hostTimestamp: hostTimestamp
+        )
+    }
+}
+
 final class RealtimeAudioCore {
     private var engine: OpaquePointer?
 
@@ -123,16 +143,33 @@ final class RealtimeAudioCore {
     }
 
     func snapshot() -> PlaybackSnapshot {
+        detailedSnapshot().playbackSnapshot
+    }
+
+    func detailedSnapshot() -> RealtimeAudioCoreSnapshot {
         guard let engine else {
-            return PlaybackSnapshot(frameIndex: 0, frameCount: 0, isPlaying: false, hostTimestamp: 0)
+            return RealtimeAudioCoreSnapshot(
+                frameIndex: 0,
+                frameCount: 0,
+                sampleRate: 0,
+                hostTimestamp: 0,
+                isPlaying: false,
+                renderedFrameCount: 0,
+                underrunCount: 0,
+                droppedCommandCount: 0
+            )
         }
 
         let snapshot = soundtime_audio_core_snapshot(engine)
-        return PlaybackSnapshot(
+        return RealtimeAudioCoreSnapshot(
             frameIndex: Int(min(snapshot.frameIndex, UInt64(Int.max))),
             frameCount: Int(min(snapshot.frameCount, UInt64(Int.max))),
+            sampleRate: snapshot.sampleRate,
+            hostTimestamp: snapshot.hostTimestamp,
             isPlaying: snapshot.isPlaying,
-            hostTimestamp: snapshot.hostTimestamp
+            renderedFrameCount: Int(min(snapshot.renderedFrameCount, UInt64(Int.max))),
+            underrunCount: Int(min(snapshot.underrunCount, UInt64(Int.max))),
+            droppedCommandCount: Int(min(snapshot.droppedCommandCount, UInt64(Int.max)))
         )
     }
 
