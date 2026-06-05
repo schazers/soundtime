@@ -74,6 +74,32 @@ final class TimelineRenderer: NSObject {
         let timestamp: CFTimeInterval
     }
 
+    private final class TimelineRenderStateStore {
+        private let lock = NSLock()
+        private var currentState: TimelineRenderState
+
+        init(initialState: TimelineRenderState) {
+            currentState = initialState
+        }
+
+        func publish(_ state: TimelineRenderState) {
+            lock.lock()
+            defer {
+                lock.unlock()
+            }
+            currentState = state
+        }
+
+        func snapshot() -> TimelineRenderState {
+            lock.lock()
+            defer {
+                lock.unlock()
+            }
+            let state = currentState
+            return state
+        }
+    }
+
     private final class DynamicVertexBufferRing {
         private let buffers: [MTLBuffer]
         private let capacity: Int
@@ -150,7 +176,12 @@ final class TimelineRenderer: NSObject {
     private let commandQueue: MTLCommandQueue
     private let pipelineState: MTLRenderPipelineState
     private let dynamicVertexBufferRing: DynamicVertexBufferRing
-    private var renderState = TimelineRenderState.empty
+    private let renderStateStore = TimelineRenderStateStore(initialState: .empty)
+    private var renderState = TimelineRenderState.empty {
+        didSet {
+            renderStateStore.publish(renderState)
+        }
+    }
     private var waveformMipLevels: [WaveformMipLevel] = []
     private var previousWaveformMipLevels: [WaveformMipLevel] = []
     private var gridCache: GridCache?
@@ -240,13 +271,13 @@ final class TimelineRenderer: NSObject {
             waveformTransitionStartTime = nil
         }
 
-        renderState = renderState.withWaveformOverview(waveformOverview)
         waveformMipLevels = nextWaveformMipLevels
         gridCache = nil
         waveformCache = nil
         playheadContactEvents.removeAll()
         previousRenderedPlayheadX = nil
         previousRenderedPlayheadTime = nil
+        renderState = renderState.withWaveformOverview(waveformOverview)
     }
 
     func updateWaveformTouchTuning(
@@ -346,11 +377,11 @@ final class TimelineRenderer: NSObject {
             return
         }
 
-        renderState = renderState.withViewport(viewport)
         gridCache = nil
         waveformCache = nil
         previousRenderedPlayheadX = nil
         previousRenderedPlayheadTime = nil
+        renderState = renderState.withViewport(viewport)
     }
 
     func displayHoverProgress(_ progress: Float?, isArmed: Bool = false) {
@@ -372,8 +403,8 @@ final class TimelineRenderer: NSObject {
         } else {
             gainPreview = nil
         }
-        renderState = renderState.withGainPreview(gainPreview)
         waveformCache = nil
+        renderState = renderState.withGainPreview(gainPreview)
     }
 
     func render(to target: TimelineRenderTarget) {
@@ -404,7 +435,7 @@ final class TimelineRenderer: NSObject {
         displayTimestamp: CFTimeInterval
     ) {
         recordFrameRate()
-        let renderState = renderState
+        let renderState = renderStateStore.snapshot()
         let renderedPlayheadProgress = currentPlayheadProgress(
             renderState: renderState,
             displayTimestamp: displayTimestamp
@@ -1063,7 +1094,7 @@ final class TimelineRenderer: NSObject {
     }
 
     func projectedPlayheadProgress(at displayTimestamp: CFTimeInterval) -> Float? {
-        projectedPlayheadProgress(at: displayTimestamp, renderState: renderState)
+        projectedPlayheadProgress(at: displayTimestamp, renderState: renderStateStore.snapshot())
     }
 
     private func currentPlayheadProgress(
