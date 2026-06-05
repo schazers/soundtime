@@ -5,9 +5,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private static let launchAspectRatio: CGFloat = 2.4
     private static let launchScreenAreaFraction: CGFloat = 0.245
     private static let screenInset: CGFloat = 48
+    var onWindowWillClose: ((MainWindowController) -> Void)?
 
-    convenience init() {
-        let contentViewController = WorkspaceViewController()
+    convenience init(restoresLastProject: Bool = true) {
+        let contentViewController = WorkspaceViewController(restoresLastProject: restoresLastProject)
         let window = NSWindow(
             contentRect: NSRect(origin: .zero, size: Self.fallbackContentSize),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -42,6 +43,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     func windowWillClose(_ notification: Notification) {
         persistOpenProjectWindowLayout()
+        onWindowWillClose?(self)
     }
 
     private static func launchWindowFrame() -> NSRect? {
