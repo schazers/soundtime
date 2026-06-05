@@ -697,7 +697,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
-        let progressDelta = Float(horizontalDelta / bounds.width) * viewport.durationProgress
+        let progressDelta = Float(-horizontalDelta / bounds.width) * viewport.durationProgress
         setViewport(viewport.panned(byProgress: progressDelta))
     }
 
