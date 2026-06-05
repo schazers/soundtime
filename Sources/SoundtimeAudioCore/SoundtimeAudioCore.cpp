@@ -38,6 +38,13 @@ struct EngineCommand {
     uint64_t frameIndex = 0;
 };
 
+struct ClockSample {
+    uint64_t frameIndex = 0;
+    uint64_t renderedFrameCount = 0;
+    double hostTimestamp = 0;
+    bool isPlaying = false;
+};
+
 template <typename T, size_t Capacity>
 class SPSCQueue {
 public:
@@ -91,6 +98,7 @@ struct SoundtimeAudioCoreEngine {
     std::atomic<uint64_t> droppedCommandCount{0};
     ez::sync<EngineConfig> config;
     SPSCQueue<EngineCommand, 256> commandQueue;
+    SPSCQueue<ClockSample, 1024> clockSamples;
     float transportGain = 1;
     float transportGainTarget = 1;
     float transportGainStep = 0;
@@ -196,6 +204,7 @@ void publish_source(SoundtimeAudioCoreEngine& engine, std::shared_ptr<const Audi
     engine.transportRampFramesRemaining = 0;
     engine.stopWhenTransportRampCompletes = false;
     engine.commandQueue.clear();
+    engine.clockSamples.clear();
     engine.config.update_publish(ez::nort, [=](EngineConfig config) {
         config.frameCount = source->frameCount;
         config.channelCount = source->channelCount;
@@ -204,6 +213,15 @@ void publish_source(SoundtimeAudioCoreEngine& engine, std::shared_ptr<const Audi
         return config;
     });
     engine.config.gc(ez::gc);
+}
+
+void publish_clock_sample(SoundtimeAudioCoreEngine& engine) {
+    static_cast<void>(engine.clockSamples.push(ClockSample{
+        .frameIndex = engine.frameIndex.load(std::memory_order_acquire),
+        .renderedFrameCount = engine.renderedFrameCount.load(std::memory_order_acquire),
+        .hostTimestamp = engine.hostTimestamp.load(std::memory_order_acquire),
+        .isPlaying = engine.isPlaying.load(std::memory_order_acquire),
+    }));
 }
 
 } // namespace
@@ -233,6 +251,7 @@ void soundtime_audio_core_reset(SoundtimeAudioCoreEngine* engine) {
     engine->transportRampFramesRemaining = 0;
     engine->stopWhenTransportRampCompletes = false;
     engine->commandQueue.clear();
+    engine->clockSamples.clear();
     engine->config.set_publish(ez::nort, EngineConfig{});
     engine->config.gc(ez::gc);
 }
@@ -259,6 +278,7 @@ void soundtime_audio_core_set_source_info(
     engine->transportRampFramesRemaining = 0;
     engine->stopWhenTransportRampCompletes = false;
     engine->commandQueue.clear();
+    engine->clockSamples.clear();
     engine->config.update_publish(ez::nort, [=](EngineConfig config) {
         config.frameCount = frameCount;
         config.channelCount = channelCount;
@@ -405,6 +425,26 @@ SoundtimeAudioCoreSnapshot soundtime_audio_core_snapshot(const SoundtimeAudioCor
     };
 }
 
+bool soundtime_audio_core_pop_clock_sample(
+    SoundtimeAudioCoreEngine* engine,
+    SoundtimeAudioCoreClockSample* sample
+) {
+    if (engine == nullptr || sample == nullptr) {
+        return false;
+    }
+
+    auto clockSample = ClockSample{};
+    if (!engine->clockSamples.pop(clockSample)) {
+        return false;
+    }
+
+    sample->frameIndex = clockSample.frameIndex;
+    sample->renderedFrameCount = clockSample.renderedFrameCount;
+    sample->hostTimestamp = clockSample.hostTimestamp;
+    sample->isPlaying = clockSample.isPlaying;
+    return true;
+}
+
 void soundtime_audio_core_render_silence(
     SoundtimeAudioCoreEngine* engine,
     float* const* outputs,
@@ -482,7 +522,12 @@ void soundtime_audio_core_render_at_host_time(
         std::fill(output, output + frameCount, 0.0f);
     }
 
-    if (engine == nullptr || !engine->isPlaying.load(std::memory_order_acquire)) {
+    if (engine == nullptr) {
+        return;
+    }
+
+    if (!engine->isPlaying.load(std::memory_order_acquire)) {
+        publish_clock_sample(*engine);
         return;
     }
 
@@ -533,4 +578,5 @@ void soundtime_audio_core_render_at_host_time(
     if (nextFrameIndex >= sourceFrameCount) {
         engine->isPlaying.store(false, std::memory_order_release);
     }
+    publish_clock_sample(*engine);
 }

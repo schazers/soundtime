@@ -151,6 +151,52 @@ final class SoundtimeAudioCoreTests: XCTestCase {
         XCTAssertFalse(snapshot.isPlaying)
     }
 
+    func testRenderPublishesClockSamples() throws {
+        let engine = try XCTUnwrap(soundtime_audio_core_create())
+        defer {
+            soundtime_audio_core_destroy(engine)
+        }
+
+        var samples: [Float] = [
+            1, 1,
+            1, 1,
+            1, 1,
+            1, 1,
+        ]
+        let didLoad = samples.withUnsafeMutableBufferPointer { sampleBuffer in
+            soundtime_audio_core_set_interleaved_source(
+                engine,
+                sampleBuffer.baseAddress,
+                4,
+                2,
+                48_000
+            )
+        }
+        XCTAssertTrue(didLoad)
+
+        soundtime_audio_core_set_transport_ramp_duration(engine, 0)
+        soundtime_audio_core_play(engine)
+
+        _ = render(engine: engine, channelCount: 2, frameCount: 2, hostTimestamp: 2.0)
+        _ = render(engine: engine, channelCount: 2, frameCount: 2, hostTimestamp: 2.5)
+
+        var firstSample = SoundtimeAudioCoreClockSample()
+        var secondSample = SoundtimeAudioCoreClockSample()
+        XCTAssertTrue(soundtime_audio_core_pop_clock_sample(engine, &firstSample))
+        XCTAssertTrue(soundtime_audio_core_pop_clock_sample(engine, &secondSample))
+        XCTAssertFalse(soundtime_audio_core_pop_clock_sample(engine, &secondSample))
+
+        XCTAssertEqual(firstSample.frameIndex, 2)
+        XCTAssertEqual(firstSample.renderedFrameCount, 2)
+        XCTAssertEqual(firstSample.hostTimestamp, 2.0)
+        XCTAssertTrue(firstSample.isPlaying)
+
+        XCTAssertEqual(secondSample.frameIndex, 4)
+        XCTAssertEqual(secondSample.renderedFrameCount, 4)
+        XCTAssertEqual(secondSample.hostTimestamp, 2.5)
+        XCTAssertFalse(secondSample.isPlaying)
+    }
+
     private func renderSilence(
         engine: OpaquePointer,
         channelCount: Int,

@@ -1,6 +1,13 @@
 import Foundation
 import SoundtimeAudioCore
 
+struct RealtimeAudioClockSample {
+    let frameIndex: Int
+    let renderedFrameCount: Int
+    let hostTimestamp: TimeInterval
+    let isPlaying: Bool
+}
+
 final class RealtimeAudioCore {
     private var engine: OpaquePointer?
 
@@ -126,6 +133,24 @@ final class RealtimeAudioCore {
             frameCount: Int(min(snapshot.frameCount, UInt64(Int.max))),
             isPlaying: snapshot.isPlaying,
             hostTimestamp: snapshot.hostTimestamp
+        )
+    }
+
+    func popClockSample() -> RealtimeAudioClockSample? {
+        guard let engine else {
+            return nil
+        }
+
+        var sample = SoundtimeAudioCoreClockSample()
+        guard soundtime_audio_core_pop_clock_sample(engine, &sample) else {
+            return nil
+        }
+
+        return RealtimeAudioClockSample(
+            frameIndex: Int(min(sample.frameIndex, UInt64(Int.max))),
+            renderedFrameCount: Int(min(sample.renderedFrameCount, UInt64(Int.max))),
+            hostTimestamp: sample.hostTimestamp,
+            isPlaying: sample.isPlaying
         )
     }
 
