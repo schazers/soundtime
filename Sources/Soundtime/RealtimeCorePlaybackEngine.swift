@@ -155,23 +155,29 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         let detailedSnapshot = core.detailedSnapshot()
         if mirroredFrameIndex >= frameCount {
             mirroredFrameIndex = 0
+        } else {
+            mirroredFrameIndex = min(max(mirroredFrameIndex, 0), max(frameCount - 1, 0))
         }
         mirroredFrameCount = frameCount
         mirroredIsPlaying = true
         mirroredHostTimestamp = CACurrentMediaTime()
         pendingCommandRenderedFrameCount = detailedSnapshot.renderedFrameCount
+        core.seek(toFrame: mirroredFrameIndex)
         core.play()
     }
 
     func pause() {
+        let pauseTimestamp = CACurrentMediaTime()
         let detailedSnapshot = core.detailedSnapshot()
-        mirroredFrameIndex = min(max(detailedSnapshot.frameIndex, 0), frameCount)
+        mirroredFrameIndex = projectedFrameIndex(
+            from: detailedSnapshot,
+            at: pauseTimestamp
+        )
         mirroredFrameCount = frameCount
         mirroredIsPlaying = false
-        mirroredHostTimestamp = detailedSnapshot.hostTimestamp > 0 ?
-            detailedSnapshot.hostTimestamp :
-            CACurrentMediaTime()
+        mirroredHostTimestamp = pauseTimestamp
         pendingCommandRenderedFrameCount = detailedSnapshot.renderedFrameCount
+        core.seek(toFrame: mirroredFrameIndex)
         core.pause()
     }
 
@@ -217,6 +223,40 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         mirroredIsPlaying = detailedSnapshot.isPlaying
         mirroredHostTimestamp = detailedSnapshot.hostTimestamp
         return detailedSnapshot.playbackSnapshot
+    }
+
+    private func projectedFrameIndex(
+        from detailedSnapshot: RealtimeAudioCoreSnapshot,
+        at timestamp: TimeInterval
+    ) -> Int {
+        let baseFrameIndex: Int
+        let baseHostTimestamp: TimeInterval
+        let baseIsPlaying: Bool
+        if
+            let pendingCommandRenderedFrameCount,
+            detailedSnapshot.renderedFrameCount <= pendingCommandRenderedFrameCount
+        {
+            baseFrameIndex = mirroredFrameIndex
+            baseHostTimestamp = mirroredHostTimestamp
+            baseIsPlaying = mirroredIsPlaying
+        } else {
+            baseFrameIndex = detailedSnapshot.frameIndex
+            baseHostTimestamp = detailedSnapshot.hostTimestamp
+            baseIsPlaying = detailedSnapshot.isPlaying
+        }
+
+        guard
+            baseIsPlaying,
+            sampleRate.isFinite,
+            sampleRate > 0,
+            baseHostTimestamp > 0
+        else {
+            return min(max(baseFrameIndex, 0), frameCount)
+        }
+
+        let elapsedTime = max(timestamp - baseHostTimestamp, 0)
+        let elapsedFrames = Int((elapsedTime * sampleRate).rounded(.down))
+        return min(max(baseFrameIndex + elapsedFrames, 0), frameCount)
     }
 
     private func configureOutputDevice(sampleRate: Double) throws {
