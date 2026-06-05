@@ -136,7 +136,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private final class WaveformShaderBufferStore: @unchecked Sendable {
         private let lock = NSLock()
         private var buffers: [WaveformMipCacheKey: MTLBuffer] = [:]
-        private var keyOrder: [WaveformMipCacheKey] = []
+        private var accessTicks: [WaveformMipCacheKey: Int] = [:]
+        private var accessTick = 0
         private var inFlightKeys: Set<WaveformMipCacheKey> = []
         private var totalBufferByteCount = 0
         private var publishedBufferCount = 0
@@ -150,7 +151,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 return nil
             }
 
-            markRecentlyUsed(key)
+            markAccessed(key)
             return buffer
         }
 
@@ -180,11 +181,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 if let existingBuffer = buffers[key] {
                     totalBufferByteCount -= existingBuffer.length
                 }
-                if buffers[key] == nil {
-                    keyOrder.append(key)
-                }
                 buffers[key] = buffer
-                markRecentlyUsed(key)
+                markAccessed(key)
                 totalBufferByteCount += buffer.length
                 publishedBufferCount += 1
             }
@@ -213,23 +211,27 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             lock.lock()
             let maximumCount = max(maximumCount, 1)
             let maximumByteCount = max(maximumByteCount, 1)
-            while (buffers.count > maximumCount || totalBufferByteCount > maximumByteCount),
-                  let oldestKey = keyOrder.first
-            {
-                keyOrder.removeFirst()
+            while buffers.count > maximumCount || totalBufferByteCount > maximumByteCount {
+                guard let oldestKey = buffers.keys.min(by: {
+                    (accessTicks[$0] ?? 0) < (accessTicks[$1] ?? 0)
+                }) else {
+                    break
+                }
                 guard !inFlightKeys.contains(oldestKey) else {
+                    accessTicks[oldestKey] = accessTick
                     continue
                 }
                 if let removedBuffer = buffers.removeValue(forKey: oldestKey) {
                     totalBufferByteCount -= removedBuffer.length
+                    accessTicks.removeValue(forKey: oldestKey)
                 }
             }
             lock.unlock()
         }
 
-        private func markRecentlyUsed(_ key: WaveformMipCacheKey) {
-            keyOrder.removeAll { $0 == key }
-            keyOrder.append(key)
+        private func markAccessed(_ key: WaveformMipCacheKey) {
+            accessTick &+= 1
+            accessTicks[key] = accessTick
         }
     }
 
