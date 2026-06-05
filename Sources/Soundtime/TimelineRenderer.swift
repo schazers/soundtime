@@ -670,7 +670,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         frameRateFrameCount += 1
 
         let elapsedTime = currentTime - frameRateWindowStartTime
-        guard elapsedTime >= 0.25 else {
+        guard elapsedTime >= 0.5 else {
             return
         }
 
