@@ -2,15 +2,13 @@ import AppKit
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var mainWindowController: MainWindowController?
+    private var windowControllers: [MainWindowController] = []
     private weak var openRecentMenu: NSMenu?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureMainMenu()
 
-        let controller = MainWindowController()
-        mainWindowController = controller
-        controller.showWindow(nil)
+        openProjectWindow(restoresLastProject: true)
         NSApplication.shared.activate(ignoringOtherApps: true)
     }
 
@@ -19,7 +17,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        mainWindowController?.persistOpenProjectWindowLayout()
+        for controller in windowControllers {
+            controller.persistOpenProjectWindowLayout()
+        }
+    }
+
+    @objc private func newProject(_ sender: Any?) {
+        openProjectWindow(restoresLastProject: false)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+    }
+
+    @discardableResult
+    private func openProjectWindow(restoresLastProject: Bool) -> MainWindowController {
+        let controller = MainWindowController(restoresLastProject: restoresLastProject)
+        controller.onWindowWillClose = { [weak self, weak controller] closingController in
+            guard let controller else {
+                return
+            }
+
+            self?.windowControllers.removeAll { $0 === closingController || $0 === controller }
+        }
+        windowControllers.append(controller)
+        controller.showWindow(nil)
+        return controller
     }
 
     private func configureMainMenu() {
@@ -43,6 +63,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func makeApplicationMenu() -> NSMenu {
         let menu = NSMenu(title: "Soundtime")
 
+        let newProjectItem = NSMenuItem(
+            title: "New Project",
+            action: #selector(newProject(_:)),
+            keyEquivalent: "n"
+        )
+        newProjectItem.target = self
+        menu.addItem(newProjectItem)
         menu.addItem(NSMenuItem(
             title: "Open Project...",
             action: #selector(TimelineView.openProject(_:)),
