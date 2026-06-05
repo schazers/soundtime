@@ -1933,7 +1933,19 @@ final class WorkspaceView: NSView {
         }
 
         do {
-            let isPlaying = try playbackController.togglePlayback()
+            let snapshot = playbackController.snapshot()
+            let wasPlaying = snapshot.isPlaying
+            let isPlaying: Bool
+            if wasPlaying {
+                let pauseProgress = displayedDuration > 0 ?
+                    timelineSurface.pausePresentationPlayheadProgress() :
+                    nil
+                playbackController.pause(atProgress: max(pauseProgress ?? snapshot.progress, snapshot.progress))
+                isPlaying = false
+            } else {
+                try playbackController.play()
+                isPlaying = true
+            }
             refreshPlaybackProgress(syncPlayheadWhenPlaying: true)
 
             if isPlaying {

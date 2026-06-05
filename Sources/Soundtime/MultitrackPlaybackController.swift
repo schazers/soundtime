@@ -266,6 +266,33 @@ final class MultitrackPlaybackController: PlaybackEngine {
         }
     }
 
+    func pause(atProgress progress: Float) {
+        guard hasSource else {
+            return
+        }
+
+        let timedFrame = currentTimedProjectFrame()
+        let frameCount = projectFrameCount()
+        pausedProjectFrame = min(
+            max(Int((min(max(progress, 0), 1) * Float(frameCount)).rounded(.down)), 0),
+            frameCount
+        )
+        pausedFrameHostTimestamp = timedFrame.hostTimestamp
+        isPlayerRunning = false
+        isRestartPending = false
+        beginTransportRamp(to: 0) { [weak self] in
+            guard let self else {
+                return
+            }
+
+            for player in trackPlayers.values {
+                player.playerNode.pause()
+            }
+            transportGain = 1
+            applyOutputVolume()
+        }
+    }
+
     func seek(toProgress progress: Float) throws {
         try seek(toProgress: progress, snapsToZeroCrossing: true)
     }
