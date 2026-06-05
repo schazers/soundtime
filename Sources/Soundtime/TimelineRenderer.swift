@@ -1365,6 +1365,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 fisheye: trackFisheye,
                 touch: trackTouch,
                 touch2: touchParameters.touch2,
+                trackID: track.id,
                 renderState: renderState
             )
 
@@ -1402,6 +1403,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         fisheye: SIMD4<Float>,
         touch: SIMD4<Float>,
         touch2: SIMD4<Float>,
+        trackID: UUID,
         renderState: TimelineRenderState
     ) -> WaveformShaderUniform {
         let baseColor = SIMD4<Float>(baseGray, baseGray, baseGray, alpha)
@@ -1412,7 +1414,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             max(backingScale, 1)
         )
         let gainPreview: SIMD4<Float>
-        if let preview = renderState.gainPreview {
+        if
+            let preview = renderState.gainPreview,
+            preview.selection.trackID == nil || preview.selection.trackID == trackID
+        {
             gainPreview = SIMD4<Float>(
                 preview.selection.startProgress,
                 preview.selection.endProgress,
@@ -2821,6 +2826,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             let trackIndex = renderState.tracks.firstIndex(where: { $0.id == selectedTrackID }),
             !renderState.tracks.isEmpty
         else {
+            return []
+        }
+        if
+            let selection = renderState.selection,
+            selection.trackID == selectedTrackID,
+            selection.startProgress <= 0.001,
+            selection.endProgress >= 0.999
+        {
             return []
         }
 
