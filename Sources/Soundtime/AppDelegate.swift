@@ -81,6 +81,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             action: #selector(TimelineView.undoTimelineEdit(_:)),
             keyEquivalent: "z"
         ))
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(
+            title: "Cut",
+            action: #selector(TimelineView.cutTimelineSelection(_:)),
+            keyEquivalent: "x"
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Copy",
+            action: #selector(TimelineView.copyTimelineSelection(_:)),
+            keyEquivalent: "c"
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Paste",
+            action: #selector(TimelineView.pasteTimelineAudio(_:)),
+            keyEquivalent: "v"
+        ))
 
         return menu
     }

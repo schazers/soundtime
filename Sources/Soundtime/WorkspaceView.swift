@@ -34,6 +34,12 @@ final class WorkspaceView: NSView {
         var isMuted: Bool
         var isSoloed: Bool
         var importID: UUID
+        var editRevision: Int
+    }
+
+    private struct AudioClipboard: Sendable {
+        let buffer: DecodedAudioBuffer
+        let waveformOverview: WaveformOverview
     }
 
     private var projectTracks: [ProjectTrack] = []
@@ -41,6 +47,7 @@ final class WorkspaceView: NSView {
     private var currentProjectURL: URL?
     private var hasRestoredLastProject = false
     private var isLoadingProject = false
+    private var audioClipboard: AudioClipboard?
     private var activeImportID = UUID()
     private var selectedAudioFile: AudioFileMetadata?
     private var decodedAudioBuffer: DecodedAudioBuffer?
@@ -90,6 +97,8 @@ final class WorkspaceView: NSView {
         WAVPreviewLevel(targetBinCount: 786_432, samplesPerBin: 4),
         WAVPreviewLevel(targetBinCount: 1_048_576, samplesPerBin: 4),
     ]
+    private let optimisticEditPreviewBinLimit = 65_536
+    private let optimisticEditPreviewSamplesPerBin = 4
 
     private struct WAVPreviewLevel {
         let targetBinCount: Int
@@ -208,6 +217,15 @@ final class WorkspaceView: NSView {
         }
         timelineSurface.onDeleteSelection = { [weak self] in
             self?.deleteSelection()
+        }
+        timelineSurface.onCutSelection = { [weak self] in
+            self?.cutSelection()
+        }
+        timelineSurface.onCopySelection = { [weak self] in
+            self?.copySelection()
+        }
+        timelineSurface.onPasteAudio = { [weak self] in
+            self?.pasteAudio()
         }
         timelineSurface.onUndo = { [weak self] in
             self?.undoLastEdit()
@@ -355,7 +373,7 @@ final class WorkspaceView: NSView {
         loadProject(from: lastProjectURL)
     }
 
-    private func refreshProjectTimelineDisplay() {
+    private func refreshProjectTimelineDisplay(rebuildControls: Bool = true) {
         timelineSurface.displayTracks(projectTracks.map { track in
             TimelineRenderState.Track(
                 id: track.id,
@@ -365,7 +383,9 @@ final class WorkspaceView: NSView {
                 isSoloed: track.isSoloed
             )
         })
-        refreshTrackControls()
+        if rebuildControls {
+            refreshTrackControls()
+        }
     }
 
     private func refreshTrackControls() {
@@ -544,7 +564,8 @@ final class WorkspaceView: NSView {
             volume: settings?.volume ?? 1,
             isMuted: settings?.isMuted ?? false,
             isSoloed: settings?.isSoloed ?? false,
-            importID: importID
+            importID: importID,
+            editRevision: 0
         )
 
         projectTracks.append(track)
@@ -690,7 +711,7 @@ final class WorkspaceView: NSView {
         }
 
         projectTracks[trackIndex].waveformOverview = waveformOverview
-        refreshProjectTimelineDisplay()
+        refreshProjectTimelineDisplay(rebuildControls: false)
         updateProjectDisplayTiming(sampleRateHint: fileInfo.sampleRate)
         updateTimeReadout()
     }
@@ -711,7 +732,7 @@ final class WorkspaceView: NSView {
         projectTracks[trackIndex].audioTimeline = AudioEditTimeline(sourceBuffer: decodedAudioBuffer)
         activeTrackID = trackID
         syncActiveTrackFields()
-        refreshProjectTimelineDisplay()
+        refreshProjectTimelineDisplay(rebuildControls: false)
         updateProjectDisplayTiming(sampleRateHint: decodedAudioBuffer.sampleRate)
         reloadPlaybackFromProjectMix(preserveProgress: true)
         updateEffectCommandState()
@@ -884,6 +905,246 @@ final class WorkspaceView: NSView {
         let soloedTracks = projectTracks.filter { $0.isSoloed }
         let candidateTracks = soloedTracks.isEmpty ? projectTracks : soloedTracks
         return candidateTracks.filter { !$0.isMuted && $0.volume > 0 }
+    }
+
+    private func activeProjectTrackIndex() -> Int? {
+        if let activeTrackID,
+           let trackIndex = projectTracks.firstIndex(where: { $0.id == activeTrackID })
+        {
+            return trackIndex
+        }
+
+        guard !projectTracks.isEmpty else {
+            return nil
+        }
+
+        return projectTracks.count - 1
+    }
+
+    private func materializeEditedTimeline(
+        trackID: UUID,
+        timeline: AudioEditTimeline,
+        editRevision: Int,
+        status: String
+    ) {
+        Task { [weak self, trackID, timeline, editRevision, status] in
+            let materialized = await Task.detached(priority: .userInitiated) {
+                Self.materializeTimeline(timeline)
+            }.value
+
+            guard let self else {
+                return
+            }
+
+            self.applyMaterializedTrackEdit(
+                trackID: trackID,
+                editRevision: editRevision,
+                materialized: materialized,
+                status: status
+            )
+        }
+    }
+
+    private func applyMaterializedTrackEdit(
+        trackID: UUID,
+        editRevision: Int,
+        materialized: (
+            buffer: DecodedAudioBuffer,
+            timeline: AudioEditTimeline,
+            waveformOverview: WaveformOverview,
+            zeroCrossingIndex: AudioZeroCrossingIndex
+        ),
+        status: String
+    ) {
+        guard
+            let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }),
+            projectTracks[trackIndex].editRevision == editRevision
+        else {
+            return
+        }
+
+        projectTracks[trackIndex].decodedAudioBuffer = materialized.buffer
+        projectTracks[trackIndex].audioTimeline = materialized.timeline
+        projectTracks[trackIndex].waveformOverview = materialized.waveformOverview
+        projectTracks[trackIndex].zeroCrossingIndex = materialized.zeroCrossingIndex
+        activeTrackID = trackID
+        syncActiveTrackFields()
+        refreshProjectTimelineDisplay(rebuildControls: false)
+        updateProjectDisplayTiming(sampleRateHint: materialized.buffer.sampleRate)
+        reloadPlaybackFromProjectMix(preserveProgress: false)
+        updateEffectCommandState()
+        updateStatus(status)
+    }
+
+    private nonisolated static func materializeTimeline(_ timeline: AudioEditTimeline) -> (
+        buffer: DecodedAudioBuffer,
+        timeline: AudioEditTimeline,
+        waveformOverview: WaveformOverview,
+        zeroCrossingIndex: AudioZeroCrossingIndex
+    ) {
+        let buffer = timeline.render()
+        return (
+            buffer: buffer,
+            timeline: timeline,
+            waveformOverview: WaveformOverviewBuilder.build(from: buffer),
+            zeroCrossingIndex: AudioZeroCrossingIndex.build(from: buffer)
+        )
+    }
+
+    private nonisolated static func materializePaste(
+        timeline: AudioEditTimeline,
+        selection: TimelineSelection,
+        clipboardBuffer: DecodedAudioBuffer
+    ) throws -> (
+        buffer: DecodedAudioBuffer,
+        timeline: AudioEditTimeline,
+        waveformOverview: WaveformOverview,
+        zeroCrossingIndex: AudioZeroCrossingIndex
+    ) {
+        let sourceBuffer = timeline.render()
+        guard
+            sourceBuffer.sampleRate > 0,
+            clipboardBuffer.sampleRate > 0,
+            abs(sourceBuffer.sampleRate - clipboardBuffer.sampleRate) < 0.001
+        else {
+            throw PlaybackError.invalidFormat
+        }
+
+        let replaceRange = timeline.frameRange(for: selection)
+        let channelCount = max(sourceBuffer.channelCount, clipboardBuffer.channelCount)
+        let nextFrameCount = replaceRange.lowerBound +
+            clipboardBuffer.frameCount +
+            max(sourceBuffer.frameCount - replaceRange.upperBound, 0)
+        var samplesByChannel = (0..<channelCount).map { _ in
+            [Float]()
+        }
+
+        for channelIndex in samplesByChannel.indices {
+            samplesByChannel[channelIndex].reserveCapacity(nextFrameCount)
+            let sourceChannel = sourceBuffer.channelCount == 1 ?
+                0 :
+                min(channelIndex, sourceBuffer.channelCount - 1)
+            let clipboardChannel = clipboardBuffer.channelCount == 1 ?
+                0 :
+                min(channelIndex, clipboardBuffer.channelCount - 1)
+            let sourceSamples = sourceBuffer.samplesByChannel[sourceChannel]
+            let clipboardSamples = clipboardBuffer.samplesByChannel[clipboardChannel]
+
+            if replaceRange.lowerBound > 0 {
+                samplesByChannel[channelIndex].append(contentsOf: sourceSamples[0..<replaceRange.lowerBound])
+            }
+            samplesByChannel[channelIndex].append(contentsOf: clipboardSamples)
+            if replaceRange.upperBound < sourceSamples.count {
+                samplesByChannel[channelIndex].append(contentsOf: sourceSamples[replaceRange.upperBound..<sourceSamples.count])
+            }
+        }
+
+        let buffer = DecodedAudioBuffer(
+            url: sourceBuffer.url,
+            sampleRate: sourceBuffer.sampleRate,
+            channelCount: channelCount,
+            frameCount: nextFrameCount,
+            samplesByChannel: samplesByChannel
+        )
+        let timeline = AudioEditTimeline(sourceBuffer: buffer)
+        return (
+            buffer: buffer,
+            timeline: timeline,
+            waveformOverview: WaveformOverviewBuilder.build(from: buffer),
+            zeroCrossingIndex: AudioZeroCrossingIndex.build(from: buffer)
+        )
+    }
+
+    private func optimisticWaveformOverview(
+        _ overview: WaveformOverview?,
+        replacing selection: TimelineSelection,
+        with replacement: WaveformOverview?
+    ) -> WaveformOverview? {
+        guard let overview else {
+            return replacement.map(overviewForOptimisticEdit)
+        }
+
+        let sourceOverview = overviewForOptimisticEdit(overview)
+        let replacementOverview = replacement.map(overviewForOptimisticEdit)
+        let binCount = sourceOverview.bins.count
+        guard binCount > 0 else {
+            return replacementOverview ?? sourceOverview
+        }
+
+        let startIndex = min(max(Int((selection.startProgress * Float(binCount)).rounded(.down)), 0), binCount)
+        let endIndex = min(max(Int((selection.endProgress * Float(binCount)).rounded(.up)), startIndex), binCount)
+        var bins: [WaveformOverview.Bin] = []
+        bins.reserveCapacity(binCount - (endIndex - startIndex) + (replacementOverview?.bins.count ?? 0))
+        if startIndex > 0 {
+            bins.append(contentsOf: sourceOverview.bins[0..<startIndex])
+        }
+        if let replacementOverview {
+            bins.append(contentsOf: replacementOverview.bins)
+        }
+        if endIndex < binCount {
+            bins.append(contentsOf: sourceOverview.bins[endIndex..<binCount])
+        }
+
+        let removedDuration = sourceOverview.duration * TimeInterval(selection.durationProgress)
+        let nextDuration = max(sourceOverview.duration - removedDuration + (replacementOverview?.duration ?? 0), 0)
+        return WaveformOverview(duration: nextDuration, bins: bins)
+    }
+
+    private func overviewForOptimisticEdit(_ overview: WaveformOverview) -> WaveformOverview {
+        guard overview.bins.count > optimisticEditPreviewBinLimit else {
+            return overview
+        }
+
+        return sparseOverview(
+            from: overview,
+            targetBinCount: optimisticEditPreviewBinLimit,
+            samplesPerBin: optimisticEditPreviewSamplesPerBin
+        )
+    }
+
+    private func sparseOverview(
+        from overview: WaveformOverview,
+        targetBinCount: Int,
+        samplesPerBin: Int
+    ) -> WaveformOverview {
+        let sourceBins = overview.bins
+        let sourceBinCount = sourceBins.count
+        let targetBinCount = min(max(targetBinCount, 1), sourceBinCount)
+        let samplesPerBin = max(samplesPerBin, 1)
+        var bins: [WaveformOverview.Bin] = []
+        bins.reserveCapacity(targetBinCount)
+
+        for targetIndex in 0..<targetBinCount {
+            let sourceStartIndex = targetIndex * sourceBinCount / targetBinCount
+            let sourceEndIndex = max(sourceStartIndex + 1, (targetIndex + 1) * sourceBinCount / targetBinCount)
+            let sourceSpan = sourceEndIndex - sourceStartIndex
+            let stride = max(sourceSpan / samplesPerBin, 1)
+            var minimumSample = Float.greatestFiniteMagnitude
+            var maximumSample = -Float.greatestFiniteMagnitude
+            var sampledIndex = sourceStartIndex
+            var sampledCount = 0
+
+            while sampledIndex < sourceEndIndex, sampledCount < samplesPerBin {
+                let bin = sourceBins[sampledIndex]
+                minimumSample = min(minimumSample, bin.minimumSample)
+                maximumSample = max(maximumSample, bin.maximumSample)
+                sampledIndex += stride
+                sampledCount += 1
+            }
+
+            if sourceSpan > 1 {
+                let finalBin = sourceBins[sourceEndIndex - 1]
+                minimumSample = min(minimumSample, finalBin.minimumSample)
+                maximumSample = max(maximumSample, finalBin.maximumSample)
+            }
+
+            bins.append(WaveformOverview.Bin(
+                minimumSample: minimumSample == Float.greatestFiniteMagnitude ? 0 : minimumSample,
+                maximumSample: maximumSample == -Float.greatestFiniteMagnitude ? 0 : maximumSample
+            ))
+        }
+
+        return WaveformOverview(duration: overview.duration, bins: bins)
     }
 
     private func loadDroppedWAVFile(at url: URL, importID: UUID) {
@@ -1073,24 +1334,160 @@ final class WorkspaceView: NSView {
     }
 
     private func deleteSelection() {
+        performOptimisticDelete(copyBeforeDeleting: false)
+    }
+
+    private func cutSelection() {
+        performOptimisticDelete(copyBeforeDeleting: true)
+    }
+
+    private func copySelection() {
         guard
-            let currentTimeline = audioTimeline,
+            let currentTimeline = activeProjectTrack?.audioTimeline,
             let selectedTimelineRange,
             selectedTimelineRange.durationProgress > 0
         else {
             return
         }
 
+        updateStatus("copying selection")
+        Task { [weak self, currentTimeline, selectedTimelineRange] in
+            let clipboard = await Task.detached(priority: .userInitiated) {
+                let buffer = currentTimeline.render(selection: selectedTimelineRange)
+                return AudioClipboard(
+                    buffer: buffer,
+                    waveformOverview: WaveformOverviewBuilder.build(from: buffer)
+                )
+            }.value
+
+            guard let self else {
+                return
+            }
+
+            self.audioClipboard = clipboard
+            self.updateStatus("copied \(self.formatDuration(clipboard.buffer.duration))")
+        }
+    }
+
+    private func pasteAudio() {
+        guard
+            let audioClipboard,
+            let trackIndex = activeProjectTrackIndex(),
+            let currentTimeline = projectTracks[trackIndex].audioTimeline
+        else {
+            return
+        }
+
+        let pasteSelection = selectedTimelineRange ??
+            TimelineSelection(
+                startProgress: playbackController.snapshot().progress,
+                endProgress: playbackController.snapshot().progress
+            )
+        let currentOverview = projectTracks[trackIndex].waveformOverview
+        let trackID = projectTracks[trackIndex].id
+        editUndoStack.append(currentTimeline)
+        projectTracks[trackIndex].editRevision += 1
+        let editRevision = projectTracks[trackIndex].editRevision
+
+        projectTracks[trackIndex].waveformOverview = optimisticWaveformOverview(
+            currentOverview,
+            replacing: pasteSelection,
+            with: audioClipboard.waveformOverview
+        )
+        projectTracks[trackIndex].decodedAudioBuffer = nil
+        projectTracks[trackIndex].zeroCrossingIndex = nil
+        projectTracks[trackIndex].audioTimeline = nil
+        selectedTimelineRange = nil
+        timelineSurface.displaySelection(nil)
+        timelineSurface.displayGainPreview(selection: nil, gain: 1)
+        stopPlaybackTimer()
+        playbackController.clear()
+        refreshProjectTimelineDisplay(rebuildControls: false)
+        updateProjectDisplayTiming()
+        updateEffectCommandState()
+        updateStatus("pasting")
+
+        Task { [weak self, currentTimeline, pasteSelection, audioClipboard, trackID, editRevision] in
+            do {
+                let materialized = try await Task.detached(priority: .userInitiated) {
+                    try Self.materializePaste(
+                        timeline: currentTimeline,
+                        selection: pasteSelection,
+                        clipboardBuffer: audioClipboard.buffer
+                    )
+                }.value
+
+                guard let self else {
+                    return
+                }
+
+                self.applyMaterializedTrackEdit(
+                    trackID: trackID,
+                    editRevision: editRevision,
+                    materialized: materialized,
+                    status: "pasted \(self.formatDuration(audioClipboard.buffer.duration))"
+                )
+            } catch {
+                guard let self else {
+                    return
+                }
+                self.updateStatus("paste failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func performOptimisticDelete(copyBeforeDeleting: Bool) {
+        guard
+            let trackIndex = activeProjectTrackIndex(),
+            let selectionToDelete = selectedTimelineRange,
+            selectionToDelete.durationProgress > 0,
+            let currentTimeline = projectTracks[trackIndex].audioTimeline
+        else {
+            return
+        }
+
+        if copyBeforeDeleting {
+            copySelection()
+        }
+
         var editedTimeline = currentTimeline
-        let deletedDuration = selectedTimelineRange.duration(in: currentTimeline.duration)
-        let deletedFrameCount = editedTimeline.delete(selectedTimelineRange)
+        let deletedStartProgress = selectionToDelete.startProgress
+        let deletedDuration = selectionToDelete.duration(in: currentTimeline.duration)
+        let deletedFrameCount = editedTimeline.delete(selectionToDelete)
         guard deletedFrameCount > 0 else {
             return
         }
 
         editUndoStack.append(currentTimeline)
-        applyTimeline(editedTimeline)
-        updateStatus("deleted \(formatDuration(deletedDuration))")
+        let trackID = projectTracks[trackIndex].id
+        projectTracks[trackIndex].editRevision += 1
+        let editRevision = projectTracks[trackIndex].editRevision
+        projectTracks[trackIndex].audioTimeline = editedTimeline
+        projectTracks[trackIndex].decodedAudioBuffer = nil
+        projectTracks[trackIndex].zeroCrossingIndex = nil
+        projectTracks[trackIndex].waveformOverview = optimisticWaveformOverview(
+            projectTracks[trackIndex].waveformOverview,
+            replacing: selectionToDelete,
+            with: nil
+        )
+
+        selectedTimelineRange = nil
+        timelineSurface.displaySelection(nil)
+        timelineSurface.displayGainPreview(selection: nil, gain: 1)
+        stopPlaybackTimer()
+        playbackController.clear()
+        displayPlaybackVisuals(progress: deletedStartProgress, isPlaying: false)
+        refreshProjectTimelineDisplay(rebuildControls: false)
+        updateProjectDisplayTiming()
+        updateEffectCommandState()
+        updateStatus("\(copyBeforeDeleting ? "cut" : "deleted") \(formatDuration(deletedDuration))")
+
+        materializeEditedTimeline(
+            trackID: trackID,
+            timeline: editedTimeline,
+            editRevision: editRevision,
+            status: "\(copyBeforeDeleting ? "cut" : "deleted") \(formatDuration(deletedDuration))"
+        )
     }
 
     private func trimTimeline(to trimRange: TimelineTrimRange) {
