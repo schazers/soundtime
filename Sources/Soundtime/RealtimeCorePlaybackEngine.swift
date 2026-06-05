@@ -122,10 +122,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         }
 
         let sampleRate = preparedTracks[0].source.sampleRate
-        guard
-            sampleRate > 0,
-            preparedTracks.allSatisfy({ $0.source.sampleRate == sampleRate })
-        else {
+        guard sampleRate > 0, preparedTracks.allSatisfy({ $0.source.sampleRate > 0 }) else {
             throw PlaybackError.invalidFormat
         }
 
@@ -141,7 +138,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             throw PlaybackError.invalidFormat
         }
 
-        frameCount = preparedTracks.map { $0.source.frameCount }.max() ?? 0
+        frameCount = projectFrameCount(for: preparedTracks, sampleRate: sampleRate)
         self.sampleRate = sampleRate
         mirroredFrameIndex = 0
         mirroredFrameCount = frameCount
@@ -506,6 +503,29 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
 
         let clampedVolume = min(max(track.volume, 0), 1)
         return clampedVolume * clampedVolume
+    }
+
+    private func projectFrameCount(
+        for tracks: [PreparedProjectTrack],
+        sampleRate: Double
+    ) -> Int {
+        guard sampleRate.isFinite, sampleRate > 0 else {
+            return 0
+        }
+
+        let duration = tracks.reduce(0.0) { longestDuration, track in
+            guard track.source.sampleRate.isFinite, track.source.sampleRate > 0 else {
+                return longestDuration
+            }
+
+            return max(longestDuration, Double(track.source.frameCount) / track.source.sampleRate)
+        }
+
+        guard duration.isFinite, duration > 0 else {
+            return 0
+        }
+
+        return Int((duration * sampleRate).rounded(.up))
     }
 
     private func zeroCrossingReferenceTrack(in tracks: [PreparedProjectTrack]) -> PreparedProjectTrack? {
