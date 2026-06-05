@@ -526,6 +526,10 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         _ frame: Int,
         allowsEnd: Bool
     ) -> Int {
+        if !preparedProjectTracks.isEmpty {
+            return snappedProjectFrameToZeroCrossing(frame, allowsEnd: allowsEnd)
+        }
+
         let clampedFrame = min(max(frame, 0), frameCount)
         guard clampedFrame > 0, clampedFrame < frameCount else {
             return clampedFrame
@@ -546,6 +550,67 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         }
 
         return boundedFrame
+    }
+
+    private func snappedProjectFrameToZeroCrossing(
+        _ frame: Int,
+        allowsEnd: Bool
+    ) -> Int {
+        let clampedFrame = min(max(frame, 0), frameCount)
+        guard clampedFrame > 0, clampedFrame < frameCount else {
+            return clampedFrame
+        }
+
+        guard let referenceTrack = zeroCrossingReferenceTrack(containingProjectFrame: clampedFrame) else {
+            return clampedFrame
+        }
+
+        let projectTime = TimeInterval(clampedFrame) / sampleRate
+        let sourceFrame = min(
+            max(Int((projectTime * referenceTrack.source.sampleRate).rounded(.down)), 0),
+            referenceTrack.source.frameCount
+        )
+        guard sourceFrame > 0, sourceFrame < referenceTrack.source.frameCount else {
+            return clampedFrame
+        }
+
+        let snappedSourceFrame: Int
+        if
+            let zeroCrossingIndex = referenceTrack.zeroCrossingIndex,
+            zeroCrossingIndex.frameCount == referenceTrack.source.frameCount
+        {
+            snappedSourceFrame = zeroCrossingIndex.nearestFrame(to: sourceFrame)
+        } else if let zeroCrossingProbe = referenceTrack.zeroCrossingProbe {
+            snappedSourceFrame = zeroCrossingProbe.nearestFrame(to: sourceFrame)
+        } else {
+            snappedSourceFrame = sourceFrame
+        }
+
+        let snappedProjectTime = TimeInterval(snappedSourceFrame) / referenceTrack.source.sampleRate
+        let snappedProjectFrame = Int((snappedProjectTime * sampleRate).rounded(.down))
+        let boundedFrame = min(max(snappedProjectFrame, 0), frameCount)
+        if !allowsEnd, boundedFrame >= frameCount {
+            return max(frameCount - 1, 0)
+        }
+
+        return boundedFrame
+    }
+
+    private func zeroCrossingReferenceTrack(containingProjectFrame projectFrame: Int) -> PreparedProjectTrack? {
+        guard sampleRate.isFinite, sampleRate > 0 else {
+            return nil
+        }
+
+        let projectTime = TimeInterval(projectFrame) / sampleRate
+        let anySoloedTrack = preparedProjectTracks.contains { $0.isSoloed }
+        return preparedProjectTracks.first { track in
+            guard isTrackAudible(track, anySoloedTrack: anySoloedTrack) else {
+                return false
+            }
+
+            let sourceFrame = Int((projectTime * track.source.sampleRate).rounded(.down))
+            return sourceFrame > 0 && sourceFrame < track.source.frameCount
+        }
     }
 
 }
