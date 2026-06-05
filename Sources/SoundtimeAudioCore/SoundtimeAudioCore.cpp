@@ -1,17 +1,27 @@
 #include "SoundtimeAudioCore.h"
 
+#include "third_party/ez/ez.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
 
+namespace {
+
+struct EngineConfig {
+    uint64_t frameCount = 0;
+    uint32_t channelCount = 0;
+    double sampleRate = 0;
+    float gain = 1;
+};
+
+} // namespace
+
 struct SoundtimeAudioCoreEngine {
     std::atomic<uint64_t> frameIndex{0};
-    std::atomic<uint64_t> frameCount{0};
-    std::atomic<uint32_t> channelCount{0};
-    std::atomic<double> sampleRate{0};
     std::atomic<bool> isPlaying{false};
     std::atomic<uint64_t> underrunCount{0};
-    std::atomic<float> gain{1};
+    ez::sync<EngineConfig> config;
 };
 
 SoundtimeAudioCoreEngine* soundtime_audio_core_create(void) {
@@ -28,12 +38,10 @@ void soundtime_audio_core_reset(SoundtimeAudioCoreEngine* engine) {
     }
 
     engine->frameIndex.store(0, std::memory_order_release);
-    engine->frameCount.store(0, std::memory_order_release);
-    engine->channelCount.store(0, std::memory_order_release);
-    engine->sampleRate.store(0, std::memory_order_release);
     engine->isPlaying.store(false, std::memory_order_release);
     engine->underrunCount.store(0, std::memory_order_release);
-    engine->gain.store(1, std::memory_order_release);
+    engine->config.set_publish(ez::nort, EngineConfig{});
+    engine->config.gc(ez::gc);
 }
 
 void soundtime_audio_core_set_source_info(
@@ -47,11 +55,15 @@ void soundtime_audio_core_set_source_info(
     }
 
     engine->frameIndex.store(0, std::memory_order_release);
-    engine->frameCount.store(frameCount, std::memory_order_release);
-    engine->channelCount.store(channelCount, std::memory_order_release);
-    engine->sampleRate.store(sampleRate, std::memory_order_release);
     engine->isPlaying.store(false, std::memory_order_release);
     engine->underrunCount.store(0, std::memory_order_release);
+    engine->config.update_publish(ez::nort, [=](EngineConfig config) {
+        config.frameCount = frameCount;
+        config.channelCount = channelCount;
+        config.sampleRate = sampleRate;
+        return config;
+    });
+    engine->config.gc(ez::gc);
 }
 
 void soundtime_audio_core_play(SoundtimeAudioCoreEngine* engine) {
@@ -59,7 +71,8 @@ void soundtime_audio_core_play(SoundtimeAudioCoreEngine* engine) {
         return;
     }
 
-    const auto frameCount = engine->frameCount.load(std::memory_order_acquire);
+    const auto config = engine->config.read(ez::nort);
+    const auto frameCount = config.frameCount;
     auto frameIndex = engine->frameIndex.load(std::memory_order_acquire);
     if (frameCount > 0 && frameIndex >= frameCount) {
         frameIndex = 0;
@@ -82,7 +95,8 @@ void soundtime_audio_core_seek(SoundtimeAudioCoreEngine* engine, uint64_t frameI
         return;
     }
 
-    const auto frameCount = engine->frameCount.load(std::memory_order_acquire);
+    const auto config = engine->config.read(ez::nort);
+    const auto frameCount = config.frameCount;
     engine->frameIndex.store(std::min(frameIndex, frameCount), std::memory_order_release);
 }
 
@@ -91,7 +105,11 @@ void soundtime_audio_core_set_gain(SoundtimeAudioCoreEngine* engine, float gain)
         return;
     }
 
-    engine->gain.store(std::max(gain, 0.0f), std::memory_order_release);
+    engine->config.update_publish(ez::nort, [=](EngineConfig config) {
+        config.gain = std::max(gain, 0.0f);
+        return config;
+    });
+    engine->config.gc(ez::gc);
 }
 
 SoundtimeAudioCoreSnapshot soundtime_audio_core_snapshot(const SoundtimeAudioCoreEngine* engine) {
@@ -99,10 +117,11 @@ SoundtimeAudioCoreSnapshot soundtime_audio_core_snapshot(const SoundtimeAudioCor
         return SoundtimeAudioCoreSnapshot{};
     }
 
+    const auto config = engine->config.read(ez::nort);
     return SoundtimeAudioCoreSnapshot{
         .frameIndex = engine->frameIndex.load(std::memory_order_acquire),
-        .frameCount = engine->frameCount.load(std::memory_order_acquire),
-        .sampleRate = engine->sampleRate.load(std::memory_order_acquire),
+        .frameCount = config.frameCount,
+        .sampleRate = config.sampleRate,
         .isPlaying = engine->isPlaying.load(std::memory_order_acquire),
         .underrunCount = engine->underrunCount.load(std::memory_order_acquire),
     };
@@ -134,7 +153,8 @@ void soundtime_audio_core_render_silence(
         return;
     }
 
-    const auto sourceFrameCount = engine->frameCount.load(std::memory_order_acquire);
+    const auto config = engine->config.read(ez::audio);
+    const auto sourceFrameCount = config->frameCount;
     auto nextFrameIndex = engine->frameIndex.load(std::memory_order_acquire);
     nextFrameIndex = std::min<uint64_t>(nextFrameIndex + frameCount, sourceFrameCount);
     engine->frameIndex.store(nextFrameIndex, std::memory_order_release);
