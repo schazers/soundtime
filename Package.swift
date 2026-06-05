@@ -25,6 +25,12 @@ let package = Package(
                 .linkedFramework("Metal"),
             ]
         ),
+        .testTarget(
+            name: "SoundtimeAudioCoreTests",
+            dependencies: [
+                "SoundtimeAudioCore",
+            ]
+        ),
     ],
     cxxLanguageStandard: .cxx20
 )
