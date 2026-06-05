@@ -420,7 +420,7 @@ final class MultitrackPlaybackController: PlaybackEngine {
             playbackStartProjectFrame + Int(elapsedTime * projectSampleRate()),
             projectFrameCount()
         )
-        return (frameIndex, currentHostTimestamp)
+        return (frameIndex, max(currentHostTimestamp, playbackStartHostTimestamp))
     }
 
     private func finishAtEnd() {
