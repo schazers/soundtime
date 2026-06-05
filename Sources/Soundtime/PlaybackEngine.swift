@@ -23,6 +23,7 @@ enum PlaybackError: LocalizedError {
     case noAudioLoaded
     case invalidFormat
     case bufferCreationFailed
+    case outputDeviceFailed(OSStatus)
 
     var errorDescription: String? {
         switch self {
@@ -32,6 +33,8 @@ enum PlaybackError: LocalizedError {
             "The decoded WAV has an unsupported playback format."
         case .bufferCreationFailed:
             "Could not create the playback buffer."
+        case let .outputDeviceFailed(status):
+            "The audio output device failed with status \(status)."
         }
     }
 }
