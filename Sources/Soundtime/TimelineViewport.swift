@@ -2,6 +2,7 @@ import Foundation
 
 struct TimelineViewport: Equatable, Sendable {
     static let full = TimelineViewport(startProgress: 0, durationProgress: 1)
+    private static let minimumDurationProgress: Float = 0.000001
 
     let startProgress: Float
     let durationProgress: Float
@@ -15,7 +16,7 @@ struct TimelineViewport: Equatable, Sendable {
     }
 
     init(startProgress: Float, durationProgress: Float) {
-        let clampedDuration = min(max(durationProgress, 0.01), 1)
+        let clampedDuration = min(max(durationProgress, Self.minimumDurationProgress), 1)
         let clampedStart = min(max(startProgress, 0), 1 - clampedDuration)
         self.startProgress = clampedStart
         self.durationProgress = clampedDuration
@@ -42,7 +43,10 @@ struct TimelineViewport: Equatable, Sendable {
 
     func zoomed(by zoomFactor: Float, around anchorProgress: Float) -> TimelineViewport {
         let clampedZoomFactor = min(max(zoomFactor, 0.1), 10)
-        let nextDuration = min(max(durationProgress / clampedZoomFactor, 0.01), 1)
+        let nextDuration = min(
+            max(durationProgress / clampedZoomFactor, Self.minimumDurationProgress),
+            1
+        )
         let anchorViewportProgress = viewportProgress(forTimelineProgress: anchorProgress)
         let nextStart = anchorProgress - anchorViewportProgress * nextDuration
 
