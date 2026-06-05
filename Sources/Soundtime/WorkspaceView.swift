@@ -337,6 +337,8 @@ final class WorkspaceView: NSView {
         }
         volumeControl.onVolumeChanged = { [weak self] volume in
             self?.playbackController.setPerceptualVolume(volume)
+        }
+        volumeControl.onVolumeEditingEnded = { [weak self] in
             self?.updateLoudnessMeter()
         }
         configureFisheyeTuningControls()

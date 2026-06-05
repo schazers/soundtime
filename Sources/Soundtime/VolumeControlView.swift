@@ -2,6 +2,7 @@ import AppKit
 
 final class VolumeControlView: NSView {
     var onVolumeChanged: ((Float) -> Void)?
+    var onVolumeEditingEnded: (() -> Void)?
 
     private let iconView = NSImageView()
     private let sliderView = VolumeSliderView()
@@ -43,6 +44,9 @@ final class VolumeControlView: NSView {
         sliderView.onValueChanged = { [weak self] value in
             self?.onVolumeChanged?(value)
         }
+        sliderView.onEditingEnded = { [weak self] in
+            self?.onVolumeEditingEnded?()
+        }
 
         addSubview(iconView)
         addSubview(sliderView)
@@ -63,10 +67,14 @@ final class VolumeControlView: NSView {
 
 private final class VolumeSliderView: NSView {
     var onValueChanged: ((Float) -> Void)?
+    var onEditingEnded: (() -> Void)?
 
     var value: Float = 1 {
         didSet {
-            value = min(max(value, 0), 1)
+            let clampedValue = min(max(value, 0), 1)
+            if value != clampedValue {
+                value = clampedValue
+            }
             needsDisplay = true
         }
     }
@@ -130,6 +138,7 @@ private final class VolumeSliderView: NSView {
         updateValue(for: event)
         isDragging = false
         needsDisplay = true
+        onEditingEnded?()
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -188,7 +197,12 @@ private final class VolumeSliderView: NSView {
         let trackLeft = maximumKnobRadius
         let trackRight = max(bounds.width - maximumKnobRadius, trackLeft)
         let trackWidth = max(trackRight - trackLeft, 1)
-        value = Float((point.x - trackLeft) / trackWidth)
-        onValueChanged?(value)
+        let nextValue = min(max(Float((point.x - trackLeft) / trackWidth), 0), 1)
+        guard abs(nextValue - value) > 0.000_5 else {
+            return
+        }
+
+        value = nextValue
+        onValueChanged?(nextValue)
     }
 }
