@@ -27,6 +27,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     private var timelineRenderer: TimelineRenderer?
+    private let timelineRenderQueue = DispatchQueue(
+        label: "Soundtime.timeline.renderer",
+        qos: .userInteractive
+    )
     private var viewport = TimelineViewport.full
     private var isSelectionEnabled = false
     private var selectionAnchorProgress: Float?
@@ -104,7 +108,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             setViewport(.full)
         }
 
-        timelineRenderer?.displayWaveform(waveformOverview)
+        updateTimelineRenderer { renderer in
+            renderer.displayWaveform(waveformOverview)
+        }
         displayTrimPreview(nil)
 
         if wasSelectionEnabled != isSelectionEnabled {
@@ -134,11 +140,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         trailFalloffSteepness: Float,
         waveformGray: Float
     ) {
-        timelineRenderer?.updateWaveformTouchTuning(
-            trailDuration: trailDuration,
-            trailFalloffSteepness: trailFalloffSteepness,
-            waveformGray: waveformGray
-        )
+        updateTimelineRenderer { renderer in
+            renderer.updateWaveformTouchTuning(
+                trailDuration: trailDuration,
+                trailFalloffSteepness: trailFalloffSteepness,
+                waveformGray: waveformGray
+            )
+        }
         requestTimelineRender()
     }
 
@@ -149,17 +157,21 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     ) {
         let clampedProgress = min(max(progress, 0), 1)
         pageViewportIfNeeded(forPlayheadProgress: clampedProgress)
-        timelineRenderer?.displayPlayheadProgress(
-            clampedProgress,
-            force: syncRenderer,
-            anchorTimestamp: anchorTimestamp
-        )
+        updateTimelineRenderer { renderer in
+            renderer.displayPlayheadProgress(
+                clampedProgress,
+                force: syncRenderer,
+                anchorTimestamp: anchorTimestamp
+            )
+        }
         requestTimelineRender()
     }
 
     func displayPlaybackActive(_ isActive: Bool) {
         isTimelinePlaybackActive = isActive
-        timelineRenderer?.displayPlaybackActive(isActive)
+        updateTimelineRenderer { renderer in
+            renderer.displayPlaybackActive(isActive)
+        }
         requestTimelineRender()
         if !isActive {
             startTransientRenderPulse()
@@ -167,22 +179,30 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     func displaySelection(_ selection: TimelineSelection?) {
-        timelineRenderer?.displaySelection(selection)
+        updateTimelineRenderer { renderer in
+            renderer.displaySelection(selection)
+        }
         requestTimelineRender()
     }
 
     func displayTrimPreview(_ trimRange: TimelineTrimRange?) {
-        timelineRenderer?.displayTrimPreview(trimRange)
+        updateTimelineRenderer { renderer in
+            renderer.displayTrimPreview(trimRange)
+        }
         requestTimelineRender()
     }
 
     func displayHoverProgress(_ progress: Float?, isArmed: Bool = false) {
-        timelineRenderer?.displayHoverProgress(progress, isArmed: isArmed)
+        updateTimelineRenderer { renderer in
+            renderer.displayHoverProgress(progress, isArmed: isArmed)
+        }
         requestTimelineRender()
     }
 
     func displayGainPreview(selection: TimelineSelection?, gain: Float) {
-        timelineRenderer?.displayGainPreview(selection: selection, gain: gain)
+        updateTimelineRenderer { renderer in
+            renderer.displayGainPreview(selection: selection, gain: gain)
+        }
         requestTimelineRender()
     }
 
@@ -236,15 +256,28 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         do {
             let renderer = try TimelineRenderer(device: metalDevice, pixelFormat: colorPixelFormat)
             timelineRenderer = renderer
-            renderer.displayViewport(viewport)
             renderer.onFrameStatsChanged = { [weak self] frameStats in
                 Task { @MainActor [weak self] in
                     self?.onFrameStatsChanged?(frameStats)
                 }
             }
+            let initialViewport = viewport
+            updateTimelineRenderer { renderer in
+                renderer.displayViewport(initialViewport)
+            }
             requestTimelineRender()
         } catch {
             Swift.print("Soundtime could not create the timeline renderer: \\(error)")
+        }
+    }
+
+    private func updateTimelineRenderer(_ update: @escaping @Sendable (TimelineRenderer) -> Void) {
+        guard let timelineRenderer else {
+            return
+        }
+
+        timelineRenderQueue.async { [timelineRenderer] in
+            update(timelineRenderer)
         }
     }
 
@@ -320,7 +353,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
-        timelineRenderer.render(to: renderTarget)
+        timelineRenderQueue.async { [timelineRenderer, renderTarget] in
+            timelineRenderer.render(to: renderTarget)
+        }
     }
 
     private func startTransientRenderPulse(duration: CFTimeInterval? = nil) {
@@ -835,7 +870,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         viewport = nextViewport
-        timelineRenderer?.displayViewport(nextViewport)
+        updateTimelineRenderer { renderer in
+            renderer.displayViewport(nextViewport)
+        }
         window?.invalidateCursorRects(for: self)
         requestTimelineRender()
     }

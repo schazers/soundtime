@@ -10,7 +10,7 @@ struct TimelineFrameStats: Equatable, Sendable {
     let worstFrameTimeMilliseconds: Double
 }
 
-struct TimelineRenderTarget {
+struct TimelineRenderTarget: @unchecked Sendable {
     let renderPassDescriptor: MTLRenderPassDescriptor
     let drawable: MTLDrawable
     let viewportSize: CGSize
@@ -18,7 +18,7 @@ struct TimelineRenderTarget {
     let displayTimestamp: CFTimeInterval
 }
 
-final class TimelineRenderer: NSObject {
+final class TimelineRenderer: NSObject, @unchecked Sendable {
     private struct TimelineVertex {
         var position: SIMD4<Float>
         var color: SIMD4<Float>
