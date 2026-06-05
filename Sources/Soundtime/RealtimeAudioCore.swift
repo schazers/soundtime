@@ -28,6 +28,51 @@ struct RealtimeAudioCoreSnapshot {
     }
 }
 
+final class PreparedRealtimeAudioSource: @unchecked Sendable {
+    fileprivate let sourcePointer: OpaquePointer
+    let frameCount: Int
+    let channelCount: Int
+    let sampleRate: Double
+
+    private init(
+        sourcePointer: OpaquePointer,
+        frameCount: Int,
+        channelCount: Int,
+        sampleRate: Double
+    ) {
+        self.sourcePointer = sourcePointer
+        self.frameCount = frameCount
+        self.channelCount = channelCount
+        self.sampleRate = sampleRate
+    }
+
+    deinit {
+        soundtime_audio_core_source_destroy(sourcePointer)
+    }
+
+    static func make(from decodedAudioBuffer: DecodedAudioBuffer) -> PreparedRealtimeAudioSource? {
+        withPlanarSamplePointers(decodedAudioBuffer.samplesByChannel) { channelPointers in
+            guard
+                let sourcePointer = soundtime_audio_core_source_create_planar(
+                    channelPointers,
+                    UInt64(max(decodedAudioBuffer.frameCount, 0)),
+                    UInt32(max(decodedAudioBuffer.channelCount, 0)),
+                    decodedAudioBuffer.sampleRate
+                )
+            else {
+                return nil
+            }
+
+            return PreparedRealtimeAudioSource(
+                sourcePointer: sourcePointer,
+                frameCount: decodedAudioBuffer.frameCount,
+                channelCount: decodedAudioBuffer.channelCount,
+                sampleRate: decodedAudioBuffer.sampleRate
+            )
+        }
+    }
+}
+
 final class RealtimeAudioCore {
     private var engine: OpaquePointer?
 
@@ -83,7 +128,7 @@ final class RealtimeAudioCore {
             return false
         }
 
-        return Self.withPlanarSamplePointers(decodedAudioBuffer.samplesByChannel) { channelPointers in
+        return withPlanarSamplePointers(decodedAudioBuffer.samplesByChannel) { channelPointers in
             soundtime_audio_core_set_planar_source(
                 engine,
                 channelPointers,
@@ -92,6 +137,17 @@ final class RealtimeAudioCore {
                 decodedAudioBuffer.sampleRate
             )
         }
+    }
+
+    func setPreparedSource(_ preparedSource: PreparedRealtimeAudioSource) -> Bool {
+        guard let engine else {
+            return false
+        }
+
+        return soundtime_audio_core_set_prepared_source(
+            engine,
+            preparedSource.sourcePointer
+        )
     }
 
     func play() {
@@ -191,28 +247,29 @@ final class RealtimeAudioCore {
         )
     }
 
-    private static func withPlanarSamplePointers<T>(
-        _ samplesByChannel: [[Float]],
-        _ body: (UnsafePointer<UnsafePointer<Float>?>?) -> T
-    ) -> T {
-        var channelPointers = [UnsafePointer<Float>?](
-            repeating: nil,
-            count: samplesByChannel.count
-        )
+}
 
-        func bindChannel(at channelIndex: Int) -> T {
-            guard channelIndex < samplesByChannel.count else {
-                return channelPointers.withUnsafeBufferPointer { pointerBuffer in
-                    body(pointerBuffer.baseAddress)
-                }
-            }
+private func withPlanarSamplePointers<T>(
+    _ samplesByChannel: [[Float]],
+    _ body: (UnsafePointer<UnsafePointer<Float>?>?) -> T
+) -> T {
+    var channelPointers = [UnsafePointer<Float>?](
+        repeating: nil,
+        count: samplesByChannel.count
+    )
 
-            return samplesByChannel[channelIndex].withUnsafeBufferPointer { sampleBuffer in
-                channelPointers[channelIndex] = sampleBuffer.baseAddress
-                return bindChannel(at: channelIndex + 1)
+    func bindChannel(at channelIndex: Int) -> T {
+        guard channelIndex < samplesByChannel.count else {
+            return channelPointers.withUnsafeBufferPointer { pointerBuffer in
+                body(pointerBuffer.baseAddress)
             }
         }
 
-        return bindChannel(at: 0)
+        return samplesByChannel[channelIndex].withUnsafeBufferPointer { sampleBuffer in
+            channelPointers[channelIndex] = sampleBuffer.baseAddress
+            return bindChannel(at: channelIndex + 1)
+        }
     }
+
+    return bindChannel(at: 0)
 }
