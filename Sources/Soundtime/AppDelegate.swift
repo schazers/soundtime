@@ -62,6 +62,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         saveAsItem.keyEquivalentModifierMask = [.command, .shift]
         menu.addItem(saveAsItem)
         menu.addItem(.separator())
+        let debugToolsItem = NSMenuItem(
+            title: "Show Debug Tools",
+            action: #selector(TimelineView.toggleDebugTools(_:)),
+            keyEquivalent: "d"
+        )
+        debugToolsItem.keyEquivalentModifierMask = [.command, .shift]
+        menu.addItem(debugToolsItem)
+        menu.addItem(.separator())
         menu.addItem(NSMenuItem(
             title: "Export...",
             action: #selector(TimelineView.exportAudio(_:)),

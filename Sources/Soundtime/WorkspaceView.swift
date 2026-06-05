@@ -99,6 +99,7 @@ final class WorkspaceView: NSView {
     private var playbackTimer: Timer?
     private var loudnessMeterTimer: Timer?
     private var keyDownMonitor: Any?
+    private var debugToolsVisible = false
     private let playbackController: PlaybackEngine = PlaybackEngineFactory.makeDefault()
     private let playbackRefreshRate: TimeInterval = 10
     private let loudnessMeterRefreshRate: TimeInterval = 60
@@ -250,6 +251,10 @@ final class WorkspaceView: NSView {
     private let timelineSurface = TimelineView()
     private let exportProgressOverlay = ExportProgressOverlayView()
     private let gainEffectOverlay = GainEffectOverlayView()
+    private var metadataToDebugConstraint: NSLayoutConstraint?
+    private var metadataToVolumeConstraint: NSLayoutConstraint?
+    private var trackControlsBelowDebugConstraint: NSLayoutConstraint?
+    private var trackControlsBelowHeaderConstraint: NSLayoutConstraint?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -306,6 +311,9 @@ final class WorkspaceView: NSView {
         }
         timelineSurface.onSaveProjectAsRequested = { [weak self] in
             self?.saveProjectAs()
+        }
+        timelineSurface.onToggleDebugTools = { [weak self] in
+            self?.toggleDebugTools()
         }
         timelineSurface.onGainRequested = { [weak self] in
             self?.showGainEffect()
@@ -372,6 +380,26 @@ final class WorkspaceView: NSView {
             constant: -18
         )
         fisheyeTrailingConstraint.priority = .defaultHigh
+        let metadataToDebugConstraint = metadataLabel.trailingAnchor.constraint(
+            equalTo: framesPerSecondLabel.leadingAnchor,
+            constant: -14
+        )
+        let metadataToVolumeConstraint = metadataLabel.trailingAnchor.constraint(
+            equalTo: volumeControl.leadingAnchor,
+            constant: -14
+        )
+        let trackControlsBelowDebugConstraint = trackControlsStack.topAnchor.constraint(
+            equalTo: fisheyeControlsStack.bottomAnchor,
+            constant: 14
+        )
+        let trackControlsBelowHeaderConstraint = trackControlsStack.topAnchor.constraint(
+            equalTo: titleLabel.bottomAnchor,
+            constant: 56
+        )
+        self.metadataToDebugConstraint = metadataToDebugConstraint
+        self.metadataToVolumeConstraint = metadataToVolumeConstraint
+        self.trackControlsBelowDebugConstraint = trackControlsBelowDebugConstraint
+        self.trackControlsBelowHeaderConstraint = trackControlsBelowHeaderConstraint
 
         NSLayoutConstraint.activate([
             titleLabel.topAnchor.constraint(equalTo: topAnchor, constant: 30),
@@ -379,7 +407,7 @@ final class WorkspaceView: NSView {
 
             metadataLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
             metadataLabel.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 14),
-            metadataLabel.trailingAnchor.constraint(equalTo: framesPerSecondLabel.leadingAnchor, constant: -14),
+            metadataToDebugConstraint,
 
             framesPerSecondLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
             framesPerSecondLabel.trailingAnchor.constraint(equalTo: frameRateHistoryView.leadingAnchor, constant: -10),
@@ -408,7 +436,7 @@ final class WorkspaceView: NSView {
             fisheyeTrailingConstraint,
             fisheyeControlsStack.heightAnchor.constraint(equalToConstant: 34),
 
-            trackControlsStack.topAnchor.constraint(equalTo: fisheyeControlsStack.bottomAnchor, constant: 14),
+            trackControlsBelowDebugConstraint,
             trackControlsStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 22),
             trackControlsStack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -22),
             trackControlsStack.widthAnchor.constraint(equalToConstant: 118),
@@ -431,6 +459,7 @@ final class WorkspaceView: NSView {
 
         updateEffectCommandState()
         updateWaveformFisheyeTuning()
+        setDebugToolsVisible(false)
         updateLoudnessMeter()
         startLoudnessMeterTimer()
     }
@@ -452,6 +481,23 @@ final class WorkspaceView: NSView {
             fisheyeControlsStack.addArrangedSubview(control)
             control.widthAnchor.constraint(equalToConstant: 136).isActive = true
         }
+    }
+
+    private func toggleDebugTools() {
+        setDebugToolsVisible(!debugToolsVisible)
+    }
+
+    private func setDebugToolsVisible(_ isVisible: Bool) {
+        debugToolsVisible = isVisible
+        timelineSurface.isDebugToolsVisible = isVisible
+        framesPerSecondLabel.isHidden = !isVisible
+        frameRateHistoryView.isHidden = !isVisible
+        fisheyeControlsStack.isHidden = !isVisible
+        metadataToDebugConstraint?.isActive = isVisible
+        metadataToVolumeConstraint?.isActive = !isVisible
+        trackControlsBelowDebugConstraint?.isActive = isVisible
+        trackControlsBelowHeaderConstraint?.isActive = !isVisible
+        needsLayout = true
     }
 
     private func updateWaveformFisheyeTuning() {
@@ -492,6 +538,15 @@ final class WorkspaceView: NSView {
     private func handleWindowKeyDown(_ event: NSEvent) -> NSEvent? {
         guard event.window === window else {
             return event
+        }
+
+        let shortcutModifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        if
+            event.charactersIgnoringModifiers?.lowercased() == "d",
+            shortcutModifiers == [.command, .shift]
+        {
+            toggleDebugTools()
+            return nil
         }
 
         if event.keyCode == 6, event.modifierFlags.contains(.command) {
@@ -2919,6 +2974,10 @@ final class WorkspaceView: NSView {
     }
 
     private func updateFrameStats(_ frameStats: TimelineFrameStats) {
+        guard debugToolsVisible else {
+            return
+        }
+
         frameRateHistoryView.display(frameStats: frameStats)
         let shaderBufferMegabytes = Int((Double(frameStats.shaderBufferByteCount) / 1_048_576).rounded())
         framesPerSecondLabel.stringValue = String(
