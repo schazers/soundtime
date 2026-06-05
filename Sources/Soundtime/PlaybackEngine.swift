@@ -83,6 +83,7 @@ protocol PlaybackEngine: AnyObject {
     func play() throws
     func pause()
     func seek(toProgress progress: Float) throws
+    func seekExactly(toProgress progress: Float) throws
     func snapshot() -> PlaybackSnapshot
 }
 
@@ -103,4 +104,8 @@ extension PlaybackEngine {
     }
 
     func updateProjectTrackMix(_ tracks: [ProjectPlaybackTrack]) {}
+
+    func seekExactly(toProgress progress: Float) throws {
+        try seek(toProgress: progress)
+    }
 }
