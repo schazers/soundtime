@@ -1429,7 +1429,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return WaveformShaderDrawable(mipLevel: preferredMipLevel, buffer: buffer)
         }
 
-        prepareWaveformShaderBinBuffer(track: track, mipLevel: preferredMipLevel)
+        prepareWaveformShaderBinBuffer(
+            track: track,
+            mipLevel: preferredMipLevel,
+            allowsSynchronousUpload: false
+        )
         if let buffer = waveformShaderBuffer(track: track, mipLevel: preferredMipLevel) {
             return WaveformShaderDrawable(mipLevel: preferredMipLevel, buffer: buffer)
         }
@@ -1511,7 +1515,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     private func prepareWaveformShaderBinBuffer(
         track: TimelineRenderState.Track,
-        mipLevel: WaveformMipLevel
+        mipLevel: WaveformMipLevel,
+        allowsSynchronousUpload: Bool
     ) {
         let key = waveformShaderBufferKey(track: track, mipLevel: mipLevel)
         guard waveformShaderBufferStore.beginPreparing(
@@ -1524,7 +1529,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let bins = mipLevel.overview.bins
         let label = "Timeline GPU waveform bins \(mipLevel.binCount)"
 
-        if mipLevel.binCount <= maximumSynchronousWaveformShaderBinBufferBins {
+        if
+            allowsSynchronousUpload,
+            mipLevel.binCount <= maximumSynchronousWaveformShaderBinBufferBins
+        {
             let buffer = makeWaveformShaderBinBuffer(from: bins, label: label)
             waveformShaderBufferStore.publish(buffer, for: key)
             waveformShaderBufferStore.trim(
@@ -1554,7 +1562,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 continue
             }
 
-            prepareWaveformShaderBinBuffer(track: track, mipLevel: lowestCostMipLevel)
+            prepareWaveformShaderBinBuffer(
+                track: track,
+                mipLevel: lowestCostMipLevel,
+                allowsSynchronousUpload: true
+            )
         }
     }
 
