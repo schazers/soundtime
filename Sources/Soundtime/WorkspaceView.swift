@@ -48,6 +48,7 @@ final class WorkspaceView: NSView {
     private var hasRestoredLastProject = false
     private var isLoadingProject = false
     private var audioClipboard: AudioClipboard?
+    private var trackPlaybackReloadTask: Task<Void, Never>?
     private var activeImportID = UUID()
     private var selectedAudioFile: AudioFileMetadata?
     private var decodedAudioBuffer: DecodedAudioBuffer?
@@ -374,7 +375,18 @@ final class WorkspaceView: NSView {
     }
 
     private func refreshProjectTimelineDisplay(rebuildControls: Bool = true) {
-        timelineSurface.displayTracks(projectTracks.map { track in
+        timelineSurface.displayTracks(timelineRenderTracks())
+        if rebuildControls {
+            refreshTrackControls()
+        }
+    }
+
+    private func refreshProjectTrackMixDisplay() {
+        timelineSurface.displayTrackMixSettings(timelineRenderTracks())
+    }
+
+    private func timelineRenderTracks() -> [TimelineRenderState.Track] {
+        projectTracks.map { track in
             TimelineRenderState.Track(
                 id: track.id,
                 waveformOverview: track.waveformOverview,
@@ -382,9 +394,6 @@ final class WorkspaceView: NSView {
                 isMuted: track.isMuted,
                 isSoloed: track.isSoloed
             )
-        })
-        if rebuildControls {
-            refreshTrackControls()
         }
     }
 
@@ -407,22 +416,52 @@ final class WorkspaceView: NSView {
                 self?.updateTrack(trackID) { $0.isSoloed = isSoloed }
             }
             controlView.onVolumeChanged = { [weak self, trackID = track.id] volume in
-                self?.updateTrack(trackID) { $0.volume = volume }
+                self?.updateTrack(trackID, reloadPlayback: false) { $0.volume = volume }
+            }
+            controlView.onVolumeEditingEnded = { [weak self] in
+                self?.reloadProjectPlaybackImmediately()
             }
             trackControlsStack.addArrangedSubview(controlView)
         }
     }
 
-    private func updateTrack(_ trackID: UUID, update: (inout ProjectTrack) -> Void) {
+    private func updateTrack(
+        _ trackID: UUID,
+        reloadPlayback: Bool = true,
+        update: (inout ProjectTrack) -> Void
+    ) {
         guard let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }) else {
             return
         }
 
         update(&projectTracks[trackIndex])
         activeTrackID = trackID
-        refreshProjectTimelineDisplay()
-        reloadPlaybackFromProjectMix(preserveProgress: true)
+        refreshProjectTrackMixDisplay()
+        if reloadPlayback {
+            reloadProjectPlaybackImmediately()
+        } else {
+            scheduleProjectPlaybackReload()
+        }
         updateStatus(currentPlaybackStatus)
+    }
+
+    private func scheduleProjectPlaybackReload() {
+        trackPlaybackReloadTask?.cancel()
+        trackPlaybackReloadTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(90))
+            guard !Task.isCancelled else {
+                return
+            }
+
+            self?.trackPlaybackReloadTask = nil
+            self?.reloadPlaybackFromProjectMix(preserveProgress: true)
+        }
+    }
+
+    private func reloadProjectPlaybackImmediately() {
+        trackPlaybackReloadTask?.cancel()
+        trackPlaybackReloadTask = nil
+        reloadPlaybackFromProjectMix(preserveProgress: true)
     }
 
     private func loadDroppedAudioFile(at url: URL) {

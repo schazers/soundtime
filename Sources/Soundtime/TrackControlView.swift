@@ -4,6 +4,7 @@ final class TrackControlView: NSView {
     var onMuteChanged: ((Bool) -> Void)?
     var onSoloChanged: ((Bool) -> Void)?
     var onVolumeChanged: ((Float) -> Void)?
+    var onVolumeEditingEnded: (() -> Void)?
 
     private let titleLabel = NSTextField(labelWithString: "")
     private let volumeSlider = VerticalTrackVolumeSliderView()
@@ -61,6 +62,9 @@ final class TrackControlView: NSView {
         volumeSlider.translatesAutoresizingMaskIntoConstraints = false
         volumeSlider.onValueChanged = { [weak self] value in
             self?.onVolumeChanged?(value)
+        }
+        volumeSlider.onEditingEnded = { [weak self] in
+            self?.onVolumeEditingEnded?()
         }
 
         muteButton.translatesAutoresizingMaskIntoConstraints = false
@@ -220,6 +224,7 @@ private final class VerticalTrackVolumeSliderView: NSView {
     }
 
     var onValueChanged: ((Float) -> Void)?
+    var onEditingEnded: (() -> Void)?
 
     private var isHovered = false {
         didSet {
@@ -235,6 +240,10 @@ private final class VerticalTrackVolumeSliderView: NSView {
 
     private var trackingArea: NSTrackingArea?
     private let knobRadius: CGFloat = 7
+
+    override var acceptsFirstResponder: Bool {
+        true
+    }
 
     override var mouseDownCanMoveWindow: Bool {
         false
@@ -256,6 +265,11 @@ private final class VerticalTrackVolumeSliderView: NSView {
         addTrackingArea(nextTrackingArea)
     }
 
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
     override func mouseEntered(with event: NSEvent) {
         isHovered = true
     }
@@ -265,6 +279,7 @@ private final class VerticalTrackVolumeSliderView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
         isDragging = true
         updateValue(with: event)
     }
@@ -276,6 +291,7 @@ private final class VerticalTrackVolumeSliderView: NSView {
     override func mouseUp(with event: NSEvent) {
         updateValue(with: event)
         isDragging = false
+        onEditingEnded?()
     }
 
     override func draw(_ dirtyRect: NSRect) {

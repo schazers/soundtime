@@ -303,6 +303,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         renderState = renderState.withTracks(tracks)
     }
 
+    func displayTrackMixSettings(_ tracks: [TimelineRenderState.Track]) {
+        renderState = renderState.withTracks(tracks)
+    }
+
     func updateWaveformTouchTuning(
         trailDuration: TimeInterval,
         trailFalloffSteepness: Float,
