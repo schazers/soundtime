@@ -70,29 +70,15 @@ class TimelineMetalLayerView: NSView {
         updateDrawableSize()
     }
 
-    func renderTimeline(using renderer: TimelineRenderer?) {
-        guard
-            let renderer,
-            let target = makeRenderTarget()
-        else {
-            return
-        }
-
-        renderer.render(to: target)
+    func makeTimelineRenderTarget() -> TimelineRenderTarget? {
+        makeRenderTarget()
     }
 
-    func renderTimeline(using renderer: TimelineRenderer?, frame: TimelineDisplayLinkFrame) {
-        guard
-            let renderer,
-            let target = makeRenderTarget(
-                drawable: frame.drawable,
-                displayTimestamp: frame.targetPresentationTimestamp
-            )
-        else {
-            return
-        }
-
-        renderer.render(to: target)
+    func makeTimelineRenderTarget(frame: TimelineDisplayLinkFrame) -> TimelineRenderTarget? {
+        makeRenderTarget(
+            drawable: frame.drawable,
+            displayTimestamp: frame.targetPresentationTimestamp
+        )
     }
 
     private func configureLayerHosting() {

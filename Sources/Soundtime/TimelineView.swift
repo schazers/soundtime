@@ -308,8 +308,19 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         needsTimelineRender = false
-        renderTimeline(using: timelineRenderer, frame: frame)
+        submitTimelineRender(frame: frame)
         stopTimelineDisplayLinkIfIdle()
+    }
+
+    private func submitTimelineRender(frame: TimelineDisplayLinkFrame) {
+        guard
+            let timelineRenderer,
+            let renderTarget = makeTimelineRenderTarget(frame: frame)
+        else {
+            return
+        }
+
+        timelineRenderer.render(to: renderTarget)
     }
 
     private func startTransientRenderPulse(duration: CFTimeInterval? = nil) {
