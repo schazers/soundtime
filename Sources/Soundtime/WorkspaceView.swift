@@ -1048,8 +1048,6 @@ final class WorkspaceView: NSView {
             selectedTimelineRange: selectedTimelineRange,
             restoreProgress: nil
         )
-        recordingStartUndoSnapshot = snapshot
-        recordingStartUndoStackCount = editUndoStack.count
         editUndoStack.append(.projectTracks(snapshot))
 
         let trackID = UUID()
@@ -1140,6 +1138,8 @@ final class WorkspaceView: NSView {
             selectedTimelineRange: selectedTimelineRange,
             restoreProgress: nil
         )
+        recordingStartUndoSnapshot = snapshot
+        recordingStartUndoStackCount = editUndoStack.count
         editUndoStack.append(.projectTracks(snapshot))
 
         recordingTrackID = trackID
