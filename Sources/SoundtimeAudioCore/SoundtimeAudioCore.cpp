@@ -12,6 +12,8 @@
 
 namespace {
 
+constexpr size_t maximumRealtimeTrackCount = 4096;
+
 struct AudioSource {
     enum class Storage {
         interleavedFloat,
@@ -151,7 +153,7 @@ private:
 
 struct SoundtimeAudioCoreEngine {
     SoundtimeAudioCoreEngine() {
-        trackGainRamps.reserve(64);
+        trackGainRamps.resize(maximumRealtimeTrackCount);
     }
 
     std::atomic<uint64_t> frameIndex{0};
@@ -182,6 +184,7 @@ struct SoundtimeAudioCoreEngine {
     uint64_t transportPauseFrameIndex = 0;
     bool hasTransportPauseFrameIndex = false;
     const RenderGraph* trackGainRampGraph = nullptr;
+    size_t trackGainRampCount = 0;
     std::vector<TrackGainRamp> trackGainRamps;
 };
 
@@ -480,15 +483,19 @@ void reconcile_track_gain_ramps(
     const AudioRenderConfig& config,
     const RenderGraph& graph
 ) {
+    const auto trackCount = graph.tracks.size();
+    if (trackCount > engine.trackGainRamps.size()) {
+        return;
+    }
+
     if (engine.trackGainRampGraph == config.graph &&
-        engine.trackGainRamps.size() == graph.tracks.size()) {
+        engine.trackGainRampCount == trackCount) {
         return;
     }
 
     const auto rampFrames = track_gain_ramp_frame_count(config);
-    const auto previousRampCount = engine.trackGainRamps.size();
-    engine.trackGainRamps.resize(graph.tracks.size());
-    for (size_t trackIndex = 0; trackIndex < graph.tracks.size(); trackIndex++) {
+    const auto previousRampCount = engine.trackGainRampCount;
+    for (size_t trackIndex = 0; trackIndex < trackCount; trackIndex++) {
         const auto& track = graph.tracks[trackIndex];
         auto& ramp = engine.trackGainRamps[trackIndex];
         const auto targetGain = std::max(track.gain, 0.0f);
@@ -506,6 +513,7 @@ void reconcile_track_gain_ramps(
     }
 
     engine.trackGainRampGraph = config.graph;
+    engine.trackGainRampCount = trackCount;
 }
 
 void process_commands(SoundtimeAudioCoreEngine& engine, const AudioRenderConfig& config) {
@@ -565,7 +573,7 @@ void reset_engine_runtime(SoundtimeAudioCoreEngine& engine) {
     engine.transportPauseFrameIndex = 0;
     engine.hasTransportPauseFrameIndex = false;
     engine.trackGainRampGraph = nullptr;
-    engine.trackGainRamps.clear();
+    engine.trackGainRampCount = 0;
     engine.commandQueue.clear();
     engine.clockSamples.clear();
     engine.meterSamples.clear();
@@ -690,6 +698,9 @@ std::shared_ptr<RenderGraph> make_graph_from_track_configs(
     if (tracks == nullptr || trackCount == 0) {
         return nullptr;
     }
+    if (trackCount > maximumRealtimeTrackCount) {
+        return nullptr;
+    }
 
     const auto* firstSource = tracks[0].source;
     if (firstSource == nullptr || !firstSource->source) {
@@ -751,6 +762,9 @@ std::shared_ptr<RenderGraph> make_graph_from_segmented_track_configs(
     uint32_t trackCount
 ) {
     if (tracks == nullptr || trackCount == 0) {
+        return nullptr;
+    }
+    if (trackCount > maximumRealtimeTrackCount) {
         return nullptr;
     }
 
