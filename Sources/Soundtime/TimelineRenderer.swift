@@ -904,7 +904,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let maximumCachedWaveformShaderBinBuffers = 768
     private let maximumCachedWaveformShaderBinBufferBytes = 1_024 * 1_024 * 1_024
     private let maximumBackgroundPrewarmedWaveformShaderBins = 16_384
-    private let maximumViewportPrewarmedWaveformShaderBins = 1_048_576
+    private let maximumViewportPrewarmedWaveformShaderBins = 2_097_152
     private let maximumViewportPrewarmTrackCount = 24
     private let maximumInFlightWaveformShaderBufferUploads = 8
     private let maximumSynchronousWaveformShaderBinBufferBins = 4_096
@@ -2304,8 +2304,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return nil
         }
 
-        if preferredIndex + 1 < mipLevels.count {
-            for fallbackIndex in (preferredIndex + 1)..<mipLevels.count {
+        if preferredIndex > 0 {
+            for fallbackIndex in stride(from: preferredIndex - 1, through: 0, by: -1) {
                 let fallbackMipLevel = mipLevels[fallbackIndex]
                 if let allocation = waveformShaderAllocation(track: track, mipLevel: fallbackMipLevel) {
                     return WaveformShaderDrawable(
@@ -2317,8 +2317,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             }
         }
 
-        if preferredIndex > 0 {
-            for fallbackIndex in stride(from: preferredIndex - 1, through: 0, by: -1) {
+        if preferredIndex + 1 < mipLevels.count {
+            for fallbackIndex in (preferredIndex + 1)..<mipLevels.count {
                 let fallbackMipLevel = mipLevels[fallbackIndex]
                 if let allocation = waveformShaderAllocation(track: track, mipLevel: fallbackMipLevel) {
                     return WaveformShaderDrawable(
