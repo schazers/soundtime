@@ -881,8 +881,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let playheadContactMinimumSpawnInterval: CFTimeInterval = 1.0 / 90.0
     private let transientParticleMaximumCount = 260
     private let maximumTransientParticleVerticesPerFrame = 10_000
-    private let deletionEffectDuration: CFTimeInterval = 0.28
-    private let deletionShardCount = 56
+    private let deletionEffectDuration: CFTimeInterval = 0.18
+    private let deletionShardCount = 40
     private let deletionEffectMaximumCount = 8
     private let deletionEffectMaximumCapturedBins = 512
     private let deletionRippleMaximumCapturedBins = 1_024
