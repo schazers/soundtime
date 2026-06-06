@@ -1158,6 +1158,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         renderState = renderState.withViewport(viewport)
     }
 
+    func displayTrackLayout(_ trackLayout: TimelineTrackLayout) {
+        guard renderState.trackLayout != trackLayout else {
+            return
+        }
+
+        gridCache = nil
+        renderState = renderState.withTrackLayout(trackLayout)
+    }
+
     func displayHoverProgress(_ progress: Float?, isArmed: Bool = false) {
         renderState = renderState.withHover(progress: progress, isArmed: isArmed)
     }

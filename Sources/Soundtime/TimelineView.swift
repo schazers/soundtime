@@ -51,6 +51,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onTrimRequested: ((TimelineTrimRange) -> Void)?
     var onFrameStatsChanged: ((TimelineFrameStats) -> Void)?
     var onTimelineInteractionBegan: (() -> Void)?
+    var onTrackLaneLayoutChanged: ((ResolvedTimelineTrackLayout) -> Void)?
     var canApplyGainEffect = false
     var canApplyFadeEffect = false
     var canReapplyLastEffect = false
@@ -74,6 +75,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         qos: .userInteractive
     )
     private var viewport = TimelineViewport.full
+    private var trackLayout = TimelineTrackLayout.default
+    private var lastPublishedTrackLayout: ResolvedTimelineTrackLayout?
     private var isSelectionEnabled = false
     private var selectionAnchorProgress: Double?
     private var selectionAnchorPoint: CGPoint?
@@ -184,6 +187,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         if !wasSelectionEnabled || !isSelectionEnabled {
             setViewport(.full)
         }
+        updateTrackLayoutForCurrentBounds(requestRender: false)
 
         updateTimelineRenderer { renderer in
             renderer.displayWaveform(waveformOverview)
@@ -222,6 +226,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         if !wasSelectionEnabled || !isSelectionEnabled {
             setViewport(.full)
         }
+        updateTrackLayoutForCurrentBounds(requestRender: false)
 
         updateTimelineRenderer { renderer in
             renderer.displayTracks(tracks)
@@ -257,6 +262,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         timelineDuration = Self.timelineDuration(for: tracks)
         let wasSelectionEnabled = isSelectionEnabled
         isSelectionEnabled = tracks.contains { $0.waveformOverview?.isEmpty == false }
+        updateTrackLayoutForCurrentBounds(requestRender: false)
 
         updateTimelineRenderer { renderer in
             renderer.displayTrackMixSettings(tracks)
@@ -420,6 +426,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     override func layout() {
         super.layout()
+        updateTrackLayoutForCurrentBounds(requestRender: false)
         requestTimelineRender()
     }
 
@@ -466,8 +473,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                 }
             }
             let initialViewport = viewport
+            let initialTrackLayout = trackLayout
             updateTimelineRenderer { renderer in
                 renderer.displayViewport(initialViewport)
+                renderer.displayTrackLayout(initialTrackLayout)
             }
             requestTimelineRender()
         } catch {
@@ -1395,6 +1404,38 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         requestTimelineRender()
     }
 
+    private func resolvedTrackLayoutForCurrentBounds() -> ResolvedTimelineTrackLayout {
+        trackLayout.resolved(
+            totalTrackCount: currentTrackIDs.count,
+            viewportHeight: Float(max(bounds.height, 1))
+        )
+    }
+
+    private func updateTrackLayoutForCurrentBounds(requestRender: Bool) {
+        let clampedLayout = trackLayout.clamped(
+            totalTrackCount: currentTrackIDs.count,
+            viewportHeight: Float(max(bounds.height, 1))
+        )
+        let layoutChanged = clampedLayout != trackLayout
+        trackLayout = clampedLayout
+        let resolvedLayout = resolvedTrackLayoutForCurrentBounds()
+        if lastPublishedTrackLayout != resolvedLayout {
+            lastPublishedTrackLayout = resolvedLayout
+            onTrackLaneLayoutChanged?(resolvedLayout)
+        }
+
+        guard layoutChanged else {
+            return
+        }
+
+        updateTimelineRenderer { renderer in
+            renderer.displayTrackLayout(clampedLayout)
+        }
+        if requestRender {
+            requestTimelineRender()
+        }
+    }
+
     private func pageViewportIfNeeded(forPlayheadProgress progress: Float) {
         guard isSelectionEnabled, !viewport.isFull else {
             return
@@ -1537,11 +1578,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return nil
         }
 
-        let normalizedYFromTop = min(max(1 - Float(point.y / bounds.height), 0), 0.999_999)
-        let trackIndex = min(
-            max(Int((normalizedYFromTop * Float(currentTrackIDs.count)).rounded(.down)), 0),
-            currentTrackIDs.count - 1
-        )
+        let yFromTop = Float(bounds.height - point.y)
+        guard let trackIndex = resolvedTrackLayoutForCurrentBounds().trackIndex(atYFromTop: yFromTop) else {
+            return nil
+        }
         return currentTrackIDs[trackIndex]
     }
 }
