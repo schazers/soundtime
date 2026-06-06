@@ -4229,7 +4229,7 @@ final class WorkspaceView: NSView {
 
     private func writeProject(to url: URL) {
         do {
-            prepareProjectForSerialization()
+            try prepareProjectForSerialization()
             let projectURL = normalizedProjectURL(url)
             try SoundtimeProjectStore.save(currentProject(), to: projectURL)
             currentProjectURL = projectURL
@@ -4249,7 +4249,7 @@ final class WorkspaceView: NSView {
         }
 
         do {
-            prepareProjectForSerialization()
+            try prepareProjectForSerialization()
             try SoundtimeProjectStore.save(currentProject(), to: currentProjectURL)
             markProjectSourceFilesAsSaved()
         } catch {
@@ -4313,10 +4313,69 @@ final class WorkspaceView: NSView {
         updateEffectCommandState()
     }
 
-    private func prepareProjectForSerialization() {
+    private func prepareProjectForSerialization() throws {
         if recordingTrackID != nil {
             stopRecording()
         }
+        try materializeInMemoryEditedProjectTracksForSerialization()
+    }
+
+    private func materializeInMemoryEditedProjectTracksForSerialization() throws {
+        var replacedTracks: [ProjectTrack] = []
+        var didMaterializeTrack = false
+
+        for trackIndex in projectTracks.indices {
+            guard needsOwnedSourceMaterializationForSave(projectTracks[trackIndex]) else {
+                continue
+            }
+
+            guard let buffer = projectTracks[trackIndex].decodedAudioBuffer ??
+                projectTracks[trackIndex].audioTimeline?.render()
+            else {
+                continue
+            }
+
+            replacedTracks.append(projectTracks[trackIndex])
+            let materializedURL = recordingFileURL(trackName: "\(projectTracks[trackIndex].name)-Edit")
+            try WAVFileWriter.write(buffer, to: materializedURL)
+            let fileInfo = try WAVAudioDecoder.inspect(url: materializedURL)
+            let waveformOverview = WaveformOverviewBuilder.build(from: buffer)
+
+            projectTracks[trackIndex].sourceURL = materializedURL
+            projectTracks[trackIndex].durationHint = buffer.duration
+            projectTracks[trackIndex].sourceWaveformOverview = waveformOverview
+            projectTracks[trackIndex].waveformOverview = waveformOverview
+            projectTracks[trackIndex].decodedAudioBuffer = buffer
+            projectTracks[trackIndex].zeroCrossingIndex = AudioZeroCrossingIndex.build(from: buffer)
+            projectTracks[trackIndex].zeroCrossingProbe = try? WAVAudioDecoder.makeZeroCrossingProbe(
+                url: materializedURL,
+                fileInfo: fileInfo
+            )
+            projectTracks[trackIndex].audioTimeline = nil
+            projectTracks[trackIndex].fileTimeline = nil
+            projectTracks[trackIndex].ownsSourceFile = true
+            projectTracks[trackIndex].importID = UUID()
+            projectTracks[trackIndex].editRevision += 1
+            didMaterializeTrack = true
+        }
+
+        guard didMaterializeTrack else {
+            return
+        }
+
+        syncActiveTrackFields()
+        refreshProjectTimelineDisplay(rebuildControls: false, animateWaveformTransition: false)
+        updateProjectDisplayTiming()
+        reloadPlaybackFromProjectTracks(preserveProgress: true)
+        cleanupOwnedSourceFiles(replacedTracks: replacedTracks)
+    }
+
+    private func needsOwnedSourceMaterializationForSave(_ track: ProjectTrack) -> Bool {
+        guard track.audioTimeline != nil else {
+            return false
+        }
+
+        return persistedEditTimeline(for: track) == nil
     }
 
     private func currentProject() -> SoundtimeProject {
