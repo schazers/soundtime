@@ -3166,7 +3166,7 @@ final class WorkspaceView: NSView {
         selectedTimelineRange = nil
         timelineSurface.displaySelection(nil)
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
-        refreshProjectTimelineDisplay(rebuildControls: false)
+        refreshProjectTimelineDisplay(rebuildControls: false, animateWaveformTransition: false)
         updateProjectDisplayTiming()
         reloadPlaybackFromProjectTracks(
             preserveProgress: false,
