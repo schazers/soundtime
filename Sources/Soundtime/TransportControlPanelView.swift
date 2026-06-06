@@ -743,12 +743,13 @@ private final class TransportControlPanelRenderer {
             float2 halfSize = float2(buttonRadius - depth * 0.55, buttonRadius - depth * 0.35);
             float buttonSDF = rounded_box_sdf(p - buttonCenter, halfSize, buttonRadius);
             float buttonCoverage = coverage_from_sdf(buttonSDF, aa);
-            float glowDistance = max(buttonSDF, 0.0);
-            float glow = exp(-glowDistance * glowDistance / (pressed > 0.0 ? 96.0 : 62.0));
-            float broadGlow = exp(-glowDistance * glowDistance / 190.0);
+            float radialDistance = max(length(p - buttonCenter) - buttonRadius, 0.0);
+            float glowLimit = 1.0 - smoothstep(15.0, 25.0, radialDistance);
+            float glow = exp(-radialDistance / (pressed > 0.0 ? 8.6 : 7.2)) * glowLimit;
+            float broadGlow = exp(-radialDistance / 10.5) * glowLimit * glowLimit;
             float pulse = 0.5 + 0.5 * sin(time * 1.45 + activeEnergy * 2.1);
-            float bloom = glow * (0.028 + 0.040 * hot + 0.050 * pressed + 0.020 * audioEnergy + statePulse) * enabled;
-            float broadBloom = broadGlow * (0.004 + 0.008 * hot + 0.009 * pressed + 0.006 * pulse * activeEnergy) * enabled;
+            float bloom = glow * (0.020 + 0.028 * hot + 0.036 * pressed + 0.015 * audioEnergy + statePulse * 0.65) * enabled;
+            float broadBloom = broadGlow * (0.0025 + 0.0045 * hot + 0.0055 * pressed + 0.004 * pulse * activeEnergy) * enabled;
             color = source_over(color, float4(mix(accent, float3(0.68, 0.98, 0.92), 0.22), broadBloom));
             color = source_over(color, float4(mix(accent, float3(0.78, 1.0, 0.96), 0.28), bloom));
 

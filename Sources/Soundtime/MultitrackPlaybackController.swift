@@ -419,6 +419,12 @@ final class MultitrackPlaybackController: PlaybackEngine {
             format = audioFile.processingFormat
             zeroCrossingIndex = nil
             zeroCrossingProbe = sourceZeroCrossingProbe
+        case let .fileTimeline(url, _, sourceZeroCrossingProbe):
+            let audioFile = try AVAudioFile(forReading: url)
+            source = .file(audioFile)
+            format = audioFile.processingFormat
+            zeroCrossingIndex = nil
+            zeroCrossingProbe = sourceZeroCrossingProbe
         case let .timeline(audioTimeline, sourceZeroCrossingIndex):
             let decodedAudioBuffer = audioTimeline.render()
             source = .decoded(decodedAudioBuffer)

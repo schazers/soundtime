@@ -382,6 +382,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     private struct DeletionEffect {
         let selection: TimelineSelection
+        let capturedBins: [WaveformOverview.Bin]
         var birthTimestamp: CFTimeInterval
         let seed: UInt64
     }
@@ -782,6 +783,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let deletionEffectDuration: CFTimeInterval = 0.58
     private let deletionShardCount = 96
     private let deletionEffectMaximumCount = 8
+    private let deletionEffectMaximumCapturedBins = 512
     private let transientParticleScorePercentile: Float = 0.997
     private let transientParticleProfileSampleLimit = 2_048
     private let transientParticleMinimumSpacing: TimeInterval = 0.32
@@ -1195,6 +1197,28 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         renderState = renderState.withGainPreview(gainPreview)
     }
 
+    func inverseFisheyeViewportProgress(
+        _ visualViewportProgress: Float,
+        trackID: UUID?,
+        timestamp: CFTimeInterval
+    ) -> Float {
+        let visualViewportProgress = min(max(visualViewportProgress, 0), 1)
+        let playheadProgress = projectedPlayheadProgress(at: timestamp) ?? renderState.playheadProgress
+        var fisheye = waveformFisheyeParameters(
+            renderState: renderState,
+            playheadProgress: playheadProgress,
+            displayTimestamp: timestamp
+        )
+        if let trackID {
+            fisheye = scaledWaveformFisheye(
+                fisheye,
+                by: trackFisheyeEnergy(for: trackID, at: timestamp)
+            )
+        }
+
+        return inverseFisheyeX(visualViewportProgress, fisheye: fisheye)
+    }
+
     func triggerDeletionEffect(selection: TimelineSelection) {
         guard selection.durationProgress > 0 else {
             return
@@ -1206,6 +1230,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         seed &+= UInt64((selection.endProgress * 1_000_000).rounded(.down))
         let effect = DeletionEffect(
             selection: selection,
+            capturedBins: capturedDeletionBins(for: selection),
             birthTimestamp: -1,
             seed: seed
         )
@@ -1216,6 +1241,56 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             deletionEffects.removeFirst(deletionEffects.count - deletionEffectMaximumCount)
         }
         deletionEffectLock.unlock()
+    }
+
+    private func capturedDeletionBins(for selection: TimelineSelection) -> [WaveformOverview.Bin] {
+        let selectedTrack = selection.trackID.flatMap { trackID in
+            renderState.tracks.first { $0.id == trackID }
+        } ?? renderState.tracks.first
+        guard
+            let overview = selectedTrack?.waveformOverview,
+            !overview.bins.isEmpty
+        else {
+            return []
+        }
+
+        let binCount = overview.bins.count
+        let startIndex = min(
+            max(Int((selection.startProgress * Double(binCount)).rounded(.down)), 0),
+            binCount
+        )
+        let endIndex = min(
+            max(Int((selection.endProgress * Double(binCount)).rounded(.up)), startIndex),
+            binCount
+        )
+        guard startIndex < endIndex else {
+            return []
+        }
+
+        let sourceCount = endIndex - startIndex
+        let targetCount = min(sourceCount, deletionEffectMaximumCapturedBins)
+        if sourceCount <= targetCount {
+            return Array(overview.bins[startIndex..<endIndex])
+        }
+
+        var capturedBins: [WaveformOverview.Bin] = []
+        capturedBins.reserveCapacity(targetCount)
+        for targetIndex in 0..<targetCount {
+            let sourceStart = startIndex + Int(
+                (Double(targetIndex) / Double(targetCount)) * Double(sourceCount)
+            )
+            let sourceEnd = startIndex + Int(
+                (Double(targetIndex + 1) / Double(targetCount)) * Double(sourceCount)
+            )
+            let clampedEnd = min(max(sourceEnd, sourceStart + 1), endIndex)
+            var accumulator = WaveformBinAccumulator()
+            for sourceIndex in sourceStart..<clampedEnd {
+                accumulator.addBin(overview.bins[sourceIndex])
+            }
+            capturedBins.append(accumulator.makeBin())
+        }
+
+        return capturedBins
     }
 
     func render(to target: TimelineRenderTarget) {
@@ -3332,7 +3407,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         let drawableSize = SIMD2<Float>(width, height)
         var vertices: [TimelineVertex] = []
-        vertices.reserveCapacity(effects.count * deletionShardCount * 12)
+        vertices.reserveCapacity(effects.count * (deletionShardCount * 12 + deletionEffectMaximumCapturedBins * 6))
 
         for effect in effects {
             let birthTimestamp = effect.birthTimestamp >= 0 ? effect.birthTimestamp : displayTimestamp
@@ -3376,6 +3451,19 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             let dissolve = 1 - smoothStep(progress)
             let blast = 1 - pow(1 - progress, 2.2)
             let shardAlpha = max(dissolve * dissolve, 0)
+
+            appendDeletedWaveformDissolve(
+                to: &vertices,
+                effect: effect,
+                leftX: leftX,
+                rightX: rightX,
+                topY: topY,
+                bottomY: bottomY,
+                centerY: centerY,
+                progress: progress,
+                blast: blast,
+                drawableSize: drawableSize
+            )
 
             appendDeletionFractureFlash(
                 to: &vertices,
@@ -3427,6 +3515,96 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         return vertices
+    }
+
+    private func appendDeletedWaveformDissolve(
+        to vertices: inout [TimelineVertex],
+        effect: DeletionEffect,
+        leftX: Float,
+        rightX: Float,
+        topY: Float,
+        bottomY: Float,
+        centerY: Float,
+        progress: Float,
+        blast: Float,
+        drawableSize: SIMD2<Float>
+    ) {
+        guard
+            !effect.capturedBins.isEmpty,
+            rightX > leftX,
+            bottomY > topY
+        else {
+            return
+        }
+
+        let visibility = 1 - smoothStep(min(max(progress / 0.48, 0), 1))
+        guard visibility > 0.002 else {
+            return
+        }
+
+        let selectionWidth = max(rightX - leftX, 1)
+        let laneHeight = max(bottomY - topY, 1)
+        let amplitude = laneHeight * 0.39
+        let binCount = effect.capturedBins.count
+        let baseStep = selectionWidth / Float(max(binCount, 1))
+        let barHalfWidth = min(max(baseStep * 0.42, 0.75), 3.2)
+        let time = progress * Float(deletionEffectDuration)
+        let fade = visibility * visibility
+
+        for (binIndex, bin) in effect.capturedBins.enumerated() {
+            let seed = effect.seed &+ UInt64(binIndex) &* 0xD6E8_FD9D_A593_6D3D
+            let phase = (Float(binIndex) + 0.5) / Float(max(binCount, 1))
+            let sourceX = leftX + selectionWidth * phase
+            let topSampleY = centerY - bin.maximumSample * amplitude
+            let bottomSampleY = centerY - bin.minimumSample * amplitude
+            var top = min(topSampleY, bottomSampleY)
+            var bottom = max(topSampleY, bottomSampleY)
+            if bottom - top < 1.4 {
+                top = centerY - 0.7
+                bottom = centerY + 0.7
+            }
+
+            let outwardX = (phase - 0.5) * 2
+            let randomAngle = pseudoRandom01(seed &+ 41) * Float.pi * 2
+            let randomDirection = SIMD2<Float>(
+                cos(randomAngle) * 0.35 + outwardX * 0.92,
+                sin(randomAngle) * 0.72
+            )
+            let speed = 26 + 150 * pseudoRandom01(seed &+ 53)
+            let offset = randomDirection * speed * time * (0.25 + blast * 1.05)
+            let stretch = 1 + blast * (0.22 + 0.36 * pseudoRandom01(seed &+ 67))
+            let center = SIMD2<Float>(sourceX, (top + bottom) * 0.5) + offset
+            let halfHeight = max((bottom - top) * 0.5 * stretch, 0.8)
+            let alpha = fade * (0.18 + 0.42 * bin.peakMagnitude)
+            let cold = pseudoRandom01(seed &+ 79)
+            let color = SIMD4<Float>(
+                0.70 + 0.22 * cold,
+                0.96 + 0.04 * cold,
+                0.94 + 0.06 * pseudoRandom01(seed &+ 83),
+                alpha
+            )
+
+            appendRectangle(
+                to: &vertices,
+                left: center.x - barHalfWidth,
+                right: center.x + barHalfWidth,
+                top: center.y - halfHeight,
+                bottom: center.y + halfHeight,
+                color: color,
+                drawableSize: drawableSize
+            )
+
+            if binIndex.isMultiple(of: 11) {
+                appendSoftParticle(
+                    to: &vertices,
+                    center: center,
+                    radius: 3.0 + 7.0 * bin.peakMagnitude,
+                    color: SIMD3<Float>(color.x, color.y, color.z),
+                    alpha: alpha * 0.32,
+                    drawableSize: drawableSize
+                )
+            }
+        }
     }
 
     private func appendDeletionFractureFlash(
@@ -4169,8 +4347,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return .zero
         }
 
-        let radius = waveformFisheyeMaximumRadius * amount
-        let exponent = 1 + (waveformFisheyeMinimumExponent - 1) * amount
+        let extendedZoomRatio = max(visibleDuration / max(waveformFisheyeMaximumVisibleDuration, 0.001), 1)
+        let extendedZoomAmount = smoothStep(min(max(Float(log2(extendedZoomRatio) / 2.1), 0), 1))
+        let radiusBoost = 1 + extendedZoomAmount * amount * 0.72
+        let exponentBoost = extendedZoomAmount * amount * 0.20
+        let radius = min(waveformFisheyeMaximumRadius * amount * radiusBoost, 0.18)
+        let targetExponent = max(waveformFisheyeMinimumExponent - exponentBoost, 0.24)
+        let exponent = 1 + (targetExponent - 1) * amount
         return SIMD4<Float>(
             min(max(centerX, 0), 1),
             max(radius, 0.001),
@@ -4230,6 +4413,53 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             1 + (fisheye.z - 1) * energy,
             fisheye.w * energy
         )
+    }
+
+    private func inverseFisheyeX(_ x: Float, fisheye: SIMD4<Float>) -> Float {
+        let radius = fisheye.y
+        let exponent = fisheye.z
+        guard radius > 0, exponent > 0, exponent < 0.999 else {
+            return min(max(x, 0), 1)
+        }
+
+        let center = fisheye.x
+        let dx = x - center
+        let distance = abs(dx)
+        let sideRadius = fisheyeSideRadius(dx: dx, radius: radius)
+        guard distance > 0.000_001, distance < sideRadius else {
+            return min(max(x, 0), 1)
+        }
+
+        let target = min(max(distance / sideRadius, 0), 1)
+        var lowerBound: Float = 0
+        var upperBound: Float = 1
+        for _ in 0..<10 {
+            let midpoint = (lowerBound + upperBound) * 0.5
+            let warpedMidpoint = fisheyeWarpedNormalizedDistance(midpoint, exponent: exponent)
+            if warpedMidpoint < target {
+                lowerBound = midpoint
+            } else {
+                upperBound = midpoint
+            }
+        }
+
+        let t = (lowerBound + upperBound) * 0.5
+        let unwarpedDistance = sideRadius * t
+        return min(max(center + (dx < 0 ? -unwarpedDistance : unwarpedDistance), 0), 1)
+    }
+
+    private func fisheyeSideRadius(dx: Float, radius: Float) -> Float {
+        let totalRadius = max(radius * 2, 0)
+        return dx < 0 ? totalRadius * 0.10 : totalRadius * 0.90
+    }
+
+    private func fisheyeWarpedNormalizedDistance(_ normalizedDistance: Float, exponent: Float) -> Float {
+        let t = min(max(normalizedDistance, 0), 1)
+        let strength = min(max(1 - exponent, 0), 1)
+        let centerDisplacement = t *
+            exp(-pow(t / 0.32, 4)) *
+            pow(max(1 - t, 0), 3)
+        return min(max(t + strength * 3 * centerDisplacement, 0), 1)
     }
 
     private func cpuFallbackWaveformFisheye(
@@ -6469,6 +6699,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         return clamp(t + strength * 3.0 * centerDisplacement, 0.0, 1.0);
     }
 
+    float fisheye_side_radius(float dx, float radius) {
+        float totalRadius = max(radius * 2.0, 0.0);
+        return dx < 0.0 ? totalRadius * 0.10 : totalRadius * 0.90;
+    }
+
     float fisheye_x(float x, float4 fisheye) {
         float radius = fisheye.y;
         float exponent = fisheye.z;
@@ -6479,12 +6714,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float center = fisheye.x;
         float dx = x - center;
         float distance = abs(dx);
-        if (distance <= 0.000001 || distance >= radius) {
+        float sideRadius = fisheye_side_radius(dx, radius);
+        if (distance <= 0.000001 || distance >= sideRadius) {
             return x;
         }
 
-        float t = clamp(distance / radius, 0.0, 1.0);
-        float warpedDistance = radius * fisheye_warped_normalized_distance(t, exponent);
+        float t = clamp(distance / sideRadius, 0.0, 1.0);
+        float warpedDistance = sideRadius * fisheye_warped_normalized_distance(t, exponent);
         return clamp(center + sign(dx) * warpedDistance, 0.0, 1.0);
     }
 
@@ -6498,11 +6734,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float center = fisheye.x;
         float dx = x - center;
         float distance = abs(dx);
-        if (distance <= 0.000001 || distance >= radius) {
+        float sideRadius = fisheye_side_radius(dx, radius);
+        if (distance <= 0.000001 || distance >= sideRadius) {
             return x;
         }
 
-        float target = clamp(distance / radius, 0.0, 1.0);
+        float target = clamp(distance / sideRadius, 0.0, 1.0);
         float lowerBound = 0.0;
         float upperBound = 1.0;
         for (uint iteration = 0; iteration < 10; ++iteration) {
@@ -6516,7 +6753,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         float t = (lowerBound + upperBound) * 0.5;
-        float unwarpedDistance = radius * t;
+        float unwarpedDistance = sideRadius * t;
         return clamp(center + sign(dx) * unwarpedDistance, 0.0, 1.0);
     }
 
@@ -6711,8 +6948,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return 0.0;
         }
 
-        float distance = abs(x - fisheye.x);
-        float normalizedDistance = clamp(distance / radius, 0.0, 1.0);
+        float dx = x - fisheye.x;
+        float sideRadius = fisheye_side_radius(dx, radius);
+        float distance = abs(dx);
+        float normalizedDistance = clamp(distance / max(sideRadius, 0.000001), 0.0, 1.0);
         float localAmount = fisheye_focus_weight(normalizedDistance);
         return clamp(localAmount * energy, 0.0, 1.0);
     }
