@@ -8,8 +8,10 @@ final class TrackControlView: NSView {
     var onVolumeEditingEnded: (() -> Void)?
     var onTrackSelected: (() -> Void)?
 
+    private let panelView = NSView()
+    private let contentStack = NSStackView()
     private let titleLabel = NSTextField(labelWithString: "")
-    private let volumeSlider = VerticalTrackVolumeSliderView()
+    private let volumeSlider = HorizontalTrackVolumeSliderView()
     private let muteButton = TrackToggleButton(title: "M")
     private let soloButton = TrackToggleButton(title: "S")
     private let recordButton = TrackIconButton(systemSymbolName: "mic.fill")
@@ -67,7 +69,11 @@ final class TrackControlView: NSView {
             return nil
         }
 
-        if hitView === titleLabel || hitView === buttonStack {
+        if hitView === titleLabel ||
+            hitView === buttonStack ||
+            hitView === contentStack ||
+            hitView === panelView
+        {
             return self
         }
 
@@ -99,6 +105,9 @@ final class TrackControlView: NSView {
 
     private func configure() {
         wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+        panelView.wantsLayer = true
+        panelView.translatesAutoresizingMaskIntoConstraints = false
         updateAppearance()
 
         titleLabel.font = .systemFont(ofSize: 10, weight: .medium)
@@ -130,45 +139,56 @@ final class TrackControlView: NSView {
             self?.onRecordRequested?()
         }
 
-        buttonStack.orientation = .vertical
-        buttonStack.alignment = .centerX
-        buttonStack.spacing = 7
+        buttonStack.orientation = .horizontal
+        buttonStack.alignment = .centerY
+        buttonStack.spacing = 6
         buttonStack.translatesAutoresizingMaskIntoConstraints = false
         buttonStack.addArrangedSubview(soloButton)
         buttonStack.addArrangedSubview(muteButton)
         buttonStack.addArrangedSubview(recordButton)
 
-        addSubview(titleLabel)
-        addSubview(volumeSlider)
-        addSubview(buttonStack)
+        contentStack.orientation = .vertical
+        contentStack.alignment = .leading
+        contentStack.distribution = .fill
+        contentStack.spacing = 6
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
+        contentStack.addArrangedSubview(titleLabel)
+        contentStack.addArrangedSubview(volumeSlider)
+        contentStack.addArrangedSubview(buttonStack)
+
+        addSubview(panelView)
+        panelView.addSubview(contentStack)
 
         NSLayoutConstraint.activate([
-            titleLabel.topAnchor.constraint(equalTo: topAnchor, constant: 8),
-            titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            titleLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            panelView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            panelView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            panelView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            panelView.topAnchor.constraint(greaterThanOrEqualTo: topAnchor, constant: 5),
+            panelView.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -5),
 
-            volumeSlider.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 8),
-            volumeSlider.leadingAnchor.constraint(equalTo: buttonStack.trailingAnchor, constant: 12),
-            volumeSlider.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
-            volumeSlider.widthAnchor.constraint(equalToConstant: 24),
+            contentStack.topAnchor.constraint(equalTo: panelView.topAnchor, constant: 8),
+            contentStack.leadingAnchor.constraint(equalTo: panelView.leadingAnchor, constant: 12),
+            contentStack.trailingAnchor.constraint(lessThanOrEqualTo: panelView.trailingAnchor, constant: -12),
+            contentStack.bottomAnchor.constraint(equalTo: panelView.bottomAnchor, constant: -8),
 
-            buttonStack.centerYAnchor.constraint(equalTo: volumeSlider.centerYAnchor),
-            buttonStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            volumeSlider.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8),
+            titleLabel.widthAnchor.constraint(equalTo: panelView.widthAnchor, constant: -24),
 
-            soloButton.widthAnchor.constraint(equalToConstant: 34),
-            soloButton.heightAnchor.constraint(equalToConstant: 28),
-            muteButton.widthAnchor.constraint(equalToConstant: 34),
-            muteButton.heightAnchor.constraint(equalToConstant: 28),
-            recordButton.widthAnchor.constraint(equalToConstant: 34),
-            recordButton.heightAnchor.constraint(equalToConstant: 28),
+            volumeSlider.widthAnchor.constraint(equalToConstant: 104),
+            volumeSlider.heightAnchor.constraint(equalToConstant: 20),
+
+            soloButton.widthAnchor.constraint(equalToConstant: 31),
+            soloButton.heightAnchor.constraint(equalToConstant: 26),
+            muteButton.widthAnchor.constraint(equalToConstant: 31),
+            muteButton.heightAnchor.constraint(equalToConstant: 26),
+            recordButton.widthAnchor.constraint(equalToConstant: 31),
+            recordButton.heightAnchor.constraint(equalToConstant: 26),
         ])
     }
 
     private func updateAppearance() {
-        layer?.backgroundColor = NSColor(white: isTrackSelected ? 0.16 : 0.075, alpha: 1).cgColor
-        layer?.borderColor = NSColor(white: isTrackSelected ? 0.46 : 0.17, alpha: 1).cgColor
-        layer?.borderWidth = 1
+        panelView.layer?.backgroundColor = NSColor(white: isTrackSelected ? 0.16 : 0.075, alpha: 1).cgColor
+        panelView.layer?.borderColor = NSColor(white: isTrackSelected ? 0.46 : 0.17, alpha: 1).cgColor
+        panelView.layer?.borderWidth = 1
     }
 }
 
@@ -461,7 +481,7 @@ private final class TrackToggleButton: NSControl {
     }
 }
 
-private final class VerticalTrackVolumeSliderView: NSView {
+private final class HorizontalTrackVolumeSliderView: NSView {
     var value: Float = 1 {
         didSet {
             value = min(max(value, 0), 1)
@@ -543,37 +563,37 @@ private final class VerticalTrackVolumeSliderView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
 
-        let trackWidth: CGFloat = 5
-        let trackTop = knobRadius
-        let trackBottom = max(bounds.height - knobRadius, trackTop)
-        let trackHeight = max(trackBottom - trackTop, 1)
-        let trackX = bounds.midX - trackWidth * 0.5
-        let trackRect = NSRect(x: trackX, y: trackTop, width: trackWidth, height: trackHeight)
-        let knobY = trackTop + CGFloat(value) * trackHeight
+        let trackHeight: CGFloat = 5
+        let trackLeft = knobRadius
+        let trackRight = max(bounds.width - knobRadius, trackLeft)
+        let trackWidth = max(trackRight - trackLeft, 1)
+        let trackY = bounds.midY - trackHeight * 0.5
+        let trackRect = NSRect(x: trackLeft, y: trackY, width: trackWidth, height: trackHeight)
+        let knobX = trackLeft + CGFloat(value) * trackWidth
 
         NSColor(white: 0.19, alpha: 1).setFill()
         NSBezierPath(
             roundedRect: trackRect,
-            xRadius: trackWidth * 0.5,
-            yRadius: trackWidth * 0.5
+            xRadius: trackHeight * 0.5,
+            yRadius: trackHeight * 0.5
         ).fill()
 
         let fillRect = NSRect(
-            x: trackX,
-            y: trackTop,
-            width: trackWidth,
-            height: max(knobY - trackTop, 0)
+            x: trackLeft,
+            y: trackY,
+            width: max(knobX - trackLeft, 0),
+            height: trackHeight
         )
         NSColor(white: 0.82, alpha: 1).setFill()
         NSBezierPath(
             roundedRect: fillRect,
-            xRadius: trackWidth * 0.5,
-            yRadius: trackWidth * 0.5
+            xRadius: trackHeight * 0.5,
+            yRadius: trackHeight * 0.5
         ).fill()
 
         let knobRect = NSRect(
-            x: bounds.midX - knobRadius,
-            y: knobY - knobRadius,
+            x: knobX - knobRadius,
+            y: bounds.midY - knobRadius,
             width: knobRadius * 2,
             height: knobRadius * 2
         )
@@ -584,10 +604,10 @@ private final class VerticalTrackVolumeSliderView: NSView {
 
     private func updateValue(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        let trackTop = knobRadius
-        let trackBottom = max(bounds.height - knobRadius, trackTop)
-        let trackHeight = max(trackBottom - trackTop, 1)
-        value = Float((point.y - trackTop) / trackHeight)
+        let trackLeft = knobRadius
+        let trackRight = max(bounds.width - knobRadius, trackLeft)
+        let trackWidth = max(trackRight - trackLeft, 1)
+        value = Float((point.x - trackLeft) / trackWidth)
         onValueChanged?(value)
     }
 }

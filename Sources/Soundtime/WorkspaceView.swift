@@ -563,7 +563,7 @@ final class WorkspaceView: NSView {
             trackControlsBelowDebugConstraint,
             trackControlsStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 22),
             trackControlsStack.bottomAnchor.constraint(equalTo: addTrackButton.topAnchor, constant: -10),
-            trackControlsStack.widthAnchor.constraint(equalToConstant: 118),
+            trackControlsStack.widthAnchor.constraint(equalToConstant: 158),
 
             addTrackButton.leadingAnchor.constraint(equalTo: trackControlsStack.leadingAnchor),
             addTrackButton.trailingAnchor.constraint(equalTo: trackControlsStack.trailingAnchor),
