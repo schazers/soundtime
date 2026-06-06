@@ -16,6 +16,11 @@ struct TimelineFrameStats: Equatable, Sendable {
     let shaderBufferByteCount: Int
     let shaderBufferUploadInFlightCount: Int
     let waveformMipCacheCount: Int
+    let effectVertexCount: Int
+    let effectDroppedVertexCount: Int
+    let transientParticleCount: Int
+    let deletionEffectCount: Int
+    let playheadContactEventCount: Int
 }
 
 struct TimelineRenderTarget: @unchecked Sendable {
@@ -794,6 +799,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var frameStatsCPUWaveformVertexCount = 0
     private var frameStatsGPUWaveformDrawCount = 0
     private var frameStatsShaderBufferUploadCount = 0
+    private var frameStatsEffectVertexCount = 0
+    private var frameStatsEffectDroppedVertexCount = 0
+    private var frameStatsTransientParticleCount = 0
+    private var frameStatsDeletionEffectCount = 0
+    private var frameStatsPlayheadContactEventCount = 0
     var onFrameStatsChanged: ((TimelineFrameStats) -> Void)?
     var onRenderDataPrepared: (() -> Void)?
 
@@ -811,7 +821,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             shaderBufferCount: waveformBufferDiagnostics.bufferCount,
             shaderBufferByteCount: waveformBufferDiagnostics.byteCount,
             shaderBufferUploadInFlightCount: waveformBufferDiagnostics.inFlightCount,
-            waveformMipCacheCount: waveformMipCacheDiagnostics().cacheCount
+            waveformMipCacheCount: waveformMipCacheDiagnostics().cacheCount,
+            effectVertexCount: frameStatsEffectVertexCount,
+            effectDroppedVertexCount: frameStatsEffectDroppedVertexCount,
+            transientParticleCount: frameStatsTransientParticleCount,
+            deletionEffectCount: frameStatsDeletionEffectCount,
+            playheadContactEventCount: frameStatsPlayheadContactEventCount
         )
     }
 
@@ -844,6 +859,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let playheadContactEventsPerTrackBudget = 8
     private let playheadContactMinimumSpawnInterval: CFTimeInterval = 1.0 / 90.0
     private let transientParticleMaximumCount = 260
+    private let maximumEffectVerticesPerFrame = 28_000
+    private let maximumTransientParticleVerticesPerFrame = 10_000
     private let deletionEffectDuration: CFTimeInterval = 0.58
     private let deletionShardCount = 96
     private let deletionEffectMaximumCount = 8
@@ -1505,13 +1522,17 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let transientParticleVertices = makeTransientParticleVertices(
             drawableSize: viewportSize,
             renderState: renderState,
-            displayTimestamp: displayTimestamp
+            displayTimestamp: displayTimestamp,
+            maximumVertexCount: maximumTransientParticleVerticesPerFrame
         )
+        frameStatsEffectVertexCount += transientParticleVertices.count
         let deletionEffectVertices = makeDeletionEffectVertices(
             drawableSize: viewportSize,
             renderState: renderState,
-            displayTimestamp: displayTimestamp
+            displayTimestamp: displayTimestamp,
+            maximumVertexCount: remainingEffectVertexBudget()
         )
+        frameStatsEffectVertexCount += deletionEffectVertices.count
         let hoverGuideVertices = makeHoverGuideVertices(
             drawableSize: viewportSize,
             backingScale: backingScale,
@@ -2459,7 +2480,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             shaderBufferCount: waveformBufferDiagnostics.bufferCount,
             shaderBufferByteCount: waveformBufferDiagnostics.byteCount,
             shaderBufferUploadInFlightCount: waveformBufferDiagnostics.inFlightCount,
-            waveformMipCacheCount: waveformMipCacheDiagnostics().cacheCount
+            waveformMipCacheCount: waveformMipCacheDiagnostics().cacheCount,
+            effectVertexCount: frameStatsEffectVertexCount,
+            effectDroppedVertexCount: frameStatsEffectDroppedVertexCount,
+            transientParticleCount: frameStatsTransientParticleCount,
+            deletionEffectCount: frameStatsDeletionEffectCount,
+            playheadContactEventCount: frameStatsPlayheadContactEventCount
         )
 
         frameRateWindowStartTime = currentTime
@@ -2485,6 +2511,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         frameStatsCPUWaveformVertexCount = 0
         frameStatsGPUWaveformDrawCount = 0
         frameStatsShaderBufferUploadCount = waveformShaderBufferStore.drainPublishedBufferCount()
+        frameStatsEffectVertexCount = 0
+        frameStatsEffectDroppedVertexCount = 0
+        frameStatsTransientParticleCount = transientParticles.count
+        deletionEffectLock.lock()
+        frameStatsDeletionEffectCount = deletionEffects.count
+        deletionEffectLock.unlock()
+        frameStatsPlayheadContactEventCount = playheadContactEvents.count
     }
 
     private func resetFrameRateWindow(startingAt currentTime: CFTimeInterval) {
@@ -3406,26 +3439,33 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private func makeTransientParticleVertices(
         drawableSize: CGSize,
         renderState: TimelineRenderState,
-        displayTimestamp: CFTimeInterval
+        displayTimestamp: CFTimeInterval,
+        maximumVertexCount: Int
     ) -> [TimelineVertex] {
         let width = Float(drawableSize.width)
         let height = Float(drawableSize.height)
-        guard width > 0, height > 0 else {
+        guard width > 0, height > 0, maximumVertexCount >= 3 else {
             return []
         }
 
         transientParticles.removeAll { particle in
             displayTimestamp - particle.birthTimestamp >= particle.lifeDuration
         }
+        frameStatsTransientParticleCount = transientParticles.count
         guard !transientParticles.isEmpty else {
             return []
         }
 
         let drawableSize = SIMD2<Float>(width, height)
         var vertices: [TimelineVertex] = []
-        vertices.reserveCapacity(transientParticles.count * 36)
+        vertices.reserveCapacity(min(maximumVertexCount, transientParticles.count * 36))
 
         for particle in transientParticles {
+            guard vertices.count + 36 <= maximumVertexCount else {
+                frameStatsEffectDroppedVertexCount += 36
+                continue
+            }
+
             let originViewportX = renderState.viewport.viewportProgress(
                 forTimelineProgress: particle.originProgress
             )
@@ -3461,11 +3501,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private func makeDeletionEffectVertices(
         drawableSize: CGSize,
         renderState: TimelineRenderState,
-        displayTimestamp: CFTimeInterval
+        displayTimestamp: CFTimeInterval,
+        maximumVertexCount: Int
     ) -> [TimelineVertex] {
         let width = Float(drawableSize.width)
         let height = Float(drawableSize.height)
-        guard width > 0, height > 0 else {
+        guard width > 0, height > 0, maximumVertexCount >= 3 else {
             return []
         }
 
@@ -3481,6 +3522,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
         let effects = deletionEffects
         deletionEffectLock.unlock()
+        frameStatsDeletionEffectCount = effects.count
 
         guard !effects.isEmpty else {
             return []
@@ -3488,9 +3530,17 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         let drawableSize = SIMD2<Float>(width, height)
         var vertices: [TimelineVertex] = []
-        vertices.reserveCapacity(effects.count * (deletionShardCount * 12 + deletionEffectMaximumCapturedBins * 6))
+        vertices.reserveCapacity(min(
+            maximumVertexCount,
+            effects.count * (deletionShardCount * 12 + deletionEffectMaximumCapturedBins * 6)
+        ))
 
         for effect in effects {
+            guard vertices.count < maximumVertexCount else {
+                frameStatsEffectDroppedVertexCount += deletionEffectEstimatedVertexCount(for: effect)
+                continue
+            }
+
             let birthTimestamp = effect.birthTimestamp >= 0 ? effect.birthTimestamp : displayTimestamp
             let age = max(displayTimestamp - birthTimestamp, 0)
             let progress = min(max(Float(age / deletionEffectDuration), 0), 1)
@@ -3593,9 +3643,31 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 progress: progress,
                 drawableSize: drawableSize
             )
+
+            if vertices.count > maximumVertexCount {
+                frameStatsEffectDroppedVertexCount += vertices.count - maximumVertexCount
+                trimTriangleVertices(&vertices, toMaximumCount: maximumVertexCount)
+            }
         }
 
         return vertices
+    }
+
+    private func remainingEffectVertexBudget() -> Int {
+        max(maximumEffectVerticesPerFrame - frameStatsEffectVertexCount, 0)
+    }
+
+    private func trimTriangleVertices(_ vertices: inout [TimelineVertex], toMaximumCount maximumCount: Int) {
+        let triangleSafeCount = max(maximumCount / 3, 0) * 3
+        guard vertices.count > triangleSafeCount else {
+            return
+        }
+
+        vertices.removeSubrange(triangleSafeCount..<vertices.count)
+    }
+
+    private func deletionEffectEstimatedVertexCount(for effect: DeletionEffect) -> Int {
+        effect.capturedBins.count * 6 + deletionShardCount * 72 + 180
     }
 
     private func appendDeletedWaveformDissolve(
@@ -5510,6 +5582,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         mipLevelSnapshot: WaveformMipLevelSnapshot,
         displayTimestamp: CFTimeInterval
     ) {
+        defer {
+            frameStatsPlayheadContactEventCount = playheadContactEvents.count
+        }
+
         playheadContactEvents.removeAll { event in
             displayTimestamp - event.timestamp >= playheadContactFadeDuration
         }

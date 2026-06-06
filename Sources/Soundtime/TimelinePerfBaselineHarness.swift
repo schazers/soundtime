@@ -53,6 +53,26 @@ enum TimelinePerfBaselineHarness {
                 rendererStats.shaderBufferUploadInFlightCount
         }
 
+        var maximumEffectVertexCount: Int {
+            rendererStatsSamples.map(\.effectVertexCount).max() ?? rendererStats.effectVertexCount
+        }
+
+        var maximumEffectDroppedVertexCount: Int {
+            rendererStatsSamples.map(\.effectDroppedVertexCount).max() ?? rendererStats.effectDroppedVertexCount
+        }
+
+        var maximumTransientParticleCount: Int {
+            rendererStatsSamples.map(\.transientParticleCount).max() ?? rendererStats.transientParticleCount
+        }
+
+        var maximumDeletionEffectCount: Int {
+            rendererStatsSamples.map(\.deletionEffectCount).max() ?? rendererStats.deletionEffectCount
+        }
+
+        var maximumPlayheadContactEventCount: Int {
+            rendererStatsSamples.map(\.playheadContactEventCount).max() ?? rendererStats.playheadContactEventCount
+        }
+
         var maximumVisibleLaneCount: Int {
             visibleLaneCounts.max() ?? 0
         }
@@ -711,6 +731,11 @@ enum TimelinePerfBaselineHarness {
             "visible_lanes_budget": result.visibleLaneBudget,
             "gpu_waveform_draws": stats.gpuWaveformDrawCount,
             "cpu_waveform_vertices": result.maximumCPUWaveformVertexCount,
+            "effect_vertices": result.maximumEffectVertexCount,
+            "effect_vertices_dropped": result.maximumEffectDroppedVertexCount,
+            "transient_particles": result.maximumTransientParticleCount,
+            "deletion_effects": result.maximumDeletionEffectCount,
+            "playhead_contact_events": result.maximumPlayheadContactEventCount,
             "shader_uploads": result.maximumShaderBufferUploadCount,
             "shader_uploads_in_flight": result.maximumShaderBufferUploadInFlightCount,
             "shader_buffers": stats.shaderBufferCount,
@@ -778,6 +803,9 @@ enum TimelinePerfBaselineHarness {
                 "(uploads=\(result.maximumShaderBufferUploadCount), " +
                 "inFlight=\(result.maximumShaderBufferUploadInFlightCount))"
             )
+        }
+        if result.maximumEffectDroppedVertexCount > 0 {
+            failures.append("\(label) dropped \(result.maximumEffectDroppedVertexCount) visual effect vertices")
         }
 
         return failures
