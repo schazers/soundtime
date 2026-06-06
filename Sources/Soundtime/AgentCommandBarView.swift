@@ -60,7 +60,8 @@ final class AgentCommandBarView: NSView, NSTextViewDelegate {
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         let textRect = convert(textBackgroundView.bounds, from: textBackgroundView).insetBy(dx: -2, dy: -2)
-        if textRect.contains(point) {
+        let scrollRect = convert(scrollView.bounds, from: scrollView)
+        if textRect.contains(point), scrollRect.contains(point) == false {
             focusPrompt()
             return
         }
@@ -71,7 +72,8 @@ final class AgentCommandBarView: NSView, NSTextViewDelegate {
     override func hitTest(_ point: NSPoint) -> NSView? {
         let textRect = convert(textBackgroundView.bounds, from: textBackgroundView).insetBy(dx: -2, dy: -2)
         if textRect.contains(point) {
-            return textView
+            let scrollPoint = convert(point, to: scrollView)
+            return scrollView.hitTest(scrollPoint) ?? scrollView
         }
 
         return super.hitTest(point)
