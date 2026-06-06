@@ -31,10 +31,17 @@ final class AudioInputRecorder: @unchecked Sendable {
     var onChunk: (@Sendable (AudioRecordingChunk) -> Void)?
 
     private var audioUnit: AudioUnit?
+    private var renderAudioBufferList: UnsafeMutableAudioBufferListPointer?
+    private var renderChannelPointers: [UnsafeMutablePointer<Float>] = []
+    private var renderFrameCapacity = 0
     private var sampleRate: Double = 44_100
     private var channelCount = 1
     private var isRunning = false
     private let chunkQueue = DispatchQueue(label: "Soundtime.audio.input.chunks", qos: .userInteractive)
+
+    deinit {
+        stop()
+    }
 
     func start(deviceID requestedDeviceID: AudioDeviceID? = nil) throws {
         stop()
@@ -91,6 +98,10 @@ final class AudioInputRecorder: @unchecked Sendable {
             ))
         }
 
+        prepareRenderBuffers(
+            frameCapacity: max(Int(maximumFramesPerSlice(for: audioUnit)), 16_384)
+        )
+
         try check(AudioUnitInitialize(audioUnit))
         try check(AudioOutputUnitStart(audioUnit))
         isRunning = true
@@ -109,6 +120,7 @@ final class AudioInputRecorder: @unchecked Sendable {
         _ = AudioUnitUninitialize(audioUnit)
         AudioComponentInstanceDispose(audioUnit)
         self.audioUnit = nil
+        releaseRenderBuffers()
     }
 
     fileprivate func renderInput(
@@ -122,25 +134,19 @@ final class AudioInputRecorder: @unchecked Sendable {
 
         let frameCount = Int(frameCount)
         let currentChannelCount = max(channelCount, 1)
-        let channelPointers = (0..<currentChannelCount).map { _ in
-            UnsafeMutablePointer<Float>.allocate(capacity: frameCount)
-        }
-        defer {
-            for pointer in channelPointers {
-                pointer.deallocate()
-            }
-        }
-
-        let audioBufferList = AudioBufferList.allocate(maximumBuffers: currentChannelCount)
-        defer {
-            audioBufferList.unsafeMutablePointer.deallocate()
+        guard
+            frameCount <= renderFrameCapacity,
+            currentChannelCount <= renderChannelPointers.count,
+            let audioBufferList = renderAudioBufferList
+        else {
+            return kAudioUnitErr_TooManyFramesToProcess
         }
 
         for channelIndex in 0..<currentChannelCount {
             audioBufferList[channelIndex] = AudioBuffer(
                 mNumberChannels: 1,
                 mDataByteSize: UInt32(frameCount * MemoryLayout<Float>.size),
-                mData: channelPointers[channelIndex]
+                mData: renderChannelPointers[channelIndex]
             )
         }
 
@@ -156,7 +162,7 @@ final class AudioInputRecorder: @unchecked Sendable {
             return status
         }
 
-        let samplesByChannel = channelPointers.map { pointer in
+        let samplesByChannel = renderChannelPointers.prefix(currentChannelCount).map { pointer in
             Array(UnsafeBufferPointer(start: pointer, count: frameCount))
         }
         let hostTime = timestamp.pointee.mHostTime
@@ -233,6 +239,44 @@ final class AudioInputRecorder: @unchecked Sendable {
         }
 
         return audioUnit
+    }
+
+    private func maximumFramesPerSlice(for audioUnit: AudioUnit) -> UInt32 {
+        var maximumFrames: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioUnitGetProperty(
+            audioUnit,
+            kAudioUnitProperty_MaximumFramesPerSlice,
+            kAudioUnitScope_Global,
+            0,
+            &maximumFrames,
+            &size
+        )
+
+        guard status == noErr, maximumFrames > 0 else {
+            return 4_096
+        }
+        return maximumFrames
+    }
+
+    private func prepareRenderBuffers(frameCapacity: Int) {
+        releaseRenderBuffers()
+
+        renderFrameCapacity = max(frameCapacity, 1)
+        renderChannelPointers = (0..<max(channelCount, 1)).map { _ in
+            UnsafeMutablePointer<Float>.allocate(capacity: renderFrameCapacity)
+        }
+        renderAudioBufferList = AudioBufferList.allocate(maximumBuffers: renderChannelPointers.count)
+    }
+
+    private func releaseRenderBuffers() {
+        for pointer in renderChannelPointers {
+            pointer.deallocate()
+        }
+        renderChannelPointers = []
+        renderAudioBufferList?.unsafeMutablePointer.deallocate()
+        renderAudioBufferList = nil
+        renderFrameCapacity = 0
     }
 
     private func check(_ status: OSStatus) throws {

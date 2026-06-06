@@ -6,6 +6,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
     private struct PreparedProjectTrack {
         let id: UUID
         let sourceRevision: Int
+        let sourceID: UUID?
         let source: PreparedRealtimeAudioSource
         let segments: [PreparedRealtimeAudioSegment]
         let zeroCrossingIndex: AudioZeroCrossingIndex?
@@ -490,7 +491,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             let sourceBuffer = audioTimeline.sourceAudioBuffer
             if let existingPreparedTrack = preparedProjectTracks.first(where: { existingTrack in
                 existingTrack.id == track.id &&
-                    existingTrack.sourceRevision == track.sourceRevision &&
+                    existingTrack.sourceID == audioTimeline.sourceID &&
                     existingTrack.source.frameCount == sourceBuffer.frameCount &&
                     existingTrack.source.channelCount == sourceBuffer.channelCount &&
                     existingTrack.source.sampleRate == sourceBuffer.sampleRate
@@ -519,6 +520,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         return PreparedProjectTrack(
             id: track.id,
             sourceRevision: track.sourceRevision,
+            sourceID: sourceID(for: track.source),
             source: preparedSource,
             segments: segments,
             zeroCrossingIndex: zeroCrossingIndex,
@@ -527,6 +529,13 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             isMuted: track.isMuted,
             isSoloed: track.isSoloed
         )
+    }
+
+    private func sourceID(for source: ProjectPlaybackTrack.Source) -> UUID? {
+        if case let .timeline(audioTimeline, _) = source {
+            return audioTimeline.sourceID
+        }
+        return nil
     }
 
     private func effectiveTrackGain(
