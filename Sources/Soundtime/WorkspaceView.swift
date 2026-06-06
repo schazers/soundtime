@@ -44,6 +44,7 @@ final class WorkspaceView: NSView {
         var name: String
         var sourceURL: URL
         var durationHint: TimeInterval?
+        var sourceWaveformOverview: WaveformOverview?
         var waveformOverview: WaveformOverview?
         var decodedAudioBuffer: DecodedAudioBuffer?
         var zeroCrossingIndex: AudioZeroCrossingIndex?
@@ -1058,6 +1059,7 @@ final class WorkspaceView: NSView {
             name: trackName,
             sourceURL: URL(fileURLWithPath: "/dev/null"),
             durationHint: nil,
+            sourceWaveformOverview: nil,
             waveformOverview: nil,
             decodedAudioBuffer: nil,
             zeroCrossingIndex: nil,
@@ -1226,6 +1228,7 @@ final class WorkspaceView: NSView {
 
         projectTracks[trackIndex].sourceURL = recordedTake.url
         projectTracks[trackIndex].durationHint = fileInfo?.duration ?? recordedTake.duration
+        projectTracks[trackIndex].sourceWaveformOverview = waveformOverview
         projectTracks[trackIndex].waveformOverview = waveformOverview
         projectTracks[trackIndex].decodedAudioBuffer = nil
         projectTracks[trackIndex].zeroCrossingIndex = nil
@@ -1686,6 +1689,7 @@ final class WorkspaceView: NSView {
             name: trackName,
             sourceURL: url,
             durationHint: durationHint,
+            sourceWaveformOverview: nil,
             waveformOverview: nil,
             decodedAudioBuffer: nil,
             zeroCrossingIndex: nil,
@@ -1882,6 +1886,7 @@ final class WorkspaceView: NSView {
         projectTracks[trackIndex].name = previewResult.metadata.displayName
         let fileTimeline = projectTracks[trackIndex].fileTimeline
         projectTracks[trackIndex].durationHint = fileTimeline?.duration ?? previewResult.fileInfo.duration
+        projectTracks[trackIndex].sourceWaveformOverview = previewResult.waveformOverview
         projectTracks[trackIndex].waveformOverview = fileTimeline?.waveformOverview(
             from: previewResult.waveformOverview
         ) ?? previewResult.waveformOverview
@@ -1905,6 +1910,7 @@ final class WorkspaceView: NSView {
         }
 
         let fileTimeline = projectTracks[trackIndex].fileTimeline
+        projectTracks[trackIndex].sourceWaveformOverview = waveformOverview
         projectTracks[trackIndex].waveformOverview = fileTimeline?.waveformOverview(from: waveformOverview) ??
             waveformOverview
         projectTracks[trackIndex].durationHint = fileTimeline?.duration ?? fileInfo.duration
@@ -1931,6 +1937,7 @@ final class WorkspaceView: NSView {
             AudioEditTimeline(sourceBuffer: decodedAudioBuffer)
 
         projectTracks[trackIndex].decodedAudioBuffer = decodedAudioBuffer
+        projectTracks[trackIndex].sourceWaveformOverview = waveformOverview
         projectTracks[trackIndex].waveformOverview = existingEditedOverview ??
             existingFileTimeline?.waveformOverview(from: waveformOverview) ??
             waveformOverview
@@ -2524,6 +2531,9 @@ final class WorkspaceView: NSView {
             existingTimeline :
             materialized.timeline
         projectTracks[trackIndex].fileTimeline = nil
+        if !shouldPreserveTimelineSource || projectTracks[trackIndex].sourceWaveformOverview == nil {
+            projectTracks[trackIndex].sourceWaveformOverview = materialized.waveformOverview
+        }
         projectTracks[trackIndex].waveformOverview = materialized.waveformOverview
         if !shouldPreserveTimelineSource {
             projectTracks[trackIndex].zeroCrossingIndex = materialized.zeroCrossingIndex
@@ -3187,13 +3197,14 @@ final class WorkspaceView: NSView {
 
     private func waveformOverview(
         for fileTimeline: AudioFileEditTimeline,
+        sourceOverview: WaveformOverview?,
         fallbackOverview: WaveformOverview?
     ) -> WaveformOverview? {
-        guard let fallbackOverview else {
+        guard let sourceOverview = sourceOverview ?? fallbackOverview else {
             return nil
         }
 
-        return fileTimeline.waveformOverview(from: fallbackOverview)
+        return fileTimeline.waveformOverview(from: sourceOverview)
     }
 
     private func pasteAudio() {
@@ -3343,10 +3354,8 @@ final class WorkspaceView: NSView {
         let editedDuration: TimeInterval
         let editedAudioTimeline: AudioEditTimeline?
         let editedFileTimeline: AudioFileEditTimeline?
-        let editedFileTimelineCanUseSourceOverview: Bool
 
         if let currentFileTimeline = try? preferredFileTimelineForEditing(trackIndex: trackIndex) {
-            editedFileTimelineCanUseSourceOverview = !currentFileTimeline.hasEdits
             var timeline = currentFileTimeline
             deletedDuration = selectionToDelete.duration(in: currentFileTimeline.duration)
             let deletedFrameCount = timeline.delete(selectionToDelete)
@@ -3357,7 +3366,6 @@ final class WorkspaceView: NSView {
             editedAudioTimeline = nil
             editedFileTimeline = timeline
         } else if let currentTimeline = projectTracks[trackIndex].audioTimeline {
-            editedFileTimelineCanUseSourceOverview = false
             var timeline = currentTimeline
             deletedDuration = selectionToDelete.duration(in: currentTimeline.duration)
             let deletedFrameCount = timeline.delete(selectionToDelete)
@@ -3376,7 +3384,6 @@ final class WorkspaceView: NSView {
                 return
             }
 
-            editedFileTimelineCanUseSourceOverview = !currentFileTimeline.hasEdits
             var timeline = currentFileTimeline
             deletedDuration = selectionToDelete.duration(in: currentFileTimeline.duration)
             let deletedFrameCount = timeline.delete(selectionToDelete)
@@ -3400,9 +3407,13 @@ final class WorkspaceView: NSView {
         projectTracks[trackIndex].decodedAudioBuffer = nil
         projectTracks[trackIndex].durationHint = editedDuration
         let currentOverview = projectTracks[trackIndex].waveformOverview
-        if let editedFileTimeline, editedFileTimelineCanUseSourceOverview {
+        if let editedFileTimeline {
             projectTracks[trackIndex].waveformOverview =
-                waveformOverview(for: editedFileTimeline, fallbackOverview: currentOverview) ??
+                waveformOverview(
+                    for: editedFileTimeline,
+                    sourceOverview: projectTracks[trackIndex].sourceWaveformOverview,
+                    fallbackOverview: currentOverview
+                ) ??
                 optimisticWaveformOverview(
                     currentOverview,
                     replacing: selectionToDelete,
@@ -3532,7 +3543,6 @@ final class WorkspaceView: NSView {
         let editRevision: Int
         let editedAudioTimeline: AudioEditTimeline?
         let editedFileTimeline: AudioFileEditTimeline?
-        let editedFileTimelineCanUseSourceOverview: Bool
         let undoSnapshot = ProjectTrackUndoSnapshot(
             tracks: projectTracks,
             activeTrackID: activeTrackID,
@@ -3542,7 +3552,6 @@ final class WorkspaceView: NSView {
         )
 
         if let currentFileTimeline = try? preferredFileTimelineForEditing(trackIndex: trackIndex) {
-            editedFileTimelineCanUseSourceOverview = !currentFileTimeline.hasEdits
             var timeline = currentFileTimeline
             let affectedFrameCount = timeline.applyGain(gain, to: selectionToApply)
             guard affectedFrameCount > 0 else {
@@ -3553,7 +3562,6 @@ final class WorkspaceView: NSView {
             editedAudioTimeline = nil
             editedFileTimeline = timeline
         } else if let currentTimeline = projectTracks[trackIndex].audioTimeline {
-            editedFileTimelineCanUseSourceOverview = false
             var timeline = currentTimeline
             let affectedFrameCount = timeline.applyGain(gain, to: selectionToApply)
             guard affectedFrameCount > 0 else {
@@ -3572,7 +3580,6 @@ final class WorkspaceView: NSView {
                 return
             }
 
-            editedFileTimelineCanUseSourceOverview = !currentFileTimeline.hasEdits
             var timeline = currentFileTimeline
             let affectedFrameCount = timeline.applyGain(gain, to: selectionToApply)
             guard affectedFrameCount > 0 else {
@@ -3591,9 +3598,13 @@ final class WorkspaceView: NSView {
         projectTracks[trackIndex].decodedAudioBuffer = nil
         projectTracks[trackIndex].durationHint = editedFileTimeline?.duration ?? editedAudioTimeline?.duration
         let currentOverview = projectTracks[trackIndex].waveformOverview
-        if let editedFileTimeline, editedFileTimelineCanUseSourceOverview {
+        if let editedFileTimeline {
             projectTracks[trackIndex].waveformOverview =
-                waveformOverview(for: editedFileTimeline, fallbackOverview: currentOverview) ??
+                waveformOverview(
+                    for: editedFileTimeline,
+                    sourceOverview: projectTracks[trackIndex].sourceWaveformOverview,
+                    fallbackOverview: currentOverview
+                ) ??
                 optimisticWaveformOverview(
                     currentOverview,
                     applyingGain: gain,
@@ -3652,7 +3663,6 @@ final class WorkspaceView: NSView {
         let editRevision: Int
         let editedAudioTimeline: AudioEditTimeline?
         let editedFileTimeline: AudioFileEditTimeline?
-        let editedFileTimelineCanUseSourceOverview: Bool
         let undoSnapshot = ProjectTrackUndoSnapshot(
             tracks: projectTracks,
             activeTrackID: activeTrackID,
@@ -3662,7 +3672,6 @@ final class WorkspaceView: NSView {
         )
 
         if let currentFileTimeline = try? preferredFileTimelineForEditing(trackIndex: trackIndex) {
-            editedFileTimelineCanUseSourceOverview = !currentFileTimeline.hasEdits
             var timeline = currentFileTimeline
             let affectedFrameCount = timeline.applyFade(timelineFadeDirection, to: selectionToApply)
             guard affectedFrameCount > 1 else {
@@ -3674,7 +3683,6 @@ final class WorkspaceView: NSView {
             editedAudioTimeline = nil
             editedFileTimeline = timeline
         } else if let currentTimeline = projectTracks[trackIndex].audioTimeline {
-            editedFileTimelineCanUseSourceOverview = false
             var timeline = currentTimeline
             let affectedFrameCount = timeline.applyFade(timelineFadeDirection, to: selectionToApply)
             guard affectedFrameCount > 1 else {
@@ -3694,7 +3702,6 @@ final class WorkspaceView: NSView {
                 return
             }
 
-            editedFileTimelineCanUseSourceOverview = !currentFileTimeline.hasEdits
             var timeline = currentFileTimeline
             let affectedFrameCount = timeline.applyFade(timelineFadeDirection, to: selectionToApply)
             guard affectedFrameCount > 1 else {
@@ -3714,9 +3721,13 @@ final class WorkspaceView: NSView {
         projectTracks[trackIndex].decodedAudioBuffer = nil
         projectTracks[trackIndex].durationHint = editedFileTimeline?.duration ?? editedAudioTimeline?.duration
         let currentOverview = projectTracks[trackIndex].waveformOverview
-        if let editedFileTimeline, editedFileTimelineCanUseSourceOverview {
+        if let editedFileTimeline {
             projectTracks[trackIndex].waveformOverview =
-                waveformOverview(for: editedFileTimeline, fallbackOverview: currentOverview) ??
+                waveformOverview(
+                    for: editedFileTimeline,
+                    sourceOverview: projectTracks[trackIndex].sourceWaveformOverview,
+                    fallbackOverview: currentOverview
+                ) ??
                 optimisticWaveformOverview(
                     currentOverview,
                     applyingFade: timelineFadeDirection,
