@@ -3751,9 +3751,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 appendSoftParticle(
                     to: &vertices,
                     center: center,
-                    radius: 3.0 + 7.0 * bin.peakMagnitude,
+                    radius: 1.4 + 3.6 * bin.peakMagnitude,
                     color: SIMD3<Float>(color.x, color.y, color.z),
-                    alpha: alpha * 0.32,
+                    alpha: alpha * 0.28,
                     drawableSize: drawableSize
                 )
             }
@@ -3841,7 +3841,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             let ageSeconds = progress * Float(deletionEffectDuration)
             let center = SIMD2<Float>(sourceX, sourceY) +
                 direction * speed * ageSeconds * (0.35 + blast * 1.25)
-            let size = 1.6 + 5.8 * pseudoRandom01(seed &+ 89)
+            let size = 0.9 + 3.5 * pseudoRandom01(seed &+ 89)
             let rotation = angle + progress * (2.4 + 6.0 * pseudoRandom01(seed &+ 109))
             let cold = pseudoRandom01(seed &+ 131)
             let color = SIMD4<Float>(
@@ -3864,9 +3864,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 appendSoftParticle(
                     to: &vertices,
                     center: center,
-                    radius: size * 2.2,
+                    radius: size * 1.45,
                     color: SIMD3<Float>(color.x, color.y, color.z),
-                    alpha: color.w * 0.48,
+                    alpha: color.w * 0.40,
                     drawableSize: drawableSize
                 )
             }
@@ -3935,7 +3935,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return
         }
 
-        let coreRadius = (10 + laneHeight * 0.12) * (0.75 + flareProgress * 1.6)
+        let coreRadius = (6 + laneHeight * 0.07) * (0.70 + flareProgress * 1.25)
         appendSoftParticle(
             to: &vertices,
             center: SIMD2<Float>(joinX, centerY),
@@ -3947,9 +3947,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         appendSoftParticle(
             to: &vertices,
             center: SIMD2<Float>(joinX, centerY),
-            radius: coreRadius * 2.2,
+            radius: coreRadius * 1.65,
             color: SIMD3<Float>(0.38, 0.96, 1.0),
-            alpha: 0.09 * flareEnergy,
+            alpha: 0.075 * flareEnergy,
             drawableSize: drawableSize
         )
         appendThickLine(
