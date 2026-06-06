@@ -608,6 +608,25 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var frameStatsShaderBufferUploadCount = 0
     var onFrameStatsChanged: ((TimelineFrameStats) -> Void)?
     var onRenderDataPrepared: (() -> Void)?
+
+    func currentFrameStatsSnapshot() -> TimelineFrameStats {
+        let waveformBufferDiagnostics = waveformShaderBufferStore.diagnostics()
+        return TimelineFrameStats(
+            framesPerSecond: 0,
+            averageFrameTimeMilliseconds: 0,
+            frameTimeJitterMilliseconds: 0,
+            worstFrameTimeMilliseconds: 0,
+            waveformRenderer: frameStatsWaveformRenderer,
+            cpuWaveformVertexCount: frameStatsCPUWaveformVertexCount,
+            gpuWaveformDrawCount: frameStatsGPUWaveformDrawCount,
+            shaderBufferUploadCount: frameStatsShaderBufferUploadCount,
+            shaderBufferCount: waveformBufferDiagnostics.bufferCount,
+            shaderBufferByteCount: waveformBufferDiagnostics.byteCount,
+            shaderBufferUploadInFlightCount: waveformBufferDiagnostics.inFlightCount,
+            waveformMipCacheCount: waveformMipCacheDiagnostics().cacheCount
+        )
+    }
+
     private let playheadTouchGeometryAheadDuration: TimeInterval = 0.055
     private let playheadTouchLightAheadDuration: TimeInterval = 0.08
     private var playheadTouchTrailDuration: TimeInterval = 0.56
@@ -1036,6 +1055,37 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         commandBuffer.present(target.drawable)
         commandBuffer.commit()
+    }
+
+    @discardableResult
+    func renderOffscreen(
+        renderPassDescriptor: MTLRenderPassDescriptor,
+        viewportSize: CGSize,
+        backingScale: Float,
+        displayTimestamp: CFTimeInterval,
+        waitUntilCompleted: Bool = false
+    ) -> MTLCommandBuffer? {
+        guard
+            let commandBuffer = commandQueue.makeCommandBuffer(),
+            let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor)
+        else {
+            return nil
+        }
+
+        dynamicVertexBufferRing.beginFrame()
+        encodeTimeline(
+            into: encoder,
+            viewportSize: viewportSize,
+            backingScale: backingScale,
+            displayTimestamp: displayTimestamp
+        )
+        encoder.endEncoding()
+
+        commandBuffer.commit()
+        if waitUntilCompleted {
+            commandBuffer.waitUntilCompleted()
+        }
+        return commandBuffer
     }
 
     private func encodeTimeline(
