@@ -802,7 +802,8 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             })
         {
             let offset = max(projectFrame - segment.outputStartFrame, 0)
-            let sourceFrame = segment.sourceStartFrame + Int((Double(offset) * segment.sourceFrameScale).rounded(.down))
+            let sourceFrameScale = effectiveSourceFrameScale(for: track, segment: segment)
+            let sourceFrame = segment.sourceStartFrame + Int((Double(offset) * sourceFrameScale).rounded(.down))
             return min(max(sourceFrame, 0), track.source.frameCount)
         }
 
@@ -820,21 +821,37 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
     ) -> Int {
         if
             let segment = track.segments.first(where: { segment in
-                sourceFrame >= segment.sourceStartFrame &&
+                let sourceFrameScale = effectiveSourceFrameScale(for: track, segment: segment)
+                return sourceFrame >= segment.sourceStartFrame &&
                     sourceFrame < segment.sourceStartFrame +
-                    Int((Double(segment.frameCount) * segment.sourceFrameScale).rounded(.up)) &&
+                    Int((Double(segment.frameCount) * sourceFrameScale).rounded(.up)) &&
                     nearProjectFrame >= segment.outputStartFrame &&
                     nearProjectFrame < segment.outputStartFrame + segment.frameCount
             })
         {
             let sourceOffset = max(sourceFrame - segment.sourceStartFrame, 0)
-            let sourceFrameScale = max(segment.sourceFrameScale, .leastNonzeroMagnitude)
+            let sourceFrameScale = max(effectiveSourceFrameScale(for: track, segment: segment), .leastNonzeroMagnitude)
             let outputOffset = Int((Double(sourceOffset) / sourceFrameScale).rounded(.down))
             return segment.outputStartFrame + outputOffset
         }
 
         let snappedProjectTime = TimeInterval(sourceFrame) / track.source.sampleRate
         return Int((snappedProjectTime * sampleRate).rounded(.down))
+    }
+
+    private func effectiveSourceFrameScale(
+        for track: PreparedProjectTrack,
+        segment: PreparedRealtimeAudioSegment
+    ) -> Double {
+        if segment.sourceFrameScale > 0, segment.sourceFrameScale.isFinite {
+            return segment.sourceFrameScale
+        }
+
+        guard sampleRate.isFinite, sampleRate > 0, track.source.sampleRate.isFinite else {
+            return 1
+        }
+
+        return max(track.source.sampleRate / sampleRate, .leastNonzeroMagnitude)
     }
 
 }

@@ -3217,6 +3217,11 @@ final class WorkspaceView: NSView {
         let displaySelectionToDelete = target.displaySelection
         let selectionToDelete = target.editSelection
         let trackID = projectTracks[trackIndex].id
+        let trackDurationBeforeDelete = trackDuration(for: projectTracks[trackIndex])
+        let targetPlaybackTime = min(
+            max(selectionToDelete.startProgress * trackDurationBeforeDelete, 0),
+            trackDurationBeforeDelete
+        )
         let undoSnapshot = ProjectTrackUndoSnapshot(
             tracks: projectTracks,
             activeTrackID: activeTrackID,
@@ -3230,7 +3235,6 @@ final class WorkspaceView: NSView {
         }
 
         let deletedDuration: TimeInterval
-        let targetPlaybackTime = displaySelectionToDelete.startProgress * projectSelectionDuration
         let editedAudioTimeline: AudioEditTimeline?
         let editedFileTimeline: AudioFileEditTimeline?
 
@@ -3283,8 +3287,16 @@ final class WorkspaceView: NSView {
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
         refreshProjectTimelineDisplay(rebuildControls: false, animateWaveformTransition: false)
         updateProjectDisplayTiming()
+        let editedTrackDuration = projectTracks.indices.contains(trackIndex) ?
+            trackDuration(for: projectTracks[trackIndex]) :
+            0
+        let clampedTargetPlaybackTime = min(
+            targetPlaybackTime,
+            max(editedTrackDuration, 0),
+            max(displayedDuration, 0)
+        )
         let targetPlaybackProgress = displayedDuration > 0 ?
-            min(max(Float(targetPlaybackTime / displayedDuration), 0), 1) :
+            min(max(Float(clampedTargetPlaybackTime / displayedDuration), 0), 1) :
             0
         reloadPlaybackFromProjectTracks(
             preserveProgress: false,
