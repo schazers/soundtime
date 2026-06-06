@@ -31,6 +31,16 @@ if CommandLine.arguments.contains("--project-edit-roundtrip-smoke") {
     }
 }
 
+if CommandLine.arguments.contains("--edit-graph-smoke") {
+    do {
+        try EditGraphSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        exit(0)
+    } catch {
+        fputs("Soundtime edit graph smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
 let app = NSApplication.shared
 let delegate = AppDelegate()
 
