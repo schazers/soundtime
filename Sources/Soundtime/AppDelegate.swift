@@ -4,6 +4,7 @@ import AppKit
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowControllers: [MainWindowController] = []
     private weak var openRecentMenu: NSMenu?
+    private lazy var audioPreferencesWindowController = AudioDevicePreferencesWindowController()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureMainMenu()
@@ -24,6 +25,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func newProject(_ sender: Any?) {
         openProjectWindow(restoresLastProject: false)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func showPreferences(_ sender: Any?) {
+        audioPreferencesWindowController.showWindow(sender)
         NSApplication.shared.activate(ignoringOtherApps: true)
     }
 
@@ -96,6 +102,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         debugToolsItem.keyEquivalentModifierMask = [.command, .shift]
         menu.addItem(debugToolsItem)
+        let preferencesItem = NSMenuItem(
+            title: "Preferences...",
+            action: #selector(showPreferences(_:)),
+            keyEquivalent: ","
+        )
+        preferencesItem.target = self
+        menu.addItem(preferencesItem)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(
             title: "Export...",

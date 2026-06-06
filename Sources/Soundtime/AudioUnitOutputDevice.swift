@@ -6,6 +6,7 @@ import SoundtimeAudioCore
 final class AudioUnitOutputDevice: RealtimeAudioOutputDevice {
     private var audioUnit: AudioUnit?
     private var configuredSampleRate: Double?
+    private var configuredOutputDeviceID: AudioDeviceID?
     private var callbackCorePointer: OpaquePointer?
     private var isInitialized = false
     private var isRunning = false
@@ -15,8 +16,27 @@ final class AudioUnitOutputDevice: RealtimeAudioOutputDevice {
             throw PlaybackError.invalidFormat
         }
 
-        let audioUnit = try configuredAudioUnit()
-        if callbackCorePointer != corePointer || configuredSampleRate != sampleRate {
+        let selectedOutputDeviceID = AudioDevicePreferences.shared.selectedOutputDeviceID()
+        if callbackCorePointer != corePointer ||
+            configuredSampleRate != sampleRate ||
+            configuredOutputDeviceID != selectedOutputDeviceID
+        {
+            resetAudioUnit()
+            let audioUnit = try configuredAudioUnit()
+            if let selectedOutputDeviceID {
+                var outputDeviceID = selectedOutputDeviceID
+                try withUnsafePointer(to: &outputDeviceID) { devicePointer in
+                    try check(AudioUnitSetProperty(
+                        audioUnit,
+                        kAudioOutputUnitProperty_CurrentDevice,
+                        kAudioUnitScope_Global,
+                        0,
+                        devicePointer,
+                        UInt32(MemoryLayout<AudioDeviceID>.size)
+                    ))
+                }
+            }
+
             if isRunning {
                 try check(AudioOutputUnitStop(audioUnit))
                 isRunning = false
@@ -68,6 +88,7 @@ final class AudioUnitOutputDevice: RealtimeAudioOutputDevice {
             try check(AudioUnitInitialize(audioUnit))
             isInitialized = true
             configuredSampleRate = sampleRate
+            configuredOutputDeviceID = selectedOutputDeviceID
             callbackCorePointer = corePointer
         }
     }
@@ -102,7 +123,7 @@ final class AudioUnitOutputDevice: RealtimeAudioOutputDevice {
 
         var description = AudioComponentDescription(
             componentType: kAudioUnitType_Output,
-            componentSubType: kAudioUnitSubType_DefaultOutput,
+            componentSubType: kAudioUnitSubType_HALOutput,
             componentManufacturer: kAudioUnitManufacturer_Apple,
             componentFlags: 0,
             componentFlagsMask: 0
@@ -117,8 +138,51 @@ final class AudioUnitOutputDevice: RealtimeAudioOutputDevice {
             throw PlaybackError.outputDeviceFailed(kAudio_ParamError)
         }
 
+        var enableOutput: UInt32 = 1
+        try withUnsafePointer(to: &enableOutput) { enablePointer in
+            try check(AudioUnitSetProperty(
+                audioUnit,
+                kAudioOutputUnitProperty_EnableIO,
+                kAudioUnitScope_Output,
+                0,
+                enablePointer,
+                UInt32(MemoryLayout<UInt32>.size)
+            ))
+        }
+
+        var disableInput: UInt32 = 0
+        try withUnsafePointer(to: &disableInput) { disablePointer in
+            try check(AudioUnitSetProperty(
+                audioUnit,
+                kAudioOutputUnitProperty_EnableIO,
+                kAudioUnitScope_Input,
+                1,
+                disablePointer,
+                UInt32(MemoryLayout<UInt32>.size)
+            ))
+        }
+
         self.audioUnit = audioUnit
         return audioUnit
+    }
+
+    private func resetAudioUnit() {
+        if let audioUnit {
+            if isRunning {
+                _ = AudioOutputUnitStop(audioUnit)
+            }
+            if isInitialized {
+                _ = AudioUnitUninitialize(audioUnit)
+            }
+            AudioComponentInstanceDispose(audioUnit)
+        }
+
+        audioUnit = nil
+        configuredSampleRate = nil
+        configuredOutputDeviceID = nil
+        callbackCorePointer = nil
+        isInitialized = false
+        isRunning = false
     }
 
     private func check(_ status: OSStatus) throws {

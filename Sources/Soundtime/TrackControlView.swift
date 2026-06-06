@@ -3,6 +3,7 @@ import AppKit
 final class TrackControlView: NSView {
     var onMuteChanged: ((Bool) -> Void)?
     var onSoloChanged: ((Bool) -> Void)?
+    var onRecordRequested: (() -> Void)?
     var onVolumeChanged: ((Float) -> Void)?
     var onVolumeEditingEnded: (() -> Void)?
     var onTrackSelected: (() -> Void)?
@@ -11,6 +12,7 @@ final class TrackControlView: NSView {
     private let volumeSlider = VerticalTrackVolumeSliderView()
     private let muteButton = TrackToggleButton(title: "M")
     private let soloButton = TrackToggleButton(title: "S")
+    private let recordButton = TrackIconButton(systemSymbolName: "mic.fill")
     private let buttonStack = NSStackView()
 
     var isTrackSelected = false {
@@ -28,6 +30,12 @@ final class TrackControlView: NSView {
     var isSoloed = false {
         didSet {
             soloButton.isSelected = isSoloed
+        }
+    }
+
+    var isRecording = false {
+        didSet {
+            recordButton.isSelected = isRecording
         }
     }
 
@@ -91,6 +99,7 @@ final class TrackControlView: NSView {
 
         muteButton.translatesAutoresizingMaskIntoConstraints = false
         soloButton.translatesAutoresizingMaskIntoConstraints = false
+        recordButton.translatesAutoresizingMaskIntoConstraints = false
         muteButton.onSelectedChanged = { [weak self] isSelected in
             self?.isMuted = isSelected
             self?.onMuteChanged?(isSelected)
@@ -99,13 +108,17 @@ final class TrackControlView: NSView {
             self?.isSoloed = isSelected
             self?.onSoloChanged?(isSelected)
         }
+        recordButton.onPressed = { [weak self] in
+            self?.onRecordRequested?()
+        }
 
         buttonStack.orientation = .vertical
         buttonStack.alignment = .centerX
-        buttonStack.spacing = 8
+        buttonStack.spacing = 7
         buttonStack.translatesAutoresizingMaskIntoConstraints = false
         buttonStack.addArrangedSubview(soloButton)
         buttonStack.addArrangedSubview(muteButton)
+        buttonStack.addArrangedSubview(recordButton)
 
         addSubview(titleLabel)
         addSubview(volumeSlider)
@@ -129,6 +142,8 @@ final class TrackControlView: NSView {
             soloButton.heightAnchor.constraint(equalToConstant: 28),
             muteButton.widthAnchor.constraint(equalToConstant: 34),
             muteButton.heightAnchor.constraint(equalToConstant: 28),
+            recordButton.widthAnchor.constraint(equalToConstant: 34),
+            recordButton.heightAnchor.constraint(equalToConstant: 28),
         ])
     }
 
@@ -136,6 +151,112 @@ final class TrackControlView: NSView {
         layer?.backgroundColor = NSColor(white: isTrackSelected ? 0.16 : 0.075, alpha: 1).cgColor
         layer?.borderColor = NSColor(white: isTrackSelected ? 0.46 : 0.17, alpha: 1).cgColor
         layer?.borderWidth = 1
+    }
+}
+
+private final class TrackIconButton: NSControl {
+    var onPressed: (() -> Void)?
+
+    var isSelected = false {
+        didSet {
+            needsDisplay = true
+        }
+    }
+
+    private var isHovered = false {
+        didSet {
+            needsDisplay = true
+        }
+    }
+
+    private let image: NSImage?
+    private var trackingArea: NSTrackingArea?
+
+    init(systemSymbolName: String) {
+        image = NSImage(
+            systemSymbolName: systemSymbolName,
+            accessibilityDescription: "Record"
+        )?.withSymbolConfiguration(.init(pointSize: 13, weight: .semibold))
+        super.init(frame: .zero)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override var mouseDownCanMoveWindow: Bool {
+        false
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+
+        let nextTrackingArea = NSTrackingArea(
+            rect: bounds,
+            options: [.activeInKeyWindow, .mouseEnteredAndExited, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        trackingArea = nextTrackingArea
+        addTrackingArea(nextTrackingArea)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onPressed?()
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        let rect = bounds.insetBy(dx: 1, dy: 1)
+        let fill: NSColor
+        let stroke: NSColor
+        let symbolColor: NSColor
+        if isSelected {
+            fill = NSColor(calibratedRed: 0.84, green: 0.10, blue: 0.12, alpha: 1)
+            stroke = NSColor(calibratedRed: 1.0, green: 0.36, blue: 0.36, alpha: 1)
+            symbolColor = NSColor.white
+        } else if isHovered {
+            fill = NSColor(white: 0.19, alpha: 1)
+            stroke = NSColor(white: 0.42, alpha: 1)
+            symbolColor = NSColor(white: 0.88, alpha: 1)
+        } else {
+            fill = NSColor(white: 0.12, alpha: 1)
+            stroke = NSColor(white: 0.25, alpha: 1)
+            symbolColor = NSColor(white: 0.64, alpha: 1)
+        }
+
+        let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
+        fill.setFill()
+        path.fill()
+        stroke.setStroke()
+        path.lineWidth = 1
+        path.stroke()
+
+        guard let image else {
+            return
+        }
+
+        let imageSize = CGSize(width: 14, height: 14)
+        let imageRect = NSRect(
+            x: bounds.midX - imageSize.width * 0.5,
+            y: bounds.midY - imageSize.height * 0.5,
+            width: imageSize.width,
+            height: imageSize.height
+        )
+        image.drawSymbol(in: imageRect, tint: symbolColor)
     }
 }
 
@@ -371,5 +492,23 @@ private final class VerticalTrackVolumeSliderView: NSView {
         let trackHeight = max(trackBottom - trackTop, 1)
         value = Float((point.y - trackTop) / trackHeight)
         onValueChanged?(value)
+    }
+}
+
+private extension NSImage {
+    func drawSymbol(in rect: NSRect, tint: NSColor) {
+        guard let tintedImage = copy() as? NSImage else {
+            draw(in: rect)
+            return
+        }
+
+        tintedImage.isTemplate = true
+        tint.set()
+        tintedImage.draw(
+            in: rect,
+            from: .zero,
+            operation: .sourceOver,
+            fraction: 1
+        )
     }
 }

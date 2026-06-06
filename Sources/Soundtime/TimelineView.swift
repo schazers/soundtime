@@ -330,6 +330,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
     }
 
+    func displayRecordingActive(_ isActive: Bool) {
+        updateTimelineRenderer { renderer in
+            renderer.displayRecordingActive(isActive)
+        }
+        requestTimelineRender()
+    }
+
     func displaySelection(_ selection: TimelineSelection?) {
         updateTimelineRenderer { renderer in
             renderer.displaySelection(selection)

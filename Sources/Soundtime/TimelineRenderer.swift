@@ -960,6 +960,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
     }
 
+    func displayRecordingActive(_ isActive: Bool) {
+        renderState = renderState.withRecordingActive(isActive)
+        if isActive {
+            playheadTouchPlayStartProgress = nil
+        }
+    }
+
     private func restartPlayheadKick(at progress: Float) {
         let timestamp = CFAbsoluteTimeGetCurrent()
         playheadKickEnergy = 1
@@ -4131,8 +4138,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             playheadX = min(max(playheadViewportProgress * width, 0), width)
         }
         let kickEnergy = currentPlayheadKickEnergy()
-        let baseColor = SIMD3<Float>(0.0, 0.75, 0.78)
-        let burstColor = SIMD3<Float>(0.0, 0.62, 0.86)
+        let baseColor = renderState.isRecordingActive ?
+            SIMD3<Float>(0.96, 0.12, 0.14) :
+            SIMD3<Float>(0.0, 0.75, 0.78)
+        let burstColor = renderState.isRecordingActive ?
+            SIMD3<Float>(1.0, 0.30, 0.24) :
+            SIMD3<Float>(0.0, 0.62, 0.86)
         let blendedColor = baseColor + (burstColor - baseColor) * kickEnergy
         let size = SIMD2<Float>(width, height)
         var vertices: [TimelineVertex] = []
