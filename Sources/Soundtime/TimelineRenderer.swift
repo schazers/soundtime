@@ -59,6 +59,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         var fisheye: SIMD4<Float>
         var touch: SIMD4<Float>
         var touch2: SIMD4<Float>
+        var touch3: SIMD4<Float>
     }
 
     private struct DeletionEffectUniform {
@@ -852,12 +853,17 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var waveformBaseGray: Float = 0.88
     private let waveformTransitionDuration: CFTimeInterval = 0.2
     private let playheadTouchDecayDuration: CFTimeInterval = 0.046
+    private let playheadTouchPauseFadeDuration: CFTimeInterval = 0.20
     private let playheadKickDecayDuration: CFTimeInterval = 0.3
     private let playheadKickTrailDuration: CFTimeInterval = 0.38
     private let playheadKickTrailLineCount = 10
     private let playheadContactFadeDuration: CFTimeInterval = 0.6
     private let playheadTouchTrailReferenceInfluence: Float = 0.015
     private let playheadTouchTrailRenderInfluenceCutoff: Float = 0.000_05
+    private let playheadTouchZoomedOutLightMinimumVisibleDuration: TimeInterval = 12
+    private let playheadTouchZoomedOutLightFullVisibleDuration: TimeInterval = 180
+    private let playheadTouchZoomedOutLightMaximumViewportFraction: Float = 0.035
+    private let waveformFisheyeEnabled = SoundtimeFeatureFlags.waveformFisheye
     private var waveformFisheyeMinimumVisibleDuration: TimeInterval = 1
     private var waveformFisheyeMaximumVisibleDuration: TimeInterval = 150
     private var waveformFisheyeMaximumRadius: Float = 0.080
@@ -1197,7 +1203,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         renderState = renderState.withPlayheadProgress(anchoredProgress, anchorTimestamp: currentTime)
-        if restartsFisheyeActivation, renderState.isPlaybackActive {
+        if waveformFisheyeEnabled, restartsFisheyeActivation, renderState.isPlaybackActive {
             restartWaveformFisheyeActivation(at: currentTime)
         }
         if restartsPlayheadKick, renderState.isPlaybackActive {
@@ -1220,11 +1226,20 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let currentTime = CACurrentMediaTime()
         updatePlayheadTouchEnergy(isPlaybackActive: renderState.isPlaybackActive)
         updatePlayheadKickEnergy()
-        updateWaveformFisheyeEnergy(at: currentTime)
+        if waveformFisheyeEnabled {
+            updateWaveformFisheyeEnergy(at: currentTime)
+        }
         let wasPlaybackActive = renderState.isPlaybackActive
 
         if wasPlaybackActive != isActive {
-            startWaveformFisheyeRamp(to: isActive ? 1 : 0, at: currentTime)
+            if waveformFisheyeEnabled {
+                startWaveformFisheyeRamp(to: isActive ? 1 : 0, at: currentTime)
+            } else {
+                waveformFisheyeEnergy = 0
+                waveformFisheyeRampStartEnergy = 0
+                waveformFisheyeRampTargetEnergy = 0
+                waveformFisheyeRampStartTime = currentTime
+            }
             let anchoredProgress = projectedPlayheadProgress(at: currentTime) ??
                 renderState.playheadProgress
             renderState = renderState
@@ -1327,6 +1342,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         timestamp: CFTimeInterval
     ) -> Float {
         let visualViewportProgress = min(max(visualViewportProgress, 0), 1)
+        guard waveformFisheyeEnabled else {
+            return visualViewportProgress
+        }
+
         let playheadProgress = projectedPlayheadProgress(at: timestamp) ?? renderState.playheadProgress
         var fisheye = waveformFisheyeParameters(
             renderState: renderState,
@@ -1939,7 +1958,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         renderState: TimelineRenderState,
         trackWaveformMipLevels: [UUID: [WaveformMipLevel]],
         fisheye: SIMD4<Float>,
-        touchParameters: (touch: SIMD4<Float>, touch2: SIMD4<Float>),
+        touchParameters: (touch: SIMD4<Float>, touch2: SIMD4<Float>, touch3: SIMD4<Float>),
         opacity: Float,
         displayTimestamp: CFTimeInterval,
         fallbackPolicy: WaveformShaderFallbackPolicy,
@@ -2030,6 +2049,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 fisheye: trackFisheye,
                 touch: trackTouch,
                 touch2: touchParameters.touch2,
+                touch3: touchParameters.touch3,
                 trackID: track.id,
                 renderState: renderState
             )
@@ -2088,6 +2108,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         fisheye: SIMD4<Float>,
         touch: SIMD4<Float>,
         touch2: SIMD4<Float>,
+        touch3: SIMD4<Float>,
         trackID: UUID,
         renderState: TimelineRenderState
     ) -> WaveformShaderUniform {
@@ -2147,7 +2168,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             gainPreview: gainPreview,
             fisheye: fisheye,
             touch: touch,
-            touch2: touch2
+            touch2: touch2,
+            touch3: touch3
         )
     }
 
@@ -3874,7 +3896,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         let selectionWidth = max(rightX - leftX, 1)
         let pullDistance = max(selectionWidth, 22)
-        let slideTime = min(max(progress / 0.34, 0), 1)
+        let slideTime = min(max(progress / 0.22, 0), 1)
         let easedSlideTime = smoothStep(slideTime)
         let slideProgress = 1 - pow(1 - easedSlideTime, 2.45)
         let overlayRightX = max(
@@ -4262,6 +4284,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         for tracks: [TimelineRenderState.Track],
         at timestamp: CFTimeInterval
     ) {
+        guard waveformFisheyeEnabled else {
+            trackFisheyeAudibilitySignature = nil
+            trackFisheyeStates.removeAll()
+            return
+        }
+
         let anySolo = tracks.contains { $0.isSoloed }
         trackFisheyeAudibilitySignature = trackAudibilitySignature(
             for: tracks,
@@ -4285,6 +4313,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         for tracks: [TimelineRenderState.Track],
         at timestamp: CFTimeInterval
     ) {
+        guard waveformFisheyeEnabled else {
+            if trackFisheyeAudibilitySignature != nil || !trackFisheyeStates.isEmpty {
+                trackFisheyeAudibilitySignature = nil
+                trackFisheyeStates.removeAll()
+            }
+            return
+        }
+
         let anySolo = tracks.contains { $0.isSoloed }
         let nextSignature = trackAudibilitySignature(for: tracks, anySolo: anySolo)
         guard nextSignature != trackFisheyeAudibilitySignature else {
@@ -4429,6 +4465,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         playheadProgress: Float,
         displayTimestamp: CFTimeInterval
     ) -> SIMD4<Float> {
+        guard waveformFisheyeEnabled else {
+            return .zero
+        }
+
         let activationEnergy = updateWaveformFisheyeEnergy(at: displayTimestamp)
         guard
             activationEnergy > 0.000_1,
@@ -4825,10 +4865,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
     }
 
-    private func emptyWaveformTouchShaderParameters() -> (touch: SIMD4<Float>, touch2: SIMD4<Float>) {
+    private func emptyWaveformTouchShaderParameters() -> (
+        touch: SIMD4<Float>,
+        touch2: SIMD4<Float>,
+        touch3: SIMD4<Float>
+    ) {
         (
             touch: SIMD4<Float>(0, 0, 0, 0),
-            touch2: SIMD4<Float>(0, 0, 0, playheadTouchTrailFalloffSteepness)
+            touch2: SIMD4<Float>(0, 0, 0, playheadTouchTrailFalloffSteepness),
+            touch3: SIMD4<Float>(0, 0, 0, 0)
         )
     }
 
@@ -4836,7 +4881,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         renderState: TimelineRenderState,
         playheadProgress: Float,
         displayTimestamp: CFTimeInterval
-    ) -> (touch: SIMD4<Float>, touch2: SIMD4<Float>) {
+    ) -> (touch: SIMD4<Float>, touch2: SIMD4<Float>, touch3: SIMD4<Float>) {
         guard
             renderState.hasWaveforms,
             let projectDuration = renderState.duration,
@@ -4852,6 +4897,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let trailDecayRadius = playheadTouchTrailRadiusProgress(forDuration: projectDuration)
         let trailRenderRadius = playheadTouchTrailRenderRadiusProgress(forDuration: projectDuration)
         let viewport = renderState.viewport
+        let lightTrailRadius = playheadTouchLightTrailRadiusProgress(
+            forDuration: projectDuration,
+            viewport: viewport
+        )
+        let touchRenderRadius = max(trailRenderRadius, lightTrailRadius)
         let touchHeadProgress: Float
         let touchRegionEnd: Float
         let touchEnergy: Float
@@ -4868,7 +4918,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             let pauseTimestamp = playheadTouchPauseTimestamp
         {
             let elapsedTime = max(displayTimestamp - pauseTimestamp, 0)
-            guard elapsedTime < playheadTouchTrailRenderDuration else {
+            let pauseFadeEnergy = playheadTouchPauseFadeEnergy(elapsedTime: elapsedTime)
+            guard pauseFadeEnergy > 0.001 else {
                 playheadTouchEnergy = 0
                 playheadTouchPauseProgress = nil
                 playheadTouchPauseTimestamp = nil
@@ -4876,7 +4927,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 return emptyWaveformTouchShaderParameters()
             }
 
-            touchEnergy = 1
+            touchEnergy = pauseFadeEnergy
             touchHeadProgress = min(max(pauseProgress + Float(elapsedTime / projectDuration), 0), 1)
             touchRegionEnd = min(max(pauseProgress, 0), viewport.endProgress)
         } else {
@@ -4893,7 +4944,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             min(max($0, 0), min(touchHeadProgress, touchRegionEnd))
         }
         let visibleTouchStart = max(
-            touchHeadProgress - trailRenderRadius,
+            touchHeadProgress - touchRenderRadius,
             playthroughTrailStart ?? 0,
             viewport.startProgress
         )
@@ -4915,6 +4966,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 lightAheadRadius,
                 trailDecayRadius,
                 playheadTouchTrailFalloffSteepness
+            ),
+            touch3: SIMD4<Float>(
+                lightTrailRadius,
+                0,
+                0,
+                0
             )
         )
     }
@@ -4946,6 +5003,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let trailDecayRadius = playheadTouchTrailRadiusProgress(forDuration: projectDuration)
         let trailRenderRadius = playheadTouchTrailRenderRadiusProgress(forDuration: projectDuration)
         let viewport = renderState.viewport
+        let lightTrailRadius = playheadTouchLightTrailRadiusProgress(
+            forDuration: projectDuration,
+            viewport: viewport
+        )
+        let touchRenderRadius = max(trailRenderRadius, lightTrailRadius)
         let touchHeadProgress: Float
         let touchRegionEnd: Float
         let touchEnergy: Float
@@ -4962,7 +5024,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             let pauseTimestamp = playheadTouchPauseTimestamp
         {
             let elapsedTime = max(displayTimestamp - pauseTimestamp, 0)
-            guard elapsedTime < playheadTouchTrailRenderDuration else {
+            let pauseFadeEnergy = playheadTouchPauseFadeEnergy(elapsedTime: elapsedTime)
+            guard pauseFadeEnergy > 0.001 else {
                 playheadTouchEnergy = 0
                 playheadTouchPauseProgress = nil
                 playheadTouchPauseTimestamp = nil
@@ -4970,7 +5033,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 return []
             }
 
-            touchEnergy = 1
+            touchEnergy = pauseFadeEnergy
             touchHeadProgress = min(max(pauseProgress + Float(elapsedTime / projectDuration), 0), 1)
             touchRegionEnd = min(max(pauseProgress, 0), viewport.endProgress)
         } else {
@@ -4987,7 +5050,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             min(max($0, 0), min(touchHeadProgress, touchRegionEnd))
         }
         let visibleTouchStart = max(
-            touchHeadProgress - trailRenderRadius,
+            touchHeadProgress - touchRenderRadius,
             playthroughTrailStart ?? 0,
             viewport.startProgress
         )
@@ -5083,7 +5146,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 let lightInfluenceRaw = playheadTouchLightInfluence(
                     offsetFromPlayhead: binCenter - touchHeadProgress,
                     aheadRadius: lightAheadRadius,
-                    trailRadius: trailDecayRadius
+                    trailRadius: lightTrailRadius
                 )
                 guard max(geometryInfluenceRaw, lightInfluenceRaw) > playheadTouchTrailRenderInfluenceCutoff else {
                     continue
@@ -5166,6 +5229,35 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         return min(max(decayRadius * playheadTouchTrailRenderRadiusMultiplier(), .ulpOfOne), 1)
     }
 
+    private func playheadTouchLightTrailRadiusProgress(
+        forDuration duration: TimeInterval,
+        viewport: TimelineViewport
+    ) -> Float {
+        let baseRadius = playheadTouchTrailRadiusProgress(forDuration: duration)
+        guard duration.isFinite, duration > 0, viewport.durationProgress > 0 else {
+            return baseRadius
+        }
+
+        let visibleDuration = duration * Double(viewport.durationProgress)
+        let zoomRange = max(
+            playheadTouchZoomedOutLightFullVisibleDuration -
+                playheadTouchZoomedOutLightMinimumVisibleDuration,
+            0.001
+        )
+        let zoomAmount = min(
+            max(
+                (visibleDuration - playheadTouchZoomedOutLightMinimumVisibleDuration) / zoomRange,
+                0
+            ),
+            1
+        )
+        let easedZoomAmount = smoothStep(Float(zoomAmount))
+        let zoomRadius = viewport.durationProgress *
+            playheadTouchZoomedOutLightMaximumViewportFraction *
+            easedZoomAmount
+        return min(max(max(baseRadius, zoomRadius), .ulpOfOne), 1)
+    }
+
     private func playheadTouchTrailRenderRadiusMultiplier() -> Float {
         let exponent = max(playheadTouchTrailFalloffSteepness, 0.25)
         let referenceInfluence = min(max(playheadTouchTrailReferenceInfluence, 0.000_1), 0.5)
@@ -5222,6 +5314,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private func currentPlayheadTouchEnergy(isPlaybackActive: Bool) -> Float {
         updatePlayheadTouchEnergy(isPlaybackActive: isPlaybackActive)
         return playheadTouchEnergy
+    }
+
+    private func playheadTouchPauseFadeEnergy(elapsedTime: CFTimeInterval) -> Float {
+        let progress = min(max(Float(elapsedTime / playheadTouchPauseFadeDuration), 0), 1)
+        let remaining = 1 - progress
+        return powf(remaining, 1.35)
     }
 
     private func updatePlayheadTouchEnergy(isPlaybackActive: Bool) {
@@ -6792,6 +6890,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float4 fisheye;
         float4 touch;
         float4 touch2;
+        float4 touch3;
     };
 
     struct DeletionEffectUniform {
@@ -6847,6 +6946,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float4 fisheye;
         float4 touch;
         float4 touch2;
+        float4 touch3;
     };
 
     struct DeletionEffectRasterizedVertex {
@@ -7008,6 +7108,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         out.fisheye = uniform.fisheye;
         out.touch = uniform.touch;
         out.touch2 = uniform.touch2;
+        out.touch3 = uniform.touch3;
         return out;
     }
 
@@ -7333,6 +7434,30 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 color = source_over(color, float4(0.070, 0.072, 0.072, coverAlpha));
             }
 
+            float compressedSelectionRight = max(left + 1.0 / width, shiftedRight);
+            float compressedSelectionWidthPixels = (compressedSelectionRight - left) * width;
+            if (compressedSelectionWidthPixels > 1.0 &&
+                point.x >= left &&
+                point.x <= compressedSelectionRight) {
+                float selectionXAA = max(fwidth(point.x) * 1.25, 1.0 / width);
+                float selectionCoverage = laneCoverage *
+                    rectangle_coverage(point.x, left, compressedSelectionRight, selectionXAA);
+                float edgePulse = 1.0 - smoothstep(
+                    0.0,
+                    max(3.5 / width, 0.000001),
+                    abs(point.x - compressedSelectionRight)
+                );
+                color = source_over(
+                    color,
+                    float4(
+                        0.0,
+                        0.84,
+                        0.78,
+                        selectionCoverage * (0.21 + 0.08 * edgePulse)
+                    )
+                );
+            }
+
             if (trailingBinCount > 0 &&
                 shiftedEnd > shiftedRight + 0.000001 &&
                 point.x >= shiftedRight &&
@@ -7614,7 +7739,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             lightInfluence = touch_light_influence(
                 offsetFromPlayhead,
                 in.touch2.y,
-                in.touch2.z,
+                in.touch3.x,
                 in.touch2.w
             ) * touchEnergy;
         }

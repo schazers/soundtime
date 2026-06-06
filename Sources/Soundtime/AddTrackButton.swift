@@ -44,6 +44,11 @@ final class AddTrackButton: NSControl {
         addTrackingArea(nextTrackingArea)
     }
 
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
     override func mouseEntered(with event: NSEvent) {
         isHovered = true
     }
@@ -101,14 +106,14 @@ final class AddTrackButton: NSControl {
         path.stroke()
 
         let center = CGPoint(x: bounds.midX, y: bounds.midY)
-        let armLength = min(bounds.width, bounds.height) * 0.22
+        let armLength = min(bounds.width, bounds.height) * 0.16
         let plusPath = NSBezierPath()
         plusPath.move(to: CGPoint(x: center.x - armLength, y: center.y))
         plusPath.line(to: CGPoint(x: center.x + armLength, y: center.y))
         plusPath.move(to: CGPoint(x: center.x, y: center.y - armLength))
         plusPath.line(to: CGPoint(x: center.x, y: center.y + armLength))
         plusPath.lineCapStyle = .round
-        plusPath.lineWidth = 2.2
+        plusPath.lineWidth = 1.8
         symbol.setStroke()
         plusPath.stroke()
     }
