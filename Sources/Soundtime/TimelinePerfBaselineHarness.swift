@@ -365,6 +365,9 @@ enum TimelinePerfBaselineHarness {
         let totalFrames = scenario.warmupFrames + scenario.frames
         let maximumSettleFrames = 240
         let requiredSettledResidencyFrames = 12
+        let minimumSettleFrame = scenario.scrollsTracksDuringRun ?
+            max(scenario.warmupFrames, totalFrames * 2) :
+            scenario.warmupFrames
         let baseTimestamp = CACurrentMediaTime()
         var frame = 0
         var hasSettledRendererResidency = false
@@ -412,13 +415,13 @@ enum TimelinePerfBaselineHarness {
                 commandBuffer?.waitUntilCompleted()
 
                 let statsAfterFrame = rendererStats()
-                if !hasSettledRendererResidency, frame >= scenario.warmupFrames {
+                if !hasSettledRendererResidency, frame >= minimumSettleFrame {
                     let isResidencySettled = statsAfterFrame.shaderBufferUploadCount == 0 &&
                         statsAfterFrame.shaderBufferUploadInFlightCount == 0
                     settledResidencyFrameCount = isResidencySettled ?
                         settledResidencyFrameCount + 1 :
                         0
-                    let exceededSettleBudget = frame >= scenario.warmupFrames + maximumSettleFrames
+                    let exceededSettleBudget = frame >= minimumSettleFrame + maximumSettleFrames
                     if settledResidencyFrameCount >= requiredSettledResidencyFrames || exceededSettleBudget {
                         hasSettledRendererResidency = true
                     }
