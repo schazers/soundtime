@@ -218,18 +218,34 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
     }
 
-    func displayTracks(_ tracks: [TimelineRenderState.Track]) {
+    func displayTracks(_ tracks: [TimelineRenderState.Track], animateWaveformTransition: Bool = true) {
+        let previousTimelineDuration = timelineDuration
+        let previousViewport = viewport
         currentTrackIDs = tracks.map(\.id)
-        timelineDuration = Self.timelineDuration(for: tracks)
+        let nextTimelineDuration = Self.timelineDuration(for: tracks)
+        timelineDuration = nextTimelineDuration
         let wasSelectionEnabled = isSelectionEnabled
         isSelectionEnabled = tracks.contains { $0.waveformOverview?.isEmpty == false }
         if !wasSelectionEnabled || !isSelectionEnabled {
             setViewport(.full)
+        } else if
+            !animateWaveformTransition,
+            previousTimelineDuration > 0,
+            nextTimelineDuration > 0,
+            previousTimelineDuration != nextTimelineDuration
+        {
+            let absoluteStart = Double(previousViewport.startProgress) * previousTimelineDuration
+            let absoluteDuration = Double(previousViewport.durationProgress) * previousTimelineDuration
+            let preservedViewport = TimelineViewport(
+                startProgress: Float(absoluteStart / nextTimelineDuration),
+                durationProgress: Float(absoluteDuration / nextTimelineDuration)
+            )
+            setViewport(preservedViewport)
         }
         updateTrackLayoutForCurrentBounds(requestRender: false)
 
         updateTimelineRenderer { renderer in
-            renderer.displayTracks(tracks)
+            renderer.displayTracks(tracks, animateWaveformTransition: animateWaveformTransition)
         }
         displayTrimPreview(nil)
 
@@ -237,7 +253,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             window?.invalidateCursorRects(for: self)
         }
 
-        startTransientRenderPulse(duration: waveformTransitionRenderPulseDuration)
+        if animateWaveformTransition {
+            startTransientRenderPulse(duration: waveformTransitionRenderPulseDuration)
+        }
 
         if !isSelectionEnabled {
             selectionAnchorProgress = nil

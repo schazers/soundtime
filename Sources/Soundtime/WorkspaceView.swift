@@ -170,6 +170,7 @@ final class WorkspaceView: NSView {
     private var audioDevicePreferencesObserver: NSObjectProtocol?
     private var debugToolsVisible = false
     private let editMaterializationDelay: TimeInterval = 0.75
+    private let deleteMaterializationDelay: TimeInterval = 1.05
     private var editMaterializationTasks: [UUID: Task<Void, Never>] = [:]
     private var editMaterializationRequestIDs: [UUID: UUID] = [:]
     private let inputRecorder = AudioInputRecorder()
@@ -837,8 +838,14 @@ final class WorkspaceView: NSView {
         loadProject(from: lastProjectURL)
     }
 
-    private func refreshProjectTimelineDisplay(rebuildControls: Bool = true) {
-        timelineSurface.displayTracks(timelineRenderTracks())
+    private func refreshProjectTimelineDisplay(
+        rebuildControls: Bool = true,
+        animateWaveformTransition: Bool = true
+    ) {
+        timelineSurface.displayTracks(
+            timelineRenderTracks(),
+            animateWaveformTransition: animateWaveformTransition
+        )
         timelineSurface.displaySelectedTrack(selectedTrackID)
         if rebuildControls {
             refreshTrackControls()
@@ -3176,7 +3183,7 @@ final class WorkspaceView: NSView {
                 editRevision: editRevision,
                 status: "\(copyBeforeDeleting ? "cut" : "deleted") \(formatDuration(deletedDuration))",
                 preservePlaybackProgress: true,
-                startDelay: editMaterializationDelay
+                startDelay: deleteMaterializationDelay
             )
         }
     }
