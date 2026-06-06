@@ -756,6 +756,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var waveformFisheyeRampTargetEnergy: Float = 0
     private var waveformFisheyeRampStartTime = CACurrentMediaTime()
     private var trackFisheyeStates: [UUID: TrackFisheyeState] = [:]
+    private var trackFisheyeAudibilitySignature: Int?
     private let playheadContactMaximumEventCount = 384
     private let playheadContactEventsPerTrackBudget = 8
     private let playheadContactMinimumSpawnInterval: CFTimeInterval = 1.0 / 90.0
@@ -1536,10 +1537,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                     touchParameters.touch.z,
                     0
                 )
-            let trackFisheye = scaledWaveformFisheye(
-                fisheye,
-                by: trackFisheyeEnergy(for: track.id, at: displayTimestamp)
-            )
+            let trackFisheye = fisheye.w > 0.000_1 ?
+                scaledWaveformFisheye(
+                    fisheye,
+                    by: trackFisheyeEnergy(for: track.id, at: displayTimestamp)
+                ) :
+                .zero
             let uniform = makeWaveformShaderUniform(
                 laneTop: laneTop,
                 laneBottom: laneBottom,
@@ -3399,6 +3402,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         at timestamp: CFTimeInterval
     ) {
         let anySolo = tracks.contains { $0.isSoloed }
+        trackFisheyeAudibilitySignature = trackAudibilitySignature(
+            for: tracks,
+            anySolo: anySolo
+        )
         trackFisheyeStates = Dictionary(uniqueKeysWithValues: tracks.map { track in
             let energy: Float = isTrackAudible(track, anySolo: anySolo) ? 1 : 0
             return (
@@ -3418,6 +3425,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         at timestamp: CFTimeInterval
     ) {
         let anySolo = tracks.contains { $0.isSoloed }
+        let nextSignature = trackAudibilitySignature(for: tracks, anySolo: anySolo)
+        guard nextSignature != trackFisheyeAudibilitySignature else {
+            return
+        }
+
+        trackFisheyeAudibilitySignature = nextSignature
         var liveTrackIDs = Set<UUID>()
 
         for track in tracks {
@@ -3453,6 +3466,19 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         trackFisheyeStates = trackFisheyeStates.filter { liveTrackIDs.contains($0.key) }
+    }
+
+    private func trackAudibilitySignature(
+        for tracks: [TimelineRenderState.Track],
+        anySolo: Bool
+    ) -> Int {
+        var hasher = Hasher()
+        hasher.combine(anySolo)
+        for track in tracks {
+            hasher.combine(track.id)
+            hasher.combine(isTrackAudible(track, anySolo: anySolo))
+        }
+        return hasher.finalize()
     }
 
     private func resolvedTrackFisheyeEnergy(
