@@ -39,3 +39,13 @@ swift run Soundtime
 ```sh
 swift build
 ```
+
+## Regression Gates
+
+Run the fast local gate before renderer or audio-engine changes:
+
+```sh
+scripts/perf-gate.sh
+```
+
+That runs the audio-core tests, the recording smoke harness, and the quick 10/50/100-track Metal timeline perf budget. Use `scripts/perf-gate.sh --full` for the longer 10/50/100/250-track baseline.
