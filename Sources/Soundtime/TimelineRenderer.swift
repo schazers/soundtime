@@ -901,7 +901,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let waveformMipTargetBinsPerPoint: Float = 96
     private let maximumCachedWaveformMipPyramids = 512
     private let maximumCachedWaveformShaderBinBuffers = 768
-    private let maximumCachedWaveformShaderBinBufferBytes = 512 * 1_024 * 1_024
+    private let maximumCachedWaveformShaderBinBufferBytes = 1_024 * 1_024 * 1_024
     private let maximumInFlightWaveformShaderBufferUploads = 8
     private let maximumSynchronousWaveformShaderBinBufferBins = 4_096
     private let maximumCachedTransientParticleScoreProfiles = 512
