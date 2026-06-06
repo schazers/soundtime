@@ -182,8 +182,11 @@ final class WorkspaceView: NSView {
     private var debugToolsVisible = false
     private let editMaterializationDelay: TimeInterval = 0.75
     private let deleteMaterializationDelay: TimeInterval = 1.05
+    private let editWaveformRefinementDelay: TimeInterval = 0.20
     private var editMaterializationTasks: [UUID: Task<Void, Never>] = [:]
     private var editMaterializationRequestIDs: [UUID: UUID] = [:]
+    private var editWaveformRefinementTasks: [UUID: Task<Void, Never>] = [:]
+    private var editWaveformRefinementRequestIDs: [UUID: UUID] = [:]
     private let inputRecorder = AudioInputRecorder()
     private var recordingTrackID: UUID?
     private var recordingTakeWriter: StreamingWAVTakeWriter?
@@ -242,7 +245,7 @@ final class WorkspaceView: NSView {
         WAVPreviewLevel(targetBinCount: 3_145_728, samplesPerBin: 2),
         WAVPreviewLevel(targetBinCount: 4_194_304, samplesPerBin: 2),
     ]
-    private let optimisticEditPreviewBinLimit = 65_536
+    private let optimisticEditPreviewBinLimit = 32_768
     private let optimisticEditPreviewSamplesPerBin = 4
 
     private struct WAVPreviewLevel {
@@ -2577,6 +2580,76 @@ final class WorkspaceView: NSView {
         editMaterializationRequestIDs[trackID] = nil
     }
 
+    private func scheduleFileTimelineWaveformRefinement(
+        trackID: UUID,
+        fileTimeline: AudioFileEditTimeline?,
+        sourceOverview: WaveformOverview?,
+        editRevision: Int
+    ) {
+        guard
+            let fileTimeline,
+            let sourceOverview,
+            sourceOverview.bins.count > optimisticEditPreviewBinLimit
+        else {
+            cancelEditWaveformRefinement(for: trackID)
+            return
+        }
+
+        editWaveformRefinementTasks[trackID]?.cancel()
+        let requestID = UUID()
+        editWaveformRefinementRequestIDs[trackID] = requestID
+
+        let task = Task { [
+            weak self,
+            trackID,
+            fileTimeline,
+            sourceOverview,
+            editRevision,
+            editWaveformRefinementDelay = editWaveformRefinementDelay,
+            requestID
+        ] in
+            try? await Task.sleep(nanoseconds: UInt64(editWaveformRefinementDelay * 1_000_000_000))
+            guard !Task.isCancelled else {
+                self?.clearEditWaveformRefinementTask(trackID: trackID, requestID: requestID)
+                return
+            }
+
+            let refinedOverview = await Task.detached(priority: .utility) {
+                fileTimeline.waveformOverview(from: sourceOverview)
+            }.value
+
+            guard let self else {
+                return
+            }
+
+            guard
+                !Task.isCancelled,
+                self.editWaveformRefinementRequestIDs[trackID] == requestID,
+                let trackIndex = self.projectTracks.firstIndex(where: { $0.id == trackID }),
+                self.projectTracks[trackIndex].editRevision == editRevision,
+                self.projectTracks[trackIndex].fileTimeline != nil
+            else {
+                self.clearEditWaveformRefinementTask(trackID: trackID, requestID: requestID)
+                return
+            }
+
+            self.clearEditWaveformRefinementTask(trackID: trackID, requestID: requestID)
+            self.projectTracks[trackIndex].waveformOverview = refinedOverview
+            self.refreshProjectTimelineDisplay(rebuildControls: false)
+            self.updateProjectDisplayTiming()
+        }
+        editWaveformRefinementTasks[trackID] = task
+    }
+
+    private func clearEditWaveformRefinementTask(trackID: UUID, requestID: UUID) {
+        guard editWaveformRefinementRequestIDs[trackID] == requestID else {
+            return
+        }
+
+        editWaveformRefinementTasks[trackID] = nil
+        editWaveformRefinementRequestIDs[trackID] = nil
+    }
+
     private func applyMaterializedTrackEdit(
         trackID: UUID,
         editRevision: Int,
@@ -3616,6 +3689,12 @@ final class WorkspaceView: NSView {
                     with: nil,
                     targetDuration: editedDuration
                 )
+            scheduleFileTimelineWaveformRefinement(
+                trackID: trackID,
+                fileTimeline: editedFileTimeline,
+                sourceOverview: projectTracks[trackIndex].sourceWaveformOverview ?? currentOverview,
+                editRevision: editRevision
+            )
         } else {
             projectTracks[trackIndex].waveformOverview = optimisticWaveformOverview(
                 currentOverview,
@@ -3623,6 +3702,7 @@ final class WorkspaceView: NSView {
                 with: nil,
                 targetDuration: editedDuration
             )
+            cancelEditWaveformRefinement(for: trackID)
         }
 
         selectedTimelineRange = nil
@@ -3837,12 +3917,19 @@ final class WorkspaceView: NSView {
                     applyingGain: gain,
                     to: selectionToApply
                 )
+            scheduleFileTimelineWaveformRefinement(
+                trackID: trackID,
+                fileTimeline: editedFileTimeline,
+                sourceOverview: projectTracks[trackIndex].sourceWaveformOverview ?? currentOverview,
+                editRevision: editRevision
+            )
         } else {
             projectTracks[trackIndex].waveformOverview = optimisticWaveformOverview(
                 currentOverview,
                 applyingGain: gain,
                 to: selectionToApply
             )
+            cancelEditWaveformRefinement(for: trackID)
         }
         let status = status ?? String(format: "gain %+.1f dB", decibels)
         self.lastEffect = lastEffect ?? .gain(decibels: decibels)
@@ -3961,12 +4048,19 @@ final class WorkspaceView: NSView {
                     applyingFade: timelineFadeDirection,
                     to: selectionToApply
                 )
+            scheduleFileTimelineWaveformRefinement(
+                trackID: trackID,
+                fileTimeline: editedFileTimeline,
+                sourceOverview: projectTracks[trackIndex].sourceWaveformOverview ?? currentOverview,
+                editRevision: editRevision
+            )
         } else {
             projectTracks[trackIndex].waveformOverview = optimisticWaveformOverview(
                 currentOverview,
                 applyingFade: timelineFadeDirection,
                 to: selectionToApply
             )
+            cancelEditWaveformRefinement(for: trackID)
         }
         lastEffect = .fade(fadeEffect)
         selectedTimelineRange = nil
@@ -4040,6 +4134,13 @@ final class WorkspaceView: NSView {
         editMaterializationTasks[trackID]?.cancel()
         editMaterializationTasks[trackID] = nil
         editMaterializationRequestIDs[trackID] = nil
+        cancelEditWaveformRefinement(for: trackID)
+    }
+
+    private func cancelEditWaveformRefinement(for trackID: UUID) {
+        editWaveformRefinementTasks[trackID]?.cancel()
+        editWaveformRefinementTasks[trackID] = nil
+        editWaveformRefinementRequestIDs[trackID] = nil
     }
 
     private func cancelAllEditMaterialization() {
@@ -4048,6 +4149,11 @@ final class WorkspaceView: NSView {
         }
         editMaterializationTasks.removeAll()
         editMaterializationRequestIDs.removeAll()
+        for task in editWaveformRefinementTasks.values {
+            task.cancel()
+        }
+        editWaveformRefinementTasks.removeAll()
+        editWaveformRefinementRequestIDs.removeAll()
     }
 
     private func togglePlayback() {
