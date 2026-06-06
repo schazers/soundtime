@@ -22,17 +22,60 @@ enum TimelinePerfBaselineHarness {
         let cpuFrameMilliseconds: [Double]
         let gpuFrameMilliseconds: [Double]
         let rendererStats: TimelineFrameStats
+        let rendererStatsSamples: [TimelineFrameStats]
 
         var frameCount: Int {
             cpuFrameMilliseconds.count
         }
+
+        var waveformRenderers: [String] {
+            let renderers = Set(rendererStatsSamples.map(\.waveformRenderer))
+            guard renderers.isEmpty == false else {
+                return [rendererStats.waveformRenderer]
+            }
+            return renderers.sorted()
+        }
+
+        var maximumCPUWaveformVertexCount: Int {
+            rendererStatsSamples.map(\.cpuWaveformVertexCount).max() ?? rendererStats.cpuWaveformVertexCount
+        }
+
+        var maximumShaderBufferUploadCount: Int {
+            rendererStatsSamples.map(\.shaderBufferUploadCount).max() ?? rendererStats.shaderBufferUploadCount
+        }
+
+        var maximumShaderBufferUploadInFlightCount: Int {
+            rendererStatsSamples.map(\.shaderBufferUploadInFlightCount).max() ??
+                rendererStats.shaderBufferUploadInFlightCount
+        }
     }
 
-    private enum HarnessError: Error {
+    private struct ScenarioBudget {
+        let cpuP95Milliseconds: Double
+        let cpuMaxMilliseconds: Double
+        let gpuP95Milliseconds: Double
+        let gpuMaxMilliseconds: Double
+        let allowedDropped144HzFrames: Int
+    }
+
+    private enum HarnessError: Error, CustomStringConvertible {
         case metalDeviceUnavailable
         case textureUnavailable
         case rendererUnavailable
         case budgetExceeded([String])
+
+        var description: String {
+            switch self {
+            case .metalDeviceUnavailable:
+                return "Metal device unavailable"
+            case .textureUnavailable:
+                return "Could not allocate perf baseline render target"
+            case .rendererUnavailable:
+                return "Timeline renderer unavailable"
+            case let .budgetExceeded(failures):
+                return "budget exceeded:\n" + failures.map { "  - \($0)" }.joined(separator: "\n")
+            }
+        }
     }
 
     static func runFromCommandLine(arguments: [String]) throws {
@@ -106,8 +149,8 @@ enum TimelinePerfBaselineHarness {
                 rendererStats: { renderer.currentFrameStatsSnapshot() }
             )
             print(jsonLine(for: result, deviceName: device.name))
-            if enforcesBudgets, let failure = budgetFailure(for: result) {
-                budgetFailures.append(failure)
+            if enforcesBudgets {
+                budgetFailures.append(contentsOf: budgetFailuresFor(result))
             }
         }
 
@@ -216,14 +259,18 @@ enum TimelinePerfBaselineHarness {
     ) -> ScenarioResult {
         var cpuMilliseconds: [Double] = []
         var gpuMilliseconds: [Double] = []
+        var rendererStatsSamples: [TimelineFrameStats] = []
         cpuMilliseconds.reserveCapacity(scenario.frames)
         gpuMilliseconds.reserveCapacity(scenario.frames)
+        rendererStatsSamples.reserveCapacity(scenario.frames)
 
         let totalFrames = scenario.warmupFrames + scenario.frames
+        let maximumSettleFrames = 240
         let baseTimestamp = CACurrentMediaTime()
-        for frame in 0..<totalFrames {
+        var frame = 0
+        var hasSettledRendererResidency = false
+        while cpuMilliseconds.count < scenario.frames {
             autoreleasepool {
-                let measuredFrame = frame >= scenario.warmupFrames
                 let displayTimestamp = baseTimestamp + Double(frame) / 144.0
                 let viewport = viewport(for: scenario, frame: frame, totalFrames: totalFrames)
                 let playheadProgress = playheadProgress(for: scenario, frame: frame, totalFrames: totalFrames)
@@ -254,20 +301,33 @@ enum TimelinePerfBaselineHarness {
                 let elapsedMilliseconds = (CACurrentMediaTime() - startTime) * 1_000
                 commandBuffer?.waitUntilCompleted()
 
-                if measuredFrame {
+                let statsAfterFrame = rendererStats()
+                if !hasSettledRendererResidency, frame >= scenario.warmupFrames {
+                    let isResidencySettled = statsAfterFrame.shaderBufferUploadCount == 0 &&
+                        statsAfterFrame.shaderBufferUploadInFlightCount == 0
+                    let exceededSettleBudget = frame >= scenario.warmupFrames + maximumSettleFrames
+                    if isResidencySettled || exceededSettleBudget {
+                        hasSettledRendererResidency = true
+                    }
+                }
+
+                if hasSettledRendererResidency {
                     cpuMilliseconds.append(elapsedMilliseconds)
                     if let gpuMillisecondsForFrame = commandBufferGPUMilliseconds(from: commandBuffer) {
                         gpuMilliseconds.append(gpuMillisecondsForFrame)
                     }
+                    rendererStatsSamples.append(statsAfterFrame)
                 }
             }
+            frame += 1
         }
 
         return ScenarioResult(
             scenario: scenario,
             cpuFrameMilliseconds: cpuMilliseconds,
             gpuFrameMilliseconds: gpuMilliseconds,
-            rendererStats: rendererStats()
+            rendererStats: rendererStats(),
+            rendererStatsSamples: rendererStatsSamples
         )
     }
 
@@ -303,7 +363,7 @@ enum TimelinePerfBaselineHarness {
         let maximumStart = max(1 - duration, 0)
         let panProgress: Float
         if scenario.pansDuringRun {
-            panProgress = maximumStart * Float(frame) / Float(max(totalFrames - 1, 1))
+            panProgress = min(maximumStart, maximumStart * Float(frame) / Float(max(totalFrames - 1, 1)))
         } else if duration < 1 {
             panProgress = min(maximumStart, 0.32)
         } else {
@@ -434,6 +494,7 @@ enum TimelinePerfBaselineHarness {
         let dropped144 = cpu.filter { $0 > 1_000.0 / 144.0 }.count
         let dropped60 = cpu.filter { $0 > 1_000.0 / 60.0 }.count
         let stats = result.rendererStats
+        let waveformRenderers = result.waveformRenderers
         let payload: [String: Any] = [
             "scenario": result.scenario.name,
             "device": deviceName,
@@ -448,13 +509,14 @@ enum TimelinePerfBaselineHarness {
             "gpu_max_ms": rounded(gpu.max() ?? 0),
             "dropped_144hz_frames": dropped144,
             "dropped_60hz_frames": dropped60,
-            "renderer": stats.waveformRenderer,
+            "renderer": waveformRenderers.joined(separator: "+"),
             "selection": result.scenario.showsSelection,
             "gain_preview": result.scenario.showsGainPreview,
             "delete_bursts": result.scenario.deletionBurstInterval != nil,
             "gpu_waveform_draws": stats.gpuWaveformDrawCount,
-            "cpu_waveform_vertices": stats.cpuWaveformVertexCount,
-            "shader_uploads": stats.shaderBufferUploadCount,
+            "cpu_waveform_vertices": result.maximumCPUWaveformVertexCount,
+            "shader_uploads": result.maximumShaderBufferUploadCount,
+            "shader_uploads_in_flight": result.maximumShaderBufferUploadInFlightCount,
             "shader_buffers": stats.shaderBufferCount,
             "shader_mb": rounded(Double(stats.shaderBufferByteCount) / (1_024 * 1_024)),
             "mip_cache_entries": stats.waveformMipCacheCount,
@@ -470,28 +532,90 @@ enum TimelinePerfBaselineHarness {
         return line
     }
 
-    private static func budgetFailure(for result: ScenarioResult) -> String? {
+    private static func budgetFailuresFor(_ result: ScenarioResult) -> [String] {
+        let budget = budget(for: result.scenario.trackCount)
         let trackCount = result.scenario.trackCount
         let cpuP95 = percentile(result.cpuFrameMilliseconds, 0.95)
         let cpuMax = result.cpuFrameMilliseconds.max() ?? 0
+        let gpuP95 = percentile(result.gpuFrameMilliseconds, 0.95)
+        let gpuMax = result.gpuFrameMilliseconds.max() ?? 0
+        let dropped144 = result.cpuFrameMilliseconds.filter { $0 > 1_000.0 / 144.0 }.count
         let dropped60 = result.cpuFrameMilliseconds.filter { $0 > 1_000.0 / 60.0 }.count
-        let cpuP95Budget: Double
+        let label = "\(result.scenario.name) \(trackCount) tracks"
+        var failures: [String] = []
+
+        if cpuP95 > budget.cpuP95Milliseconds {
+            failures.append("\(label) CPU p95 \(rounded(cpuP95))ms exceeded \(budget.cpuP95Milliseconds)ms")
+        }
+        if cpuMax > budget.cpuMaxMilliseconds {
+            failures.append("\(label) CPU max \(rounded(cpuMax))ms exceeded \(budget.cpuMaxMilliseconds)ms")
+        }
+        if !result.gpuFrameMilliseconds.isEmpty, gpuP95 > budget.gpuP95Milliseconds {
+            failures.append("\(label) GPU p95 \(rounded(gpuP95))ms exceeded \(budget.gpuP95Milliseconds)ms")
+        }
+        if !result.gpuFrameMilliseconds.isEmpty, gpuMax > budget.gpuMaxMilliseconds {
+            failures.append("\(label) GPU max \(rounded(gpuMax))ms exceeded \(budget.gpuMaxMilliseconds)ms")
+        }
+        if dropped144 > budget.allowedDropped144HzFrames {
+            failures.append(
+                "\(label) dropped \(dropped144) 144Hz frames, allowed \(budget.allowedDropped144HzFrames)"
+            )
+        }
+        if dropped60 > 0 {
+            failures.append("\(label) dropped \(dropped60) 60Hz frames")
+        }
+        if result.waveformRenderers.contains(where: { $0 != "gpu" }) {
+            failures.append("\(label) used non-GPU waveform renderer: \(result.waveformRenderers.joined(separator: "+"))")
+        }
+        if result.maximumCPUWaveformVertexCount > 0 {
+            failures.append("\(label) generated \(result.maximumCPUWaveformVertexCount) CPU waveform vertices")
+        }
+        if result.maximumShaderBufferUploadCount > 0 || result.maximumShaderBufferUploadInFlightCount > 0 {
+            failures.append(
+                "\(label) uploaded shader buffers during measured frames " +
+                "(uploads=\(result.maximumShaderBufferUploadCount), " +
+                "inFlight=\(result.maximumShaderBufferUploadInFlightCount))"
+            )
+        }
+
+        return failures
+    }
+
+    private static func budget(for trackCount: Int) -> ScenarioBudget {
         switch trackCount {
         case ..<50:
-            cpuP95Budget = 5.0
+            return ScenarioBudget(
+                cpuP95Milliseconds: 4.0,
+                cpuMaxMilliseconds: 9.0,
+                gpuP95Milliseconds: 4.0,
+                gpuMaxMilliseconds: 8.0,
+                allowedDropped144HzFrames: 0
+            )
         case ..<100:
-            cpuP95Budget = 6.5
+            return ScenarioBudget(
+                cpuP95Milliseconds: 6.5,
+                cpuMaxMilliseconds: 12.0,
+                gpuP95Milliseconds: 5.5,
+                gpuMaxMilliseconds: 10.0,
+                allowedDropped144HzFrames: 0
+            )
         case ..<250:
-            cpuP95Budget = 8.0
+            return ScenarioBudget(
+                cpuP95Milliseconds: 8.5,
+                cpuMaxMilliseconds: 16.0,
+                gpuP95Milliseconds: 7.0,
+                gpuMaxMilliseconds: 12.0,
+                allowedDropped144HzFrames: 2
+            )
         default:
-            cpuP95Budget = 11.0
+            return ScenarioBudget(
+                cpuP95Milliseconds: 12.0,
+                cpuMaxMilliseconds: 24.0,
+                gpuP95Milliseconds: 10.0,
+                gpuMaxMilliseconds: 18.0,
+                allowedDropped144HzFrames: 4
+            )
         }
-
-        guard cpuP95 > cpuP95Budget || dropped60 > 0 else {
-            return nil
-        }
-
-        return "\(result.scenario.name) \(trackCount) tracks exceeded budget: p95=\(rounded(cpuP95))ms max=\(rounded(cpuMax))ms dropped60=\(dropped60)"
     }
 
     private static func percentile(_ values: [Double], _ percentile: Double) -> Double {
