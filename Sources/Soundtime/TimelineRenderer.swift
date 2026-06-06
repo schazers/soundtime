@@ -1721,6 +1721,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 baseGray: gray,
                 alpha: trackAlpha,
                 style: style,
+                drawableSize: drawableSize,
                 backingScale: backingScale,
                 fisheye: trackFisheye,
                 touch: trackTouch,
@@ -1776,6 +1777,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         baseGray: Float,
         alpha: Float,
         style: WaveformVisualStyle,
+        drawableSize: CGSize,
         backingScale: Float,
         fisheye: SIMD4<Float>,
         touch: SIMD4<Float>,
@@ -1809,7 +1811,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             trackDurationProgress,
             Float(max(binCount, 1)),
             Float(max(binOffset, 0)),
-            0
+            waveformSampleSmoothingAmount(
+                drawableSize: drawableSize,
+                binCount: binCount,
+                trackDurationProgress: trackDurationProgress,
+                renderState: renderState
+            )
         )
         let commonStyle = SIMD4<Float>(
             style.spectralAmount,
@@ -1874,26 +1881,36 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
             checkedRenderableTrack = true
             let preferredMipLevel = mipLevels[preferredIndex]
-            guard waveformShaderAllocation(track: track, mipLevel: preferredMipLevel) != nil else {
-                prepareWaveformShaderBinBuffer(
-                    track: track,
-                    mipLevel: preferredMipLevel,
-                    allowsSynchronousUpload: false
-                )
-                guard waveformShaderDrawable(
-                    track: track,
-                    mipLevels: mipLevels,
-                    drawableSize: drawableSize,
-                    renderState: renderState,
-                    fallbackPolicy: .allowFallbacks
-                ) != nil else {
-                    return false
-                }
+            if waveformShaderAllocation(track: track, mipLevel: preferredMipLevel) != nil {
                 continue
+            }
+
+            prepareWaveformShaderBinBuffer(
+                track: track,
+                mipLevel: preferredMipLevel,
+                allowsSynchronousUpload: false
+            )
+            guard waveformShaderAllocation(track: track, mipLevel: preferredMipLevel) != nil else {
+                return false
             }
         }
 
         return checkedRenderableTrack
+    }
+
+    private func waveformSampleSmoothingAmount(
+        drawableSize: CGSize,
+        binCount: Int,
+        trackDurationProgress: Float,
+        renderState: TimelineRenderState
+    ) -> Float {
+        let trackViewportProgress = min(
+            max(renderState.viewport.durationProgress / max(trackDurationProgress, 0.000_001), 0),
+            1
+        )
+        let visibleBins = max(Float(max(binCount, 1)) * trackViewportProgress, 1)
+        let pointsPerBin = Float(max(drawableSize.width, 1)) / visibleBins
+        return min(max((pointsPerBin - 0.35) / 2.75, 0), 0.92)
     }
 
     private func waveformShaderDrawable(
@@ -7093,7 +7110,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         float localProgress = timelineProgress / trackDurationProgress;
-        float smoothAmount = fisheye_sample_smoothing(in.normalizedPosition.x, in.fisheye);
+        float smoothAmount = max(
+            clamp(in.track.w, 0.0, 1.0),
+            fisheye_sample_smoothing(in.normalizedPosition.x, in.fisheye)
+        );
         WaveformShaderBin bin = sample_waveform_bin(localProgress, bins, binCount, binOffset, smoothAmount);
         float gain = waveform_gain(timelineProgress, in.gainPreview);
         float minimumSample = clamp(bin.minimumSample * gain, -1.0, 1.0);
