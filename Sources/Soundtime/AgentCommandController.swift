@@ -63,6 +63,13 @@ final class AgentCommandRegistry {
         )
         register(
             AgentCommandCapability(
+                identifier: "timeline.normalize",
+                title: "Normalize Selection",
+                summary: "Normalize the active selection through the edit graph without blocking playback or rendering."
+            )
+        )
+        register(
+            AgentCommandCapability(
                 identifier: "timeline.zoomToRegion",
                 title: "Zoom To Region",
                 summary: "Move the viewport to a track/time range so the user can inspect it."
