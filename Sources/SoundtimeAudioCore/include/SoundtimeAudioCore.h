@@ -48,6 +48,22 @@ typedef struct SoundtimeAudioCoreTrackConfig {
     float gain;
 } SoundtimeAudioCoreTrackConfig;
 
+typedef struct SoundtimeAudioCoreSegmentConfig {
+    uint64_t outputStartFrame;
+    uint64_t sourceStartFrame;
+    uint64_t frameCount;
+    double sourceFrameScale;
+    float gainStart;
+    float gainEnd;
+} SoundtimeAudioCoreSegmentConfig;
+
+typedef struct SoundtimeAudioCoreSegmentedTrackConfig {
+    const SoundtimeAudioCoreSource* source;
+    const SoundtimeAudioCoreSegmentConfig* segments;
+    uint32_t segmentCount;
+    float gain;
+} SoundtimeAudioCoreSegmentedTrackConfig;
+
 SoundtimeAudioCoreEngine* soundtime_audio_core_create(void);
 void soundtime_audio_core_destroy(SoundtimeAudioCoreEngine* engine);
 SoundtimeAudioCoreSource* soundtime_audio_core_source_create_planar(
@@ -101,6 +117,16 @@ bool soundtime_audio_core_set_prepared_tracks(
 bool soundtime_audio_core_update_prepared_tracks(
     SoundtimeAudioCoreEngine* engine,
     const SoundtimeAudioCoreTrackConfig* tracks,
+    uint32_t trackCount
+);
+bool soundtime_audio_core_set_prepared_segmented_tracks(
+    SoundtimeAudioCoreEngine* engine,
+    const SoundtimeAudioCoreSegmentedTrackConfig* tracks,
+    uint32_t trackCount
+);
+bool soundtime_audio_core_update_prepared_segmented_tracks(
+    SoundtimeAudioCoreEngine* engine,
+    const SoundtimeAudioCoreSegmentedTrackConfig* tracks,
     uint32_t trackCount
 );
 void soundtime_audio_core_play(SoundtimeAudioCoreEngine* engine);

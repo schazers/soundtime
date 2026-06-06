@@ -215,8 +215,8 @@ final class WorkspaceView: NSView {
         let label = NSTextField(labelWithString: "Soundtime")
         label.font = .systemFont(ofSize: 16, weight: .semibold)
         label.textColor = NSColor.labelColor
-        label.setContentCompressionResistancePriority(.required, for: .horizontal)
-        label.setContentHuggingPriority(.required, for: .horizontal)
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        label.setContentHuggingPriority(.defaultLow, for: .horizontal)
         label.translatesAutoresizingMaskIntoConstraints = false
         return label
     }()
@@ -237,10 +237,10 @@ final class WorkspaceView: NSView {
         let label = NSTextField(labelWithString: "00:00.000 / 00:00.000")
         label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
         label.alignment = .right
-        label.textColor = NSColor.secondaryLabelColor
+        label.textColor = NSColor.white
         label.lineBreakMode = .byClipping
-        label.setContentCompressionResistancePriority(.required, for: .horizontal)
-        label.setContentHuggingPriority(.required, for: .horizontal)
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        label.setContentHuggingPriority(.defaultLow, for: .horizontal)
         label.translatesAutoresizingMaskIntoConstraints = false
         return label
     }()
@@ -251,8 +251,8 @@ final class WorkspaceView: NSView {
         label.alignment = .right
         label.textColor = NSColor.secondaryLabelColor
         label.lineBreakMode = .byClipping
-        label.setContentCompressionResistancePriority(.required, for: .horizontal)
-        label.setContentHuggingPriority(.required, for: .horizontal)
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        label.setContentHuggingPriority(.defaultLow, for: .horizontal)
         label.translatesAutoresizingMaskIntoConstraints = false
         return label
     }()
@@ -260,6 +260,7 @@ final class WorkspaceView: NSView {
     private let frameRateHistoryView = FrameRateHistoryView()
     private let volumeControl = VolumeControlView()
     private let loudnessMeter = LoudnessMeterView()
+    private let transportControlPanel = TransportControlPanelView()
     private let fisheyeRadiusControl = TimelineTuningSliderView(
         title: "Fish Radius",
         value: FisheyeDefaults.radius,
@@ -302,6 +303,8 @@ final class WorkspaceView: NSView {
         stackView.alignment = .centerY
         stackView.distribution = .fill
         stackView.spacing = 10
+        stackView.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        stackView.setContentHuggingPriority(.defaultLow, for: .horizontal)
         stackView.translatesAutoresizingMaskIntoConstraints = false
         return stackView
     }()
@@ -318,8 +321,7 @@ final class WorkspaceView: NSView {
     private let addTrackButton = AddTrackButton()
     private let exportProgressOverlay = ExportProgressOverlayView()
     private let gainEffectOverlay = GainEffectOverlayView()
-    private var metadataToDebugConstraint: NSLayoutConstraint?
-    private var metadataToVolumeConstraint: NSLayoutConstraint?
+    private var framesPerSecondWidthConstraint: NSLayoutConstraint?
     private var trackControlsBelowDebugConstraint: NSLayoutConstraint?
     private var trackControlsBelowHeaderConstraint: NSLayoutConstraint?
 
@@ -341,6 +343,7 @@ final class WorkspaceView: NSView {
         timelineSurface.translatesAutoresizingMaskIntoConstraints = false
         frameRateHistoryView.translatesAutoresizingMaskIntoConstraints = false
         addTrackButton.translatesAutoresizingMaskIntoConstraints = false
+        transportControlPanel.translatesAutoresizingMaskIntoConstraints = false
         timelineSurface.onAudioFileDropped = { [weak self] url in
             self?.loadDroppedAudioFile(at: url)
         }
@@ -427,6 +430,9 @@ final class WorkspaceView: NSView {
         volumeControl.onVolumeEditingEnded = { [weak self] in
             self?.updateLoudnessMeter()
         }
+        transportControlPanel.onAction = { [weak self] action in
+            self?.handleTransportAction(action)
+        }
         configureFisheyeTuningControls()
         gainEffectOverlay.onGainChanged = { [weak self] _, gain in
             self?.previewSelectedGain(gain)
@@ -442,6 +448,7 @@ final class WorkspaceView: NSView {
         addSubview(metadataLabel)
         addSubview(framesPerSecondLabel)
         addSubview(frameRateHistoryView)
+        addSubview(transportControlPanel)
         addSubview(volumeControl)
         addSubview(timeReadoutLabel)
         addSubview(loudnessMeter)
@@ -456,15 +463,27 @@ final class WorkspaceView: NSView {
             lessThanOrEqualTo: loudnessMeter.leadingAnchor,
             constant: -18
         )
-        fisheyeTrailingConstraint.priority = .defaultHigh
-        let metadataToDebugConstraint = metadataLabel.trailingAnchor.constraint(
-            equalTo: framesPerSecondLabel.leadingAnchor,
-            constant: -14
+        fisheyeTrailingConstraint.priority = .defaultLow
+        let metadataToTransportConstraint = metadataLabel.trailingAnchor.constraint(
+            lessThanOrEqualTo: timeReadoutLabel.leadingAnchor,
+            constant: -18
         )
-        let metadataToVolumeConstraint = metadataLabel.trailingAnchor.constraint(
-            equalTo: volumeControl.leadingAnchor,
-            constant: -14
+        metadataToTransportConstraint.priority = .defaultLow
+        let volumeToDebugConstraint = volumeControl.trailingAnchor.constraint(
+            lessThanOrEqualTo: framesPerSecondLabel.leadingAnchor,
+            constant: -18
         )
+        volumeToDebugConstraint.priority = .defaultLow
+        let framesPerSecondWidthConstraint = framesPerSecondLabel.widthAnchor.constraint(equalToConstant: 330)
+        framesPerSecondWidthConstraint.priority = .defaultLow
+        let frameRateHistoryWidthConstraint = frameRateHistoryView.widthAnchor.constraint(equalToConstant: 132)
+        frameRateHistoryWidthConstraint.priority = .defaultLow
+        let transportPanelWidthConstraint = transportControlPanel.widthAnchor.constraint(equalToConstant: 96)
+        transportPanelWidthConstraint.priority = .defaultHigh
+        let volumeControlWidthConstraint = volumeControl.widthAnchor.constraint(equalToConstant: 150)
+        volumeControlWidthConstraint.priority = .defaultLow
+        let loudnessMeterWidthConstraint = loudnessMeter.widthAnchor.constraint(equalToConstant: 292)
+        loudnessMeterWidthConstraint.priority = .defaultLow
         let trackControlsBelowDebugConstraint = trackControlsStack.topAnchor.constraint(
             equalTo: fisheyeControlsStack.bottomAnchor,
             constant: 14
@@ -473,8 +492,7 @@ final class WorkspaceView: NSView {
             equalTo: titleLabel.bottomAnchor,
             constant: 56
         )
-        self.metadataToDebugConstraint = metadataToDebugConstraint
-        self.metadataToVolumeConstraint = metadataToVolumeConstraint
+        self.framesPerSecondWidthConstraint = framesPerSecondWidthConstraint
         self.trackControlsBelowDebugConstraint = trackControlsBelowDebugConstraint
         self.trackControlsBelowHeaderConstraint = trackControlsBelowHeaderConstraint
 
@@ -484,28 +502,34 @@ final class WorkspaceView: NSView {
 
             metadataLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
             metadataLabel.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 14),
-            metadataToDebugConstraint,
+            metadataToTransportConstraint,
 
             framesPerSecondLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
             framesPerSecondLabel.trailingAnchor.constraint(equalTo: frameRateHistoryView.leadingAnchor, constant: -10),
-            framesPerSecondLabel.widthAnchor.constraint(equalToConstant: 330),
+            framesPerSecondWidthConstraint,
 
             frameRateHistoryView.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
-            frameRateHistoryView.trailingAnchor.constraint(equalTo: volumeControl.leadingAnchor, constant: -12),
-            frameRateHistoryView.widthAnchor.constraint(equalToConstant: 132),
+            frameRateHistoryView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -22),
+            frameRateHistoryWidthConstraint,
             frameRateHistoryView.heightAnchor.constraint(equalToConstant: 24),
 
+            transportControlPanel.centerXAnchor.constraint(equalTo: centerXAnchor),
+            transportControlPanel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
+            transportPanelWidthConstraint,
+            transportControlPanel.heightAnchor.constraint(equalToConstant: 82),
+
             volumeControl.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
-            volumeControl.trailingAnchor.constraint(equalTo: timeReadoutLabel.leadingAnchor, constant: -18),
-            volumeControl.widthAnchor.constraint(equalToConstant: 150),
+            volumeControl.leadingAnchor.constraint(equalTo: transportControlPanel.trailingAnchor, constant: 16),
+            volumeControlWidthConstraint,
             volumeControl.heightAnchor.constraint(equalToConstant: 24),
+            volumeToDebugConstraint,
 
             timeReadoutLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
-            timeReadoutLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -22),
+            timeReadoutLabel.trailingAnchor.constraint(equalTo: transportControlPanel.leadingAnchor, constant: -16),
 
-            loudnessMeter.topAnchor.constraint(equalTo: volumeControl.bottomAnchor, constant: 6),
-            loudnessMeter.trailingAnchor.constraint(equalTo: timeReadoutLabel.trailingAnchor),
-            loudnessMeter.widthAnchor.constraint(equalToConstant: 292),
+            loudnessMeter.topAnchor.constraint(equalTo: frameRateHistoryView.bottomAnchor, constant: 6),
+            loudnessMeter.trailingAnchor.constraint(equalTo: frameRateHistoryView.trailingAnchor),
+            loudnessMeterWidthConstraint,
             loudnessMeter.heightAnchor.constraint(equalToConstant: 34),
 
             fisheyeControlsStack.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 12),
@@ -543,6 +567,7 @@ final class WorkspaceView: NSView {
         updateWaveformFisheyeTuning()
         setDebugToolsVisible(Self.defaultDebugToolsVisible)
         updateLoudnessMeter()
+        updateTransportControlState(isPlaying: false)
         startLoudnessMeterTimer()
     }
 
@@ -560,8 +585,12 @@ final class WorkspaceView: NSView {
             control.onValueChanged = { [weak self] _ in
                 self?.updateWaveformFisheyeTuning()
             }
+            control.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            control.setContentHuggingPriority(.defaultLow, for: .horizontal)
             fisheyeControlsStack.addArrangedSubview(control)
-            control.widthAnchor.constraint(equalToConstant: 136).isActive = true
+            let widthConstraint = control.widthAnchor.constraint(equalToConstant: 136)
+            widthConstraint.priority = .defaultLow
+            widthConstraint.isActive = true
         }
     }
 
@@ -573,13 +602,27 @@ final class WorkspaceView: NSView {
         debugToolsVisible = isVisible
         timelineSurface.isDebugToolsVisible = isVisible
         framesPerSecondLabel.isHidden = !isVisible
-        frameRateHistoryView.isHidden = !isVisible
+        frameRateHistoryView.isHidden = false
         fisheyeControlsStack.isHidden = !isVisible
-        metadataToDebugConstraint?.isActive = isVisible
-        metadataToVolumeConstraint?.isActive = !isVisible
+        framesPerSecondWidthConstraint?.constant = isVisible ? 330 : 0
         trackControlsBelowDebugConstraint?.isActive = isVisible
         trackControlsBelowHeaderConstraint?.isActive = !isVisible
         needsLayout = true
+    }
+
+    private func handleTransportAction(_ action: TransportControlPanelView.TransportAction) {
+        switch action {
+        case .togglePlayback:
+            togglePlayback()
+        }
+
+        window?.makeFirstResponder(timelineSurface)
+        updateTransportControlState(isPlaying: playbackController.isPlaying)
+    }
+
+    private func updateTransportControlState(isPlaying: Bool) {
+        transportControlPanel.isPlaying = isPlaying
+        transportControlPanel.isTransportEnabled = playbackController.hasSource || recordingTrackID != nil
     }
 
     private func updateWaveformFisheyeTuning() {
@@ -638,10 +681,10 @@ final class WorkspaceView: NSView {
 
         if
             (event.keyCode == 51 || event.keyCode == 117),
-            selectedTrackID != nil,
+            selectedTrackID != nil || (selectedTimelineRange?.durationProgress ?? 0) > 0,
             !event.modifierFlags.contains(.command)
         {
-            deleteSelectedTrack()
+            deleteSelectedTrackOrSelection()
             return nil
         }
 
@@ -1561,10 +1604,14 @@ final class WorkspaceView: NSView {
         return "Soundtime - Untitled Project"
     }
 
-    private func reloadPlaybackFromProjectTracks(preserveProgress: Bool) {
+    private func reloadPlaybackFromProjectTracks(
+        preserveProgress: Bool,
+        targetProgress: Float? = nil,
+        resumeIfPlaying: Bool? = nil
+    ) {
         let previousSnapshot = playbackController.snapshot()
-        let previousProgress = previousSnapshot.progress
-        let wasPlaying = previousSnapshot.isPlaying
+        let previousProgress = targetProgress ?? previousSnapshot.progress
+        let shouldResume = resumeIfPlaying ?? (preserveProgress && previousSnapshot.isPlaying)
         let playbackTracks = projectPlaybackTracks()
 
         guard !playbackTracks.isEmpty else {
@@ -1577,9 +1624,9 @@ final class WorkspaceView: NSView {
 
         do {
             try playbackController.loadProjectTracks(playbackTracks)
-            if preserveProgress {
+            if preserveProgress || targetProgress != nil {
                 try playbackController.seek(toProgress: previousProgress)
-                if wasPlaying {
+                if shouldResume {
                     try playbackController.play()
                 }
             } else if playbackController.hasSource {
@@ -1618,6 +1665,11 @@ final class WorkspaceView: NSView {
                 source = .file(
                     url: track.sourceURL,
                     zeroCrossingProbe: track.zeroCrossingProbe
+                )
+            } else if let audioTimeline = track.audioTimeline {
+                source = .timeline(
+                    audioTimeline: audioTimeline,
+                    zeroCrossingIndex: track.zeroCrossingIndex
                 )
             } else if let decodedAudioBuffer = track.decodedAudioBuffer {
                 source = .decoded(
@@ -1809,9 +1861,14 @@ final class WorkspaceView: NSView {
         projectTracks[trackIndex].zeroCrossingIndex = materialized.zeroCrossingIndex
         activeTrackID = trackID
         syncActiveTrackFields()
+        timelineSurface.displayGainPreview(selection: nil, gain: 1)
         refreshProjectTimelineDisplay(rebuildControls: false)
         updateProjectDisplayTiming(sampleRateHint: materialized.buffer.sampleRate)
-        reloadPlaybackFromProjectTracks(preserveProgress: preservePlaybackProgress)
+        if playbackController.isPlaying {
+            updateProjectPlaybackTrackMix()
+        } else {
+            reloadPlaybackFromProjectTracks(preserveProgress: preservePlaybackProgress)
+        }
         updateEffectCommandState()
         updateStatus(status)
     }
@@ -2360,11 +2417,23 @@ final class WorkspaceView: NSView {
 
     private func performOptimisticDelete(copyBeforeDeleting: Bool) {
         guard
-            let trackIndex = activeProjectTrackIndex(),
             let selectionToDelete = selectedTimelineRange,
-            selectionToDelete.durationProgress > 0,
-            let currentTimeline = projectTracks[trackIndex].audioTimeline
+            selectionToDelete.durationProgress > 0
         else {
+            updateStatus("select audio to delete")
+            return
+        }
+
+        guard
+            let trackIndex = activeProjectTrackIndex(),
+            projectTracks.indices.contains(trackIndex)
+        else {
+            updateStatus("no track selected")
+            return
+        }
+
+        guard let currentTimeline = projectTracks[trackIndex].audioTimeline else {
+            updateStatus("track still resolving - delete available when ready")
             return
         }
 
@@ -2373,12 +2442,15 @@ final class WorkspaceView: NSView {
         }
 
         var editedTimeline = currentTimeline
-        let deletedStartProgress = selectionToDelete.startProgress
+        let deletedStartTime = selectionToDelete.startProgress * currentTimeline.duration
         let deletedDuration = selectionToDelete.duration(in: currentTimeline.duration)
         let deletedFrameCount = editedTimeline.delete(selectionToDelete)
         guard deletedFrameCount > 0 else {
             return
         }
+        let targetPlaybackProgress = editedTimeline.duration > 0 ?
+            min(max(Float(deletedStartTime / editedTimeline.duration), 0), 1) :
+            0
 
         let trackID = projectTracks[trackIndex].id
         editUndoStack.append(.timeline(trackID: trackID, timeline: currentTimeline))
@@ -2393,14 +2465,17 @@ final class WorkspaceView: NSView {
             with: nil
         )
 
+        timelineSurface.triggerDeletionEffect(selection: selectionToDelete)
         selectedTimelineRange = nil
         timelineSurface.displaySelection(nil)
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
-        stopPlaybackTimer()
-        playbackController.clear()
-        displayPlaybackVisuals(progress: Float(deletedStartProgress), isPlaying: false)
         refreshProjectTimelineDisplay(rebuildControls: false)
         updateProjectDisplayTiming()
+        reloadPlaybackFromProjectTracks(
+            preserveProgress: false,
+            targetProgress: targetPlaybackProgress,
+            resumeIfPlaying: playbackController.isPlaying
+        )
         updateEffectCommandState()
         updateStatus("\(copyBeforeDeleting ? "cut" : "deleted") \(formatDuration(deletedDuration))")
 
@@ -2408,7 +2483,8 @@ final class WorkspaceView: NSView {
             trackID: trackID,
             timeline: editedTimeline,
             editRevision: editRevision,
-            status: "\(copyBeforeDeleting ? "cut" : "deleted") \(formatDuration(deletedDuration))"
+            status: "\(copyBeforeDeleting ? "cut" : "deleted") \(formatDuration(deletedDuration))",
+            preservePlaybackProgress: true
         )
     }
 
@@ -2499,18 +2575,14 @@ final class WorkspaceView: NSView {
         projectTracks[trackIndex].audioTimeline = editedTimeline
         projectTracks[trackIndex].decodedAudioBuffer = nil
         projectTracks[trackIndex].zeroCrossingIndex = nil
-        projectTracks[trackIndex].waveformOverview = optimisticWaveformOverview(
-            projectTracks[trackIndex].waveformOverview,
-            applyingGain: gain,
-            to: selectionToApply
-        )
         lastEffect = .gain(decibels: decibels)
         selectedTimelineRange = nil
         timelineSurface.displaySelection(nil)
-        timelineSurface.displayGainPreview(selection: nil, gain: 1)
+        timelineSurface.displayGainPreview(selection: selectionToApply, gain: gain)
         syncActiveTrackFields()
         refreshProjectTimelineDisplay(rebuildControls: false)
         updateProjectDisplayTiming()
+        reloadPlaybackFromProjectTracks(preserveProgress: true)
         updateEffectCommandState()
         updateStatus(String(format: "gain %+.1f dB", decibels))
 
@@ -2527,65 +2599,53 @@ final class WorkspaceView: NSView {
         guard
             let trackIndex = activeProjectTrackIndex(),
             let currentTimeline = projectTracks[trackIndex].audioTimeline,
-            let selectedTimelineRange,
-            selectedTimelineRange.durationProgress > 0
+            let selectionToApply = selectedTimelineRange,
+            selectionToApply.durationProgress > 0
         else {
             return
         }
 
-        let renderedBuffer = currentTimeline.render()
-        let startFrame = min(
-            max(Int((selectedTimelineRange.startProgress * Double(renderedBuffer.frameCount)).rounded(.down)), 0),
-            renderedBuffer.frameCount
-        )
-        let endFrame = min(
-            max(Int((selectedTimelineRange.endProgress * Double(renderedBuffer.frameCount)).rounded(.up)), startFrame),
-            renderedBuffer.frameCount
-        )
-        guard endFrame - startFrame > 1 else {
+        var editedTimeline = currentTimeline
+        let timelineFadeDirection: AudioEditTimeline.FadeDirection
+        switch fadeEffect {
+        case .fadeIn:
+            timelineFadeDirection = .fadeIn
+        case .fadeOut:
+            timelineFadeDirection = .fadeOut
+        }
+        let affectedFrameCount = editedTimeline.applyFade(timelineFadeDirection, to: selectionToApply)
+        guard affectedFrameCount > 1 else {
             return
         }
 
-        var samplesByChannel = renderedBuffer.samplesByChannel
-        let selectedFrameCount = endFrame - startFrame
-        for channelIndex in samplesByChannel.indices {
-            guard startFrame < samplesByChannel[channelIndex].count else {
-                continue
-            }
-
-            let clampedEndFrame = min(endFrame, samplesByChannel[channelIndex].count)
-            for frameIndex in startFrame..<clampedEndFrame {
-                let offset = frameIndex - startFrame
-                let progress = Float(offset) / Float(max(selectedFrameCount - 1, 1))
-                let curve = smoothstep(progress)
-                let gain: Float
-                switch fadeEffect {
-                case .fadeIn:
-                    gain = curve
-                case .fadeOut:
-                    gain = 1 - curve
-                }
-
-                samplesByChannel[channelIndex][frameIndex] = clampAudioSample(
-                    samplesByChannel[channelIndex][frameIndex] * gain
-                )
-            }
-        }
-
-        let editedBuffer = DecodedAudioBuffer(
-            url: renderedBuffer.url,
-            sampleRate: renderedBuffer.sampleRate,
-            channelCount: renderedBuffer.channelCount,
-            frameCount: renderedBuffer.frameCount,
-            samplesByChannel: samplesByChannel
-        )
-        let editedTimeline = AudioEditTimeline(sourceBuffer: editedBuffer)
+        let selectedDuration = selectionToApply.duration(in: currentTimeline.duration)
         let trackID = projectTracks[trackIndex].id
         activeTrackID = trackID
         editUndoStack.append(.timeline(trackID: trackID, timeline: currentTimeline))
+        projectTracks[trackIndex].editRevision += 1
+        let editRevision = projectTracks[trackIndex].editRevision
+        projectTracks[trackIndex].audioTimeline = editedTimeline
+        projectTracks[trackIndex].decodedAudioBuffer = nil
+        projectTracks[trackIndex].zeroCrossingIndex = nil
         lastEffect = .fade(fadeEffect)
-        applyTimeline(editedTimeline)
-        updateStatus("\(fadeEffect.displayName) \(formatDuration(selectedTimelineRange.duration(in: renderedBuffer.duration)))")
+        selectedTimelineRange = nil
+        timelineSurface.displaySelection(nil)
+        timelineSurface.displayGainPreview(selection: nil, gain: 1)
+        syncActiveTrackFields()
+        refreshProjectTimelineDisplay(rebuildControls: false)
+        updateProjectDisplayTiming()
+        reloadPlaybackFromProjectTracks(preserveProgress: true)
+        updateEffectCommandState()
+        let status = "\(fadeEffect.displayName) \(formatDuration(selectedDuration))"
+        updateStatus(status)
+
+        materializeEditedTimeline(
+            trackID: trackID,
+            timeline: editedTimeline,
+            editRevision: editRevision,
+            status: status,
+            preservePlaybackProgress: true
+        )
     }
 
     private func undoLastEdit() {
@@ -2955,10 +3015,17 @@ final class WorkspaceView: NSView {
             return
         }
 
-        frame.size.width = min(frame.width, visibleFrame.width)
-        frame.size.height = min(frame.height, visibleFrame.height)
-        frame.origin.x = min(max(frame.origin.x, visibleFrame.minX), visibleFrame.maxX - frame.width)
-        frame.origin.y = min(max(frame.origin.y, visibleFrame.minY), visibleFrame.maxY - frame.height)
+        if frame.width <= visibleFrame.width {
+            frame.origin.x = min(max(frame.origin.x, visibleFrame.minX), visibleFrame.maxX - frame.width)
+        } else {
+            frame.origin.x = visibleFrame.minX
+        }
+
+        if frame.height <= visibleFrame.height {
+            frame.origin.y = min(max(frame.origin.y, visibleFrame.minY), visibleFrame.maxY - frame.height)
+        } else {
+            frame.origin.y = visibleFrame.maxY - frame.height
+        }
         window.setFrame(frame, display: true, animate: false)
     }
 
@@ -3043,7 +3110,9 @@ final class WorkspaceView: NSView {
     }
 
     private func updateLoudnessMeter() {
-        loudnessMeter.display(levels: currentLoudnessMeterLevels())
+        let levels = currentLoudnessMeterLevels()
+        loudnessMeter.display(levels: levels)
+        transportControlPanel.displayOutputActivity(levels: levels)
     }
 
     private func currentLoudnessMeterLevels() -> LoudnessMeterLevels {
@@ -3315,6 +3384,7 @@ final class WorkspaceView: NSView {
     private func displayPlaybackActiveIfNeeded(_ isPlaying: Bool) {
         visualPlaybackActive = isPlaying
         ImportWorkBudget.shared.setPlaybackActive(isPlaying)
+        updateTransportControlState(isPlaying: isPlaying)
         guard displayedPlaybackActive != isPlaying else {
             return
         }
@@ -3356,11 +3426,11 @@ final class WorkspaceView: NSView {
     }
 
     private func updateFrameStats(_ frameStats: TimelineFrameStats) {
+        frameRateHistoryView.display(frameStats: frameStats)
         guard debugToolsVisible else {
             return
         }
 
-        frameRateHistoryView.display(frameStats: frameStats)
         let shaderBufferMegabytes = Int((Double(frameStats.shaderBufferByteCount) / 1_048_576).rounded())
         framesPerSecondLabel.stringValue = String(
             format: "%d fps %@ c%d g%d b%d/%dMB u%d/%d m%d +/-%.1f max %.1f",
@@ -3473,31 +3543,41 @@ final class WorkspaceView: NSView {
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
         updateEffectCommandState()
         currentPlayheadFrame = 0
-        stopPlaybackTimer()
-
-        let renderedBuffer = audioTimeline.render()
-        decodedAudioBuffer = renderedBuffer
-        displayedFrameCount = renderedBuffer.frameCount
-        displayedSampleRate = renderedBuffer.sampleRate
         timelineSurface.displaySelection(nil)
         displayPlaybackVisuals(progress: 0, isPlaying: false)
 
-        let waveformOverview = WaveformOverviewBuilder.build(from: renderedBuffer)
-        let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: renderedBuffer)
         if
             let activeTrackID,
             let trackIndex = projectTracks.firstIndex(where: { $0.id == activeTrackID })
         {
-            projectTracks[trackIndex].decodedAudioBuffer = renderedBuffer
+            projectTracks[trackIndex].editRevision += 1
+            let editRevision = projectTracks[trackIndex].editRevision
             projectTracks[trackIndex].audioTimeline = audioTimeline
-            projectTracks[trackIndex].waveformOverview = waveformOverview
-            projectTracks[trackIndex].zeroCrossingIndex = zeroCrossingIndex
-        }
+            projectTracks[trackIndex].decodedAudioBuffer = nil
+            projectTracks[trackIndex].zeroCrossingIndex = nil
+            projectTracks[trackIndex].durationHint = audioTimeline.duration
 
-        refreshProjectTimelineDisplay()
-        reloadPlaybackFromProjectTracks(preserveProgress: false)
-        updateLoadedAudioSummary(for: renderedBuffer)
-        updateTimeReadout()
+            decodedAudioBuffer = nil
+            displayedFrameCount = audioTimeline.frameCount
+            displayedSampleRate = audioTimeline.sourceAudioBuffer.sampleRate
+            syncActiveTrackFields()
+            refreshProjectTimelineDisplay()
+            reloadPlaybackFromProjectTracks(preserveProgress: false)
+            updateTimeReadout()
+
+            materializeEditedTimeline(
+                trackID: activeTrackID,
+                timeline: audioTimeline,
+                editRevision: editRevision,
+                status: "track ready"
+            )
+        } else {
+            decodedAudioBuffer = nil
+            displayedFrameCount = audioTimeline.frameCount
+            displayedSampleRate = audioTimeline.sourceAudioBuffer.sampleRate
+            refreshProjectTimelineDisplay()
+            updateTimeReadout()
+        }
     }
 
     private func updateTimeReadout() {

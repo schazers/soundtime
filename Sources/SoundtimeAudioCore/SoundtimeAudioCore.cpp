@@ -37,7 +37,8 @@ struct RenderSegment {
     uint64_t frameCount = 0;
     double sourceFrameScale = 1;
     bool usesExactSourceFrames = true;
-    float gain = 1;
+    float gainStart = 1;
+    float gainEnd = 1;
 };
 
 struct RenderTrack {
@@ -431,6 +432,23 @@ float sample_at_linear(const AudioSource& source, double framePosition, uint32_t
     return lowerSample + (upperSample - lowerSample) * fraction;
 }
 
+float smoothstep(float progress) {
+    const auto clampedProgress = std::clamp(progress, 0.0f, 1.0f);
+    return clampedProgress * clampedProgress * (3.0f - 2.0f * clampedProgress);
+}
+
+float segment_gain(const RenderSegment& segment, uint64_t segmentFrameOffset) {
+    if (segment.frameCount <= 1 || std::fabs(segment.gainStart - segment.gainEnd) <= 0.000'001f) {
+        return segment.gainEnd;
+    }
+
+    const auto progress = static_cast<float>(
+        static_cast<double>(std::min(segmentFrameOffset, segment.frameCount - 1)) /
+            static_cast<double>(segment.frameCount - 1)
+    );
+    return segment.gainStart + (segment.gainEnd - segment.gainStart) * smoothstep(progress);
+}
+
 uint64_t output_frame_count_for_source(const AudioSource& source, double outputSampleRate) {
     if (source.frameCount == 0 || source.sampleRate <= 0 || outputSampleRate <= 0) {
         return 0;
@@ -709,9 +727,102 @@ std::shared_ptr<RenderGraph> make_graph_from_track_configs(
                 .frameCount = outputFrameCount,
                 .sourceFrameScale = sourceFrameScale,
                 .usesExactSourceFrames = std::fabs(sourceFrameScale - 1.0) <= 0.000'000'001,
-                .gain = 1,
+                .gainStart = 1,
+                .gainEnd = 1,
             });
         }
+        graph->tracks.push_back(std::move(track));
+    }
+
+    if (graph->channelCount == 0 || graph->frameCount == 0) {
+        return nullptr;
+    }
+
+    return graph;
+}
+
+std::shared_ptr<RenderGraph> make_graph_from_segmented_track_configs(
+    const SoundtimeAudioCoreSegmentedTrackConfig* tracks,
+    uint32_t trackCount
+) {
+    if (tracks == nullptr || trackCount == 0) {
+        return nullptr;
+    }
+
+    const auto* firstSource = tracks[0].source;
+    if (firstSource == nullptr || !firstSource->source) {
+        return nullptr;
+    }
+
+    const auto sampleRate = firstSource->source->sampleRate;
+    if (sampleRate <= 0) {
+        return nullptr;
+    }
+
+    auto graph = std::make_shared<RenderGraph>();
+    graph->sampleRate = sampleRate;
+
+    for (uint32_t trackIndex = 0; trackIndex < trackCount; trackIndex++) {
+        const auto& trackConfig = tracks[trackIndex];
+        if (trackConfig.source == nullptr || !trackConfig.source->source) {
+            return nullptr;
+        }
+
+        const auto source = trackConfig.source->source;
+        if (source->sampleRate <= 0 || source->channelCount == 0) {
+            return nullptr;
+        }
+
+        graph->channelCount = std::max(graph->channelCount, source->channelCount);
+
+        auto track = RenderTrack{
+            .source = source,
+            .segments = {},
+            .gain = std::max(trackConfig.gain, 0.0f),
+        };
+
+        if (trackConfig.segmentCount == 0 || trackConfig.segments == nullptr) {
+            const auto outputFrameCount = output_frame_count_for_source(*source, sampleRate);
+            graph->frameCount = std::max(graph->frameCount, outputFrameCount);
+            if (outputFrameCount > 0) {
+                const auto sourceFrameScale = source->sampleRate / sampleRate;
+                track.segments.push_back(RenderSegment{
+                    .outputStartFrame = 0,
+                    .sourceStartFrame = 0,
+                    .frameCount = outputFrameCount,
+                    .sourceFrameScale = sourceFrameScale,
+                    .usesExactSourceFrames = std::fabs(sourceFrameScale - 1.0) <= 0.000'000'001,
+                    .gainStart = 1,
+                    .gainEnd = 1,
+                });
+            }
+        } else {
+            track.segments.reserve(trackConfig.segmentCount);
+            for (uint32_t segmentIndex = 0; segmentIndex < trackConfig.segmentCount; segmentIndex++) {
+                const auto& segmentConfig = trackConfig.segments[segmentIndex];
+                if (segmentConfig.frameCount == 0) {
+                    continue;
+                }
+
+                const auto sourceFrameScale = segmentConfig.sourceFrameScale > 0 ?
+                    segmentConfig.sourceFrameScale :
+                    source->sampleRate / sampleRate;
+                track.segments.push_back(RenderSegment{
+                    .outputStartFrame = segmentConfig.outputStartFrame,
+                    .sourceStartFrame = segmentConfig.sourceStartFrame,
+                    .frameCount = segmentConfig.frameCount,
+                    .sourceFrameScale = sourceFrameScale,
+                    .usesExactSourceFrames = std::fabs(sourceFrameScale - 1.0) <= 0.000'000'001,
+                    .gainStart = std::max(segmentConfig.gainStart, 0.0f),
+                    .gainEnd = std::max(segmentConfig.gainEnd, 0.0f),
+                });
+                graph->frameCount = std::max(
+                    graph->frameCount,
+                    segmentConfig.outputStartFrame + segmentConfig.frameCount
+                );
+            }
+        }
+
         graph->tracks.push_back(std::move(track));
     }
 
@@ -739,7 +850,8 @@ void publish_source(SoundtimeAudioCoreEngine& engine, std::shared_ptr<const Audi
             .frameCount = source->frameCount,
             .sourceFrameScale = 1,
             .usesExactSourceFrames = true,
-            .gain = 1,
+            .gainStart = 1,
+            .gainEnd = 1,
         });
     }
     graph->tracks.push_back(std::move(track));
@@ -1056,6 +1168,42 @@ bool soundtime_audio_core_update_prepared_tracks(
     return true;
 }
 
+bool soundtime_audio_core_set_prepared_segmented_tracks(
+    SoundtimeAudioCoreEngine* engine,
+    const SoundtimeAudioCoreSegmentedTrackConfig* tracks,
+    uint32_t trackCount
+) {
+    if (engine == nullptr) {
+        return false;
+    }
+
+    const auto graph = make_graph_from_segmented_track_configs(tracks, trackCount);
+    if (!graph) {
+        return false;
+    }
+
+    publish_graph(*engine, graph, true);
+    return true;
+}
+
+bool soundtime_audio_core_update_prepared_segmented_tracks(
+    SoundtimeAudioCoreEngine* engine,
+    const SoundtimeAudioCoreSegmentedTrackConfig* tracks,
+    uint32_t trackCount
+) {
+    if (engine == nullptr) {
+        return false;
+    }
+
+    const auto graph = make_graph_from_segmented_track_configs(tracks, trackCount);
+    if (!graph) {
+        return false;
+    }
+
+    publish_graph(*engine, graph, false);
+    return true;
+}
+
 void soundtime_audio_core_play(SoundtimeAudioCoreEngine* engine) {
     if (engine == nullptr) {
         return;
@@ -1313,7 +1461,7 @@ void soundtime_audio_core_render_at_host_time(
                     const auto segmentFrameOffset = outputFrameIndex - segment.outputStartFrame;
 
                     const auto sourceChannelCount = source->channelCount;
-                    const auto outputGain = outputGainBase * trackGain * segment.gain;
+                    const auto outputGain = outputGainBase * trackGain * segment_gain(segment, segmentFrameOffset);
                     for (uint32_t outputChannel = 0; outputChannel < channelCount; outputChannel++) {
                         auto* output = outputs[outputChannel];
                         if (output == nullptr) {
