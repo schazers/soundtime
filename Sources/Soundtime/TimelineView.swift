@@ -429,6 +429,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         startTransientRenderPulse(duration: 0.62)
     }
 
+    func clearDeletionEffects() {
+        updateTimelineRenderer { renderer in
+            renderer.clearDeletionEffects()
+        }
+        requestTimelineRender()
+    }
+
     private func configure() {
         colorPixelFormat = .bgra8Unorm
         clearColor = MTLClearColor(red: 0.08, green: 0.08, blue: 0.08, alpha: 1.0)

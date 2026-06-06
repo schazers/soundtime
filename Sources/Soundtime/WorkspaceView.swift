@@ -3581,11 +3581,12 @@ final class WorkspaceView: NSView {
         }
         selectedTimelineRange = snapshot.selectedTimelineRange
         syncActiveTrackFields()
+        updateProjectDisplayTiming()
+        timelineSurface.clearDeletionEffects()
         timelineSurface.displaySelection(selectedTimelineRange)
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
         timelineSurface.displaySelectedTrack(selectedTrackID)
-        refreshProjectTimelineDisplay()
-        updateProjectDisplayTiming()
+        refreshProjectTimelineDisplay(animateWaveformTransition: false)
         reloadPlaybackFromProjectTracks(
             preserveProgress: snapshot.restoreProgress == nil,
             targetProgress: snapshot.restoreProgress
