@@ -572,17 +572,11 @@ void reset_engine_runtime(SoundtimeAudioCoreEngine& engine) {
 }
 
 void gc_retired_graphs_locked(SoundtimeAudioCoreEngine& engine) {
-    const auto* graphInUse = engine.renderGraphInUse.load(std::memory_order_acquire);
-    engine.retiredGraphs.erase(
-        std::remove_if(
-            engine.retiredGraphs.begin(),
-            engine.retiredGraphs.end(),
-            [graphInUse](const std::shared_ptr<const RenderGraph>& graph) {
-                return graph.get() != graphInUse;
-            }
-        ),
-        engine.retiredGraphs.end()
-    );
+    // Render graphs are tiny immutable routing/edit descriptions; they do not own
+    // decoded sample buffers beyond shared source references. Keep retired graphs
+    // for the engine lifetime so the realtime callback never observes memory that
+    // was reclaimed between graph publication and render acquisition.
+    static_cast<void>(engine);
 }
 
 void publish_render_config(
