@@ -330,6 +330,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         func trim(toMaximumCount maximumCount: Int, maximumByteCount: Int) {
             lock.lock()
             if allocations.count > maximumCount || diagnosticsByteCountLocked() > maximumByteCount {
+                compactAllocationsLocked(
+                    maximumCount: max(maximumCount, 1),
+                    maximumByteCount: max(maximumByteCount, 0)
+                )
+            } else {
                 compactAccessTicksLocked()
             }
             lock.unlock()
@@ -345,6 +350,65 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             accessTicks = accessTicks.filter { key, _ in
                 allocations[key] != nil || inFlightKeys.contains(key)
             }
+        }
+
+        private func compactAllocationsLocked(maximumCount: Int, maximumByteCount: Int) {
+            guard !allocations.isEmpty else {
+                slabs.removeAll()
+                compactAccessTicksLocked()
+                return
+            }
+
+            let rankedKeys = allocations.keys.sorted { lhs, rhs in
+                (accessTicks[lhs] ?? 0) > (accessTicks[rhs] ?? 0)
+            }
+            var keptAllocations: [(key: WaveformMipCacheKey, allocation: WaveformShaderBufferAllocation)] = []
+            keptAllocations.reserveCapacity(min(maximumCount, allocations.count))
+            var keptByteCount = 0
+
+            for key in rankedKeys {
+                guard let allocation = allocations[key] else {
+                    continue
+                }
+
+                let projectedByteCount = keptByteCount + allocation.byteCount
+                let fitsCount = keptAllocations.count < maximumCount
+                let fitsBytes = projectedByteCount <= maximumByteCount || keptAllocations.isEmpty
+                guard fitsCount, fitsBytes else {
+                    continue
+                }
+
+                keptAllocations.append((key, allocation))
+                keptByteCount = projectedByteCount
+            }
+
+            let oldAllocations = keptAllocations
+            slabs.removeAll(keepingCapacity: true)
+            allocations.removeAll(keepingCapacity: true)
+
+            for item in oldAllocations {
+                let binCount = item.allocation.binCount
+                guard let slabIndex = slabIndexForAllocation(binCount: binCount) else {
+                    continue
+                }
+
+                let destinationBinOffset = slabs[slabIndex].usedBins
+                let destinationByteOffset = destinationBinOffset * MemoryLayout<WaveformShaderBin>.stride
+                let sourceByteOffset = item.allocation.binOffset * MemoryLayout<WaveformShaderBin>.stride
+                let sourcePointer = item.allocation.buffer.contents().advanced(by: sourceByteOffset)
+                let destinationPointer = slabs[slabIndex].buffer.contents().advanced(by: destinationByteOffset)
+                destinationPointer.copyMemory(from: sourcePointer, byteCount: item.allocation.byteCount)
+
+                allocations[item.key] = WaveformShaderBufferAllocation(
+                    buffer: slabs[slabIndex].buffer,
+                    binOffset: destinationBinOffset,
+                    binCount: binCount,
+                    byteCount: item.allocation.byteCount
+                )
+                slabs[slabIndex].usedBins += binCount
+            }
+
+            compactAccessTicksLocked()
         }
 
         private func markAccessed(_ key: WaveformMipCacheKey) {
