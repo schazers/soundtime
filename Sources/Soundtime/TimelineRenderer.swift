@@ -781,6 +781,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let waveformMipLevelCacheLock = NSLock()
     private let waveformShaderBufferStore: WaveformShaderBufferStore
     private var waveformShaderBatchScratch: [WaveformShaderBatch] = []
+    private var selectedTrackVertexScratch: [TimelineVertex] = []
+    private var selectionVertexScratch: [TimelineVertex] = []
     private var gridCache: GridCache?
     private var waveformTransitionStartTime: CFTimeInterval?
     private var previousRenderedPlayheadX: Float?
@@ -3948,12 +3950,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         drawableSize: CGSize,
         renderState: TimelineRenderState
     ) -> [TimelineVertex] {
+        selectionVertexScratch.removeAll(keepingCapacity: true)
         guard
             let selection = renderState.selection,
             renderState.hasWaveforms,
             selection.durationProgress > 0
         else {
-            return []
+            return selectionVertexScratch
         }
 
         let viewport = renderState.viewport
@@ -3962,7 +3965,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let left = Float((selection.startProgress - viewportStart) / viewportDuration)
         let right = Float((selection.endProgress - viewportStart) / viewportDuration)
         guard right > 0, left < 1 else {
-            return []
+            return selectionVertexScratch
         }
 
         let color = SIMD4<Float>(0.0, 0.84, 0.78, 0.22)
@@ -3971,13 +3974,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             renderState: renderState,
             drawableSize: drawableSize
         ) else {
-            return []
+            return selectionVertexScratch
         }
-        var vertices: [TimelineVertex] = []
-        vertices.reserveCapacity(6)
+        selectionVertexScratch.reserveCapacity(6)
 
         appendRectangle(
-            to: &vertices,
+            to: &selectionVertexScratch,
             left: max(left, 0),
             right: min(right, 1),
             top: verticalRange.top,
@@ -3985,19 +3987,20 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             color: color
         )
 
-        return vertices
+        return selectionVertexScratch
     }
 
     private func makeSelectedTrackVertices(
         drawableSize: CGSize,
         renderState: TimelineRenderState
     ) -> [TimelineVertex] {
+        selectedTrackVertexScratch.removeAll(keepingCapacity: true)
         guard
             let selectedTrackID = renderState.selectedTrackID,
             let trackIndex = renderState.tracks.firstIndex(where: { $0.id == selectedTrackID }),
             !renderState.tracks.isEmpty
         else {
-            return []
+            return selectedTrackVertexScratch
         }
         if
             let selection = renderState.selection,
@@ -4005,7 +4008,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             selection.startProgress <= 0.001,
             selection.endProgress >= 0.999
         {
-            return []
+            return selectedTrackVertexScratch
         }
 
         guard let laneFrame = laneFrame(
@@ -4013,19 +4016,18 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             renderState: renderState,
             drawableSize: drawableSize
         ) else {
-            return []
+            return selectedTrackVertexScratch
         }
-        var vertices: [TimelineVertex] = []
-        vertices.reserveCapacity(6)
+        selectedTrackVertexScratch.reserveCapacity(6)
         appendRectangle(
-            to: &vertices,
+            to: &selectedTrackVertexScratch,
             left: 0,
             right: 1,
             top: max(laneFrame.top, 0),
             bottom: min(laneFrame.bottom, 1),
             color: SIMD4<Float>(0.78, 0.78, 0.78, 0.075)
         )
-        return vertices
+        return selectedTrackVertexScratch
     }
 
     private func selectionVerticalRange(

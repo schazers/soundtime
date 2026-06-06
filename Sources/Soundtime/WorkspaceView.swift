@@ -3214,6 +3214,18 @@ final class WorkspaceView: NSView {
         return fileTimeline.waveformOverview(from: sourceOverview)
     }
 
+    private func optimisticWaveformOverview(
+        for fileTimeline: AudioFileEditTimeline,
+        sourceOverview: WaveformOverview?,
+        fallbackOverview: WaveformOverview?
+    ) -> WaveformOverview? {
+        guard let sourceOverview = sourceOverview ?? fallbackOverview else {
+            return nil
+        }
+
+        return fileTimeline.waveformOverview(from: overviewForOptimisticEdit(sourceOverview))
+    }
+
     private func pasteAudio() {
         guard
             let audioClipboard,
@@ -3416,7 +3428,7 @@ final class WorkspaceView: NSView {
         let currentOverview = projectTracks[trackIndex].waveformOverview
         if let editedFileTimeline {
             projectTracks[trackIndex].waveformOverview =
-                waveformOverview(
+                optimisticWaveformOverview(
                     for: editedFileTimeline,
                     sourceOverview: projectTracks[trackIndex].sourceWaveformOverview,
                     fallbackOverview: currentOverview
@@ -3607,7 +3619,7 @@ final class WorkspaceView: NSView {
         let currentOverview = projectTracks[trackIndex].waveformOverview
         if let editedFileTimeline {
             projectTracks[trackIndex].waveformOverview =
-                waveformOverview(
+                optimisticWaveformOverview(
                     for: editedFileTimeline,
                     sourceOverview: projectTracks[trackIndex].sourceWaveformOverview,
                     fallbackOverview: currentOverview
@@ -3730,7 +3742,7 @@ final class WorkspaceView: NSView {
         let currentOverview = projectTracks[trackIndex].waveformOverview
         if let editedFileTimeline {
             projectTracks[trackIndex].waveformOverview =
-                waveformOverview(
+                optimisticWaveformOverview(
                     for: editedFileTimeline,
                     sourceOverview: projectTracks[trackIndex].sourceWaveformOverview,
                     fallbackOverview: currentOverview
