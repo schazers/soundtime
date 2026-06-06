@@ -167,6 +167,7 @@ final class WorkspaceView: NSView {
     private var recordingSampleRate: Double = 0
     private var recordingAccumulator: LiveRecordingWaveformAccumulator?
     private var lastRecordingVisualUpdateTimestamp = CACurrentMediaTime()
+    private var trackControlViewsByID: [UUID: TrackControlView] = [:]
     private let playbackController: PlaybackEngine = PlaybackEngineFactory.makeDefault()
     private let playbackRefreshRate: TimeInterval = 10
     private let loudnessMeterRefreshRate: TimeInterval = 60
@@ -836,19 +837,31 @@ final class WorkspaceView: NSView {
     }
 
     private func refreshTrackControls() {
-        let existingSubviews = trackControlsStack.arrangedSubviews
-        for subview in existingSubviews {
-            trackControlsStack.removeArrangedSubview(subview)
-            subview.removeFromSuperview()
+        let visibleTrackIDs = Set(projectTracks.map(\.id))
+        for (trackID, controlView) in trackControlViewsByID where !visibleTrackIDs.contains(trackID) {
+            trackControlsStack.removeArrangedSubview(controlView)
+            controlView.removeFromSuperview()
+            trackControlViewsByID[trackID] = nil
         }
 
+        var orderedControlViews: [TrackControlView] = []
         for track in projectTracks {
-            let controlView = TrackControlView(title: track.name)
-            controlView.isMuted = track.isMuted
-            controlView.isSoloed = track.isSoloed
-            controlView.volume = track.volume
-            controlView.isTrackSelected = track.id == selectedTrackID
-            controlView.isRecording = track.id == recordingTrackID
+            let controlView: TrackControlView
+            if let cachedControlView = trackControlViewsByID[track.id] {
+                controlView = cachedControlView
+            } else {
+                controlView = TrackControlView(title: track.name)
+                trackControlViewsByID[track.id] = controlView
+            }
+
+            controlView.configure(
+                title: track.name,
+                isMuted: track.isMuted,
+                isSoloed: track.isSoloed,
+                volume: track.volume,
+                isTrackSelected: track.id == selectedTrackID,
+                isRecording: track.id == recordingTrackID
+            )
             controlView.onTrackSelected = { [weak self, trackID = track.id] in
                 self?.selectTrack(trackID)
             }
@@ -867,7 +880,26 @@ final class WorkspaceView: NSView {
             controlView.onVolumeEditingEnded = { [weak self] in
                 self?.updateProjectPlaybackTrackMix()
             }
-            trackControlsStack.addArrangedSubview(controlView)
+            orderedControlViews.append(controlView)
+        }
+
+        let desiredObjectIDs = Set(orderedControlViews.map(ObjectIdentifier.init))
+        for subview in trackControlsStack.arrangedSubviews
+            where !desiredObjectIDs.contains(ObjectIdentifier(subview)) {
+            trackControlsStack.removeArrangedSubview(subview)
+            subview.removeFromSuperview()
+        }
+
+        for (index, controlView) in orderedControlViews.enumerated() {
+            let arrangedSubviews = trackControlsStack.arrangedSubviews
+            if index < arrangedSubviews.count, arrangedSubviews[index] === controlView {
+                continue
+            }
+
+            if arrangedSubviews.contains(where: { $0 === controlView }) {
+                trackControlsStack.removeArrangedSubview(controlView)
+            }
+            trackControlsStack.insertArrangedSubview(controlView, at: index)
         }
     }
 
