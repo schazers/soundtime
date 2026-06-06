@@ -11,6 +11,16 @@ if CommandLine.arguments.contains("--timeline-perf-baseline") {
     }
 }
 
+if CommandLine.arguments.contains("--recording-smoke") {
+    do {
+        try RecordingSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        exit(0)
+    } catch {
+        fputs("Soundtime recording smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
 let app = NSApplication.shared
 let delegate = AppDelegate()
 
