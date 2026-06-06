@@ -66,6 +66,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         var overlayRect: SIMD4<Float>
         var timing: SIMD4<Float>
         var metrics: SIMD4<Float>
+        var ripple: SIMD4<Float>
     }
 
     private struct WaveformShaderBin {
@@ -459,8 +460,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     private struct DeletionEffect {
         let selection: TimelineSelection
+        let visualAnchor: SIMD4<Float>
         let capturedBinBuffer: MTLBuffer?
         let capturedBinCount: Int
+        let trailingBinCount: Int
         var birthTimestamp: CFTimeInterval
         let seed: UInt64
     }
@@ -876,6 +879,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let deletionShardCount = 96
     private let deletionEffectMaximumCount = 8
     private let deletionEffectMaximumCapturedBins = 512
+    private let deletionRippleMaximumCapturedBins = 1_024
     private let transientParticleScorePercentile: Float = 0.997
     private let transientParticleProfileSampleLimit = 2_048
     private let transientParticleMinimumSpacing: TimeInterval = 0.32
@@ -991,9 +995,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         deletionEffectDescriptor.colorAttachments[0].rgbBlendOperation = .add
         deletionEffectDescriptor.colorAttachments[0].alphaBlendOperation = .add
         deletionEffectDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
-        deletionEffectDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
-        deletionEffectDescriptor.colorAttachments[0].destinationRGBBlendFactor = .one
-        deletionEffectDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .one
+        deletionEffectDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
+        deletionEffectDescriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        deletionEffectDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
         let deletionParticleDescriptor = MTLRenderPipelineDescriptor()
         deletionParticleDescriptor.vertexFunction = deletionParticleVertexFunction
         deletionParticleDescriptor.fragmentFunction = deletionParticleFragmentFunction
@@ -1339,6 +1343,69 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         return inverseFisheyeX(visualViewportProgress, fisheye: fisheye)
     }
 
+    private func deletionEffectVisualAnchor(
+        for selection: TimelineSelection,
+        displayTimestamp: CFTimeInterval
+    ) -> SIMD4<Float> {
+        let playheadProgress = projectedPlayheadProgress(at: displayTimestamp) ?? renderState.playheadProgress
+        let baseFisheye = waveformFisheyeParameters(
+            renderState: renderState,
+            playheadProgress: playheadProgress,
+            displayTimestamp: displayTimestamp
+        )
+        let effectFisheye = selectionFisheye(
+            for: selection,
+            renderState: renderState,
+            baseFisheye: baseFisheye,
+            displayTimestamp: displayTimestamp
+        )
+
+        var left = renderState.viewport.viewportProgress(
+            forTimelineProgress: selection.startProgressFloat
+        )
+        var right = renderState.viewport.viewportProgress(
+            forTimelineProgress: selection.endProgressFloat
+        )
+        left = fisheyeX(left, fisheye: effectFisheye)
+        right = fisheyeX(right, fisheye: effectFisheye)
+        if right < left {
+            swap(&left, &right)
+        }
+
+        let trailingEndProgress = deletionTrailingDisplayEndProgress(
+            for: selection,
+            renderState: renderState
+        )
+        var trailingEnd = renderState.viewport.viewportProgress(
+            forTimelineProgress: trailingEndProgress
+        )
+        trailingEnd = fisheyeX(trailingEnd, fisheye: effectFisheye)
+        trailingEnd = max(trailingEnd, right)
+
+        return SIMD4<Float>(left, right, trailingEnd, 0)
+    }
+
+    private func deletionTrailingDisplayEndProgress(
+        for selection: TimelineSelection,
+        renderState: TimelineRenderState
+    ) -> Float {
+        guard
+            let projectDuration = renderState.duration,
+            projectDuration.isFinite,
+            projectDuration > 0
+        else {
+            return max(selection.endProgressFloat, renderState.viewport.endProgress)
+        }
+
+        let selectedTrack = selection.trackID.flatMap { trackID in
+            renderState.tracks.first { $0.id == trackID }
+        } ?? renderState.tracks.first
+        let trackDuration = selectedTrack?.durationHint ?? projectDuration
+        let trackEndProgress = Float(min(max(trackDuration / projectDuration, 0), 1))
+        let visibleTrackEnd = min(trackEndProgress, renderState.viewport.endProgress)
+        return max(selection.endProgressFloat, visibleTrackEnd)
+    }
+
     func triggerDeletionEffect(selection: TimelineSelection, sourceSelection: TimelineSelection? = nil) {
         guard selection.durationProgress > 0 else {
             return
@@ -1349,12 +1416,23 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         seed &+= UInt64((capturedSelection.startProgress * 1_000_000).rounded(.down))
         seed &*= 0x9E37_79B9_7F4A_7C15
         seed &+= UInt64((capturedSelection.endProgress * 1_000_000).rounded(.down))
+        let displayTimestamp = CACurrentMediaTime()
+        let visualAnchor = deletionEffectVisualAnchor(
+            for: selection,
+            displayTimestamp: displayTimestamp
+        )
         let capturedBins = capturedDeletionBins(for: capturedSelection)
-        let capturedBinBuffer = makeDeletionWaveformBinBuffer(from: capturedBins)
+        let trailingBins = capturedDeletionTrailingBins(
+            for: capturedSelection,
+            displaySelection: selection
+        )
+        let capturedBinBuffer = makeDeletionWaveformBinBuffer(from: capturedBins + trailingBins)
         let effect = DeletionEffect(
             selection: selection,
+            visualAnchor: visualAnchor,
             capturedBinBuffer: capturedBinBuffer,
             capturedBinCount: capturedBins.count,
+            trailingBinCount: trailingBins.count,
             birthTimestamp: -1,
             seed: seed
         )
@@ -1368,23 +1446,86 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
 
     private func capturedDeletionBins(for selection: TimelineSelection) -> [WaveformOverview.Bin] {
-        let selectedTrack = selection.trackID.flatMap { trackID in
-            renderState.tracks.first { $0.id == trackID }
-        } ?? renderState.tracks.first
+        guard let overview = deletionCaptureOverview(for: selection) else {
+            return []
+        }
+
+        return capturedDeletionBins(
+            in: overview,
+            startProgress: selection.startProgress,
+            endProgress: selection.endProgress,
+            maximumBinCount: deletionEffectMaximumCapturedBins
+        )
+    }
+
+    private func capturedDeletionTrailingBins(
+        for selection: TimelineSelection,
+        displaySelection: TimelineSelection
+    ) -> [WaveformOverview.Bin] {
         guard
-            let overview = selectedTrack?.waveformOverview,
-            !overview.bins.isEmpty
+            let overview = deletionCaptureOverview(for: selection),
+            let projectDuration = renderState.duration,
+            projectDuration.isFinite,
+            projectDuration > 0,
+            overview.duration.isFinite,
+            overview.duration > 0
         else {
             return []
         }
 
+        let viewportEndTime = Double(renderState.viewport.endProgress) * projectDuration
+        let displayEndTime = displaySelection.endProgress * projectDuration
+        guard viewportEndTime > displayEndTime else {
+            return []
+        }
+
+        let visibleEndProgress = min(
+            max(viewportEndTime / overview.duration, selection.endProgress),
+            1
+        )
+        return capturedDeletionBins(
+            in: overview,
+            startProgress: selection.endProgress,
+            endProgress: visibleEndProgress,
+            maximumBinCount: deletionRippleMaximumCapturedBins
+        )
+    }
+
+    private func deletionCaptureOverview(for selection: TimelineSelection) -> WaveformOverview? {
+        let selectedTrack = selection.trackID.flatMap { trackID in
+            renderState.tracks.first { $0.id == trackID }
+        } ?? renderState.tracks.first
+        if let overview = selectedTrack?.waveformOverview, !overview.bins.isEmpty {
+            return overview
+        }
+
+        guard let trackID = selectedTrack?.id ?? selection.trackID else {
+            return nil
+        }
+
+        waveformMipLevelStateLock.lock()
+        let mipLevels = trackWaveformMipLevels[trackID]
+        waveformMipLevelStateLock.unlock()
+        return mipLevels?.first { !$0.overview.bins.isEmpty }?.overview
+    }
+
+    private func capturedDeletionBins(
+        in overview: WaveformOverview,
+        startProgress: Double,
+        endProgress: Double,
+        maximumBinCount: Int
+    ) -> [WaveformOverview.Bin] {
         let binCount = overview.bins.count
+        guard binCount > 0 else {
+            return []
+        }
+
         let startIndex = min(
-            max(Int((selection.startProgress * Double(binCount)).rounded(.down)), 0),
+            max(Int((startProgress * Double(binCount)).rounded(.down)), 0),
             binCount
         )
         let endIndex = min(
-            max(Int((selection.endProgress * Double(binCount)).rounded(.up)), startIndex),
+            max(Int((endProgress * Double(binCount)).rounded(.up)), startIndex),
             binCount
         )
         guard startIndex < endIndex else {
@@ -1392,7 +1533,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         let sourceCount = endIndex - startIndex
-        let targetCount = min(sourceCount, deletionEffectMaximumCapturedBins)
+        let targetCount = min(sourceCount, max(maximumBinCount, 1))
         if sourceCount <= targetCount {
             return Array(overview.bins[startIndex..<endIndex])
         }
@@ -3613,7 +3754,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         for effect in effects {
             guard
                 let binBuffer = effect.capturedBinBuffer,
-                effect.capturedBinCount > 0,
+                effect.capturedBinCount + effect.trailingBinCount > 0,
                 var uniform = deletionEffectUniform(
                     for: effect,
                     drawableSize: drawableSize,
@@ -3688,35 +3829,26 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let age = max(displayTimestamp - birthTimestamp, 0)
         let progress = min(max(Float(age / deletionEffectDuration), 0), 1)
         let selection = effect.selection
-        var leftViewport = renderState.viewport.viewportProgress(
-            forTimelineProgress: selection.startProgressFloat
-        )
-        var rightViewport = renderState.viewport.viewportProgress(
-            forTimelineProgress: selection.endProgressFloat
-        )
+        let leftViewport = effect.visualAnchor.x
+        let rightViewport = effect.visualAnchor.y
+        let trailingEndViewport = effect.visualAnchor.z
         guard rightViewport > -0.1, leftViewport < 1.1 else {
             return nil
         }
 
-        let effectFisheye = selectionFisheye(
-            for: selection,
-            renderState: renderState,
-            baseFisheye: baseFisheye,
-            displayTimestamp: displayTimestamp
-        )
-        leftViewport = fisheyeX(leftViewport, fisheye: effectFisheye)
-        rightViewport = fisheyeX(rightViewport, fisheye: effectFisheye)
-
         var leftX = leftViewport * width
         var rightX = rightViewport * width
+        var trailingEndX = trailingEndViewport * width
         if rightX < leftX {
             swap(&leftX, &rightX)
         }
+        trailingEndX = max(trailingEndX, rightX)
         let minimumEffectWidth: Float = 18
         if rightX - leftX < minimumEffectWidth {
             let centerX = (leftX + rightX) * 0.5
             leftX = centerX - minimumEffectWidth * 0.5
             rightX = centerX + minimumEffectWidth * 0.5
+            trailingEndX = max(trailingEndX, rightX)
         }
 
         guard let verticalRange = selectionVerticalRange(
@@ -3735,7 +3867,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         let selectionWidth = max(rightX - leftX, 1)
         let pullDistance = max(selectionWidth, 22)
-        let overlayRightX = rightX + 20 + min(pullDistance * 0.32, 90)
+        let slideTime = min(max(progress / 0.42, 0), 1)
+        let slideProgress = pow(slideTime, 2.35)
+        let overlayRightX = max(
+            rightX + 20 + min(pullDistance * 0.32, 90),
+            trailingEndX + 6
+        )
         let overlayLeftX = leftX - 4
         let seed = Float(UInt32(truncatingIfNeeded: effect.seed & 0x00FF_FFFF))
         return DeletionEffectUniform(
@@ -3762,6 +3899,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 height,
                 max(bottomY - topY, 1),
                 Float(deletionEffectDuration)
+            ),
+            ripple: SIMD4<Float>(
+                trailingEndX / width,
+                slideProgress,
+                Float(effect.trailingBinCount),
+                selectionWidth / width
             )
         )
     }
@@ -6648,6 +6791,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float4 overlayRect;
         float4 timing;
         float4 metrics;
+        float4 ripple;
     };
 
     struct TimelineRulerUniform {
@@ -7152,20 +7296,89 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float progress = clamp(effect.timing.x, 0.0, 1.0);
         float blast = clamp(effect.timing.y, 0.0, 1.0);
         float seed = effect.timing.z;
-        uint binCount = uint(max(effect.timing.w, 1.0));
+        uint selectedBinCount = uint(max(effect.timing.w, 0.0));
+        uint trailingBinCount = uint(max(effect.ripple.z, 0.0));
         float left = effect.rect.x;
         float right = effect.rect.y;
         float top = effect.rect.z;
         float bottom = effect.rect.w;
+        float trailingEnd = max(effect.ripple.x, right);
+        float slide = clamp(effect.ripple.y, 0.0, 1.0);
+        float deletionWidth = max(effect.ripple.w, max(right - left, 0.000001));
+        float shiftedRight = mix(right, left, slide);
+        float shiftedEnd = max(shiftedRight, trailingEnd - deletionWidth * slide);
         float centerY = (top + bottom) * 0.5;
         float2 point = in.normalizedPosition;
         float2 pixelPoint = point * float2(width, height);
+        float yAA = max(fwidth(point.y) * 0.75, 0.000001);
         float4 color = float4(0.0);
 
-        if (point.x >= left && point.x <= right && point.y >= top && point.y <= bottom) {
+        if (point.y >= top && point.y <= bottom) {
+            float laneCoverage = rectangle_coverage(point.y, top, bottom, yAA);
+            float maskRight = max(max(right, shiftedEnd), left + deletionWidth);
+            if (point.x >= left && point.x <= maskRight) {
+                float coverFade = 1.0 - smoothstep(0.86, 1.0, slide);
+                float xAA = max(fwidth(point.x) * 1.5, 0.0005);
+                float xCoverage = smoothstep(left - xAA, left + xAA, point.x) *
+                    (1.0 - smoothstep(maskRight - xAA, maskRight + xAA, point.x));
+                float coverAlpha = 0.92 * coverFade * laneCoverage * xCoverage;
+                color = source_over(color, float4(0.070, 0.072, 0.072, coverAlpha));
+            }
+
+            if (trailingBinCount > 0 &&
+                shiftedEnd > shiftedRight + 0.000001 &&
+                point.x >= shiftedRight &&
+                point.x <= shiftedEnd) {
+                float localX = clamp(
+                    (point.x - shiftedRight) / max(shiftedEnd - shiftedRight, 0.000001),
+                    0.0,
+                    1.0
+                );
+                float localY = clamp((point.y - top) / max(bottom - top, 0.000001), 0.0, 1.0);
+                float localYAA = max(fwidth(localY) * 0.75, 0.000001);
+                WaveformShaderBin bin = sample_waveform_bin(
+                    localX,
+                    bins,
+                    trailingBinCount,
+                    selectedBinCount,
+                    0.82
+                );
+                float peakTop = 0.5 - bin.maximumSample * 0.39;
+                float peakBottom = 0.5 - bin.minimumSample * 0.39;
+                if (peakBottom - peakTop < 0.006) {
+                    float midpoint = (peakTop + peakBottom) * 0.5;
+                    peakTop = midpoint - 0.003;
+                    peakBottom = midpoint + 0.003;
+                }
+
+                float waveformCoverage = rectangle_coverage(localY, peakTop, peakBottom, localYAA);
+                float edgeFade = smoothstep(0.0, 0.010, localX) *
+                    (1.0 - smoothstep(0.992, 1.0, localX));
+                float settleFade = 1.0 - smoothstep(0.92, 1.0, slide);
+                float waveformAlpha = waveformCoverage *
+                    edgeFade *
+                    settleFade *
+                    (0.24 + 0.38 * bin.peakMagnitude);
+                if (waveformAlpha > 0.0) {
+                    float cold = hash11(seed + floor(localX * float(trailingBinCount)) * 61.0);
+                    float3 waveformColor = float3(
+                        0.70 + 0.12 * cold,
+                        0.88 + 0.08 * cold,
+                        0.86 + 0.08 * hash11(seed + floor(localX * float(trailingBinCount)) * 67.0)
+                    );
+                    color = source_over(color, float4(waveformColor, waveformAlpha));
+                }
+            }
+        }
+
+        if (selectedBinCount > 0 &&
+            point.x >= left &&
+            point.x <= right &&
+            point.y >= top &&
+            point.y <= bottom) {
             float localX = clamp((point.x - left) / max(right - left, 0.000001), 0.0, 1.0);
             float localY = clamp((point.y - top) / max(bottom - top, 0.000001), 0.0, 1.0);
-            WaveformShaderBin bin = sample_waveform_bin(localX, bins, binCount, 0u, 0.72);
+            WaveformShaderBin bin = sample_waveform_bin(localX, bins, selectedBinCount, 0u, 0.72);
             float peakTop = 0.5 - bin.maximumSample * 0.39;
             float peakBottom = 0.5 - bin.minimumSample * 0.39;
             if (peakBottom - peakTop < 0.006) {
@@ -7174,11 +7387,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 peakBottom = midpoint + 0.003;
             }
 
-            float yAA = max(fwidth(localY) * 0.75, 0.000001);
-            float waveformCoverage = rectangle_coverage(localY, peakTop, peakBottom, yAA);
+            float localYAA = max(fwidth(localY) * 0.75, 0.000001);
+            float waveformCoverage = rectangle_coverage(localY, peakTop, peakBottom, localYAA);
             float visibility = 1.0 - smoothstep(0.0, 0.48, progress);
             float dissolveNoise = hash21(float2(
-                floor(localX * float(binCount) * 1.7) + seed,
+                floor(localX * float(selectedBinCount) * 1.7) + seed,
                 floor(localY * 86.0)
             ));
             float dissolveMask = 1.0 - smoothstep(progress * 1.15, progress * 1.15 + 0.22, dissolveNoise);
@@ -7187,27 +7400,30 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 dissolveMask *
                 (0.18 + 0.42 * bin.peakMagnitude);
             if (waveformAlpha > 0.0) {
-                float cold = hash11(seed + floor(localX * float(binCount)) * 79.0);
+                float cold = hash11(seed + floor(localX * float(selectedBinCount)) * 79.0);
                 float3 waveformColor = float3(
                     0.70 + 0.22 * cold,
                     0.96 + 0.04 * cold,
-                    0.94 + 0.06 * hash11(seed + floor(localX * float(binCount)) * 83.0)
+                    0.94 + 0.06 * hash11(seed + floor(localX * float(selectedBinCount)) * 83.0)
                 );
-                color += float4(waveformColor, waveformAlpha);
+                color = source_over(color, float4(waveformColor, waveformAlpha));
             }
 
             float flash = 1.0 - smoothstep(0.0, 0.15, progress);
             if (flash > 0.001) {
                 float inset = min(0.10, 18.0 / laneHeightPixels);
-                float flashCoverage = rectangle_coverage(localY, inset, 1.0 - inset, yAA);
-                color += float4(0.34, 1.0, 0.94, 0.10 * flash * flashCoverage);
+                float flashCoverage = rectangle_coverage(localY, inset, 1.0 - inset, localYAA);
+                color = source_over(color, float4(0.34, 1.0, 0.94, 0.10 * flash * flashCoverage));
 
                 float centerCoverage = 1.0 - smoothstep(
                     1.2 + 3.0 * flash,
                     2.2 + 3.0 * flash,
                     abs((localY - 0.5) * laneHeightPixels)
                 );
-                color += float4(0.82, 1.0, 0.98, 0.28 * flash * max(centerCoverage, 0.0));
+                color = source_over(
+                    color,
+                    float4(0.82, 1.0, 0.98, 0.28 * flash * max(centerCoverage, 0.0))
+                );
             }
         }
 
@@ -7232,12 +7448,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                     0.65 + 0.70 * hash11(localSeed + 89.0),
                     1.1
                 );
-                color += float4(
+                color = source_over(color, float4(
                     0.70,
                     0.98,
                     0.96,
                     coverage * streakAlpha * (0.55 + hash11(localSeed + 73.0) * 0.45)
-                );
+                ));
             }
         }
 
@@ -7249,8 +7465,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             float coreRadius = (6.0 + laneHeightPixels * 0.07) * (0.70 + flareProgress * 1.25);
             float coreCoverage = 1.0 - smoothstep(coreRadius, coreRadius + 10.0, distance);
             float haloCoverage = 1.0 - smoothstep(coreRadius * 1.65, coreRadius * 1.65 + 18.0, distance);
-            color += float4(0.78, 1.0, 0.96, max(coreCoverage, 0.0) * 0.28 * flareEnergy);
-            color += float4(0.38, 0.96, 1.0, max(haloCoverage, 0.0) * 0.075 * flareEnergy);
+            color = source_over(
+                color,
+                float4(0.78, 1.0, 0.96, max(coreCoverage, 0.0) * 0.28 * flareEnergy)
+            );
+            color = source_over(
+                color,
+                float4(0.38, 0.96, 1.0, max(haloCoverage, 0.0) * 0.075 * flareEnergy)
+            );
 
             float verticalCoverage = 1.0 - smoothstep(
                 0.6 + 2.1 * flareEnergy,
@@ -7263,10 +7485,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 flareCenter.y + laneHeightPixels * 0.42,
                 1.2
             );
-            color += float4(0.72, 1.0, 0.96, verticalCoverage * verticalSpan * 0.18 * flareEnergy);
+            color = source_over(
+                color,
+                float4(0.72, 1.0, 0.96, verticalCoverage * verticalSpan * 0.18 * flareEnergy)
+            );
         }
 
-        return color;
+        return float4(clamp(color.rgb, float3(0.0), float3(1.0)), clamp(color.a, 0.0, 1.0));
     }
 
     vertex DeletionParticleRasterizedVertex deletion_particle_vertex(
