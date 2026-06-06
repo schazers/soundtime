@@ -153,6 +153,60 @@ final class WorkspaceView: NSView {
         }
     }
 
+    private final class RecordingPreviewCoalescer: @unchecked Sendable {
+        private let queue = DispatchQueue(label: "Soundtime.recording.preview.coalescer", qos: .userInteractive)
+        private let minimumFlushInterval: TimeInterval = 1.0 / 45.0
+        private var pendingChunks: [AudioRecordingChunk] = []
+        private var isFlushScheduled = false
+        private var lastFlushTimestamp = CACurrentMediaTime()
+
+        func enqueue(
+            _ chunk: AudioRecordingChunk,
+            deliver: @escaping @Sendable ([AudioRecordingChunk]) -> Void
+        ) {
+            queue.async { [minimumFlushInterval] in
+                self.pendingChunks.append(chunk)
+                guard !self.isFlushScheduled else {
+                    return
+                }
+
+                self.isFlushScheduled = true
+                let now = CACurrentMediaTime()
+                let delay = max(0, minimumFlushInterval - (now - self.lastFlushTimestamp))
+                self.queue.asyncAfter(deadline: .now() + delay) {
+                    let chunks = self.takePendingChunksLocked()
+                    guard !chunks.isEmpty else {
+                        return
+                    }
+
+                    deliver(chunks)
+                }
+            }
+        }
+
+        func reset() {
+            queue.sync {
+                pendingChunks.removeAll(keepingCapacity: true)
+                isFlushScheduled = false
+                lastFlushTimestamp = CACurrentMediaTime()
+            }
+        }
+
+        func drainPending() -> [AudioRecordingChunk] {
+            queue.sync {
+                takePendingChunksLocked()
+            }
+        }
+
+        private func takePendingChunksLocked() -> [AudioRecordingChunk] {
+            let chunks = pendingChunks
+            pendingChunks.removeAll(keepingCapacity: true)
+            isFlushScheduled = false
+            lastFlushTimestamp = CACurrentMediaTime()
+            return chunks
+        }
+    }
+
     private var projectTracks: [ProjectTrack] = []
     private var activeTrackID: UUID?
     private var selectedTrackID: UUID?
@@ -194,6 +248,7 @@ final class WorkspaceView: NSView {
     private var recordingStartUndoStackCount: Int?
     private var recordingSampleRate: Double = 0
     private var recordingAccumulator: LiveRecordingWaveformAccumulator?
+    private let recordingPreviewCoalescer = RecordingPreviewCoalescer()
     private var lastRecordingVisualUpdateTimestamp = CACurrentMediaTime()
     private var trackControlViewsByID: [UUID: TrackControlView] = [:]
     private var trackControlReusePool: [TrackControlView] = []
@@ -1153,10 +1208,13 @@ final class WorkspaceView: NSView {
             return
         }
 
+        recordingPreviewCoalescer.reset()
         inputRecorder.onChunk = { [weak self, takeWriter] chunk in
             takeWriter.append(chunk)
-            Task { @MainActor in
-                self?.appendRecordingChunk(chunk)
+            self?.recordingPreviewCoalescer.enqueue(chunk) { chunks in
+                Task { @MainActor in
+                    self?.appendRecordingChunks(chunks)
+                }
             }
         }
 
@@ -1221,10 +1279,12 @@ final class WorkspaceView: NSView {
         }
 
         inputRecorder.stop()
+        appendRecordingChunks(recordingPreviewCoalescer.drainPending())
         applyLiveRecordingOverview(force: true)
         let takeWriter = recordingTakeWriter
         recordingTakeWriter = nil
         inputRecorder.onChunk = nil
+        recordingPreviewCoalescer.reset()
 
         recordingTrackID = nil
         timelineSurface.displayRecordingActive(false)
@@ -1324,7 +1384,23 @@ final class WorkspaceView: NSView {
         return "recording failed: \(error.localizedDescription)"
     }
 
-    private func appendRecordingChunk(_ chunk: AudioRecordingChunk) {
+    private func appendRecordingChunks(_ chunks: [AudioRecordingChunk]) {
+        guard !chunks.isEmpty else {
+            return
+        }
+
+        for chunk in chunks {
+            appendRecordingChunkSamples(chunk)
+        }
+
+        let now = CACurrentMediaTime()
+        if now - lastRecordingVisualUpdateTimestamp >= 1.0 / 45.0 {
+            applyLiveRecordingOverview(force: false)
+            lastRecordingVisualUpdateTimestamp = now
+        }
+    }
+
+    private func appendRecordingChunkSamples(_ chunk: AudioRecordingChunk) {
         guard recordingTrackID != nil, chunk.frameCount > 0, chunk.sampleRate > 0 else {
             return
         }
@@ -1346,12 +1422,6 @@ final class WorkspaceView: NSView {
             samplesByChannel: chunk.samplesByChannel,
             frameCount: frameCount
         )
-
-        let now = CACurrentMediaTime()
-        if now - lastRecordingVisualUpdateTimestamp >= 1.0 / 45.0 {
-            applyLiveRecordingOverview(force: false)
-            lastRecordingVisualUpdateTimestamp = now
-        }
     }
 
     private func applyLiveRecordingOverview(force: Bool) {
