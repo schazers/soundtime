@@ -3,6 +3,7 @@ import AppKit
 @MainActor
 final class AgentCommandBarView: NSView, NSTextViewDelegate {
     var onSubmit: ((String) -> Void)?
+    var onBlurRequested: (() -> Void)?
 
     var presentationState: AgentCommandController.PresentationState = .idle {
         didSet {
@@ -76,7 +77,11 @@ final class AgentCommandBarView: NSView, NSTextViewDelegate {
             return
         }
 
-        window?.makeFirstResponder(nil)
+        if let onBlurRequested {
+            onBlurRequested()
+        } else {
+            window?.makeFirstResponder(nil)
+        }
     }
 
     private func configure() {
@@ -102,7 +107,7 @@ final class AgentCommandBarView: NSView, NSTextViewDelegate {
             self?.submit()
         }
         textView.onCancelShortcut = { [weak self] in
-            self?.window?.makeFirstResponder(nil)
+            self?.blurPrompt()
         }
 
         placeholderLabel.font = .systemFont(ofSize: 15, weight: .regular)
