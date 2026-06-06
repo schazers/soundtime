@@ -913,7 +913,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let highResolutionWaveformVisibleDurationThreshold: TimeInterval = 90
     private let waveformMipTargetBinsPerPoint: Float = 96
     private let maximumCachedWaveformMipPyramids = 512
-    private let maximumCachedWaveformShaderBinBuffers = 768
+    private let maximumCachedWaveformShaderBinBuffers = 2_048
     private let maximumCachedWaveformShaderBinBufferBytes = 1_024 * 1_024 * 1_024
     private let maximumBackgroundPrewarmedWaveformShaderBins = 16_384
     private let maximumViewportPrewarmedWaveformShaderBins = 2_097_152
@@ -2423,7 +2423,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             )
             self?.waveformShaderBufferStore.publish(shaderBins, for: key)
             self?.waveformShaderBufferStore.trim(
-                toMaximumCount: self?.maximumCachedWaveformShaderBinBuffers ?? 768,
+                toMaximumCount: self?.maximumCachedWaveformShaderBinBuffers ?? 2_048,
                 maximumByteCount: self?.maximumCachedWaveformShaderBinBufferBytes ?? 512 * 1_024 * 1_024
             )
             self?.onRenderDataPrepared?()
