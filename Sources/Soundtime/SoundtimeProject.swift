@@ -15,6 +15,7 @@ struct SoundtimeProject: Codable, Sendable {
         var volume: Float
         var isMuted: Bool
         var isSoloed: Bool
+        var editTimeline: AudioFileEditTimeline.PersistentState?
     }
 
     var tracks: [Track]

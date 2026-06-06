@@ -3,6 +3,19 @@ import Foundation
 struct AudioFileEditTimeline: Sendable {
     private static let gainEpsilon: Float = 0.000_001
 
+    struct PersistentSegment: Codable, Sendable {
+        var sourceStartFrame: Int
+        var frameCount: Int
+        var gainStart: Float
+        var gainEnd: Float
+    }
+
+    struct PersistentState: Codable, Sendable {
+        var sourceFrameCount: Int
+        var sourceSampleRate: Double
+        var segments: [PersistentSegment]
+    }
+
     private struct Segment: Sendable {
         let sourceStartFrame: Int
         let frameCount: Int
@@ -68,6 +81,66 @@ struct AudioFileEditTimeline: Sendable {
         }
     }
 
+    init?(persistentState: PersistentState) {
+        guard
+            persistentState.sourceFrameCount >= 0,
+            persistentState.sourceSampleRate > 0,
+            persistentState.sourceSampleRate.isFinite
+        else {
+            return nil
+        }
+
+        sourceFrameCount = persistentState.sourceFrameCount
+        sourceSampleRate = persistentState.sourceSampleRate
+        segments = Self.validatedSegments(
+            persistentState.segments.map { persistentSegment in
+                Segment(
+                    sourceStartFrame: persistentSegment.sourceStartFrame,
+                    frameCount: persistentSegment.frameCount,
+                    gainStart: persistentSegment.gainStart,
+                    gainEnd: persistentSegment.gainEnd
+                )
+            },
+            sourceFrameCount: persistentState.sourceFrameCount
+        )
+
+        guard persistentState.sourceFrameCount == 0 || !segments.isEmpty else {
+            return nil
+        }
+    }
+
+    init?(
+        sourceFrameCount: Int,
+        sourceSampleRate: Double,
+        playbackSegments: [AudioEditTimeline.PlaybackSegment]
+    ) {
+        guard
+            sourceFrameCount >= 0,
+            sourceSampleRate > 0,
+            sourceSampleRate.isFinite
+        else {
+            return nil
+        }
+
+        self.sourceFrameCount = sourceFrameCount
+        self.sourceSampleRate = sourceSampleRate
+        segments = Self.validatedSegments(
+            playbackSegments.map { playbackSegment in
+                Segment(
+                    sourceStartFrame: playbackSegment.sourceStartFrame,
+                    frameCount: playbackSegment.frameCount,
+                    gainStart: playbackSegment.gainStart,
+                    gainEnd: playbackSegment.gainEnd
+                )
+            },
+            sourceFrameCount: sourceFrameCount
+        )
+
+        guard sourceFrameCount == 0 || !segments.isEmpty else {
+            return nil
+        }
+    }
+
     var frameCount: Int {
         segments.reduce(0) { total, segment in
             total + segment.frameCount
@@ -90,6 +163,25 @@ struct AudioFileEditTimeline: Sendable {
             segment.frameCount != sourceFrameCount ||
             abs(segment.gainStart - 1) > Float.ulpOfOne ||
             abs(segment.gainEnd - 1) > Float.ulpOfOne
+    }
+
+    var persistentState: PersistentState? {
+        guard sourceFrameCount >= 0, sourceSampleRate > 0, sourceSampleRate.isFinite else {
+            return nil
+        }
+
+        return PersistentState(
+            sourceFrameCount: sourceFrameCount,
+            sourceSampleRate: sourceSampleRate,
+            segments: segments.map { segment in
+                PersistentSegment(
+                    sourceStartFrame: segment.sourceStartFrame,
+                    frameCount: segment.frameCount,
+                    gainStart: segment.gainStart,
+                    gainEnd: segment.gainEnd
+                )
+            }
+        )
     }
 
     var playbackSegments: [AudioEditTimeline.PlaybackSegment] {
@@ -115,6 +207,47 @@ struct AudioFileEditTimeline: Sendable {
             sourceBuffer: sourceBuffer,
             playbackSegments: playbackSegments
         )
+    }
+
+    func isCompatible(with fileInfo: WAVFileInfo) -> Bool {
+        sourceFrameCount == fileInfo.frameCount &&
+            abs(sourceSampleRate - fileInfo.sampleRate) < 0.001
+    }
+
+    func waveformOverview(from sourceOverview: WaveformOverview) -> WaveformOverview {
+        guard sourceFrameCount > 0, !sourceOverview.bins.isEmpty else {
+            return WaveformOverview(duration: duration, bins: [])
+        }
+
+        var editedBins: [WaveformOverview.Bin] = []
+        let sourceBinCount = sourceOverview.bins.count
+        let sourceFramesPerBin = Double(sourceFrameCount) / Double(sourceBinCount)
+        for segment in segments {
+            let startBin = min(
+                max(Int((Double(segment.sourceStartFrame) / sourceFramesPerBin).rounded(.down)), 0),
+                sourceBinCount
+            )
+            let endBin = min(
+                max(Int((Double(segment.sourceEndFrame) / sourceFramesPerBin).rounded(.up)), startBin),
+                sourceBinCount
+            )
+            guard startBin < endBin else {
+                continue
+            }
+
+            editedBins.reserveCapacity(editedBins.count + endBin - startBin)
+            for sourceBinIndex in startBin..<endBin {
+                let binCenterFrame = min(
+                    max(Int((Double(sourceBinIndex) + 0.5) * sourceFramesPerBin), segment.sourceStartFrame),
+                    max(segment.sourceEndFrame - 1, segment.sourceStartFrame)
+                )
+                editedBins.append(sourceOverview.bins[sourceBinIndex].scaled(
+                    by: segment.gain(at: binCenterFrame - segment.sourceStartFrame)
+                ))
+            }
+        }
+
+        return WaveformOverview(duration: duration, bins: editedBins)
     }
 
     mutating func delete(_ selection: TimelineSelection) -> Int {
@@ -185,7 +318,7 @@ struct AudioFileEditTimeline: Sendable {
         let deletedFrameCount = frameCount - nextSegments.reduce(0) { total, segment in
             total + segment.frameCount
         }
-        segments = coalescedSegments(nextSegments)
+        segments = Self.coalescedSegments(nextSegments)
         return deletedFrameCount
     }
 
@@ -241,7 +374,7 @@ struct AudioFileEditTimeline: Sendable {
             }
         }
 
-        segments = coalescedSegments(nextSegments)
+        segments = Self.coalescedSegments(nextSegments)
         return affectedFrameCount
     }
 
@@ -311,7 +444,7 @@ struct AudioFileEditTimeline: Sendable {
             }
         }
 
-        segments = coalescedSegments(nextSegments)
+        segments = Self.coalescedSegments(nextSegments)
         return affectedFrameCount
     }
 
@@ -358,7 +491,7 @@ struct AudioFileEditTimeline: Sendable {
         }
     }
 
-    private func coalescedSegments(_ segments: [Segment]) -> [Segment] {
+    private static func coalescedSegments(_ segments: [Segment]) -> [Segment] {
         var result: [Segment] = []
         result.reserveCapacity(segments.count)
 
@@ -386,5 +519,36 @@ struct AudioFileEditTimeline: Sendable {
         }
 
         return result
+    }
+
+    private static func validatedSegments(
+        _ segments: [Segment],
+        sourceFrameCount: Int
+    ) -> [Segment] {
+        coalescedSegments(segments.compactMap { segment in
+            guard
+                segment.sourceStartFrame >= 0,
+                segment.frameCount > 0,
+                segment.sourceStartFrame < sourceFrameCount,
+                segment.gainStart >= 0,
+                segment.gainStart.isFinite,
+                segment.gainEnd >= 0,
+                segment.gainEnd.isFinite
+            else {
+                return nil
+            }
+
+            let frameCount = min(segment.frameCount, sourceFrameCount - segment.sourceStartFrame)
+            guard frameCount > 0 else {
+                return nil
+            }
+
+            return Segment(
+                sourceStartFrame: segment.sourceStartFrame,
+                frameCount: frameCount,
+                gainStart: segment.gainStart,
+                gainEnd: segment.gainEnd
+            )
+        })
     }
 }

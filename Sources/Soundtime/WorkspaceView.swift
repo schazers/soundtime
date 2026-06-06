@@ -1541,7 +1541,19 @@ final class WorkspaceView: NSView {
         let trackID = settings?.id ?? UUID()
         let importID = UUID()
         let trackName = settings?.name ?? url.deletingPathExtension().lastPathComponent
-        let durationHint = try? WAVAudioDecoder.inspect(url: url).duration
+        let fileInfo = try? WAVAudioDecoder.inspect(url: url)
+        let persistedFileTimeline: AudioFileEditTimeline?
+        if
+            let editTimeline = settings?.editTimeline,
+            let restoredTimeline = AudioFileEditTimeline(persistentState: editTimeline),
+            let fileInfo,
+            restoredTimeline.isCompatible(with: fileInfo)
+        {
+            persistedFileTimeline = restoredTimeline
+        } else {
+            persistedFileTimeline = nil
+        }
+        let durationHint = persistedFileTimeline?.duration ?? fileInfo?.duration
         let track = ProjectTrack(
             id: trackID,
             name: trackName,
@@ -1552,13 +1564,13 @@ final class WorkspaceView: NSView {
             zeroCrossingIndex: nil,
             zeroCrossingProbe: nil,
             audioTimeline: nil,
-            fileTimeline: nil,
+            fileTimeline: persistedFileTimeline,
             ownsSourceFile: false,
             volume: settings?.volume ?? 1,
             isMuted: settings?.isMuted ?? false,
             isSoloed: settings?.isSoloed ?? false,
             importID: importID,
-            editRevision: 0
+            editRevision: persistedFileTimeline?.hasEdits == true ? 1 : 0
         )
 
         projectTracks.append(track)
@@ -1741,8 +1753,11 @@ final class WorkspaceView: NSView {
         }
 
         projectTracks[trackIndex].name = previewResult.metadata.displayName
-        projectTracks[trackIndex].durationHint = previewResult.fileInfo.duration
-        projectTracks[trackIndex].waveformOverview = previewResult.waveformOverview
+        let fileTimeline = projectTracks[trackIndex].fileTimeline
+        projectTracks[trackIndex].durationHint = fileTimeline?.duration ?? previewResult.fileInfo.duration
+        projectTracks[trackIndex].waveformOverview = fileTimeline?.waveformOverview(
+            from: previewResult.waveformOverview
+        ) ?? previewResult.waveformOverview
         projectTracks[trackIndex].zeroCrossingProbe = previewResult.zeroCrossingProbe
         activeTrackID = trackID
         window?.title = projectWindowTitle()
@@ -1762,8 +1777,10 @@ final class WorkspaceView: NSView {
             return
         }
 
-        projectTracks[trackIndex].waveformOverview = waveformOverview
-        projectTracks[trackIndex].durationHint = fileInfo.duration
+        let fileTimeline = projectTracks[trackIndex].fileTimeline
+        projectTracks[trackIndex].waveformOverview = fileTimeline?.waveformOverview(from: waveformOverview) ??
+            waveformOverview
+        projectTracks[trackIndex].durationHint = fileTimeline?.duration ?? fileInfo.duration
         refreshProjectTimelineDisplay(rebuildControls: false)
         updateProjectDisplayTiming(sampleRateHint: fileInfo.sampleRate)
         updateTimeReadout()
@@ -1787,8 +1804,10 @@ final class WorkspaceView: NSView {
             AudioEditTimeline(sourceBuffer: decodedAudioBuffer)
 
         projectTracks[trackIndex].decodedAudioBuffer = decodedAudioBuffer
-        projectTracks[trackIndex].waveformOverview = existingEditedOverview ?? waveformOverview
-        projectTracks[trackIndex].durationHint = decodedAudioBuffer.duration
+        projectTracks[trackIndex].waveformOverview = existingEditedOverview ??
+            existingFileTimeline?.waveformOverview(from: waveformOverview) ??
+            waveformOverview
+        projectTracks[trackIndex].durationHint = decodedTimeline.duration
         projectTracks[trackIndex].zeroCrossingIndex = zeroCrossingIndex
         projectTracks[trackIndex].audioTimeline = decodedTimeline
         projectTracks[trackIndex].fileTimeline = nil
@@ -3521,11 +3540,40 @@ final class WorkspaceView: NSView {
                     filePath: track.sourceURL.path,
                     volume: track.volume,
                     isMuted: track.isMuted,
-                    isSoloed: track.isSoloed
+                    isSoloed: track.isSoloed,
+                    editTimeline: persistedEditTimeline(for: track)
                 )
             },
             windowLayout: currentWindowLayout()
         )
+    }
+
+    private func persistedEditTimeline(for track: ProjectTrack) -> AudioFileEditTimeline.PersistentState? {
+        guard WAVAudioDecoder.canDecode(track.sourceURL) else {
+            return nil
+        }
+
+        if let fileTimeline = track.fileTimeline, fileTimeline.hasEdits {
+            return fileTimeline.persistentState
+        }
+
+        guard
+            let audioTimeline = track.audioTimeline,
+            let fileInfo = try? WAVAudioDecoder.inspect(url: track.sourceURL),
+            audioTimeline.sourceAudioBuffer.frameCount == fileInfo.frameCount,
+            abs(audioTimeline.sourceAudioBuffer.sampleRate - fileInfo.sampleRate) < 0.001,
+            let fileTimeline = AudioFileEditTimeline(
+                sourceFrameCount: fileInfo.frameCount,
+                sourceSampleRate: fileInfo.sampleRate,
+                playbackSegments: audioTimeline.playbackSegments
+            ),
+            fileTimeline.hasEdits,
+            fileTimeline.isCompatible(with: fileInfo)
+        else {
+            return nil
+        }
+
+        return fileTimeline.persistentState
     }
 
     private func currentWindowLayout() -> SoundtimeProject.WindowLayout? {
