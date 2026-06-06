@@ -36,6 +36,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         var position: SIMD4<Float>
     }
 
+    private struct TimelineRulerUniform {
+        var viewport: SIMD4<Float>
+        var metrics: SIMD4<Float>
+        var style: SIMD4<Float>
+        var color: SIMD4<Float>
+    }
+
     private struct WaveformShaderUniform {
         var baseColor: SIMD4<Float>
         var lane: SIMD4<Float>
@@ -371,6 +378,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let color: SIMD3<Float>
     }
 
+    private struct DeletionEffect {
+        let selection: TimelineSelection
+        var birthTimestamp: CFTimeInterval
+        let seed: UInt64
+    }
+
     private struct TransientParticleScoreProfile {
         let threshold: Float
         let loudestScore: Float
@@ -652,6 +665,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let commandQueue: MTLCommandQueue
     private let pipelineState: MTLRenderPipelineState
     private let waveformPipelineState: MTLRenderPipelineState
+    private let rulerPipelineState: MTLRenderPipelineState
     private let additivePipelineState: MTLRenderPipelineState
     private let dynamicVertexBufferRing: DynamicVertexBufferRing
     private let waveformQuadVertexBuffer: MTLBuffer
@@ -695,6 +709,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var playheadContactEvents: [PlayheadContactEvent] = []
     private var lastPlayheadContactEventTimestamp: CFTimeInterval?
     private var transientParticles: [TransientParticle] = []
+    private var deletionEffects: [DeletionEffect] = []
+    private let deletionEffectLock = NSLock()
     private var previousTransientScanProgress: Float?
     private var lastTransientParticleBins: [UUID: Int] = [:]
     private var transientParticleScoreProfiles: [WaveformMipCacheKey: TransientParticleScoreProfile] = [:]
@@ -761,6 +777,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let playheadContactEventsPerTrackBudget = 8
     private let playheadContactMinimumSpawnInterval: CFTimeInterval = 1.0 / 90.0
     private let transientParticleMaximumCount = 260
+    private let deletionEffectDuration: CFTimeInterval = 0.58
+    private let deletionShardCount = 96
+    private let deletionEffectMaximumCount = 8
     private let transientParticleScorePercentile: Float = 0.997
     private let transientParticleProfileSampleLimit = 2_048
     private let transientParticleMinimumSpacing: TimeInterval = 0.32
@@ -813,7 +832,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             let vertexFunction = library.makeFunction(name: "timeline_vertex"),
             let fragmentFunction = library.makeFunction(name: "timeline_fragment"),
             let waveformVertexFunction = library.makeFunction(name: "waveform_vertex"),
-            let waveformFragmentFunction = library.makeFunction(name: "waveform_fragment")
+            let waveformFragmentFunction = library.makeFunction(name: "waveform_fragment"),
+            let rulerVertexFunction = library.makeFunction(name: "timeline_ruler_vertex"),
+            let rulerFragmentFunction = library.makeFunction(name: "timeline_ruler_fragment")
         else {
             throw RendererError.shaderFunctionUnavailable
         }
@@ -840,6 +861,17 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         waveformDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
         waveformDescriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
         waveformDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        let rulerDescriptor = MTLRenderPipelineDescriptor()
+        rulerDescriptor.vertexFunction = rulerVertexFunction
+        rulerDescriptor.fragmentFunction = rulerFragmentFunction
+        rulerDescriptor.colorAttachments[0].pixelFormat = pixelFormat
+        rulerDescriptor.colorAttachments[0].isBlendingEnabled = true
+        rulerDescriptor.colorAttachments[0].rgbBlendOperation = .add
+        rulerDescriptor.colorAttachments[0].alphaBlendOperation = .add
+        rulerDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        rulerDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+        rulerDescriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        rulerDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
         let additiveDescriptor = MTLRenderPipelineDescriptor()
         additiveDescriptor.vertexFunction = vertexFunction
         additiveDescriptor.fragmentFunction = fragmentFunction
@@ -862,6 +894,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         )
         pipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
         waveformPipelineState = try device.makeRenderPipelineState(descriptor: waveformDescriptor)
+        rulerPipelineState = try device.makeRenderPipelineState(descriptor: rulerDescriptor)
         additivePipelineState = try device.makeRenderPipelineState(descriptor: additiveDescriptor)
 
         super.init()
@@ -1151,6 +1184,29 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         renderState = renderState.withGainPreview(gainPreview)
     }
 
+    func triggerDeletionEffect(selection: TimelineSelection) {
+        guard selection.durationProgress > 0 else {
+            return
+        }
+
+        var seed = UInt64(bitPattern: Int64(selection.trackID?.hashValue ?? 0))
+        seed &+= UInt64((selection.startProgress * 1_000_000).rounded(.down))
+        seed &*= 0x9E37_79B9_7F4A_7C15
+        seed &+= UInt64((selection.endProgress * 1_000_000).rounded(.down))
+        let effect = DeletionEffect(
+            selection: selection,
+            birthTimestamp: -1,
+            seed: seed
+        )
+
+        deletionEffectLock.lock()
+        deletionEffects.append(effect)
+        if deletionEffects.count > deletionEffectMaximumCount {
+            deletionEffects.removeFirst(deletionEffects.count - deletionEffectMaximumCount)
+        }
+        deletionEffectLock.unlock()
+    }
+
     func render(to target: TimelineRenderTarget) {
         guard
             let commandBuffer = commandQueue.makeCommandBuffer(),
@@ -1295,6 +1351,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             renderState: renderState,
             displayTimestamp: displayTimestamp
         )
+        let deletionEffectVertices = makeDeletionEffectVertices(
+            drawableSize: viewportSize,
+            renderState: renderState,
+            displayTimestamp: displayTimestamp
+        )
         let hoverGuideVertices = makeHoverGuideVertices(
             drawableSize: viewportSize,
             backingScale: backingScale,
@@ -1317,6 +1378,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         ) {
             draw(cachedVertices: gridVertices, primitiveType: .triangle, encoder: encoder)
         }
+        drawTimelineRulerTicks(
+            drawableSize: viewportSize,
+            backingScale: backingScale,
+            renderState: renderState,
+            encoder: encoder
+        )
+        encoder.setRenderPipelineState(pipelineState)
         draw(vertices: selectedTrackVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: selectionVertices, primitiveType: .triangle, encoder: encoder)
         if let previousShaderRenderState, usesPreviousWaveformShader {
@@ -1383,9 +1451,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             )
         }
         draw(vertices: playheadTouchVertices, primitiveType: .triangle, encoder: encoder)
-        if !transientParticleVertices.isEmpty {
+        if !transientParticleVertices.isEmpty || !deletionEffectVertices.isEmpty {
             encoder.setRenderPipelineState(additivePipelineState)
             draw(vertices: transientParticleVertices, primitiveType: .triangle, encoder: encoder)
+            draw(vertices: deletionEffectVertices, primitiveType: .triangle, encoder: encoder)
             encoder.setRenderPipelineState(pipelineState)
         }
         draw(vertices: trimPreviewVertices, primitiveType: .triangle, encoder: encoder)
@@ -1938,6 +2007,85 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 instanceCount: uniforms.count
             )
         }
+    }
+
+    private func drawTimelineRulerTicks(
+        drawableSize: CGSize,
+        backingScale: Float,
+        renderState: TimelineRenderState,
+        encoder: MTLRenderCommandEncoder
+    ) {
+        guard var uniform = makeTimelineRulerUniform(
+            drawableSize: drawableSize,
+            backingScale: backingScale,
+            renderState: renderState
+        ) else {
+            return
+        }
+
+        encoder.setRenderPipelineState(rulerPipelineState)
+        encoder.setVertexBuffer(waveformQuadVertexBuffer, offset: 0, index: 0)
+        encoder.setVertexBytes(
+            &uniform,
+            length: MemoryLayout<TimelineRulerUniform>.stride,
+            index: 1
+        )
+        encoder.setFragmentBytes(
+            &uniform,
+            length: MemoryLayout<TimelineRulerUniform>.stride,
+            index: 1
+        )
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+    }
+
+    private func makeTimelineRulerUniform(
+        drawableSize: CGSize,
+        backingScale: Float,
+        renderState: TimelineRenderState
+    ) -> TimelineRulerUniform? {
+        let width = Float(drawableSize.width)
+        let height = Float(drawableSize.height)
+        guard
+            width > 0,
+            height > 0,
+            let projectDuration = renderState.duration,
+            projectDuration.isFinite,
+            projectDuration > 0
+        else {
+            return nil
+        }
+
+        let scale = max(backingScale, 1)
+        let visibleSeconds = max(Double(renderState.viewport.durationProgress) * projectDuration, 0.000001)
+        let targetMinorSpacingPoints: Float = 52
+        let approximateMinorStep = visibleSeconds * Double(targetMinorSpacingPoints / max(width, 1))
+        let minorStepSeconds = max(Float(niceSecondsStep(approximateMinorStep)), 0.000001)
+        let rulerHeightPixels = min(
+            max(18 * scale, height * scale * 0.032),
+            28 * scale
+        )
+
+        return TimelineRulerUniform(
+            viewport: SIMD4<Float>(
+                renderState.viewport.startProgress,
+                renderState.viewport.durationProgress,
+                Float(projectDuration),
+                minorStepSeconds
+            ),
+            metrics: SIMD4<Float>(
+                width,
+                height,
+                scale,
+                rulerHeightPixels
+            ),
+            style: SIMD4<Float>(
+                5,
+                10,
+                0.72,
+                rulerHeightPixels * 0.34
+            ),
+            color: SIMD4<Float>(0.78, 0.88, 0.90, 0.72)
+        )
     }
 
     private func waveformMipLevelSnapshot() -> WaveformMipLevelSnapshot {
@@ -3080,6 +3228,332 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         return vertices
+    }
+
+    private func makeDeletionEffectVertices(
+        drawableSize: CGSize,
+        renderState: TimelineRenderState,
+        displayTimestamp: CFTimeInterval
+    ) -> [TimelineVertex] {
+        let width = Float(drawableSize.width)
+        let height = Float(drawableSize.height)
+        guard width > 0, height > 0 else {
+            return []
+        }
+
+        deletionEffectLock.lock()
+        for index in deletionEffects.indices {
+            if deletionEffects[index].birthTimestamp < 0 {
+                deletionEffects[index].birthTimestamp = displayTimestamp
+            }
+        }
+        deletionEffects.removeAll { effect in
+            effect.birthTimestamp >= 0 &&
+                displayTimestamp - effect.birthTimestamp >= deletionEffectDuration
+        }
+        let effects = deletionEffects
+        deletionEffectLock.unlock()
+
+        guard !effects.isEmpty else {
+            return []
+        }
+
+        let drawableSize = SIMD2<Float>(width, height)
+        var vertices: [TimelineVertex] = []
+        vertices.reserveCapacity(effects.count * deletionShardCount * 12)
+
+        for effect in effects {
+            let birthTimestamp = effect.birthTimestamp >= 0 ? effect.birthTimestamp : displayTimestamp
+            let age = max(displayTimestamp - birthTimestamp, 0)
+            let progress = min(max(Float(age / deletionEffectDuration), 0), 1)
+            let selection = effect.selection
+            let leftViewport = renderState.viewport.viewportProgress(
+                forTimelineProgress: selection.startProgressFloat
+            )
+            let rightViewport = renderState.viewport.viewportProgress(
+                forTimelineProgress: selection.endProgressFloat
+            )
+            guard rightViewport > -0.1, leftViewport < 1.1 else {
+                continue
+            }
+
+            var leftX = leftViewport * width
+            var rightX = rightViewport * width
+            if rightX < leftX {
+                swap(&leftX, &rightX)
+            }
+            let minimumEffectWidth: Float = 18
+            if rightX - leftX < minimumEffectWidth {
+                let centerX = (leftX + rightX) * 0.5
+                leftX = centerX - minimumEffectWidth * 0.5
+                rightX = centerX + minimumEffectWidth * 0.5
+            }
+
+            let verticalRange = selectionVerticalRange(
+                for: selection,
+                tracks: renderState.tracks
+            )
+            let topY = verticalRange.top * height
+            let bottomY = verticalRange.bottom * height
+            let laneHeight = max(bottomY - topY, 1)
+            let centerY = (topY + bottomY) * 0.5
+            let joinX = min(max(leftX, -width * 0.2), width * 1.2)
+            let dissolve = 1 - smoothStep(progress)
+            let blast = 1 - pow(1 - progress, 2.2)
+            let shardAlpha = max(dissolve * dissolve, 0)
+
+            appendDeletionFractureFlash(
+                to: &vertices,
+                leftX: leftX,
+                rightX: rightX,
+                topY: topY,
+                bottomY: bottomY,
+                centerY: centerY,
+                progress: progress,
+                drawableSize: drawableSize
+            )
+
+            if progress < 0.78, shardAlpha > 0.002 {
+                appendDeletionShards(
+                    to: &vertices,
+                    effect: effect,
+                    leftX: leftX,
+                    rightX: rightX,
+                    topY: topY,
+                    bottomY: bottomY,
+                    centerY: centerY,
+                    progress: progress,
+                    blast: blast,
+                    alpha: shardAlpha,
+                    drawableSize: drawableSize
+                )
+            }
+
+            appendDeletionConjoinStreaks(
+                to: &vertices,
+                effect: effect,
+                leftX: leftX,
+                rightX: rightX,
+                joinX: joinX,
+                topY: topY,
+                laneHeight: laneHeight,
+                progress: progress,
+                drawableSize: drawableSize
+            )
+
+            appendDeletionJoinFlare(
+                to: &vertices,
+                joinX: joinX,
+                centerY: centerY,
+                laneHeight: laneHeight,
+                progress: progress,
+                drawableSize: drawableSize
+            )
+        }
+
+        return vertices
+    }
+
+    private func appendDeletionFractureFlash(
+        to vertices: inout [TimelineVertex],
+        leftX: Float,
+        rightX: Float,
+        topY: Float,
+        bottomY: Float,
+        centerY: Float,
+        progress: Float,
+        drawableSize: SIMD2<Float>
+    ) {
+        let flash = 1 - smoothStep(min(max(progress / 0.15, 0), 1))
+        guard flash > 0.002 else {
+            return
+        }
+
+        let width = max(rightX - leftX, 1)
+        let laneHeight = max(bottomY - topY, 1)
+        let insetY = min(laneHeight * 0.10, 18)
+        let flashTop = min(topY + insetY, centerY)
+        let flashBottom = max(bottomY - insetY, centerY)
+        appendRectangle(
+            to: &vertices,
+            left: leftX,
+            right: rightX,
+            top: flashTop,
+            bottom: flashBottom,
+            color: SIMD4<Float>(0.34, 1.0, 0.94, 0.10 * flash),
+            drawableSize: drawableSize
+        )
+
+        appendThickLine(
+            to: &vertices,
+            start: SIMD2<Float>(leftX + width * 0.04, centerY),
+            end: SIMD2<Float>(rightX - width * 0.04, centerY),
+            width: 1.2 + 3.0 * flash,
+            color: SIMD4<Float>(0.82, 1.0, 0.98, 0.28 * flash),
+            drawableSize: drawableSize
+        )
+
+        let crackCount = 7
+        for crackIndex in 0..<crackCount {
+            let phase = Float(crackIndex) / Float(max(crackCount - 1, 1))
+            let x = leftX + width * (0.10 + phase * 0.80)
+            let height = laneHeight * (0.10 + 0.12 * sin(phase * Float.pi * 3.0))
+            appendThickLine(
+                to: &vertices,
+                start: SIMD2<Float>(x, centerY - height),
+                end: SIMD2<Float>(x + (phase - 0.5) * 12, centerY + height),
+                width: 0.9 + 1.4 * flash,
+                color: SIMD4<Float>(0.80, 1.0, 0.98, 0.20 * flash),
+                drawableSize: drawableSize
+            )
+        }
+    }
+
+    private func appendDeletionShards(
+        to vertices: inout [TimelineVertex],
+        effect: DeletionEffect,
+        leftX: Float,
+        rightX: Float,
+        topY: Float,
+        bottomY: Float,
+        centerY: Float,
+        progress: Float,
+        blast: Float,
+        alpha: Float,
+        drawableSize: SIMD2<Float>
+    ) {
+        let selectionWidth = max(rightX - leftX, 1)
+        let laneHeight = max(bottomY - topY, 1)
+        for shardIndex in 0..<deletionShardCount {
+            let seed = effect.seed &+ UInt64(shardIndex) &* 0xBF58_476D_1CE4_E5B9
+            let sourceX = leftX + pseudoRandom01(seed &+ 17) * selectionWidth
+            let yBias = pow(pseudoRandom01(seed &+ 31), 1.7)
+            let sourceY = centerY + (yBias * 2 - 1) * laneHeight * 0.39
+            let angle = pseudoRandom01(seed &+ 47) * Float.pi * 2
+            let direction = SIMD2<Float>(cos(angle), sin(angle))
+            let speed = 34 + 210 * pseudoRandom01(seed &+ 71)
+            let ageSeconds = progress * Float(deletionEffectDuration)
+            let center = SIMD2<Float>(sourceX, sourceY) +
+                direction * speed * ageSeconds * (0.35 + blast * 1.25)
+            let size = 1.6 + 5.8 * pseudoRandom01(seed &+ 89)
+            let rotation = angle + progress * (2.4 + 6.0 * pseudoRandom01(seed &+ 109))
+            let cold = pseudoRandom01(seed &+ 131)
+            let color = SIMD4<Float>(
+                0.70 + 0.30 * cold,
+                0.91 + 0.09 * cold,
+                0.92 + 0.08 * pseudoRandom01(seed &+ 149),
+                alpha * (0.40 + 0.34 * pseudoRandom01(seed &+ 167))
+            )
+
+            appendShardTriangle(
+                to: &vertices,
+                center: center,
+                radius: size,
+                rotation: rotation,
+                color: color,
+                drawableSize: drawableSize
+            )
+
+            if shardIndex.isMultiple(of: 5) {
+                appendSoftParticle(
+                    to: &vertices,
+                    center: center,
+                    radius: size * 2.2,
+                    color: SIMD3<Float>(color.x, color.y, color.z),
+                    alpha: color.w * 0.48,
+                    drawableSize: drawableSize
+                )
+            }
+        }
+    }
+
+    private func appendDeletionConjoinStreaks(
+        to vertices: inout [TimelineVertex],
+        effect: DeletionEffect,
+        leftX: Float,
+        rightX: Float,
+        joinX: Float,
+        topY: Float,
+        laneHeight: Float,
+        progress: Float,
+        drawableSize: SIMD2<Float>
+    ) {
+        let travelProgress = smoothStep(min(max(progress / 0.34, 0), 1))
+        let fadeOut = 1 - smoothStep(min(max((progress - 0.24) / 0.28, 0), 1))
+        let alpha = 0.34 * travelProgress * fadeOut
+        guard alpha > 0.002 else {
+            return
+        }
+
+        let pullDistance = max(rightX - leftX, 22)
+        for streakIndex in 0..<9 {
+            let seed = effect.seed &+ UInt64(streakIndex) &* 0x94D0_49BB_1331_11EB
+            let y = topY + (0.20 + 0.60 * pseudoRandom01(seed &+ 19)) * laneHeight
+            let jitter = (pseudoRandom01(seed &+ 29) - 0.5) * laneHeight * 0.08
+            let rightStart = rightX + 18 + pseudoRandom01(seed &+ 41) * min(pullDistance * 0.32, 90)
+            let rightNow = rightStart + (joinX - rightStart) * travelProgress
+            let leftStart = leftX - 12 - pseudoRandom01(seed &+ 59) * min(pullDistance * 0.18, 48)
+            let leftNow = leftStart + (joinX - leftStart) * min(travelProgress * 1.12, 1)
+            let color = SIMD4<Float>(0.70, 0.98, 0.96, alpha * (0.55 + pseudoRandom01(seed &+ 73) * 0.45))
+
+            appendThickLine(
+                to: &vertices,
+                start: SIMD2<Float>(rightNow, y + jitter),
+                end: SIMD2<Float>(joinX, y + jitter * 0.35),
+                width: 1.2 + 1.4 * pseudoRandom01(seed &+ 89),
+                color: color,
+                drawableSize: drawableSize
+            )
+            appendThickLine(
+                to: &vertices,
+                start: SIMD2<Float>(leftNow, y - jitter),
+                end: SIMD2<Float>(joinX, y - jitter * 0.35),
+                width: 0.8 + 1.0 * pseudoRandom01(seed &+ 101),
+                color: color * SIMD4<Float>(1, 1, 1, 0.55),
+                drawableSize: drawableSize
+            )
+        }
+    }
+
+    private func appendDeletionJoinFlare(
+        to vertices: inout [TimelineVertex],
+        joinX: Float,
+        centerY: Float,
+        laneHeight: Float,
+        progress: Float,
+        drawableSize: SIMD2<Float>
+    ) {
+        let flareProgress = min(max((progress - 0.16) / 0.30, 0), 1)
+        let flareEnergy = sin(flareProgress * Float.pi)
+        guard flareEnergy > 0.002 else {
+            return
+        }
+
+        let coreRadius = (10 + laneHeight * 0.12) * (0.75 + flareProgress * 1.6)
+        appendSoftParticle(
+            to: &vertices,
+            center: SIMD2<Float>(joinX, centerY),
+            radius: coreRadius,
+            color: SIMD3<Float>(0.78, 1.0, 0.96),
+            alpha: 0.28 * flareEnergy,
+            drawableSize: drawableSize
+        )
+        appendSoftParticle(
+            to: &vertices,
+            center: SIMD2<Float>(joinX, centerY),
+            radius: coreRadius * 2.2,
+            color: SIMD3<Float>(0.38, 0.96, 1.0),
+            alpha: 0.09 * flareEnergy,
+            drawableSize: drawableSize
+        )
+        appendThickLine(
+            to: &vertices,
+            start: SIMD2<Float>(joinX, centerY - laneHeight * 0.42),
+            end: SIMD2<Float>(joinX, centerY + laneHeight * 0.42),
+            width: 1.2 + 4.2 * flareEnergy,
+            color: SIMD4<Float>(0.72, 1.0, 0.96, 0.18 * flareEnergy),
+            drawableSize: drawableSize
+        )
     }
 
     private func makeSelectionVertices(renderState: TimelineRenderState) -> [TimelineVertex] {
@@ -5267,6 +5741,115 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         vertices.append(bottomLeft)
     }
 
+    private func appendShardTriangle(
+        to vertices: inout [TimelineVertex],
+        center: SIMD2<Float>,
+        radius: Float,
+        rotation: Float,
+        color: SIMD4<Float>,
+        drawableSize: SIMD2<Float>
+    ) {
+        guard
+            drawableSize.x > 0,
+            drawableSize.y > 0,
+            radius > 0,
+            color.w > 0
+        else {
+            return
+        }
+
+        if
+            center.x + radius < 0 ||
+            center.x - radius > drawableSize.x ||
+            center.y + radius < 0 ||
+            center.y - radius > drawableSize.y
+        {
+            return
+        }
+
+        let angles = [
+            rotation,
+            rotation + Float.pi * 0.73,
+            rotation + Float.pi * 1.48,
+        ]
+        for angle in angles {
+            let point = SIMD2<Float>(
+                center.x + cos(angle) * radius,
+                center.y + sin(angle) * radius * 0.62
+            )
+            vertices.append(makeVertex(
+                normalizedPosition: SIMD2<Float>(
+                    point.x / drawableSize.x,
+                    point.y / drawableSize.y
+                ),
+                color: color
+            ))
+        }
+    }
+
+    private func appendThickLine(
+        to vertices: inout [TimelineVertex],
+        start: SIMD2<Float>,
+        end: SIMD2<Float>,
+        width: Float,
+        color: SIMD4<Float>,
+        drawableSize: SIMD2<Float>
+    ) {
+        guard
+            drawableSize.x > 0,
+            drawableSize.y > 0,
+            width > 0,
+            color.w > 0
+        else {
+            return
+        }
+
+        let delta = end - start
+        let length = simd_length(delta)
+        guard length > 0.001 else {
+            appendSoftParticle(
+                to: &vertices,
+                center: start,
+                radius: width * 1.8,
+                color: SIMD3<Float>(color.x, color.y, color.z),
+                alpha: color.w,
+                drawableSize: drawableSize
+            )
+            return
+        }
+
+        let perpendicular = SIMD2<Float>(-delta.y, delta.x) / length * width * 0.5
+        let startA = start + perpendicular
+        let startB = start - perpendicular
+        let endA = end + perpendicular
+        let endB = end - perpendicular
+
+        vertices.append(makeVertex(
+            normalizedPosition: SIMD2<Float>(startA.x / drawableSize.x, startA.y / drawableSize.y),
+            color: color
+        ))
+        vertices.append(makeVertex(
+            normalizedPosition: SIMD2<Float>(endA.x / drawableSize.x, endA.y / drawableSize.y),
+            color: color
+        ))
+        vertices.append(makeVertex(
+            normalizedPosition: SIMD2<Float>(startB.x / drawableSize.x, startB.y / drawableSize.y),
+            color: color
+        ))
+        vertices.append(makeVertex(
+            normalizedPosition: SIMD2<Float>(endA.x / drawableSize.x, endA.y / drawableSize.y),
+            color: color
+        ))
+        vertices.append(makeVertex(
+            normalizedPosition: SIMD2<Float>(endB.x / drawableSize.x, endB.y / drawableSize.y),
+            color: color
+        ))
+        vertices.append(makeVertex(
+            normalizedPosition: SIMD2<Float>(startB.x / drawableSize.x, startB.y / drawableSize.y),
+            color: color
+        ))
+    }
+
     private func appendSoftParticle(
         to vertices: inout [TimelineVertex],
         center: SIMD2<Float>,
@@ -5604,6 +6187,27 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         return 10 * base
     }
 
+    private func niceSecondsStep(_ secondsStep: Double) -> Double {
+        guard secondsStep > 0, secondsStep.isFinite else {
+            return 1
+        }
+
+        let exponent = floor(log10(secondsStep))
+        let base = pow(10, exponent)
+        let normalizedStep = secondsStep / base
+
+        if normalizedStep <= 1 {
+            return base
+        }
+        if normalizedStep <= 2 {
+            return 2 * base
+        }
+        if normalizedStep <= 5 {
+            return 5 * base
+        }
+        return 10 * base
+    }
+
     private func playheadTouchGeometryInfluence(
         offsetFromPlayhead: Float,
         aheadRadius: Float,
@@ -5690,6 +6294,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float4 touch2;
     };
 
+    struct TimelineRulerUniform {
+        float4 viewport;
+        float4 metrics;
+        float4 style;
+        float4 color;
+    };
+
     struct WaveformShaderBin {
         float minimumSample;
         float maximumSample;
@@ -5703,6 +6314,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     struct RasterizedVertex {
         float4 position [[position]];
+        float4 color;
+    };
+
+    struct TimelineRulerRasterizedVertex {
+        float4 position [[position]];
+        float2 normalizedPosition;
+        float4 viewport;
+        float4 metrics;
+        float4 style;
         float4 color;
     };
 
@@ -5807,6 +6427,28 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         return out;
     }
 
+    vertex TimelineRulerRasterizedVertex timeline_ruler_vertex(
+        uint vertexID [[vertex_id]],
+        constant WaveformShaderQuadVertex *vertices [[buffer(0)]],
+        constant TimelineRulerUniform &uniform [[buffer(1)]]
+    ) {
+        float2 normalizedPosition = vertices[vertexID].position.xy;
+
+        TimelineRulerRasterizedVertex out;
+        out.position = float4(
+            normalizedPosition.x * 2.0 - 1.0,
+            1.0 - normalizedPosition.y * 2.0,
+            0.0,
+            1.0
+        );
+        out.normalizedPosition = normalizedPosition;
+        out.viewport = uniform.viewport;
+        out.metrics = uniform.metrics;
+        out.style = uniform.style;
+        out.color = uniform.color;
+        return out;
+    }
+
     vertex WaveformRasterizedVertex waveform_vertex(
         uint vertexID [[vertex_id]],
         uint instanceID [[instance_id]],
@@ -5843,6 +6485,65 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         constant float &opacity [[buffer(1)]]
     ) {
         return float4(in.color.rgb, in.color.a * opacity);
+    }
+
+    fragment float4 timeline_ruler_fragment(
+        TimelineRulerRasterizedVertex in [[stage_in]]
+    ) {
+        float height = max(in.metrics.y, 1.0);
+        float scale = max(in.metrics.z, 1.0);
+        float rulerHeightPixels = max(in.metrics.w, 1.0);
+        float yPixels = in.normalizedPosition.y * height * scale;
+        if (yPixels > rulerHeightPixels + 1.0) {
+            return float4(0.0);
+        }
+
+        float projectDuration = max(in.viewport.z, 0.000001);
+        float minorStepSeconds = max(in.viewport.w, 0.000001);
+        float timelineProgress = in.viewport.x + in.normalizedPosition.x * in.viewport.y;
+        float timelineSeconds = timelineProgress * projectDuration;
+        if (timelineSeconds < -minorStepSeconds ||
+            timelineSeconds > projectDuration + minorStepSeconds) {
+            return float4(0.0);
+        }
+
+        float scaledTick = timelineSeconds / minorStepSeconds;
+        float nearestTickIndex = floor(scaledTick + 0.5);
+        float tickDistance = abs(scaledTick - nearestTickIndex);
+        float tickDerivative = max(fwidth(scaledTick), 0.000001);
+        float distancePixels = tickDistance / tickDerivative;
+        float lineHalfWidthPixels = max(in.style.z, 0.25);
+        float xCoverage = 1.0 - smoothstep(
+            lineHalfWidthPixels,
+            lineHalfWidthPixels + 1.0,
+            distancePixels
+        );
+        if (xCoverage <= 0.0) {
+            return float4(0.0);
+        }
+
+        float mediumEvery = max(in.style.x, 1.0);
+        float majorEvery = max(in.style.y, 1.0);
+        float majorModulo = fmod(abs(nearestTickIndex), majorEvery);
+        float mediumModulo = fmod(abs(nearestTickIndex), mediumEvery);
+        float majorDistance = min(majorModulo, majorEvery - majorModulo);
+        float mediumDistance = min(mediumModulo, mediumEvery - mediumModulo);
+        bool isMajor = majorDistance < 0.01;
+        bool isMedium = mediumDistance < 0.01;
+
+        float minorHeightPixels = max(in.style.w, 1.0);
+        float mediumHeightPixels = rulerHeightPixels * 0.42;
+        float majorHeightPixels = rulerHeightPixels * 0.50;
+        float tickHeightPixels = isMajor ? majorHeightPixels : (isMedium ? mediumHeightPixels : minorHeightPixels);
+        float yCoverage = 1.0 - smoothstep(tickHeightPixels, tickHeightPixels + 1.0, yPixels);
+        if (yCoverage <= 0.0) {
+            return float4(0.0);
+        }
+
+        float tickAlpha = isMajor ? 1.0 : (isMedium ? 0.68 : 0.38);
+        float edgeFade = 1.0 - smoothstep(rulerHeightPixels * 0.72, rulerHeightPixels, yPixels);
+        float alpha = in.color.a * xCoverage * yCoverage * tickAlpha * max(edgeFade, 0.15);
+        return float4(in.color.rgb, alpha);
     }
 
     static WaveformShaderBin sample_waveform_bin(

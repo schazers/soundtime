@@ -393,6 +393,84 @@ final class SoundtimeAudioCoreTests: XCTestCase {
         XCTAssertEqual(output[1], [0.80, -1.00, 1.20, -1.40])
     }
 
+    func testPreparedSegmentedTracksRenderTimelineEditsWithoutMaterialization() throws {
+        let engine = try XCTUnwrap(soundtime_audio_core_create())
+        defer {
+            soundtime_audio_core_destroy(engine)
+        }
+
+        var left: [Float] = [1, 2, 3, 4, 5, 6]
+        var right: [Float] = [-1, -2, -3, -4, -5, -6]
+        let preparedSource = left.withUnsafeMutableBufferPointer { leftSamples in
+            right.withUnsafeMutableBufferPointer { rightSamples in
+                var channels = [
+                    UnsafePointer(leftSamples.baseAddress),
+                    UnsafePointer(rightSamples.baseAddress),
+                ]
+                return channels.withUnsafeMutableBufferPointer { channelPointers in
+                    soundtime_audio_core_source_create_planar(
+                        channelPointers.baseAddress,
+                        UInt64(leftSamples.count),
+                        2,
+                        48_000
+                    )
+                }
+            }
+        }
+        let source = try XCTUnwrap(preparedSource)
+        defer {
+            soundtime_audio_core_source_destroy(source)
+        }
+
+        var segments = [
+            SoundtimeAudioCoreSegmentConfig(
+                outputStartFrame: 0,
+                sourceStartFrame: 0,
+                frameCount: 2,
+                sourceFrameScale: 1,
+                gainStart: 1,
+                gainEnd: 1
+            ),
+            SoundtimeAudioCoreSegmentConfig(
+                outputStartFrame: 2,
+                sourceStartFrame: 4,
+                frameCount: 2,
+                sourceFrameScale: 1,
+                gainStart: 0.5,
+                gainEnd: 1
+            ),
+        ]
+        let didLoad = segments.withUnsafeMutableBufferPointer { segmentBuffer in
+            var tracks = [
+                SoundtimeAudioCoreSegmentedTrackConfig(
+                    source: source,
+                    segments: segmentBuffer.baseAddress,
+                    segmentCount: UInt32(segmentBuffer.count),
+                    gain: 1
+                ),
+            ]
+            return tracks.withUnsafeMutableBufferPointer { trackBuffer in
+                soundtime_audio_core_set_prepared_segmented_tracks(
+                    engine,
+                    trackBuffer.baseAddress,
+                    UInt32(trackBuffer.count)
+                )
+            }
+        }
+        XCTAssertTrue(didLoad)
+
+        let snapshot = soundtime_audio_core_snapshot(engine)
+        XCTAssertEqual(snapshot.frameCount, 4)
+        XCTAssertEqual(snapshot.sampleRate, 48_000)
+
+        soundtime_audio_core_set_transport_ramp_duration(engine, 0)
+        soundtime_audio_core_play(engine)
+
+        let output = render(engine: engine, channelCount: 2, frameCount: 4, hostTimestamp: 4)
+        XCTAssertEqual(output[0], [1, 2, 2.5, 6])
+        XCTAssertEqual(output[1], [-1, -2, -2.5, -6])
+    }
+
     func testPreparedTracksWithMixedSampleRatesRenderOnProjectTimeline() throws {
         let engine = try XCTUnwrap(soundtime_audio_core_create())
         defer {

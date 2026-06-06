@@ -63,6 +63,10 @@ struct ProjectPlaybackTrack: Sendable {
             url: URL,
             zeroCrossingProbe: WAVZeroCrossingProbe?
         )
+        case timeline(
+            audioTimeline: AudioEditTimeline,
+            zeroCrossingIndex: AudioZeroCrossingIndex?
+        )
     }
 
     let id: UUID
@@ -116,6 +120,8 @@ extension PlaybackEngine {
             try load(decodedAudioBuffer, zeroCrossingIndex: zeroCrossingIndex)
         case let .file(url, zeroCrossingProbe):
             try loadFile(at: url, zeroCrossingProbe: zeroCrossingProbe)
+        case let .timeline(audioTimeline, zeroCrossingIndex):
+            try load(audioTimeline.render(), zeroCrossingIndex: zeroCrossingIndex)
         }
     }
 

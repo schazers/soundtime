@@ -7,6 +7,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         let id: UUID
         let sourceRevision: Int
         let source: PreparedRealtimeAudioSource
+        let segments: [PreparedRealtimeAudioSegment]
         let zeroCrossingIndex: AudioZeroCrossingIndex?
         let zeroCrossingProbe: WAVZeroCrossingProbe?
         var volume: Float
@@ -130,7 +131,8 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             preparedTracks.map { preparedTrack in
                 PreparedRealtimeAudioTrack(
                     source: preparedTrack.source,
-                    gain: effectiveTrackGain(preparedTrack, in: preparedTracks)
+                    gain: effectiveTrackGain(preparedTrack, in: preparedTracks),
+                    segments: preparedTrack.segments
                 )
             }
         )
@@ -332,7 +334,8 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             updatedPreparedTracks.map { preparedTrack in
                 PreparedRealtimeAudioTrack(
                     source: preparedTrack.source,
-                    gain: effectiveTrackGain(preparedTrack, in: updatedPreparedTracks)
+                    gain: effectiveTrackGain(preparedTrack, in: updatedPreparedTracks),
+                    segments: preparedTrack.segments
                 )
             }
         )
@@ -436,6 +439,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
 
     private func preparedProjectTrack(from track: ProjectPlaybackTrack) throws -> PreparedProjectTrack {
         let preparedSource: PreparedRealtimeAudioSource
+        let segments: [PreparedRealtimeAudioSegment]
         let zeroCrossingIndex: AudioZeroCrossingIndex?
         let zeroCrossingProbe: WAVZeroCrossingProbe?
 
@@ -449,6 +453,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
                     existingTrack.source.sampleRate == decodedAudioBuffer.sampleRate
             }) {
                 preparedSource = existingPreparedTrack.source
+                segments = existingPreparedTrack.segments
                 zeroCrossingIndex = sourceZeroCrossingIndex
                 zeroCrossingProbe = nil
                 break
@@ -458,6 +463,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
                 throw PlaybackError.invalidFormat
             }
             preparedSource = source
+            segments = []
             zeroCrossingIndex = sourceZeroCrossingIndex
             zeroCrossingProbe = nil
         case let .file(url, sourceZeroCrossingProbe):
@@ -467,6 +473,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
                     existingTrack.source.frameCount > 0
             }) {
                 preparedSource = existingPreparedTrack.source
+                segments = existingPreparedTrack.segments
                 zeroCrossingIndex = nil
                 zeroCrossingProbe = sourceZeroCrossingProbe
                 break
@@ -476,14 +483,44 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
                 throw PlaybackError.invalidFormat
             }
             preparedSource = source
+            segments = []
             zeroCrossingIndex = nil
             zeroCrossingProbe = sourceZeroCrossingProbe
+        case let .timeline(audioTimeline, sourceZeroCrossingIndex):
+            let sourceBuffer = audioTimeline.sourceAudioBuffer
+            if let existingPreparedTrack = preparedProjectTracks.first(where: { existingTrack in
+                existingTrack.id == track.id &&
+                    existingTrack.sourceRevision == track.sourceRevision &&
+                    existingTrack.source.frameCount == sourceBuffer.frameCount &&
+                    existingTrack.source.channelCount == sourceBuffer.channelCount &&
+                    existingTrack.source.sampleRate == sourceBuffer.sampleRate
+            }) {
+                preparedSource = existingPreparedTrack.source
+            } else {
+                guard let source = PreparedRealtimeAudioSource.make(from: sourceBuffer) else {
+                    throw PlaybackError.invalidFormat
+                }
+                preparedSource = source
+            }
+            segments = audioTimeline.playbackSegments.map { segment in
+                PreparedRealtimeAudioSegment(
+                    outputStartFrame: segment.outputStartFrame,
+                    sourceStartFrame: segment.sourceStartFrame,
+                    frameCount: segment.frameCount,
+                    sourceFrameScale: segment.sourceFrameScale,
+                    gainStart: segment.gainStart,
+                    gainEnd: segment.gainEnd
+                )
+            }
+            zeroCrossingIndex = sourceZeroCrossingIndex
+            zeroCrossingProbe = nil
         }
 
         return PreparedProjectTrack(
             id: track.id,
             sourceRevision: track.sourceRevision,
             source: preparedSource,
+            segments: segments,
             zeroCrossingIndex: zeroCrossingIndex,
             zeroCrossingProbe: zeroCrossingProbe,
             volume: track.volume,
@@ -514,6 +551,13 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         }
 
         let duration = tracks.reduce(0.0) { longestDuration, track in
+            let segmentedFrameCount = track.segments.reduce(0) { result, segment in
+                max(result, segment.outputStartFrame + segment.frameCount)
+            }
+            if segmentedFrameCount > 0 {
+                return max(longestDuration, Double(segmentedFrameCount) / sampleRate)
+            }
+
             guard track.source.sampleRate.isFinite, track.source.sampleRate > 0 else {
                 return longestDuration
             }
@@ -585,11 +629,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             return clampedFrame
         }
 
-        let projectTime = TimeInterval(clampedFrame) / sampleRate
-        let sourceFrame = min(
-            max(Int((projectTime * referenceTrack.source.sampleRate).rounded(.down)), 0),
-            referenceTrack.source.frameCount
-        )
+        let sourceFrame = sourceFrame(forProjectFrame: clampedFrame, in: referenceTrack)
         guard sourceFrame > 0, sourceFrame < referenceTrack.source.frameCount else {
             return clampedFrame
         }
@@ -606,8 +646,11 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             snappedSourceFrame = sourceFrame
         }
 
-        let snappedProjectTime = TimeInterval(snappedSourceFrame) / referenceTrack.source.sampleRate
-        let snappedProjectFrame = Int((snappedProjectTime * sampleRate).rounded(.down))
+        let snappedProjectFrame = projectFrame(
+            forSourceFrame: snappedSourceFrame,
+            nearProjectFrame: clampedFrame,
+            in: referenceTrack
+        )
         let boundedFrame = min(max(snappedProjectFrame, 0), frameCount)
         if !allowsEnd, boundedFrame >= frameCount {
             return max(frameCount - 1, 0)
@@ -628,9 +671,62 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
                 return false
             }
 
+            if !track.segments.isEmpty {
+                return track.segments.contains { segment in
+                    projectFrame >= segment.outputStartFrame &&
+                        projectFrame < segment.outputStartFrame + segment.frameCount
+                }
+            }
+
             let sourceFrame = Int((projectTime * track.source.sampleRate).rounded(.down))
             return sourceFrame > 0 && sourceFrame < track.source.frameCount
         }
+    }
+
+    private func sourceFrame(
+        forProjectFrame projectFrame: Int,
+        in track: PreparedProjectTrack
+    ) -> Int {
+        if
+            let segment = track.segments.first(where: { segment in
+                projectFrame >= segment.outputStartFrame &&
+                    projectFrame < segment.outputStartFrame + segment.frameCount
+            })
+        {
+            let offset = max(projectFrame - segment.outputStartFrame, 0)
+            let sourceFrame = segment.sourceStartFrame + Int((Double(offset) * segment.sourceFrameScale).rounded(.down))
+            return min(max(sourceFrame, 0), track.source.frameCount)
+        }
+
+        let projectTime = TimeInterval(projectFrame) / sampleRate
+        return min(
+            max(Int((projectTime * track.source.sampleRate).rounded(.down)), 0),
+            track.source.frameCount
+        )
+    }
+
+    private func projectFrame(
+        forSourceFrame sourceFrame: Int,
+        nearProjectFrame: Int,
+        in track: PreparedProjectTrack
+    ) -> Int {
+        if
+            let segment = track.segments.first(where: { segment in
+                sourceFrame >= segment.sourceStartFrame &&
+                    sourceFrame < segment.sourceStartFrame +
+                    Int((Double(segment.frameCount) * segment.sourceFrameScale).rounded(.up)) &&
+                    nearProjectFrame >= segment.outputStartFrame &&
+                    nearProjectFrame < segment.outputStartFrame + segment.frameCount
+            })
+        {
+            let sourceOffset = max(sourceFrame - segment.sourceStartFrame, 0)
+            let sourceFrameScale = max(segment.sourceFrameScale, .leastNonzeroMagnitude)
+            let outputOffset = Int((Double(sourceOffset) / sourceFrameScale).rounded(.down))
+            return segment.outputStartFrame + outputOffset
+        }
+
+        let snappedProjectTime = TimeInterval(sourceFrame) / track.source.sampleRate
+        return Int((snappedProjectTime * sampleRate).rounded(.down))
     }
 
 }

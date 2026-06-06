@@ -142,9 +142,29 @@ final class PreparedRealtimeAudioSource: @unchecked Sendable {
     }
 }
 
+struct PreparedRealtimeAudioSegment: Sendable {
+    let outputStartFrame: Int
+    let sourceStartFrame: Int
+    let frameCount: Int
+    let sourceFrameScale: Double
+    let gainStart: Float
+    let gainEnd: Float
+}
+
 struct PreparedRealtimeAudioTrack: Sendable {
     let source: PreparedRealtimeAudioSource
     let gain: Float
+    let segments: [PreparedRealtimeAudioSegment]
+
+    init(
+        source: PreparedRealtimeAudioSource,
+        gain: Float,
+        segments: [PreparedRealtimeAudioSegment] = []
+    ) {
+        self.source = source
+        self.gain = gain
+        self.segments = segments
+    }
 }
 
 final class RealtimeAudioCore {
@@ -229,8 +249,8 @@ final class RealtimeAudioCore {
             return false
         }
 
-        return withTrackConfigs(tracks) { trackConfigs in
-            soundtime_audio_core_set_prepared_tracks(
+        return withSegmentedTrackConfigs(tracks) { trackConfigs in
+            soundtime_audio_core_set_prepared_segmented_tracks(
                 engine,
                 trackConfigs.baseAddress,
                 UInt32(trackConfigs.count)
@@ -243,12 +263,49 @@ final class RealtimeAudioCore {
             return false
         }
 
-        return withTrackConfigs(tracks) { trackConfigs in
-            soundtime_audio_core_update_prepared_tracks(
+        return withSegmentedTrackConfigs(tracks) { trackConfigs in
+            soundtime_audio_core_update_prepared_segmented_tracks(
                 engine,
                 trackConfigs.baseAddress,
                 UInt32(trackConfigs.count)
             )
+        }
+    }
+
+    private func withSegmentedTrackConfigs<T>(
+        _ tracks: [PreparedRealtimeAudioTrack],
+        _ body: (UnsafeBufferPointer<SoundtimeAudioCoreSegmentedTrackConfig>) -> T
+    ) -> T {
+        let segmentConfigs = tracks.flatMap { track in
+            track.segments.map { segment in
+                SoundtimeAudioCoreSegmentConfig(
+                    outputStartFrame: UInt64(max(segment.outputStartFrame, 0)),
+                    sourceStartFrame: UInt64(max(segment.sourceStartFrame, 0)),
+                    frameCount: UInt64(max(segment.frameCount, 0)),
+                    sourceFrameScale: segment.sourceFrameScale,
+                    gainStart: max(segment.gainStart, 0),
+                    gainEnd: max(segment.gainEnd, 0)
+                )
+            }
+        }
+
+        return segmentConfigs.withUnsafeBufferPointer { segmentBuffer in
+            var segmentOffset = 0
+            let trackConfigs = tracks.map { track in
+                let segmentCount = track.segments.count
+                let segmentPointer = segmentCount > 0 ?
+                    segmentBuffer.baseAddress?.advanced(by: segmentOffset) :
+                    nil
+                segmentOffset += segmentCount
+                return SoundtimeAudioCoreSegmentedTrackConfig(
+                    source: track.source.sourcePointer,
+                    segments: segmentPointer,
+                    segmentCount: UInt32(max(segmentCount, 0)),
+                    gain: max(track.gain, 0)
+                )
+            }
+
+            return trackConfigs.withUnsafeBufferPointer(body)
         }
     }
 

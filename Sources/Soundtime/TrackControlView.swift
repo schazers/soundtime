@@ -170,16 +170,11 @@ private final class TrackIconButton: NSControl {
         }
     }
 
-    private let image: NSImage?
     private var trackingArea: NSTrackingArea?
     private var blinkTimer: Timer?
     private var showsRecordingFill = true
 
     init(systemSymbolName: String) {
-        image = NSImage(
-            systemSymbolName: systemSymbolName,
-            accessibilityDescription: "Record"
-        )?.withSymbolConfiguration(.init(pointSize: 13, weight: .semibold))
         super.init(frame: .zero)
         wantsLayer = true
     }
@@ -289,10 +284,6 @@ private final class TrackIconButton: NSControl {
         path.lineWidth = 1
         path.stroke()
 
-        guard let image else {
-            return
-        }
-
         let imageSize = CGSize(width: 14, height: 14)
         let imageRect = NSRect(
             x: bounds.midX - imageSize.width * 0.5,
@@ -300,7 +291,51 @@ private final class TrackIconButton: NSControl {
             width: imageSize.width,
             height: imageSize.height
         )
-        image.drawSymbol(in: imageRect, tint: symbolColor)
+        drawMicrophoneIcon(in: imageRect, color: symbolColor)
+    }
+
+    private func drawMicrophoneIcon(in rect: NSRect, color: NSColor) {
+        color.setFill()
+        color.setStroke()
+
+        let capsuleWidth = rect.width * 0.43
+        let capsuleHeight = rect.height * 0.58
+        let capsuleRect = NSRect(
+            x: rect.midX - capsuleWidth * 0.5,
+            y: rect.minY + rect.height * 0.34,
+            width: capsuleWidth,
+            height: capsuleHeight
+        )
+        NSBezierPath(
+            roundedRect: capsuleRect,
+            xRadius: capsuleWidth * 0.5,
+            yRadius: capsuleWidth * 0.5
+        ).fill()
+
+        let stemPath = NSBezierPath()
+        stemPath.lineWidth = 1.9
+        stemPath.lineCapStyle = .round
+        stemPath.move(to: NSPoint(x: rect.midX, y: rect.minY + rect.height * 0.22))
+        stemPath.line(to: NSPoint(x: rect.midX, y: rect.minY + rect.height * 0.39))
+        stemPath.stroke()
+
+        let basePath = NSBezierPath()
+        basePath.lineWidth = 1.9
+        basePath.lineCapStyle = .round
+        basePath.move(to: NSPoint(x: rect.midX - rect.width * 0.22, y: rect.minY + rect.height * 0.18))
+        basePath.line(to: NSPoint(x: rect.midX + rect.width * 0.22, y: rect.minY + rect.height * 0.18))
+        basePath.stroke()
+
+        let yokePath = NSBezierPath()
+        yokePath.lineWidth = 1.7
+        yokePath.lineCapStyle = .round
+        yokePath.move(to: NSPoint(x: rect.minX + rect.width * 0.23, y: rect.minY + rect.height * 0.48))
+        yokePath.curve(
+            to: NSPoint(x: rect.maxX - rect.width * 0.23, y: rect.minY + rect.height * 0.48),
+            controlPoint1: NSPoint(x: rect.minX + rect.width * 0.25, y: rect.minY + rect.height * 0.24),
+            controlPoint2: NSPoint(x: rect.maxX - rect.width * 0.25, y: rect.minY + rect.height * 0.24)
+        )
+        yokePath.stroke()
     }
 }
 
@@ -536,23 +571,5 @@ private final class VerticalTrackVolumeSliderView: NSView {
         let trackHeight = max(trackBottom - trackTop, 1)
         value = Float((point.y - trackTop) / trackHeight)
         onValueChanged?(value)
-    }
-}
-
-private extension NSImage {
-    func drawSymbol(in rect: NSRect, tint: NSColor) {
-        guard let tintedImage = copy() as? NSImage else {
-            draw(in: rect)
-            return
-        }
-
-        tintedImage.isTemplate = true
-        tint.set()
-        tintedImage.draw(
-            in: rect,
-            from: .zero,
-            operation: .sourceOver,
-            fraction: 1
-        )
     }
 }

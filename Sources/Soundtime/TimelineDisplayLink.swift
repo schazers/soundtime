@@ -10,6 +10,7 @@ final class TimelineDisplayLink: NSObject, CAMetalDisplayLinkDelegate {
     var onFrame: ((TimelineDisplayLinkFrame) -> Void)?
 
     private let displayLink: CAMetalDisplayLink
+    private var isInvalidated = false
 
     init(metalLayer: CAMetalLayer, preferredFramesPerSecond: Int) {
         displayLink = CAMetalDisplayLink(metalLayer: metalLayer)
@@ -23,10 +24,14 @@ final class TimelineDisplayLink: NSObject, CAMetalDisplayLinkDelegate {
     }
 
     deinit {
-        displayLink.invalidate()
+        invalidate()
     }
 
     func updatePreferredFramesPerSecond(_ preferredFramesPerSecond: Int) {
+        guard !isInvalidated else {
+            return
+        }
+
         let preferred = Float(max(preferredFramesPerSecond, 60))
         displayLink.preferredFrameRateRange = CAFrameRateRange(
             minimum: 60,
@@ -36,14 +41,30 @@ final class TimelineDisplayLink: NSObject, CAMetalDisplayLinkDelegate {
     }
 
     func start() {
+        guard !isInvalidated else {
+            return
+        }
+
         displayLink.isPaused = false
     }
 
     func stop() {
+        guard !isInvalidated else {
+            return
+        }
+
         displayLink.isPaused = true
     }
 
     func invalidate() {
+        guard !isInvalidated else {
+            return
+        }
+
+        isInvalidated = true
+        onFrame = nil
+        displayLink.isPaused = true
+        displayLink.delegate = nil
         displayLink.invalidate()
     }
 

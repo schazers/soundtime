@@ -24,8 +24,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         window.backgroundColor = SoundtimeColors.windowBackground
         window.appearance = NSAppearance(named: .darkAqua)
         window.isMovableByWindowBackground = true
-        window.minSize = NSSize(width: 760, height: 460)
+        Self.applyWindowSizeLimits(to: window)
         window.contentViewController = contentViewController
+        Self.applyWindowSizeLimits(to: window)
 
         if let launchFrame = Self.launchWindowFrame() {
             window.setFrame(launchFrame, display: false)
@@ -44,6 +45,25 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         persistOpenProjectWindowLayout()
         onWindowWillClose?(self)
+    }
+
+    func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
+        NSSize(
+            width: max(frameSize.width, Self.windowMinWidth),
+            height: max(frameSize.height, Self.windowMinHeight)
+        )
+    }
+
+    private static func applyWindowSizeLimits(to window: NSWindow) {
+        let minimumSize = NSSize(width: windowMinWidth, height: windowMinHeight)
+        let maximumSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        window.minSize = minimumSize
+        window.contentMinSize = minimumSize
+        window.maxSize = maximumSize
+        window.contentMaxSize = maximumSize
     }
 
     private static func launchWindowFrame() -> NSRect? {
@@ -85,10 +105,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private static var windowMinWidth: CGFloat {
-        760
+        200
     }
 
     private static var windowMinHeight: CGFloat {
-        460
+        200
     }
 }
