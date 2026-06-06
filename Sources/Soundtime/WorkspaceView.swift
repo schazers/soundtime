@@ -2602,7 +2602,8 @@ final class WorkspaceView: NSView {
     private func optimisticWaveformOverview(
         _ overview: WaveformOverview?,
         replacing selection: TimelineSelection,
-        with replacement: WaveformOverview?
+        with replacement: WaveformOverview?,
+        targetDuration: TimeInterval? = nil
     ) -> WaveformOverview? {
         guard let overview else {
             return replacement.map(overviewForOptimisticEdit)
@@ -2616,7 +2617,24 @@ final class WorkspaceView: NSView {
         }
 
         let startIndex = min(max(Int((selection.startProgress * Double(binCount)).rounded(.down)), 0), binCount)
-        let endIndex = min(max(Int((selection.endProgress * Double(binCount)).rounded(.up)), startIndex), binCount)
+        let endIndex: Int
+        if
+            replacementOverview == nil,
+            let targetDuration,
+            targetDuration.isFinite,
+            targetDuration >= 0,
+            sourceOverview.duration.isFinite,
+            sourceOverview.duration > 0
+        {
+            let targetBinCount = min(
+                max(Int((Double(binCount) * targetDuration / sourceOverview.duration).rounded()), 0),
+                binCount
+            )
+            let targetRemovedBinCount = min(max(binCount - targetBinCount, 0), binCount - startIndex)
+            endIndex = min(startIndex + targetRemovedBinCount, binCount)
+        } else {
+            endIndex = min(max(Int((selection.endProgress * Double(binCount)).rounded(.up)), startIndex), binCount)
+        }
         var bins: [WaveformOverview.Bin] = []
         bins.reserveCapacity(binCount - (endIndex - startIndex) + (replacementOverview?.bins.count ?? 0))
         if startIndex > 0 {
@@ -2630,7 +2648,8 @@ final class WorkspaceView: NSView {
         }
 
         let removedDuration = sourceOverview.duration * TimeInterval(selection.durationProgress)
-        let nextDuration = max(sourceOverview.duration - removedDuration + (replacementOverview?.duration ?? 0), 0)
+        let nextDuration = targetDuration.map { max($0, 0) } ??
+            max(sourceOverview.duration - removedDuration + (replacementOverview?.duration ?? 0), 0)
         return WaveformOverview(duration: nextDuration, bins: bins)
     }
 
@@ -3235,6 +3254,7 @@ final class WorkspaceView: NSView {
         }
 
         let deletedDuration: TimeInterval
+        let editedDuration: TimeInterval
         let editedAudioTimeline: AudioEditTimeline?
         let editedFileTimeline: AudioFileEditTimeline?
 
@@ -3245,6 +3265,7 @@ final class WorkspaceView: NSView {
             guard deletedFrameCount > 0 else {
                 return
             }
+            editedDuration = timeline.duration
             editedAudioTimeline = timeline
             editedFileTimeline = nil
         } else {
@@ -3262,6 +3283,7 @@ final class WorkspaceView: NSView {
             guard deletedFrameCount > 0 else {
                 return
             }
+            editedDuration = timeline.duration
             editedAudioTimeline = nil
             editedFileTimeline = timeline
         }
@@ -3279,7 +3301,8 @@ final class WorkspaceView: NSView {
         projectTracks[trackIndex].waveformOverview = optimisticWaveformOverview(
             projectTracks[trackIndex].waveformOverview,
             replacing: selectionToDelete,
-            with: nil
+            with: nil,
+            targetDuration: editedDuration
         )
 
         selectedTimelineRange = nil
