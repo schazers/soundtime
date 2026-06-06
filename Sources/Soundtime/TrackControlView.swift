@@ -79,6 +79,24 @@ final class TrackControlView: NSView {
         onTrackSelected?()
     }
 
+    func configure(
+        title: String,
+        isMuted: Bool,
+        isSoloed: Bool,
+        volume: Float,
+        isTrackSelected: Bool,
+        isRecording: Bool
+    ) {
+        if titleLabel.stringValue != title {
+            titleLabel.stringValue = title
+        }
+        self.isMuted = isMuted
+        self.isSoloed = isSoloed
+        self.volume = volume
+        self.isTrackSelected = isTrackSelected
+        self.isRecording = isRecording
+    }
+
     private func configure() {
         wantsLayer = true
         updateAppearance()
