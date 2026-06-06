@@ -94,6 +94,7 @@ protocol PlaybackEngine: AnyObject {
     ) throws
     func loadFile(at url: URL, zeroCrossingProbe: WAVZeroCrossingProbe?) throws
     func loadProjectTracks(_ tracks: [ProjectPlaybackTrack]) throws
+    func updateProjectTracks(_ tracks: [ProjectPlaybackTrack]) throws
     func replaceWithDecodedSource(
         _ decodedAudioBuffer: DecodedAudioBuffer,
         zeroCrossingIndex: AudioZeroCrossingIndex?
@@ -133,6 +134,10 @@ extension PlaybackEngine {
     }
 
     func updateProjectTrackMix(_ tracks: [ProjectPlaybackTrack]) {}
+
+    func updateProjectTracks(_ tracks: [ProjectPlaybackTrack]) throws {
+        try loadProjectTracks(tracks)
+    }
 
     func pause(atProgress progress: Float) {
         pause()
