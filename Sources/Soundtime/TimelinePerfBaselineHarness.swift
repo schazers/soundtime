@@ -407,9 +407,9 @@ enum TimelinePerfBaselineHarness {
                 Scenario(
                     name: "high-res zoom fidelity",
                     trackCount: 1,
-                    waveformBinCount: 1_048_576,
+                    waveformBinCount: 2_097_152,
                     frames: max(frames / 2, 36),
-                    warmupFrames: max(warmupFrames * 3, 72),
+                    warmupFrames: max(warmupFrames * 8, 360),
                     viewportDuration: 0.012,
                     isPlaybackActive: true,
                     pansDuringRun: true,
