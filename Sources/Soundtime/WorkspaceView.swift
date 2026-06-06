@@ -168,6 +168,7 @@ final class WorkspaceView: NSView {
     private var loudnessMeterTimer: Timer?
     private var keyDownMonitor: Any?
     private var debugToolsVisible = false
+    private let deleteMaterializationDelay: TimeInterval = 0.75
     private let inputRecorder = AudioInputRecorder()
     private var recordingTrackID: UUID?
     private var recordingTakeWriter: StreamingWAVTakeWriter?
@@ -2249,10 +2250,19 @@ final class WorkspaceView: NSView {
         timeline: AudioEditTimeline,
         editRevision: Int,
         status: String,
-        preservePlaybackProgress: Bool = false
+        preservePlaybackProgress: Bool = false,
+        startDelay: TimeInterval = 0
     ) {
-        Task { [weak self, trackID, timeline, editRevision, status, preservePlaybackProgress] in
-            let materialized = await Task.detached(priority: .userInitiated) {
+        Task { [weak self, trackID, timeline, editRevision, status, preservePlaybackProgress, startDelay] in
+            if startDelay > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(startDelay * 1_000_000_000))
+            }
+
+            guard !Task.isCancelled else {
+                return
+            }
+
+            let materialized = await Task.detached(priority: .utility) {
                 Self.materializeTimeline(timeline)
             }.value
 
@@ -2281,7 +2291,8 @@ final class WorkspaceView: NSView {
         ),
         status: String,
         preservePlaybackProgress: Bool = false,
-        reloadPlaybackSource: Bool = false
+        reloadPlaybackSource: Bool = false,
+        preserveTimelineSource: Bool = true
     ) {
         guard
             let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }),
@@ -2290,20 +2301,28 @@ final class WorkspaceView: NSView {
             return
         }
 
+        let existingTimeline = projectTracks[trackIndex].audioTimeline
+        let shouldPreserveTimelineSource = preserveTimelineSource && existingTimeline != nil
         projectTracks[trackIndex].decodedAudioBuffer = materialized.buffer
-        projectTracks[trackIndex].audioTimeline = materialized.timeline
+        projectTracks[trackIndex].audioTimeline = shouldPreserveTimelineSource ?
+            existingTimeline :
+            materialized.timeline
         projectTracks[trackIndex].fileTimeline = nil
         projectTracks[trackIndex].waveformOverview = materialized.waveformOverview
-        projectTracks[trackIndex].zeroCrossingIndex = materialized.zeroCrossingIndex
+        if !shouldPreserveTimelineSource {
+            projectTracks[trackIndex].zeroCrossingIndex = materialized.zeroCrossingIndex
+        }
         activeTrackID = trackID
         syncActiveTrackFields()
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
         refreshProjectTimelineDisplay(rebuildControls: false)
         updateProjectDisplayTiming(sampleRateHint: materialized.buffer.sampleRate)
-        if playbackController.isPlaying, !reloadPlaybackSource {
-            updateProjectPlaybackTrackMix()
-        } else {
-            reloadPlaybackFromProjectTracks(preserveProgress: preservePlaybackProgress)
+        if !shouldPreserveTimelineSource || reloadPlaybackSource {
+            if playbackController.isPlaying, !reloadPlaybackSource {
+                updateProjectPlaybackTrackMix()
+            } else {
+                reloadPlaybackFromProjectTracks(preserveProgress: preservePlaybackProgress)
+            }
         }
         updateEffectCommandState()
         updateStatus(status)
@@ -2974,7 +2993,8 @@ final class WorkspaceView: NSView {
                     materialized: materialized,
                     status: "pasted \(self.formatDuration(audioClipboard.buffer.duration))",
                     preservePlaybackProgress: true,
-                    reloadPlaybackSource: true
+                    reloadPlaybackSource: true,
+                    preserveTimelineSource: false
                 )
             } catch {
                 guard let self else {
@@ -3064,9 +3084,6 @@ final class WorkspaceView: NSView {
         projectTracks[trackIndex].audioTimeline = editedAudioTimeline
         projectTracks[trackIndex].fileTimeline = editedFileTimeline
         projectTracks[trackIndex].decodedAudioBuffer = nil
-        if editedAudioTimeline != nil {
-            projectTracks[trackIndex].zeroCrossingIndex = nil
-        }
         projectTracks[trackIndex].waveformOverview = optimisticWaveformOverview(
             projectTracks[trackIndex].waveformOverview,
             replacing: selectionToDelete,
@@ -3092,7 +3109,8 @@ final class WorkspaceView: NSView {
                 timeline: editedAudioTimeline,
                 editRevision: editRevision,
                 status: "\(copyBeforeDeleting ? "cut" : "deleted") \(formatDuration(deletedDuration))",
-                preservePlaybackProgress: true
+                preservePlaybackProgress: true,
+                startDelay: deleteMaterializationDelay
             )
         }
     }
@@ -3217,9 +3235,6 @@ final class WorkspaceView: NSView {
         projectTracks[trackIndex].audioTimeline = editedAudioTimeline
         projectTracks[trackIndex].fileTimeline = editedFileTimeline
         projectTracks[trackIndex].decodedAudioBuffer = nil
-        if editedAudioTimeline != nil {
-            projectTracks[trackIndex].zeroCrossingIndex = nil
-        }
         projectTracks[trackIndex].waveformOverview = optimisticWaveformOverview(
             projectTracks[trackIndex].waveformOverview,
             applyingGain: gain,
@@ -3315,9 +3330,6 @@ final class WorkspaceView: NSView {
         projectTracks[trackIndex].audioTimeline = editedAudioTimeline
         projectTracks[trackIndex].fileTimeline = editedFileTimeline
         projectTracks[trackIndex].decodedAudioBuffer = nil
-        if editedAudioTimeline != nil {
-            projectTracks[trackIndex].zeroCrossingIndex = nil
-        }
         projectTracks[trackIndex].waveformOverview = optimisticWaveformOverview(
             projectTracks[trackIndex].waveformOverview,
             applyingFade: timelineFadeDirection,
