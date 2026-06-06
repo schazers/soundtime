@@ -1003,7 +1003,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         displayTracks(tracks)
     }
 
-    func displayTracks(_ tracks: [TimelineRenderState.Track]) {
+    func displayTracks(_ tracks: [TimelineRenderState.Track], animateWaveformTransition: Bool = true) {
         let previousTracks = renderState.tracks
         let renderTracks = tracks.map { lightweightRenderTrack(from: $0) }
         let hasNextWaveforms = renderTracks.contains { $0.hasWaveform }
@@ -1017,7 +1017,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             }
         }
         let nextWaveformMipLevels = tracks.first.flatMap { nextTrackWaveformMipLevels[$0.id] } ?? []
-        if renderState.hasWaveforms, hasNextWaveforms {
+        if animateWaveformTransition, renderState.hasWaveforms, hasNextWaveforms {
             waveformMipLevelStateLock.lock()
             previousTrackWaveformMipLevels = trackWaveformMipLevels
             waveformMipLevelStateLock.unlock()
@@ -3755,9 +3755,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 appendSoftParticle(
                     to: &vertices,
                     center: center,
-                    radius: 1.4 + 3.6 * bin.peakMagnitude,
+                    radius: 0.75 + 2.1 * bin.peakMagnitude,
                     color: SIMD3<Float>(color.x, color.y, color.z),
-                    alpha: alpha * 0.28,
+                    alpha: alpha * 0.22,
                     drawableSize: drawableSize
                 )
             }
@@ -3845,7 +3845,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             let ageSeconds = progress * Float(deletionEffectDuration)
             let center = SIMD2<Float>(sourceX, sourceY) +
                 direction * speed * ageSeconds * (0.35 + blast * 1.25)
-            let size = 0.9 + 3.5 * pseudoRandom01(seed &+ 89)
+            let size = 0.55 + 2.25 * pseudoRandom01(seed &+ 89)
             let rotation = angle + progress * (2.4 + 6.0 * pseudoRandom01(seed &+ 109))
             let cold = pseudoRandom01(seed &+ 131)
             let color = SIMD4<Float>(
@@ -3868,9 +3868,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 appendSoftParticle(
                     to: &vertices,
                     center: center,
-                    radius: size * 1.45,
+                    radius: size * 1.12,
                     color: SIMD3<Float>(color.x, color.y, color.z),
-                    alpha: color.w * 0.40,
+                    alpha: color.w * 0.34,
                     drawableSize: drawableSize
                 )
             }
@@ -3902,8 +3902,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             let jitter = (pseudoRandom01(seed &+ 29) - 0.5) * laneHeight * 0.08
             let rightStart = rightX + 18 + pseudoRandom01(seed &+ 41) * min(pullDistance * 0.32, 90)
             let rightNow = rightStart + (joinX - rightStart) * travelProgress
-            let leftStart = leftX - 12 - pseudoRandom01(seed &+ 59) * min(pullDistance * 0.18, 48)
-            let leftNow = leftStart + (joinX - leftStart) * min(travelProgress * 1.12, 1)
             let color = SIMD4<Float>(0.70, 0.98, 0.96, alpha * (0.55 + pseudoRandom01(seed &+ 73) * 0.45))
 
             appendThickLine(
@@ -3912,14 +3910,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 end: SIMD2<Float>(joinX, y + jitter * 0.35),
                 width: 1.2 + 1.4 * pseudoRandom01(seed &+ 89),
                 color: color,
-                drawableSize: drawableSize
-            )
-            appendThickLine(
-                to: &vertices,
-                start: SIMD2<Float>(leftNow, y - jitter),
-                end: SIMD2<Float>(joinX, y - jitter * 0.35),
-                width: 0.8 + 1.0 * pseudoRandom01(seed &+ 101),
-                color: color * SIMD4<Float>(1, 1, 1, 0.55),
                 drawableSize: drawableSize
             )
         }
