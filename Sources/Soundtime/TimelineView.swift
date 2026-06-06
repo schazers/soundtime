@@ -421,9 +421,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         requestTimelineRender()
     }
 
-    func triggerDeletionEffect(selection: TimelineSelection) {
+    func triggerDeletionEffect(selection: TimelineSelection, sourceSelection: TimelineSelection? = nil) {
         updateTimelineRenderer { renderer in
-            renderer.triggerDeletionEffect(selection: selection)
+            renderer.triggerDeletionEffect(selection: selection, sourceSelection: sourceSelection)
         }
         requestTimelineRender()
         startTransientRenderPulse(duration: 0.62)
