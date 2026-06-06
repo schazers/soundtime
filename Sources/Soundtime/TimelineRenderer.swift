@@ -1430,7 +1430,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 touchParameters: waveformTouchParameters,
                 opacity: waveformTransitionOpacities.current,
                 displayTimestamp: displayTimestamp,
-                fallbackPolicy: hasWaveformTransition ? .preferredOnly : .allowFallbacks,
+                fallbackPolicy: .allowFallbacks,
                 encoder: encoder
             )
             encoder.setRenderPipelineState(pipelineState)
@@ -1782,7 +1782,16 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                     mipLevel: preferredMipLevel,
                     allowsSynchronousUpload: false
                 )
-                return false
+                guard waveformShaderDrawable(
+                    track: track,
+                    mipLevels: mipLevels,
+                    drawableSize: drawableSize,
+                    renderState: renderState,
+                    fallbackPolicy: .allowFallbacks
+                ) != nil else {
+                    return false
+                }
+                continue
             }
         }
 

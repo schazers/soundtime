@@ -324,6 +324,7 @@ final class WorkspaceView: NSView {
     private var framesPerSecondWidthConstraint: NSLayoutConstraint?
     private var trackControlsBelowDebugConstraint: NSLayoutConstraint?
     private var trackControlsBelowHeaderConstraint: NSLayoutConstraint?
+    private var lastResponsiveLayoutWidth: CGFloat = -1
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -571,6 +572,33 @@ final class WorkspaceView: NSView {
         startLoudnessMeterTimer()
     }
 
+    override func layout() {
+        super.layout()
+        updateResponsiveChromeVisibilityIfNeeded()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard window == nil else {
+            return
+        }
+
+        tearDownRuntimeState()
+    }
+
+    private func tearDownRuntimeState() {
+        if let keyDownMonitor {
+            NSEvent.removeMonitor(keyDownMonitor)
+            self.keyDownMonitor = nil
+        }
+        stopPlaybackTimer()
+        loudnessMeterTimer?.invalidate()
+        loudnessMeterTimer = nil
+        inputRecorder.stop()
+        playbackController.clear()
+        ImportWorkBudget.shared.setPlaybackActive(false)
+    }
+
     private func configureFisheyeTuningControls() {
         let controls = [
             fisheyeRadiusControl,
@@ -601,13 +629,38 @@ final class WorkspaceView: NSView {
     private func setDebugToolsVisible(_ isVisible: Bool) {
         debugToolsVisible = isVisible
         timelineSurface.isDebugToolsVisible = isVisible
-        framesPerSecondLabel.isHidden = !isVisible
-        frameRateHistoryView.isHidden = false
-        fisheyeControlsStack.isHidden = !isVisible
-        framesPerSecondWidthConstraint?.constant = isVisible ? 330 : 0
-        trackControlsBelowDebugConstraint?.isActive = isVisible
-        trackControlsBelowHeaderConstraint?.isActive = !isVisible
+        lastResponsiveLayoutWidth = -1
+        updateResponsiveChromeVisibilityIfNeeded()
         needsLayout = true
+    }
+
+    private func updateResponsiveChromeVisibilityIfNeeded() {
+        guard abs(bounds.width - lastResponsiveLayoutWidth) > 0.5 else {
+            return
+        }
+
+        lastResponsiveLayoutWidth = bounds.width
+        let width = bounds.width
+        let showsTitle = width >= 290
+        let showsMetadata = width >= 560
+        let showsTime = width >= 440
+        let showsVolume = width >= 620
+        let showsLoudness = width >= 760
+        let showsFrameHistory = width >= 380
+        let showsDebugText = debugToolsVisible && width >= 760
+        let showsDebugSliders = debugToolsVisible && width >= 980
+
+        titleLabel.isHidden = !showsTitle
+        metadataLabel.isHidden = !showsMetadata
+        timeReadoutLabel.isHidden = !showsTime
+        volumeControl.isHidden = !showsVolume
+        loudnessMeter.isHidden = !showsLoudness
+        frameRateHistoryView.isHidden = !showsFrameHistory
+        framesPerSecondLabel.isHidden = !showsDebugText
+        fisheyeControlsStack.isHidden = !showsDebugSliders
+        framesPerSecondWidthConstraint?.constant = showsDebugText ? 330 : 0
+        trackControlsBelowDebugConstraint?.isActive = showsDebugSliders
+        trackControlsBelowHeaderConstraint?.isActive = !showsDebugSliders
     }
 
     private func handleTransportAction(_ action: TransportControlPanelView.TransportAction) {
@@ -922,6 +975,7 @@ final class WorkspaceView: NSView {
             restartsPlayheadKick: true
         )
         timelineSurface.displayRecordingActive(true)
+        window?.makeFirstResponder(timelineSurface)
         updateStatus("recording \(projectTracks[trackIndex].name)")
     }
 
@@ -937,6 +991,7 @@ final class WorkspaceView: NSView {
         timelineSurface.displayRecordingActive(false)
         displayPlaybackVisuals(progress: 1, isPlaying: false, syncPlayhead: true)
         refreshTrackControls()
+        window?.makeFirstResponder(timelineSurface)
 
         guard
             let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }),
@@ -2016,6 +2071,53 @@ final class WorkspaceView: NSView {
         return WaveformOverview(duration: sourceOverview.duration, bins: bins)
     }
 
+    private func optimisticWaveformOverview(
+        _ overview: WaveformOverview?,
+        applyingFade fadeDirection: AudioEditTimeline.FadeDirection,
+        to selection: TimelineSelection
+    ) -> WaveformOverview? {
+        guard let overview else {
+            return nil
+        }
+
+        let sourceOverview = overviewForOptimisticEdit(overview)
+        let binCount = sourceOverview.bins.count
+        guard binCount > 0 else {
+            return sourceOverview
+        }
+
+        let startIndex = min(max(Int((selection.startProgress * Double(binCount)).rounded(.down)), 0), binCount)
+        let endIndex = min(max(Int((selection.endProgress * Double(binCount)).rounded(.up)), startIndex), binCount)
+        guard startIndex < endIndex else {
+            return sourceOverview
+        }
+
+        let selectedCount = max(endIndex - startIndex, 1)
+        var bins = sourceOverview.bins
+        for index in startIndex..<endIndex {
+            let selectedOffset = index - startIndex
+            let progress = selectedCount > 1 ?
+                Float(selectedOffset) / Float(selectedCount - 1) :
+                1
+            let curve = smoothStep(progress)
+            let multiplier: Float
+            switch fadeDirection {
+            case .fadeIn:
+                multiplier = curve
+            case .fadeOut:
+                multiplier = 1 - curve
+            }
+            bins[index] = bins[index].scaled(by: multiplier)
+        }
+
+        return WaveformOverview(duration: sourceOverview.duration, bins: bins)
+    }
+
+    private func smoothStep(_ progress: Float) -> Float {
+        let clampedProgress = min(max(progress, 0), 1)
+        return clampedProgress * clampedProgress * (3 - 2 * clampedProgress)
+    }
+
     private func overviewForOptimisticEdit(_ overview: WaveformOverview) -> WaveformOverview {
         guard overview.bins.count > optimisticEditPreviewBinLimit else {
             return overview
@@ -2575,10 +2677,15 @@ final class WorkspaceView: NSView {
         projectTracks[trackIndex].audioTimeline = editedTimeline
         projectTracks[trackIndex].decodedAudioBuffer = nil
         projectTracks[trackIndex].zeroCrossingIndex = nil
+        projectTracks[trackIndex].waveformOverview = optimisticWaveformOverview(
+            projectTracks[trackIndex].waveformOverview,
+            applyingGain: gain,
+            to: selectionToApply
+        )
         lastEffect = .gain(decibels: decibels)
         selectedTimelineRange = nil
         timelineSurface.displaySelection(nil)
-        timelineSurface.displayGainPreview(selection: selectionToApply, gain: gain)
+        timelineSurface.displayGainPreview(selection: nil, gain: 1)
         syncActiveTrackFields()
         refreshProjectTimelineDisplay(rebuildControls: false)
         updateProjectDisplayTiming()
@@ -2627,6 +2734,11 @@ final class WorkspaceView: NSView {
         projectTracks[trackIndex].audioTimeline = editedTimeline
         projectTracks[trackIndex].decodedAudioBuffer = nil
         projectTracks[trackIndex].zeroCrossingIndex = nil
+        projectTracks[trackIndex].waveformOverview = optimisticWaveformOverview(
+            projectTracks[trackIndex].waveformOverview,
+            applyingFade: timelineFadeDirection,
+            to: selectionToApply
+        )
         lastEffect = .fade(fadeEffect)
         selectedTimelineRange = nil
         timelineSurface.displaySelection(nil)

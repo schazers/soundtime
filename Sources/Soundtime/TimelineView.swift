@@ -154,10 +154,22 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         false
     }
 
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil {
+            tearDownTimelineAnimation()
+        }
+        super.viewWillMove(toWindow: newWindow)
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        window?.makeFirstResponder(self)
-        window?.acceptsMouseMovedEvents = true
+        guard let window else {
+            tearDownTimelineAnimation()
+            return
+        }
+
+        window.makeFirstResponder(self)
+        window.acceptsMouseMovedEvents = true
         configureDisplayLinkIfNeeded()
         updatePreferredFrameRate()
         requestTimelineRender()
@@ -527,6 +539,16 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         timelineDisplayLink?.stop()
+    }
+
+    private func tearDownTimelineAnimation() {
+        timelineDisplayLink?.invalidate()
+        timelineDisplayLink = nil
+        transientRenderEndTime = nil
+        needsTimelineRender = false
+        isTimelinePlaybackActive = false
+        stopRightPanMomentum()
+        stopZoomMomentum()
     }
 
     private func displayLinkDidTick(_ frame: TimelineDisplayLinkFrame) {

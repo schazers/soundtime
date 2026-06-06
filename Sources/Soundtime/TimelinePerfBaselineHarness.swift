@@ -12,6 +12,9 @@ enum TimelinePerfBaselineHarness {
         let isPlaybackActive: Bool
         let pansDuringRun: Bool
         let zoomsDuringRun: Bool
+        let showsSelection: Bool
+        let showsGainPreview: Bool
+        let deletionBurstInterval: Int?
     }
 
     private struct ScenarioResult {
@@ -29,10 +32,12 @@ enum TimelinePerfBaselineHarness {
         case metalDeviceUnavailable
         case textureUnavailable
         case rendererUnavailable
+        case budgetExceeded([String])
     }
 
     static func runFromCommandLine(arguments: [String]) throws {
         let isQuick = arguments.contains("--quick") || arguments.contains("--timeline-perf-baseline-quick")
+        let enforcesBudgets = arguments.contains("--ci") || arguments.contains("--timeline-perf-baseline-ci")
         let pixelFormat: MTLPixelFormat = .bgra8Unorm
         let viewportSize = CGSize(width: isQuick ? 1_440 : 1_920, height: isQuick ? 900 : 1_080)
         let backingScale: Float = 2
@@ -75,6 +80,7 @@ enum TimelinePerfBaselineHarness {
         print("device=\(device.name) mode=\(isQuick ? "quick" : "full") viewport=\(Int(viewportSize.width))x\(Int(viewportSize.height)) scale=\(backingScale) bins=\(syntheticBinCount)")
 
         var trackCache: [Int: [TimelineRenderState.Track]] = [:]
+        var budgetFailures: [String] = []
         for scenario in scenarios {
             let tracks: [TimelineRenderState.Track]
             if let cachedTracks = trackCache[scenario.trackCount] {
@@ -100,6 +106,13 @@ enum TimelinePerfBaselineHarness {
                 rendererStats: { renderer.currentFrameStatsSnapshot() }
             )
             print(jsonLine(for: result, deviceName: device.name))
+            if enforcesBudgets, let failure = budgetFailure(for: result) {
+                budgetFailures.append(failure)
+            }
+        }
+
+        if !budgetFailures.isEmpty {
+            throw HarnessError.budgetExceeded(budgetFailures)
         }
     }
 
@@ -119,7 +132,10 @@ enum TimelinePerfBaselineHarness {
                     viewportDuration: 1,
                     isPlaybackActive: true,
                     pansDuringRun: false,
-                    zoomsDuringRun: false
+                    zoomsDuringRun: false,
+                    showsSelection: false,
+                    showsGainPreview: false,
+                    deletionBurstInterval: nil
                 ),
                 Scenario(
                     name: "zoomed-in playback",
@@ -129,7 +145,10 @@ enum TimelinePerfBaselineHarness {
                     viewportDuration: 0.035,
                     isPlaybackActive: true,
                     pansDuringRun: false,
-                    zoomsDuringRun: false
+                    zoomsDuringRun: false,
+                    showsSelection: false,
+                    showsGainPreview: false,
+                    deletionBurstInterval: nil
                 ),
                 Scenario(
                     name: "pan sweep",
@@ -139,7 +158,10 @@ enum TimelinePerfBaselineHarness {
                     viewportDuration: 0.12,
                     isPlaybackActive: false,
                     pansDuringRun: true,
-                    zoomsDuringRun: false
+                    zoomsDuringRun: false,
+                    showsSelection: false,
+                    showsGainPreview: false,
+                    deletionBurstInterval: nil
                 ),
                 Scenario(
                     name: "zoom pulse",
@@ -149,7 +171,36 @@ enum TimelinePerfBaselineHarness {
                     viewportDuration: 0.18,
                     isPlaybackActive: true,
                     pansDuringRun: true,
-                    zoomsDuringRun: true
+                    zoomsDuringRun: true,
+                    showsSelection: false,
+                    showsGainPreview: false,
+                    deletionBurstInterval: nil
+                ),
+                Scenario(
+                    name: "edit overlays",
+                    trackCount: trackCount,
+                    frames: frames,
+                    warmupFrames: warmupFrames,
+                    viewportDuration: 0.10,
+                    isPlaybackActive: true,
+                    pansDuringRun: true,
+                    zoomsDuringRun: false,
+                    showsSelection: true,
+                    showsGainPreview: true,
+                    deletionBurstInterval: nil
+                ),
+                Scenario(
+                    name: "delete bursts",
+                    trackCount: trackCount,
+                    frames: frames,
+                    warmupFrames: warmupFrames,
+                    viewportDuration: 0.16,
+                    isPlaybackActive: false,
+                    pansDuringRun: true,
+                    zoomsDuringRun: false,
+                    showsSelection: false,
+                    showsGainPreview: false,
+                    deletionBurstInterval: isQuick ? 30 : 45
                 ),
             ]
         }
@@ -183,6 +234,12 @@ enum TimelinePerfBaselineHarness {
                     force: true,
                     anchorTimestamp: displayTimestamp,
                     resetsTouchStart: frame == 0
+                )
+                displayEditOverlays(
+                    scenario: scenario,
+                    renderer: renderer,
+                    frame: frame,
+                    totalFrames: totalFrames
                 )
 
                 let renderPassDescriptor = makeRenderPassDescriptor(texture: texture)
@@ -270,6 +327,49 @@ enum TimelinePerfBaselineHarness {
         return min(max(viewport.startProgress + progressThroughViewport * viewport.durationProgress, 0), 1)
     }
 
+    private static func displayEditOverlays(
+        scenario: Scenario,
+        renderer: TimelineRenderer,
+        frame: Int,
+        totalFrames: Int
+    ) {
+        guard scenario.showsSelection || scenario.showsGainPreview || scenario.deletionBurstInterval != nil else {
+            renderer.displaySelection(nil)
+            renderer.displayGainPreview(selection: nil, gain: 1)
+            return
+        }
+
+        let viewport = viewport(for: scenario, frame: frame, totalFrames: totalFrames)
+        let startProgress = min(max(Double(viewport.startProgress + viewport.durationProgress * 0.32), 0), 0.98)
+        let endProgress = min(max(startProgress + Double(viewport.durationProgress * 0.18), startProgress), 1)
+        let selection = TimelineSelection(
+            startProgress: startProgress,
+            endProgress: endProgress,
+            trackID: nil
+        )
+
+        if scenario.showsSelection {
+            renderer.displaySelection(selection)
+        } else {
+            renderer.displaySelection(nil)
+        }
+
+        if scenario.showsGainPreview {
+            let gain = 0.45 + 0.40 * pulse(frame: frame, period: 72)
+            renderer.displayGainPreview(selection: selection, gain: gain)
+        } else {
+            renderer.displayGainPreview(selection: nil, gain: 1)
+        }
+
+        if
+            let deletionBurstInterval = scenario.deletionBurstInterval,
+            frame >= scenario.warmupFrames,
+            frame.isMultiple(of: deletionBurstInterval)
+        {
+            renderer.triggerDeletionEffect(selection: selection)
+        }
+    }
+
     private static func pulse(frame: Int, period: Int) -> Float {
         let phase = Float(frame % period) / Float(max(period, 1))
         return 0.5 - 0.5 * cos(phase * 2 * .pi)
@@ -349,6 +449,9 @@ enum TimelinePerfBaselineHarness {
             "dropped_144hz_frames": dropped144,
             "dropped_60hz_frames": dropped60,
             "renderer": stats.waveformRenderer,
+            "selection": result.scenario.showsSelection,
+            "gain_preview": result.scenario.showsGainPreview,
+            "delete_bursts": result.scenario.deletionBurstInterval != nil,
             "gpu_waveform_draws": stats.gpuWaveformDrawCount,
             "cpu_waveform_vertices": stats.cpuWaveformVertexCount,
             "shader_uploads": stats.shaderBufferUploadCount,
@@ -365,6 +468,30 @@ enum TimelinePerfBaselineHarness {
         }
 
         return line
+    }
+
+    private static func budgetFailure(for result: ScenarioResult) -> String? {
+        let trackCount = result.scenario.trackCount
+        let cpuP95 = percentile(result.cpuFrameMilliseconds, 0.95)
+        let cpuMax = result.cpuFrameMilliseconds.max() ?? 0
+        let dropped60 = result.cpuFrameMilliseconds.filter { $0 > 1_000.0 / 60.0 }.count
+        let cpuP95Budget: Double
+        switch trackCount {
+        case ..<50:
+            cpuP95Budget = 5.0
+        case ..<100:
+            cpuP95Budget = 6.5
+        case ..<250:
+            cpuP95Budget = 8.0
+        default:
+            cpuP95Budget = 11.0
+        }
+
+        guard cpuP95 > cpuP95Budget || dropped60 > 0 else {
+            return nil
+        }
+
+        return "\(result.scenario.name) \(trackCount) tracks exceeded budget: p95=\(rounded(cpuP95))ms max=\(rounded(cpuMax))ms dropped60=\(dropped60)"
     }
 
     private static func percentile(_ values: [Double], _ percentile: Double) -> Double {

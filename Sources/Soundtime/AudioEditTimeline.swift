@@ -63,10 +63,12 @@ struct AudioEditTimeline: Sendable {
     }
 
     private let sourceBuffer: DecodedAudioBuffer
+    let sourceID: UUID
     private var segments: [Segment]
 
     init(sourceBuffer: DecodedAudioBuffer) {
         self.sourceBuffer = sourceBuffer
+        sourceID = UUID()
         if sourceBuffer.frameCount > 0 {
             segments = [
                 Segment(
