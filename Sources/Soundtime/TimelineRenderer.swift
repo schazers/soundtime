@@ -134,6 +134,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let binOffset: Int
     }
 
+    private struct WaveformShaderBufferAllocation {
+        let buffer: MTLBuffer
+        let binOffset: Int
+        let binCount: Int
+        let byteCount: Int
+    }
+
     private struct WaveformShaderBatch {
         let buffer: MTLBuffer
         var uniforms: [WaveformShaderUniform]
@@ -145,25 +152,38 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
 
     private final class WaveformShaderBufferStore: @unchecked Sendable {
+        private struct Slab {
+            let buffer: MTLBuffer
+            let capacityBins: Int
+            var usedBins: Int
+        }
+
         private let lock = NSLock()
-        private var buffers: [WaveformMipCacheKey: MTLBuffer] = [:]
+        private let device: MTLDevice
+        private let preferredSlabBinCapacity: Int
+        private var slabs: [Slab] = []
+        private var allocations: [WaveformMipCacheKey: WaveformShaderBufferAllocation] = [:]
         private var accessTicks: [WaveformMipCacheKey: Int] = [:]
         private var accessTick = 0
         private var inFlightKeys: Set<WaveformMipCacheKey> = []
-        private var totalBufferByteCount = 0
         private var publishedBufferCount = 0
 
-        func buffer(for key: WaveformMipCacheKey) -> MTLBuffer? {
+        init(device: MTLDevice, preferredSlabBinCapacity: Int) {
+            self.device = device
+            self.preferredSlabBinCapacity = max(preferredSlabBinCapacity, 1)
+        }
+
+        func allocation(for key: WaveformMipCacheKey) -> WaveformShaderBufferAllocation? {
             lock.lock()
             defer {
                 lock.unlock()
             }
-            guard let buffer = buffers[key] else {
+            guard let allocation = allocations[key] else {
                 return nil
             }
 
             markAccessed(key)
-            return buffer
+            return allocation
         }
 
         func beginPreparing(
@@ -176,7 +196,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             }
 
             guard
-                buffers[key] == nil,
+                allocations[key] == nil,
                 !inFlightKeys.contains(key),
                 inFlightKeys.count < max(maximumInFlightCount, 1)
             else {
@@ -186,15 +206,92 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return true
         }
 
+        func publish(_ bins: [WaveformShaderBin]?, for key: WaveformMipCacheKey) {
+            lock.lock()
+            if let bins, !bins.isEmpty {
+                publishLocked(bins, for: key)
+            }
+            inFlightKeys.remove(key)
+            lock.unlock()
+        }
+
+        private func publishLocked(_ bins: [WaveformShaderBin], for key: WaveformMipCacheKey) {
+            guard allocations[key] == nil else {
+                markAccessed(key)
+                publishedBufferCount += 1
+                return
+            }
+
+            let binCount = bins.count
+            guard let slabIndex = slabIndexForAllocation(binCount: binCount) else {
+                return
+            }
+
+            let binOffset = slabs[slabIndex].usedBins
+            let byteOffset = binOffset * MemoryLayout<WaveformShaderBin>.stride
+            let byteCount = binCount * MemoryLayout<WaveformShaderBin>.stride
+            bins.withUnsafeBytes { sourceBytes in
+                guard let baseAddress = sourceBytes.baseAddress else {
+                    return
+                }
+
+                slabs[slabIndex].buffer.contents()
+                    .advanced(by: byteOffset)
+                    .copyMemory(from: baseAddress, byteCount: byteCount)
+            }
+
+            let allocation = WaveformShaderBufferAllocation(
+                buffer: slabs[slabIndex].buffer,
+                binOffset: binOffset,
+                binCount: binCount,
+                byteCount: byteCount
+            )
+            allocations[key] = allocation
+            slabs[slabIndex].usedBins += binCount
+            markAccessed(key)
+            publishedBufferCount += 1
+        }
+
+        private func slabIndexForAllocation(binCount: Int) -> Int? {
+            if let index = slabs.indices.first(where: {
+                slabs[$0].capacityBins - slabs[$0].usedBins >= binCount
+            }) {
+                return index
+            }
+
+            let capacityBins = max(preferredSlabBinCapacity, nextPowerOfTwo(binCount))
+            let byteCount = capacityBins * MemoryLayout<WaveformShaderBin>.stride
+            guard let buffer = device.makeBuffer(length: byteCount, options: [.storageModeShared]) else {
+                return nil
+            }
+            buffer.label = "Timeline waveform bin arena slab \(slabs.count)"
+            slabs.append(Slab(buffer: buffer, capacityBins: capacityBins, usedBins: 0))
+            return slabs.indices.last
+        }
+
+        private func nextPowerOfTwo(_ value: Int) -> Int {
+            guard value > 1 else {
+                return 1
+            }
+
+            var result = 1
+            while result < value {
+                result <<= 1
+            }
+            return result
+        }
+
         func publish(_ buffer: MTLBuffer?, for key: WaveformMipCacheKey) {
             lock.lock()
             if let buffer {
-                if let existingBuffer = buffers[key] {
-                    totalBufferByteCount -= existingBuffer.length
-                }
-                buffers[key] = buffer
+                let allocation = WaveformShaderBufferAllocation(
+                    buffer: buffer,
+                    binOffset: 0,
+                    binCount: max(buffer.length / MemoryLayout<WaveformShaderBin>.stride, 1),
+                    byteCount: buffer.length
+                )
+                allocations[key] = allocation
                 markAccessed(key)
-                totalBufferByteCount += buffer.length
                 publishedBufferCount += 1
             }
             inFlightKeys.remove(key)
@@ -215,29 +312,30 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 lock.unlock()
             }
 
-            return (buffers.count, totalBufferByteCount, inFlightKeys.count)
+            let totalSlabByteCount = slabs.reduce(0) { result, slab in
+                result + slab.buffer.length
+            }
+            return (allocations.count, totalSlabByteCount, inFlightKeys.count)
         }
 
         func trim(toMaximumCount maximumCount: Int, maximumByteCount: Int) {
             lock.lock()
-            let maximumCount = max(maximumCount, 1)
-            let maximumByteCount = max(maximumByteCount, 1)
-            while buffers.count > maximumCount || totalBufferByteCount > maximumByteCount {
-                guard let oldestKey = buffers.keys.min(by: {
-                    (accessTicks[$0] ?? 0) < (accessTicks[$1] ?? 0)
-                }) else {
-                    break
-                }
-                guard !inFlightKeys.contains(oldestKey) else {
-                    accessTicks[oldestKey] = accessTick
-                    continue
-                }
-                if let removedBuffer = buffers.removeValue(forKey: oldestKey) {
-                    totalBufferByteCount -= removedBuffer.length
-                    accessTicks.removeValue(forKey: oldestKey)
-                }
+            if allocations.count > maximumCount || diagnosticsByteCountLocked() > maximumByteCount {
+                compactAccessTicksLocked()
             }
             lock.unlock()
+        }
+
+        private func diagnosticsByteCountLocked() -> Int {
+            slabs.reduce(0) { result, slab in
+                result + slab.buffer.length
+            }
+        }
+
+        private func compactAccessTicksLocked() {
+            accessTicks = accessTicks.filter { key, _ in
+                allocations[key] != nil || inFlightKeys.contains(key)
+            }
         }
 
         private func markAccessed(_ key: WaveformMipCacheKey) {
@@ -580,7 +678,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var waveformMipLevelCacheOrder: [WaveformMipCacheKey] = []
     private var waveformMipLevelBuildsInFlight: Set<WaveformMipCacheKey> = []
     private let waveformMipLevelCacheLock = NSLock()
-    private let waveformShaderBufferStore = WaveformShaderBufferStore()
+    private let waveformShaderBufferStore: WaveformShaderBufferStore
     private var gridCache: GridCache?
     private var waveformTransitionStartTime: CFTimeInterval?
     private var previousRenderedPlayheadX: Float?
@@ -757,6 +855,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         self.commandQueue = commandQueue
         self.dynamicVertexBufferRing = dynamicVertexBufferRing
         self.waveformQuadVertexBuffer = waveformQuadVertexBuffer
+        waveformShaderBufferStore = WaveformShaderBufferStore(
+            device: device,
+            preferredSlabBinCapacity: 262_144
+        )
         pipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
         waveformPipelineState = try device.makeRenderPipelineState(descriptor: waveformDescriptor)
         additivePipelineState = try device.makeRenderPipelineState(descriptor: additiveDescriptor)
@@ -1602,7 +1704,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
             checkedRenderableTrack = true
             let preferredMipLevel = mipLevels[preferredIndex]
-            guard waveformShaderBuffer(track: track, mipLevel: preferredMipLevel) != nil else {
+            guard waveformShaderAllocation(track: track, mipLevel: preferredMipLevel) != nil else {
                 prepareWaveformShaderBinBuffer(
                     track: track,
                     mipLevel: preferredMipLevel,
@@ -1634,8 +1736,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         let preferredMipLevel = mipLevels[preferredIndex]
-        if let buffer = waveformShaderBuffer(track: track, mipLevel: preferredMipLevel) {
-            return WaveformShaderDrawable(mipLevel: preferredMipLevel, buffer: buffer, binOffset: 0)
+        if let allocation = waveformShaderAllocation(track: track, mipLevel: preferredMipLevel) {
+            return WaveformShaderDrawable(
+                mipLevel: preferredMipLevel,
+                buffer: allocation.buffer,
+                binOffset: allocation.binOffset
+            )
         }
 
         prepareWaveformShaderBinBuffer(
@@ -1643,8 +1749,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             mipLevel: preferredMipLevel,
             allowsSynchronousUpload: false
         )
-        if let buffer = waveformShaderBuffer(track: track, mipLevel: preferredMipLevel) {
-            return WaveformShaderDrawable(mipLevel: preferredMipLevel, buffer: buffer, binOffset: 0)
+        if let allocation = waveformShaderAllocation(track: track, mipLevel: preferredMipLevel) {
+            return WaveformShaderDrawable(
+                mipLevel: preferredMipLevel,
+                buffer: allocation.buffer,
+                binOffset: allocation.binOffset
+            )
         }
 
         guard fallbackPolicy == .allowFallbacks else {
@@ -1654,8 +1764,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         if preferredIndex + 1 < mipLevels.count {
             for fallbackIndex in (preferredIndex + 1)..<mipLevels.count {
                 let fallbackMipLevel = mipLevels[fallbackIndex]
-                if let buffer = waveformShaderBuffer(track: track, mipLevel: fallbackMipLevel) {
-                    return WaveformShaderDrawable(mipLevel: fallbackMipLevel, buffer: buffer, binOffset: 0)
+                if let allocation = waveformShaderAllocation(track: track, mipLevel: fallbackMipLevel) {
+                    return WaveformShaderDrawable(
+                        mipLevel: fallbackMipLevel,
+                        buffer: allocation.buffer,
+                        binOffset: allocation.binOffset
+                    )
                 }
             }
         }
@@ -1663,8 +1777,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         if preferredIndex > 0 {
             for fallbackIndex in stride(from: preferredIndex - 1, through: 0, by: -1) {
                 let fallbackMipLevel = mipLevels[fallbackIndex]
-                if let buffer = waveformShaderBuffer(track: track, mipLevel: fallbackMipLevel) {
-                    return WaveformShaderDrawable(mipLevel: fallbackMipLevel, buffer: buffer, binOffset: 0)
+                if let allocation = waveformShaderAllocation(track: track, mipLevel: fallbackMipLevel) {
+                    return WaveformShaderDrawable(
+                        mipLevel: fallbackMipLevel,
+                        buffer: allocation.buffer,
+                        binOffset: allocation.binOffset
+                    )
                 }
             }
         }
@@ -1672,30 +1790,21 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         return nil
     }
 
-    private func makeWaveformShaderBinBuffer(
+    private func makeWaveformShaderBins(
         from bins: [WaveformOverview.Bin],
-        label: String,
         shouldYieldForPlayback: Bool = false
-    ) -> MTLBuffer? {
+    ) -> [WaveformShaderBin]? {
         guard !bins.isEmpty else {
             return nil
         }
 
-        let bufferLength = bins.count * MemoryLayout<WaveformShaderBin>.stride
-        guard let buffer = device.makeBuffer(
-            length: bufferLength,
-            options: [.storageModeShared]
-        ) else {
-            return nil
-        }
-
-        let destination = buffer.contents()
-            .bindMemory(to: WaveformShaderBin.self, capacity: bins.count)
+        var shaderBins: [WaveformShaderBin] = []
+        shaderBins.reserveCapacity(bins.count)
         for (index, bin) in bins.enumerated() {
             if shouldYieldForPlayback, index.isMultiple(of: 8_192) {
                 try? ImportWorkBudget.shared.waitIfPlaybackActive()
             }
-            destination[index] = WaveformShaderBin(
+            shaderBins.append(WaveformShaderBin(
                 minimumSample: bin.minimumSample,
                 maximumSample: bin.maximumSample,
                 rmsSample: bin.rmsSample,
@@ -1704,11 +1813,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 highEnergy: bin.highEnergy,
                 peakMagnitude: bin.peakMagnitude,
                 reserved: 0
-            )
+            ))
         }
 
-        buffer.label = label
-        return buffer
+        return shaderBins
     }
 
     private func waveformShaderBufferKey(
@@ -1723,11 +1831,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         )
     }
 
-    private func waveformShaderBuffer(
+    private func waveformShaderAllocation(
         track: TimelineRenderState.Track,
         mipLevel: WaveformMipLevel
-    ) -> MTLBuffer? {
-        waveformShaderBufferStore.buffer(for: waveformShaderBufferKey(track: track, mipLevel: mipLevel))
+    ) -> WaveformShaderBufferAllocation? {
+        waveformShaderBufferStore.allocation(for: waveformShaderBufferKey(track: track, mipLevel: mipLevel))
     }
 
     private func prepareWaveformShaderBinBuffer(
@@ -1744,14 +1852,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         let bins = mipLevel.overview.bins
-        let label = "Timeline GPU waveform bins \(mipLevel.binCount)"
-
         if
             allowsSynchronousUpload,
             mipLevel.binCount <= maximumSynchronousWaveformShaderBinBufferBins
         {
-            let buffer = makeWaveformShaderBinBuffer(from: bins, label: label)
-            waveformShaderBufferStore.publish(buffer, for: key)
+            let shaderBins = makeWaveformShaderBins(from: bins)
+            waveformShaderBufferStore.publish(shaderBins, for: key)
             waveformShaderBufferStore.trim(
                 toMaximumCount: maximumCachedWaveformShaderBinBuffers,
                 maximumByteCount: maximumCachedWaveformShaderBinBufferBytes
@@ -1760,12 +1866,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         waveformGeometryQueue.async { [weak self] in
-            let buffer = self?.makeWaveformShaderBinBuffer(
+            let shaderBins = self?.makeWaveformShaderBins(
                 from: bins,
-                label: label,
                 shouldYieldForPlayback: true
             )
-            self?.waveformShaderBufferStore.publish(buffer, for: key)
+            self?.waveformShaderBufferStore.publish(shaderBins, for: key)
             self?.waveformShaderBufferStore.trim(
                 toMaximumCount: self?.maximumCachedWaveformShaderBinBuffers ?? 768,
                 maximumByteCount: self?.maximumCachedWaveformShaderBinBufferBytes ?? 512 * 1_024 * 1_024
