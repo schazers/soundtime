@@ -78,7 +78,8 @@ final class WorkspaceView: NSView {
 
     private struct EditableSelectionTarget {
         let trackIndex: Int
-        let selection: TimelineSelection
+        let displaySelection: TimelineSelection
+        let editSelection: TimelineSelection
     }
 
     private struct ProjectMixTrackSnapshot: Sendable {
@@ -1463,7 +1464,7 @@ final class WorkspaceView: NSView {
 
         selectedTrackID = trackID
         activeTrackID = trackID
-        let fullTrackSelection = fullTrackSelection(for: trackID)
+        let fullTrackSelection = fullTrackDisplaySelection(for: trackID)
         selectedTimelineRange = fullTrackSelection
         timelineSurface.displaySelection(fullTrackSelection)
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
@@ -2232,12 +2233,47 @@ final class WorkspaceView: NSView {
         return projectTracks.count - 1
     }
 
-    private func fullTrackSelection(for trackID: UUID) -> TimelineSelection {
-        TimelineSelection(
+    private func trackDuration(for track: ProjectTrack) -> TimeInterval {
+        track.audioTimeline?.duration ??
+            track.fileTimeline?.duration ??
+            track.waveformOverview?.duration ??
+            track.decodedAudioBuffer?.duration ??
+            track.durationHint ??
+            0
+    }
+
+    private var projectSelectionDuration: TimeInterval {
+        let duration = displayedDuration
+        if duration > 0 {
+            return duration
+        }
+
+        return projectTracks.reduce(TimeInterval(0)) { result, track in
+            max(result, trackDuration(for: track))
+        }
+    }
+
+    private func fullTrackDisplaySelection(for trackID: UUID) -> TimelineSelection {
+        guard
+            let track = projectTracks.first(where: { $0.id == trackID })
+        else {
+            return TimelineSelection(startProgress: 0, endProgress: 1, trackID: trackID)
+        }
+
+        let projectDuration = projectSelectionDuration
+        let trackDuration = trackDuration(for: track)
+        let endProgress = projectDuration > 0 && trackDuration > 0 ?
+            min(max(trackDuration / projectDuration, 0), 1) :
+            1
+        return TimelineSelection(
             startProgress: 0,
-            endProgress: 1,
+            endProgress: endProgress,
             trackID: trackID
         )
+    }
+
+    private func fullTrackEditSelection(for trackID: UUID) -> TimelineSelection {
+        TimelineSelection(startProgress: 0, endProgress: 1, trackID: trackID)
     }
 
     private func isFullTrackSelection(_ selection: TimelineSelection?, trackID: UUID) -> Bool {
@@ -2245,7 +2281,70 @@ final class WorkspaceView: NSView {
             return false
         }
 
-        return selection.startProgress <= 0.000_001 && selection.endProgress >= 0.999_999
+        let expectedSelection = fullTrackDisplaySelection(for: trackID)
+        let epsilon = 0.000_001
+        if
+            abs(selection.startProgress - expectedSelection.startProgress) <= epsilon,
+            abs(selection.endProgress - expectedSelection.endProgress) <= epsilon
+        {
+            return true
+        }
+
+        return selection.startProgress <= epsilon && selection.endProgress >= 1 - epsilon
+    }
+
+    private func editSelection(
+        from displaySelection: TimelineSelection,
+        trackIndex: Int
+    ) -> TimelineSelection? {
+        guard projectTracks.indices.contains(trackIndex) else {
+            return nil
+        }
+
+        let track = projectTracks[trackIndex]
+        let projectDuration = projectSelectionDuration
+        let trackDuration = trackDuration(for: track)
+        guard projectDuration > 0, trackDuration > 0 else {
+            return nil
+        }
+
+        let startTime = displaySelection.startProgress * projectDuration
+        let endTime = displaySelection.endProgress * projectDuration
+        let clampedStartTime = min(max(startTime, 0), trackDuration)
+        let clampedEndTime = min(max(endTime, 0), trackDuration)
+        let selection = TimelineSelection(
+            startProgress: clampedStartTime / trackDuration,
+            endProgress: clampedEndTime / trackDuration,
+            trackID: track.id
+        )
+        return selection.durationProgress > 0 ? selection : nil
+    }
+
+    private func editInsertionSelection(
+        forPlaybackProgress progress: Float,
+        trackIndex: Int
+    ) -> TimelineSelection {
+        guard projectTracks.indices.contains(trackIndex) else {
+            let clampedProgress = Double(min(max(progress, 0), 1))
+            return TimelineSelection(startProgress: clampedProgress, endProgress: clampedProgress)
+        }
+
+        let track = projectTracks[trackIndex]
+        let projectDuration = projectSelectionDuration
+        let trackDuration = trackDuration(for: track)
+        let insertionProgress: Double
+        if projectDuration > 0, trackDuration > 0 {
+            let insertionTime = Double(min(max(progress, 0), 1)) * projectDuration
+            insertionProgress = min(max(insertionTime / trackDuration, 0), 1)
+        } else {
+            insertionProgress = Double(min(max(progress, 0), 1))
+        }
+
+        return TimelineSelection(
+            startProgress: insertionProgress,
+            endProgress: insertionProgress,
+            trackID: track.id
+        )
     }
 
     private func trackIndex(for selection: TimelineSelection) -> Int? {
@@ -2267,16 +2366,19 @@ final class WorkspaceView: NSView {
             let selection = selectedTimelineRange,
             selection.durationProgress > 0,
             let trackIndex = trackIndex(for: selection),
-            projectTracks.indices.contains(trackIndex)
+            projectTracks.indices.contains(trackIndex),
+            let editSelection = editSelection(from: selection, trackIndex: trackIndex)
         {
             let trackID = projectTracks[trackIndex].id
+            let displaySelection = TimelineSelection(
+                startProgress: selection.startProgress,
+                endProgress: selection.endProgress,
+                trackID: trackID
+            )
             return EditableSelectionTarget(
                 trackIndex: trackIndex,
-                selection: TimelineSelection(
-                    startProgress: selection.startProgress,
-                    endProgress: selection.endProgress,
-                    trackID: trackID
-                )
+                displaySelection: displaySelection,
+                editSelection: editSelection
             )
         }
 
@@ -2286,7 +2388,8 @@ final class WorkspaceView: NSView {
         {
             return EditableSelectionTarget(
                 trackIndex: trackIndex,
-                selection: fullTrackSelection(for: selectedTrackID)
+                displaySelection: fullTrackDisplaySelection(for: selectedTrackID),
+                editSelection: fullTrackEditSelection(for: selectedTrackID)
             )
         }
 
@@ -2904,7 +3007,7 @@ final class WorkspaceView: NSView {
         }
 
         let trackIndex = target.trackIndex
-        let selectedTimelineRange = target.selection
+        let selectedTimelineRange = target.editSelection
         if let currentTimeline = projectTracks[trackIndex].audioTimeline {
             updateStatus("copying selection")
             Task { [weak self, currentTimeline, selectedTimelineRange] in
@@ -2993,12 +3096,12 @@ final class WorkspaceView: NSView {
             currentFileTimeline = nil
         }
 
-        let pasteSelection = selectedTimelineRange ??
-            currentEditableSelectionTarget()?.selection ??
-            TimelineSelection(
-                startProgress: Double(playbackController.snapshot().progress),
-                endProgress: Double(playbackController.snapshot().progress),
-                trackID: projectTracks[trackIndex].id
+        let pasteSelection =
+            selectedTimelineRange.flatMap { editSelection(from: $0, trackIndex: trackIndex) } ??
+            currentEditableSelectionTarget()?.editSelection ??
+            editInsertionSelection(
+                forPlaybackProgress: playbackController.snapshot().progress,
+                trackIndex: trackIndex
             )
         let currentOverview = projectTracks[trackIndex].waveformOverview
         let trackID = projectTracks[trackIndex].id
@@ -3094,37 +3197,33 @@ final class WorkspaceView: NSView {
         }
 
         let trackIndex = target.trackIndex
-        let selectionToDelete = target.selection
+        let displaySelectionToDelete = target.displaySelection
+        let selectionToDelete = target.editSelection
         let trackID = projectTracks[trackIndex].id
         let undoSnapshot = ProjectTrackUndoSnapshot(
             tracks: projectTracks,
             activeTrackID: activeTrackID,
             selectedTrackID: selectedTrackID,
             selectedTimelineRange: selectedTimelineRange,
-            restoreProgress: selectionToDelete.startProgressFloat
+            restoreProgress: displaySelectionToDelete.startProgressFloat
         )
 
         if copyBeforeDeleting {
             copySelection()
         }
 
-        let deletedStartTime: TimeInterval
         let deletedDuration: TimeInterval
-        let targetPlaybackProgress: Float
+        let targetPlaybackTime = displaySelectionToDelete.startProgress * projectSelectionDuration
         let editedAudioTimeline: AudioEditTimeline?
         let editedFileTimeline: AudioFileEditTimeline?
 
         if let currentTimeline = projectTracks[trackIndex].audioTimeline {
             var timeline = currentTimeline
-            deletedStartTime = selectionToDelete.startProgress * currentTimeline.duration
             deletedDuration = selectionToDelete.duration(in: currentTimeline.duration)
             let deletedFrameCount = timeline.delete(selectionToDelete)
             guard deletedFrameCount > 0 else {
                 return
             }
-            targetPlaybackProgress = timeline.duration > 0 ?
-                min(max(Float(deletedStartTime / timeline.duration), 0), 1) :
-                0
             editedAudioTimeline = timeline
             editedFileTimeline = nil
         } else {
@@ -3137,20 +3236,19 @@ final class WorkspaceView: NSView {
             }
 
             var timeline = currentFileTimeline
-            deletedStartTime = selectionToDelete.startProgress * currentFileTimeline.duration
             deletedDuration = selectionToDelete.duration(in: currentFileTimeline.duration)
             let deletedFrameCount = timeline.delete(selectionToDelete)
             guard deletedFrameCount > 0 else {
                 return
             }
-            targetPlaybackProgress = timeline.duration > 0 ?
-                min(max(Float(deletedStartTime / timeline.duration), 0), 1) :
-                0
             editedAudioTimeline = nil
             editedFileTimeline = timeline
         }
 
-        timelineSurface.triggerDeletionEffect(selection: selectionToDelete)
+        timelineSurface.triggerDeletionEffect(
+            selection: displaySelectionToDelete,
+            sourceSelection: selectionToDelete
+        )
         editUndoStack.append(.projectTracks(undoSnapshot))
         projectTracks[trackIndex].editRevision += 1
         let editRevision = projectTracks[trackIndex].editRevision
@@ -3168,6 +3266,9 @@ final class WorkspaceView: NSView {
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
         refreshProjectTimelineDisplay(rebuildControls: false, animateWaveformTransition: false)
         updateProjectDisplayTiming()
+        let targetPlaybackProgress = displayedDuration > 0 ?
+            min(max(Float(targetPlaybackTime / displayedDuration), 0), 1) :
+            0
         reloadPlaybackFromProjectTracks(
             preserveProgress: false,
             targetProgress: targetPlaybackProgress,
@@ -3239,7 +3340,7 @@ final class WorkspaceView: NSView {
             return
         }
 
-        timelineSurface.displayGainPreview(selection: target.selection, gain: gain)
+        timelineSurface.displayGainPreview(selection: target.displaySelection, gain: gain)
     }
 
     private func cancelSelectedGainPreview() {
@@ -3260,7 +3361,7 @@ final class WorkspaceView: NSView {
         }
 
         let trackIndex = target.trackIndex
-        let selectionToApply = target.selection
+        let selectionToApply = target.editSelection
         let trackID = projectTracks[trackIndex].id
         let editRevision: Int
         let editedAudioTimeline: AudioEditTimeline?
@@ -3344,7 +3445,7 @@ final class WorkspaceView: NSView {
         }
 
         let trackIndex = target.trackIndex
-        let selectionToApply = target.selection
+        let selectionToApply = target.editSelection
         let timelineFadeDirection: AudioEditTimeline.FadeDirection
         switch fadeEffect {
         case .fadeIn:
@@ -4312,7 +4413,7 @@ final class WorkspaceView: NSView {
             track.audioTimeline != nil ||
             track.fileTimeline != nil ||
             WAVAudioDecoder.canDecode(track.sourceURL)
-        return hasEditableTimeline && target.selection.durationProgress > 0
+        return hasEditableTimeline && target.editSelection.durationProgress > 0
     }
 
     private func updateEffectCommandState() {

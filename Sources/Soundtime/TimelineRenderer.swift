@@ -1339,16 +1339,17 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         return inverseFisheyeX(visualViewportProgress, fisheye: fisheye)
     }
 
-    func triggerDeletionEffect(selection: TimelineSelection) {
+    func triggerDeletionEffect(selection: TimelineSelection, sourceSelection: TimelineSelection? = nil) {
         guard selection.durationProgress > 0 else {
             return
         }
 
+        let capturedSelection = sourceSelection ?? selection
         var seed = UInt64(bitPattern: Int64(selection.trackID?.hashValue ?? 0))
-        seed &+= UInt64((selection.startProgress * 1_000_000).rounded(.down))
+        seed &+= UInt64((capturedSelection.startProgress * 1_000_000).rounded(.down))
         seed &*= 0x9E37_79B9_7F4A_7C15
-        seed &+= UInt64((selection.endProgress * 1_000_000).rounded(.down))
-        let capturedBins = capturedDeletionBins(for: selection)
+        seed &+= UInt64((capturedSelection.endProgress * 1_000_000).rounded(.down))
+        let capturedBins = capturedDeletionBins(for: capturedSelection)
         let capturedBinBuffer = makeDeletionWaveformBinBuffer(from: capturedBins)
         let effect = DeletionEffect(
             selection: selection,
@@ -1510,6 +1511,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             playheadProgress: renderedPlayheadProgress,
             displayTimestamp: displayTimestamp
         )
+        let selectionFisheye = selectionFisheye(
+            for: renderState.selection,
+            renderState: renderState,
+            baseFisheye: waveformFisheye,
+            displayTimestamp: displayTimestamp
+        )
         let selectedTrackVertices = makeSelectedTrackVertices(
             drawableSize: viewportSize,
             renderState: renderState
@@ -1621,7 +1628,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         )
         encoder.setRenderPipelineState(pipelineState)
         draw(vertices: selectedTrackVertices, primitiveType: .triangle, encoder: encoder)
-        draw(vertices: selectionVertices, primitiveType: .triangle, encoder: encoder)
+        draw(vertices: selectionVertices, primitiveType: .triangle, encoder: encoder, fisheye: selectionFisheye)
         if let previousShaderRenderState, usesPreviousWaveformShader {
             encoder.setRenderPipelineState(waveformPipelineState)
             drawShaderWaveforms(
@@ -1694,6 +1701,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         drawDeletionEffects(
             drawableSize: viewportSize,
             renderState: renderState,
+            baseFisheye: waveformFisheye,
             displayTimestamp: displayTimestamp,
             encoder: encoder
         )
@@ -3584,6 +3592,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private func drawDeletionEffects(
         drawableSize: CGSize,
         renderState: TimelineRenderState,
+        baseFisheye: SIMD4<Float>,
         displayTimestamp: CFTimeInterval,
         encoder: MTLRenderCommandEncoder
     ) {
@@ -3609,6 +3618,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                     for: effect,
                     drawableSize: drawableSize,
                     renderState: renderState,
+                    baseFisheye: baseFisheye,
                     displayTimestamp: displayTimestamp
                 )
             else {
@@ -3636,6 +3646,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 for: effect,
                 drawableSize: drawableSize,
                 renderState: renderState,
+                baseFisheye: baseFisheye,
                 displayTimestamp: displayTimestamp
             ) else {
                 continue
@@ -3664,6 +3675,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         for effect: DeletionEffect,
         drawableSize: CGSize,
         renderState: TimelineRenderState,
+        baseFisheye: SIMD4<Float>,
         displayTimestamp: CFTimeInterval
     ) -> DeletionEffectUniform? {
         let width = Float(drawableSize.width)
@@ -3676,15 +3688,24 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let age = max(displayTimestamp - birthTimestamp, 0)
         let progress = min(max(Float(age / deletionEffectDuration), 0), 1)
         let selection = effect.selection
-        let leftViewport = renderState.viewport.viewportProgress(
+        var leftViewport = renderState.viewport.viewportProgress(
             forTimelineProgress: selection.startProgressFloat
         )
-        let rightViewport = renderState.viewport.viewportProgress(
+        var rightViewport = renderState.viewport.viewportProgress(
             forTimelineProgress: selection.endProgressFloat
         )
         guard rightViewport > -0.1, leftViewport < 1.1 else {
             return nil
         }
+
+        let effectFisheye = selectionFisheye(
+            for: selection,
+            renderState: renderState,
+            baseFisheye: baseFisheye,
+            displayTimestamp: displayTimestamp
+        )
+        leftViewport = fisheyeX(leftViewport, fisheye: effectFisheye)
+        rightViewport = fisheyeX(rightViewport, fisheye: effectFisheye)
 
         var leftX = leftViewport * width
         var rightX = rightViewport * width
@@ -4349,6 +4370,50 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             1 + (fisheye.z - 1) * energy,
             fisheye.w * energy
         )
+    }
+
+    private func selectionFisheye(
+        for selection: TimelineSelection?,
+        renderState: TimelineRenderState,
+        baseFisheye: SIMD4<Float>,
+        displayTimestamp: CFTimeInterval
+    ) -> SIMD4<Float> {
+        guard baseFisheye.w > 0.000_1 else {
+            return .zero
+        }
+
+        guard let trackID = selection?.trackID else {
+            return cpuFallbackWaveformFisheye(
+                baseFisheye,
+                renderState: renderState,
+                displayTimestamp: displayTimestamp
+            )
+        }
+
+        return scaledWaveformFisheye(
+            baseFisheye,
+            by: trackFisheyeEnergy(for: trackID, at: displayTimestamp)
+        )
+    }
+
+    private func fisheyeX(_ x: Float, fisheye: SIMD4<Float>) -> Float {
+        let radius = fisheye.y
+        let exponent = fisheye.z
+        guard radius > 0, exponent > 0, exponent < 0.999 else {
+            return x
+        }
+
+        let center = fisheye.x
+        let dx = x - center
+        let distance = abs(dx)
+        let sideRadius = fisheyeSideRadius(dx: dx, radius: radius)
+        guard distance > 0.000_001, distance < sideRadius else {
+            return x
+        }
+
+        let t = min(max(distance / sideRadius, 0), 1)
+        let warpedDistance = sideRadius * fisheyeWarpedNormalizedDistance(t, exponent: exponent)
+        return min(max(center + (dx < 0 ? -warpedDistance : warpedDistance), 0), 1)
     }
 
     private func inverseFisheyeX(_ x: Float, fisheye: SIMD4<Float>) -> Float {
