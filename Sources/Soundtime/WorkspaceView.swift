@@ -171,6 +171,8 @@ final class WorkspaceView: NSView {
     private let inputRecorder = AudioInputRecorder()
     private var recordingTrackID: UUID?
     private var recordingTakeWriter: StreamingWAVTakeWriter?
+    private var recordingStartUndoSnapshot: ProjectTrackUndoSnapshot?
+    private var recordingStartUndoStackCount: Int?
     private var recordingSampleRate: Double = 0
     private var recordingAccumulator: LiveRecordingWaveformAccumulator?
     private var lastRecordingVisualUpdateTimestamp = CACurrentMediaTime()
@@ -613,6 +615,8 @@ final class WorkspaceView: NSView {
         recordingTakeWriter?.cancel()
         recordingTakeWriter = nil
         recordingTrackID = nil
+        recordingStartUndoSnapshot = nil
+        recordingStartUndoStackCount = nil
         recordingSampleRate = 0
         recordingAccumulator = nil
         playbackController.clear()
@@ -966,6 +970,8 @@ final class WorkspaceView: NSView {
             selectedTimelineRange: selectedTimelineRange,
             restoreProgress: nil
         )
+        recordingStartUndoSnapshot = snapshot
+        recordingStartUndoStackCount = editUndoStack.count
         editUndoStack.append(.projectTracks(snapshot))
 
         let trackID = UUID()
@@ -1115,6 +1121,8 @@ final class WorkspaceView: NSView {
         else {
             recordingSampleRate = 0
             recordingAccumulator = nil
+            recordingStartUndoSnapshot = nil
+            recordingStartUndoStackCount = nil
             updateProjectDisplayTiming()
             updateStatus("recording stopped")
             return
@@ -1125,10 +1133,9 @@ final class WorkspaceView: NSView {
             recordedTake = try takeWriter.finish()
         } catch {
             takeWriter.cancel()
-            recordingSampleRate = 0
-            recordingAccumulator = nil
-            updateProjectDisplayTiming()
-            updateStatus("recording failed: \(error.localizedDescription)")
+            restoreAfterDiscardedRecording(
+                status: recordingDiscardStatus(for: error)
+            )
             return
         }
 
@@ -1154,6 +1161,8 @@ final class WorkspaceView: NSView {
 
         recordingSampleRate = 0
         recordingAccumulator = nil
+        recordingStartUndoSnapshot = nil
+        recordingStartUndoStackCount = nil
         syncActiveTrackFields()
         refreshProjectTimelineDisplay()
         updateProjectDisplayTiming(sampleRateHint: recordedTake.sampleRate)
@@ -1161,6 +1170,40 @@ final class WorkspaceView: NSView {
         startRecordedTakePreviewRefinement(trackID: trackID, importID: importID, url: recordedTake.url)
         updateEffectCommandState()
         updateStatus("recorded \(formatDuration(recordedTake.duration))")
+    }
+
+    private func restoreAfterDiscardedRecording(status: String) {
+        recordingSampleRate = 0
+        recordingAccumulator = nil
+
+        if
+            let undoStackCount = recordingStartUndoStackCount,
+            editUndoStack.count == undoStackCount + 1
+        {
+            _ = editUndoStack.popLast()
+        }
+
+        if let snapshot = recordingStartUndoSnapshot {
+            recordingStartUndoSnapshot = nil
+            recordingStartUndoStackCount = nil
+            restoreProjectTracks(from: snapshot)
+        } else {
+            recordingStartUndoStackCount = nil
+            refreshProjectTimelineDisplay()
+            updateProjectDisplayTiming()
+        }
+
+        updateStatus(status)
+    }
+
+    private func recordingDiscardStatus(for error: Error) -> String {
+        if let writerError = error as? StreamingWAVTakeWriter.WriterError,
+           case .noSamplesWritten = writerError
+        {
+            return "recording canceled"
+        }
+
+        return "recording failed: \(error.localizedDescription)"
     }
 
     private func appendRecordingChunk(_ chunk: AudioRecordingChunk) {
