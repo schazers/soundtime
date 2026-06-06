@@ -1404,6 +1404,24 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         requestTimelineRender()
     }
 
+    func scrollTracks(byPixels deltaPixels: Float) {
+        let nextTrackLayout = trackLayout.scrolled(
+            by: deltaPixels,
+            totalTrackCount: currentTrackIDs.count,
+            viewportHeight: Float(max(bounds.height, 1))
+        )
+        guard nextTrackLayout != trackLayout else {
+            return
+        }
+
+        trackLayout = nextTrackLayout
+        updateTimelineRenderer { renderer in
+            renderer.displayTrackLayout(nextTrackLayout)
+        }
+        updateTrackLayoutForCurrentBounds(requestRender: false)
+        requestTimelineRender()
+    }
+
     private func resolvedTrackLayoutForCurrentBounds() -> ResolvedTimelineTrackLayout {
         trackLayout.resolved(
             totalTrackCount: currentTrackIDs.count,
