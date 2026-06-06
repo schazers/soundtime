@@ -2140,7 +2140,8 @@ final class WorkspaceView: NSView {
             zeroCrossingIndex: AudioZeroCrossingIndex
         ),
         status: String,
-        preservePlaybackProgress: Bool = false
+        preservePlaybackProgress: Bool = false,
+        reloadPlaybackSource: Bool = false
     ) {
         guard
             let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }),
@@ -2159,7 +2160,7 @@ final class WorkspaceView: NSView {
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
         refreshProjectTimelineDisplay(rebuildControls: false)
         updateProjectDisplayTiming(sampleRateHint: materialized.buffer.sampleRate)
-        if playbackController.isPlaying {
+        if playbackController.isPlaying, !reloadPlaybackSource {
             updateProjectPlaybackTrackMix()
         } else {
             reloadPlaybackFromProjectTracks(preserveProgress: preservePlaybackProgress)
@@ -2664,39 +2665,100 @@ final class WorkspaceView: NSView {
 
     private func copySelection() {
         guard
-            let currentTimeline = activeProjectTrack?.audioTimeline,
+            let trackIndex = activeProjectTrackIndex(),
+            projectTracks.indices.contains(trackIndex),
             let selectedTimelineRange,
             selectedTimelineRange.durationProgress > 0
         else {
             return
         }
 
+        if let currentTimeline = projectTracks[trackIndex].audioTimeline {
+            updateStatus("copying selection")
+            Task { [weak self, currentTimeline, selectedTimelineRange] in
+                let clipboard = await Task.detached(priority: .userInitiated) {
+                    let buffer = currentTimeline.render(selection: selectedTimelineRange)
+                    return AudioClipboard(
+                        buffer: buffer,
+                        waveformOverview: WaveformOverviewBuilder.build(from: buffer)
+                    )
+                }.value
+
+                guard let self else {
+                    return
+                }
+
+                self.audioClipboard = clipboard
+                self.updateStatus("copied \(self.formatDuration(clipboard.buffer.duration))")
+            }
+            return
+        }
+
+        let fileTimeline: AudioFileEditTimeline
+        do {
+            fileTimeline = try editableFileTimeline(forTrackAt: trackIndex)
+        } catch {
+            updateStatus("copy failed: \(error.localizedDescription)")
+            return
+        }
+
+        let sourceURL = projectTracks[trackIndex].sourceURL
         updateStatus("copying selection")
-        Task { [weak self, currentTimeline, selectedTimelineRange] in
+        Task { [weak self, fileTimeline, selectedTimelineRange, sourceURL] in
             let clipboard = await Task.detached(priority: .userInitiated) {
-                let buffer = currentTimeline.render(selection: selectedTimelineRange)
+                let sourceBuffer = try WAVAudioDecoder.decode(url: sourceURL)
+                let timeline = fileTimeline.audioTimeline(sourceBuffer: sourceBuffer)
+                let buffer = timeline.render(selection: selectedTimelineRange)
                 return AudioClipboard(
                     buffer: buffer,
                     waveformOverview: WaveformOverviewBuilder.build(from: buffer)
                 )
-            }.value
+            }.result
 
             guard let self else {
                 return
             }
 
-            self.audioClipboard = clipboard
-            self.updateStatus("copied \(self.formatDuration(clipboard.buffer.duration))")
+            switch clipboard {
+            case let .success(clipboard):
+                self.audioClipboard = clipboard
+                self.updateStatus("copied \(self.formatDuration(clipboard.buffer.duration))")
+            case let .failure(error):
+                self.updateStatus("copy failed: \(error.localizedDescription)")
+            }
         }
+    }
+
+    private func editableFileTimeline(forTrackAt trackIndex: Int) throws -> AudioFileEditTimeline {
+        if let fileTimeline = projectTracks[trackIndex].fileTimeline {
+            return fileTimeline
+        }
+
+        return AudioFileEditTimeline(
+            fileInfo: try WAVAudioDecoder.inspect(url: projectTracks[trackIndex].sourceURL)
+        )
     }
 
     private func pasteAudio() {
         guard
             let audioClipboard,
             let trackIndex = activeProjectTrackIndex(),
-            let currentTimeline = projectTracks[trackIndex].audioTimeline
+            projectTracks.indices.contains(trackIndex)
         else {
             return
+        }
+
+        let currentTimeline = projectTracks[trackIndex].audioTimeline
+        let currentFileTimeline: AudioFileEditTimeline?
+        if currentTimeline == nil {
+            do {
+                currentFileTimeline = try editableFileTimeline(forTrackAt: trackIndex)
+            } catch {
+                updateStatus("paste failed: \(error.localizedDescription)")
+                return
+            }
+        } else {
+            currentFileTimeline = nil
         }
 
         let pasteSelection = selectedTimelineRange ??
@@ -2707,7 +2769,19 @@ final class WorkspaceView: NSView {
             )
         let currentOverview = projectTracks[trackIndex].waveformOverview
         let trackID = projectTracks[trackIndex].id
-        editUndoStack.append(.timeline(trackID: trackID, timeline: currentTimeline))
+        let sourceURL = projectTracks[trackIndex].sourceURL
+        if let currentTimeline {
+            editUndoStack.append(.timeline(trackID: trackID, timeline: currentTimeline))
+        } else {
+            let snapshot = ProjectTrackUndoSnapshot(
+                tracks: projectTracks,
+                activeTrackID: activeTrackID,
+                selectedTrackID: selectedTrackID,
+                selectedTimelineRange: selectedTimelineRange,
+                restoreProgress: nil
+            )
+            editUndoStack.append(.projectTracks(snapshot))
+        }
         projectTracks[trackIndex].editRevision += 1
         let editRevision = projectTracks[trackIndex].editRevision
 
@@ -2719,21 +2793,31 @@ final class WorkspaceView: NSView {
         projectTracks[trackIndex].decodedAudioBuffer = nil
         projectTracks[trackIndex].zeroCrossingIndex = nil
         projectTracks[trackIndex].audioTimeline = nil
+        projectTracks[trackIndex].fileTimeline = nil
         selectedTimelineRange = nil
         timelineSurface.displaySelection(nil)
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
-        stopPlaybackTimer()
-        playbackController.clear()
         refreshProjectTimelineDisplay(rebuildControls: false)
         updateProjectDisplayTiming()
         updateEffectCommandState()
         updateStatus("pasting")
 
-        Task { [weak self, currentTimeline, pasteSelection, audioClipboard, trackID, editRevision] in
+        Task {
+            [weak self, currentTimeline, currentFileTimeline, pasteSelection, audioClipboard, sourceURL, trackID, editRevision] in
             do {
                 let materialized = try await Task.detached(priority: .userInitiated) {
-                    try Self.materializePaste(
-                        timeline: currentTimeline,
+                    let timeline: AudioEditTimeline
+                    if let currentTimeline {
+                        timeline = currentTimeline
+                    } else if let currentFileTimeline {
+                        let sourceBuffer = try WAVAudioDecoder.decode(url: sourceURL)
+                        timeline = currentFileTimeline.audioTimeline(sourceBuffer: sourceBuffer)
+                    } else {
+                        throw PlaybackError.invalidFormat
+                    }
+
+                    return try Self.materializePaste(
+                        timeline: timeline,
                         selection: pasteSelection,
                         clipboardBuffer: audioClipboard.buffer
                     )
@@ -2747,7 +2831,9 @@ final class WorkspaceView: NSView {
                     trackID: trackID,
                     editRevision: editRevision,
                     materialized: materialized,
-                    status: "pasted \(self.formatDuration(audioClipboard.buffer.duration))"
+                    status: "pasted \(self.formatDuration(audioClipboard.buffer.duration))",
+                    preservePlaybackProgress: true,
+                    reloadPlaybackSource: true
                 )
             } catch {
                 guard let self else {
@@ -2809,17 +2895,11 @@ final class WorkspaceView: NSView {
             editedFileTimeline = nil
         } else {
             let currentFileTimeline: AudioFileEditTimeline
-            if let fileTimeline = projectTracks[trackIndex].fileTimeline {
-                currentFileTimeline = fileTimeline
-            } else {
-                do {
-                    currentFileTimeline = AudioFileEditTimeline(
-                        fileInfo: try WAVAudioDecoder.inspect(url: projectTracks[trackIndex].sourceURL)
-                    )
-                } catch {
-                    updateStatus("delete failed: \(error.localizedDescription)")
-                    return
-                }
+            do {
+                currentFileTimeline = try editableFileTimeline(forTrackAt: trackIndex)
+            } catch {
+                updateStatus("delete failed: \(error.localizedDescription)")
+                return
             }
 
             var timeline = currentFileTimeline
@@ -2944,25 +3024,61 @@ final class WorkspaceView: NSView {
         guard
             let trackIndex = activeProjectTrackIndex(),
             let selectionToApply = selectedTimelineRange,
-            selectionToApply.durationProgress > 0,
-            let currentTimeline = projectTracks[trackIndex].audioTimeline
+            selectionToApply.durationProgress > 0
         else {
             return
         }
 
-        var editedTimeline = currentTimeline
-        let affectedFrameCount = editedTimeline.applyGain(gain, to: selectionToApply)
-        guard affectedFrameCount > 0 else {
-            return
+        let trackID = projectTracks[trackIndex].id
+        let editRevision: Int
+        let editedAudioTimeline: AudioEditTimeline?
+        let editedFileTimeline: AudioFileEditTimeline?
+
+        if let currentTimeline = projectTracks[trackIndex].audioTimeline {
+            var timeline = currentTimeline
+            let affectedFrameCount = timeline.applyGain(gain, to: selectionToApply)
+            guard affectedFrameCount > 0 else {
+                return
+            }
+
+            editUndoStack.append(.timeline(trackID: trackID, timeline: currentTimeline))
+            editedAudioTimeline = timeline
+            editedFileTimeline = nil
+        } else {
+            let currentFileTimeline: AudioFileEditTimeline
+            do {
+                currentFileTimeline = try editableFileTimeline(forTrackAt: trackIndex)
+            } catch {
+                updateStatus("gain failed: \(error.localizedDescription)")
+                return
+            }
+
+            var timeline = currentFileTimeline
+            let affectedFrameCount = timeline.applyGain(gain, to: selectionToApply)
+            guard affectedFrameCount > 0 else {
+                return
+            }
+
+            let snapshot = ProjectTrackUndoSnapshot(
+                tracks: projectTracks,
+                activeTrackID: activeTrackID,
+                selectedTrackID: selectedTrackID,
+                selectedTimelineRange: selectedTimelineRange,
+                restoreProgress: nil
+            )
+            editUndoStack.append(.projectTracks(snapshot))
+            editedAudioTimeline = nil
+            editedFileTimeline = timeline
         }
 
-        let trackID = projectTracks[trackIndex].id
-        editUndoStack.append(.timeline(trackID: trackID, timeline: currentTimeline))
         projectTracks[trackIndex].editRevision += 1
-        let editRevision = projectTracks[trackIndex].editRevision
-        projectTracks[trackIndex].audioTimeline = editedTimeline
+        editRevision = projectTracks[trackIndex].editRevision
+        projectTracks[trackIndex].audioTimeline = editedAudioTimeline
+        projectTracks[trackIndex].fileTimeline = editedFileTimeline
         projectTracks[trackIndex].decodedAudioBuffer = nil
-        projectTracks[trackIndex].zeroCrossingIndex = nil
+        if editedAudioTimeline != nil {
+            projectTracks[trackIndex].zeroCrossingIndex = nil
+        }
         projectTracks[trackIndex].waveformOverview = optimisticWaveformOverview(
             projectTracks[trackIndex].waveformOverview,
             applyingGain: gain,
@@ -2979,26 +3095,26 @@ final class WorkspaceView: NSView {
         updateEffectCommandState()
         updateStatus(String(format: "gain %+.1f dB", decibels))
 
-        materializeEditedTimeline(
-            trackID: trackID,
-            timeline: editedTimeline,
-            editRevision: editRevision,
-            status: String(format: "gain %+.1f dB", decibels),
-            preservePlaybackProgress: true
-        )
+        if let editedAudioTimeline {
+            materializeEditedTimeline(
+                trackID: trackID,
+                timeline: editedAudioTimeline,
+                editRevision: editRevision,
+                status: String(format: "gain %+.1f dB", decibels),
+                preservePlaybackProgress: true
+            )
+        }
     }
 
     private func applyFadeEffect(_ fadeEffect: FadeEffect) {
         guard
             let trackIndex = activeProjectTrackIndex(),
-            let currentTimeline = projectTracks[trackIndex].audioTimeline,
             let selectionToApply = selectedTimelineRange,
             selectionToApply.durationProgress > 0
         else {
             return
         }
 
-        var editedTimeline = currentTimeline
         let timelineFadeDirection: AudioEditTimeline.FadeDirection
         switch fadeEffect {
         case .fadeIn:
@@ -3006,20 +3122,61 @@ final class WorkspaceView: NSView {
         case .fadeOut:
             timelineFadeDirection = .fadeOut
         }
-        let affectedFrameCount = editedTimeline.applyFade(timelineFadeDirection, to: selectionToApply)
-        guard affectedFrameCount > 1 else {
-            return
-        }
 
-        let selectedDuration = selectionToApply.duration(in: currentTimeline.duration)
         let trackID = projectTracks[trackIndex].id
         activeTrackID = trackID
-        editUndoStack.append(.timeline(trackID: trackID, timeline: currentTimeline))
+        let selectedDuration: TimeInterval
+        let editRevision: Int
+        let editedAudioTimeline: AudioEditTimeline?
+        let editedFileTimeline: AudioFileEditTimeline?
+
+        if let currentTimeline = projectTracks[trackIndex].audioTimeline {
+            var timeline = currentTimeline
+            let affectedFrameCount = timeline.applyFade(timelineFadeDirection, to: selectionToApply)
+            guard affectedFrameCount > 1 else {
+                return
+            }
+
+            selectedDuration = selectionToApply.duration(in: currentTimeline.duration)
+            editUndoStack.append(.timeline(trackID: trackID, timeline: currentTimeline))
+            editedAudioTimeline = timeline
+            editedFileTimeline = nil
+        } else {
+            let currentFileTimeline: AudioFileEditTimeline
+            do {
+                currentFileTimeline = try editableFileTimeline(forTrackAt: trackIndex)
+            } catch {
+                updateStatus("\(fadeEffect.displayName) failed: \(error.localizedDescription)")
+                return
+            }
+
+            var timeline = currentFileTimeline
+            let affectedFrameCount = timeline.applyFade(timelineFadeDirection, to: selectionToApply)
+            guard affectedFrameCount > 1 else {
+                return
+            }
+
+            selectedDuration = selectionToApply.duration(in: currentFileTimeline.duration)
+            let snapshot = ProjectTrackUndoSnapshot(
+                tracks: projectTracks,
+                activeTrackID: activeTrackID,
+                selectedTrackID: selectedTrackID,
+                selectedTimelineRange: selectedTimelineRange,
+                restoreProgress: nil
+            )
+            editUndoStack.append(.projectTracks(snapshot))
+            editedAudioTimeline = nil
+            editedFileTimeline = timeline
+        }
+
         projectTracks[trackIndex].editRevision += 1
-        let editRevision = projectTracks[trackIndex].editRevision
-        projectTracks[trackIndex].audioTimeline = editedTimeline
+        editRevision = projectTracks[trackIndex].editRevision
+        projectTracks[trackIndex].audioTimeline = editedAudioTimeline
+        projectTracks[trackIndex].fileTimeline = editedFileTimeline
         projectTracks[trackIndex].decodedAudioBuffer = nil
-        projectTracks[trackIndex].zeroCrossingIndex = nil
+        if editedAudioTimeline != nil {
+            projectTracks[trackIndex].zeroCrossingIndex = nil
+        }
         projectTracks[trackIndex].waveformOverview = optimisticWaveformOverview(
             projectTracks[trackIndex].waveformOverview,
             applyingFade: timelineFadeDirection,
@@ -3037,13 +3194,15 @@ final class WorkspaceView: NSView {
         let status = "\(fadeEffect.displayName) \(formatDuration(selectedDuration))"
         updateStatus(status)
 
-        materializeEditedTimeline(
-            trackID: trackID,
-            timeline: editedTimeline,
-            editRevision: editRevision,
-            status: status,
-            preservePlaybackProgress: true
-        )
+        if let editedAudioTimeline {
+            materializeEditedTimeline(
+                trackID: trackID,
+                timeline: editedAudioTimeline,
+                editRevision: editRevision,
+                status: status,
+                preservePlaybackProgress: true
+            )
+        }
     }
 
     private func undoLastEdit() {
@@ -3857,13 +4016,18 @@ final class WorkspaceView: NSView {
     private var canApplyGainEffect: Bool {
         guard
             let trackIndex = activeProjectTrackIndex(),
-            projectTracks[trackIndex].audioTimeline != nil,
+            projectTracks.indices.contains(trackIndex),
             let selectedTimelineRange
         else {
             return false
         }
 
-        return selectedTimelineRange.durationProgress > 0
+        let track = projectTracks[trackIndex]
+        let hasEditableTimeline =
+            track.audioTimeline != nil ||
+            track.fileTimeline != nil ||
+            WAVAudioDecoder.canDecode(track.sourceURL)
+        return hasEditableTimeline && selectedTimelineRange.durationProgress > 0
     }
 
     private func updateEffectCommandState() {
