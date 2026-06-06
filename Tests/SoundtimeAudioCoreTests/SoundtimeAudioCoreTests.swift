@@ -1223,6 +1223,176 @@ final class SoundtimeAudioCoreTests: XCTestCase {
         XCTAssertGreaterThan(snapshot.frameCount, 3_000)
     }
 
+    func testManySegmentedTrackUpdatesCanOverlapRenderBlocks() throws {
+        let engine = try XCTUnwrap(soundtime_audio_core_create())
+        defer {
+            soundtime_audio_core_destroy(engine)
+        }
+
+        let trackCount = 64
+        var left = (0..<8_192).map { frame in
+            Float(((frame * 17) % 251) - 125) / 251
+        }
+        var right = (0..<8_192).map { frame in
+            Float(((frame * 29) % 257) - 128) / 257
+        }
+        let source = left.withUnsafeMutableBufferPointer { leftSamples in
+            right.withUnsafeMutableBufferPointer { rightSamples in
+                var channels = [
+                    UnsafePointer(leftSamples.baseAddress),
+                    UnsafePointer(rightSamples.baseAddress),
+                ]
+                return channels.withUnsafeMutableBufferPointer { channelPointers in
+                    soundtime_audio_core_source_create_planar(
+                        channelPointers.baseAddress,
+                        UInt64(leftSamples.count),
+                        2,
+                        48_000
+                    )
+                }
+            }
+        }
+        let sourcePointer = try XCTUnwrap(source)
+        defer {
+            soundtime_audio_core_source_destroy(sourcePointer)
+        }
+
+        func makeSegments(trackIndex: Int, iteration: Int) -> [SoundtimeAudioCoreSegmentConfig] {
+            let offset = UInt64((trackIndex * 31 + iteration * 17) % 384)
+            let deleteSkip = UInt64(96 + (trackIndex + iteration) % 96)
+            let fadeGain = Float((trackIndex + iteration) % 11 + 1) / 12
+            return [
+                SoundtimeAudioCoreSegmentConfig(
+                    outputStartFrame: 0,
+                    sourceStartFrame: offset,
+                    frameCount: 768,
+                    sourceFrameScale: 1,
+                    gainStart: 1,
+                    gainEnd: fadeGain
+                ),
+                SoundtimeAudioCoreSegmentConfig(
+                    outputStartFrame: 768,
+                    sourceStartFrame: offset + 768 + deleteSkip,
+                    frameCount: 768,
+                    sourceFrameScale: 1,
+                    gainStart: fadeGain,
+                    gainEnd: 1
+                ),
+                SoundtimeAudioCoreSegmentConfig(
+                    outputStartFrame: 1_536,
+                    sourceStartFrame: offset + 1_632 + deleteSkip,
+                    frameCount: 768,
+                    sourceFrameScale: 1,
+                    gainStart: 1,
+                    gainEnd: 1
+                ),
+            ]
+        }
+
+        func publish(iteration: Int, resetTransport: Bool) -> Bool {
+            var allSegments: [SoundtimeAudioCoreSegmentConfig] = []
+            var segmentCounts: [Int] = []
+            allSegments.reserveCapacity(trackCount * 3)
+            segmentCounts.reserveCapacity(trackCount)
+
+            for trackIndex in 0..<trackCount {
+                let segments = makeSegments(trackIndex: trackIndex, iteration: iteration)
+                segmentCounts.append(segments.count)
+                allSegments.append(contentsOf: segments)
+            }
+
+            return allSegments.withUnsafeMutableBufferPointer { segmentBuffer in
+                guard let segmentBaseAddress = segmentBuffer.baseAddress else {
+                    return false
+                }
+
+                var segmentOffset = 0
+                var tracks: [SoundtimeAudioCoreSegmentedTrackConfig] = []
+                tracks.reserveCapacity(trackCount)
+                for trackIndex in 0..<trackCount {
+                    let segmentCount = segmentCounts[trackIndex]
+                    tracks.append(SoundtimeAudioCoreSegmentedTrackConfig(
+                        source: sourcePointer,
+                        segments: segmentBaseAddress.advanced(by: segmentOffset),
+                        segmentCount: UInt32(segmentCount),
+                        gain: Float((trackIndex + iteration) % 19 + 1) / 19
+                    ))
+                    segmentOffset += segmentCount
+                }
+
+                return tracks.withUnsafeMutableBufferPointer { trackBuffer in
+                    if resetTransport {
+                        return soundtime_audio_core_set_prepared_segmented_tracks(
+                            engine,
+                            trackBuffer.baseAddress,
+                            UInt32(trackBuffer.count)
+                        )
+                    }
+
+                    return soundtime_audio_core_update_prepared_segmented_tracks(
+                        engine,
+                        trackBuffer.baseAddress,
+                        UInt32(trackBuffer.count)
+                    )
+                }
+            }
+        }
+
+        XCTAssertTrue(publish(iteration: 0, resetTransport: true))
+        soundtime_audio_core_set_transport_ramp_duration(engine, 0)
+        soundtime_audio_core_play(engine)
+
+        let renderQueue = DispatchQueue(label: "SoundtimeAudioCoreTests.manySegmentedTracksRenderStress")
+        let renderGroup = DispatchGroup()
+        let start = DispatchSemaphore(value: 0)
+        let engineBox = AudioCoreEngineBox(engine)
+
+        renderGroup.enter()
+        renderQueue.async {
+            start.wait()
+
+            var leftOutput = [Float](repeating: 0, count: 128)
+            var rightOutput = [Float](repeating: 0, count: 128)
+            for iteration in 0..<900 {
+                leftOutput.withUnsafeMutableBufferPointer { leftSamples in
+                    rightOutput.withUnsafeMutableBufferPointer { rightSamples in
+                        var outputs = [
+                            leftSamples.baseAddress,
+                            rightSamples.baseAddress,
+                        ]
+                        outputs.withUnsafeMutableBufferPointer { outputPointers in
+                            soundtime_audio_core_render_at_host_time(
+                                engineBox.engine,
+                                outputPointers.baseAddress,
+                                2,
+                                UInt32(leftSamples.count),
+                                Double(iteration) / 48_000
+                            )
+                        }
+                    }
+                }
+
+                if iteration.isMultiple(of: 137) {
+                    soundtime_audio_core_seek(engineBox.engine, UInt64((iteration * 23) % 1_900))
+                    soundtime_audio_core_play(engineBox.engine)
+                }
+            }
+
+            renderGroup.leave()
+        }
+
+        start.signal()
+        for iteration in 1...900 {
+            XCTAssertTrue(publish(iteration: iteration, resetTransport: false))
+        }
+
+        XCTAssertEqual(renderGroup.wait(timeout: .now() + 5), .success)
+
+        let snapshot = soundtime_audio_core_snapshot(engine)
+        XCTAssertEqual(snapshot.sampleRate, 48_000)
+        XCTAssertGreaterThan(snapshot.frameCount, 2_000)
+    }
+
     func testPauseAtFramePinsTransportAfterRamp() throws {
         let engine = try XCTUnwrap(soundtime_audio_core_create())
         defer {
