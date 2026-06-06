@@ -589,6 +589,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var playheadKickStartTime = CFAbsoluteTimeGetCurrent()
     private var lastPlayheadKickEnergyUpdateTime = CFAbsoluteTimeGetCurrent()
     private var playheadContactEvents: [PlayheadContactEvent] = []
+    private var lastPlayheadContactEventTimestamp: CFTimeInterval?
     private var transientParticles: [TransientParticle] = []
     private var previousTransientScanProgress: Float?
     private var lastTransientParticleBins: [UUID: Int] = [:]
@@ -651,7 +652,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var waveformFisheyeRampTargetEnergy: Float = 0
     private var waveformFisheyeRampStartTime = CACurrentMediaTime()
     private var trackFisheyeStates: [UUID: TrackFisheyeState] = [:]
-    private let playheadContactMaximumEventCount = 1_024
+    private let playheadContactMaximumEventCount = 384
+    private let playheadContactEventsPerTrackBudget = 8
+    private let playheadContactMinimumSpawnInterval: CFTimeInterval = 1.0 / 90.0
     private let transientParticleMaximumCount = 260
     private let transientParticleScorePercentile: Float = 0.997
     private let transientParticleProfileSampleLimit = 2_048
@@ -818,6 +821,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             waveformGeometryStore.clearCurrent()
         }
         playheadContactEvents.removeAll()
+        lastPlayheadContactEventTimestamp = nil
         transientParticles.removeAll()
         previousTransientScanProgress = nil
         lastTransientParticleBins.removeAll()
@@ -935,6 +939,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             playheadTouchPauseTimestamp = nil
         }
         if force, renderState.isPlaybackActive {
+            lastPlayheadContactEventTimestamp = nil
             resetTransientParticleScan(to: anchoredProgress)
         }
         previousRenderedPlayheadX = nil
@@ -962,6 +967,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 playheadTouchPauseProgress = nil
                 playheadTouchPauseTimestamp = nil
                 playheadContactEvents.removeAll()
+                lastPlayheadContactEventTimestamp = nil
                 resetTransientParticleScan(to: anchoredProgress)
             } else if wasPlaybackActive {
                 playheadTouchPauseProgress = anchoredProgress
@@ -4426,6 +4432,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         playheadContactEvents.removeAll { event in
             displayTimestamp - event.timestamp >= playheadContactFadeDuration
         }
+        trimPlayheadContactEvents(to: playheadContactEventBudget(trackCount: renderState.tracks.count))
 
         guard
             renderState.isPlaybackActive,
@@ -4438,6 +4445,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return
         }
 
+        if let lastPlayheadContactEventTimestamp,
+           displayTimestamp - lastPlayheadContactEventTimestamp < playheadContactMinimumSpawnInterval
+        {
+            return
+        }
+        lastPlayheadContactEventTimestamp = displayTimestamp
+
         playheadContactEvents.append(contentsOf: contacts.map { contact in
             PlayheadContactEvent(
                 centerY: contact.centerY,
@@ -4448,9 +4462,22 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             )
         })
 
-        if playheadContactEvents.count > playheadContactMaximumEventCount {
-            playheadContactEvents.removeFirst(playheadContactEvents.count - playheadContactMaximumEventCount)
+        trimPlayheadContactEvents(to: playheadContactEventBudget(trackCount: renderState.tracks.count))
+    }
+
+    private func playheadContactEventBudget(trackCount: Int) -> Int {
+        min(
+            playheadContactMaximumEventCount,
+            max(48, max(trackCount, 1) * playheadContactEventsPerTrackBudget)
+        )
+    }
+
+    private func trimPlayheadContactEvents(to budget: Int) {
+        guard playheadContactEvents.count > budget else {
+            return
         }
+
+        playheadContactEvents.removeFirst(playheadContactEvents.count - budget)
     }
 
     private func playheadWaveformContacts(
