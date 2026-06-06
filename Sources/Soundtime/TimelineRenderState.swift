@@ -54,6 +54,7 @@ struct TimelineRenderState: Sendable {
     )
 
     let tracks: [Track]
+    let duration: TimeInterval?
     let viewport: TimelineViewport
     let trackLayout: TimelineTrackLayout
     let playheadProgress: Float
@@ -80,9 +81,11 @@ struct TimelineRenderState: Sendable {
         selection: TimelineSelection?,
         selectedTrackID: UUID?,
         trimPreview: TimelineTrimRange?,
-        gainPreview: GainPreview?
+        gainPreview: GainPreview?,
+        duration: TimeInterval? = nil
     ) {
         self.tracks = tracks
+        self.duration = duration ?? Self.projectDuration(for: tracks)
         self.viewport = viewport
         self.trackLayout = trackLayout
         self.playheadProgress = playheadProgress
@@ -105,7 +108,7 @@ struct TimelineRenderState: Sendable {
         tracks.contains { $0.hasWaveform }
     }
 
-    var duration: TimeInterval? {
+    private static func projectDuration(for tracks: [Track]) -> TimeInterval? {
         let duration = tracks.reduce(TimeInterval(0)) { result, track in
             max(result, track.durationHint ?? track.waveformOverview?.duration ?? 0)
         }
@@ -177,7 +180,8 @@ struct TimelineRenderState: Sendable {
             selection: selection,
             selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
-            gainPreview: gainPreview
+            gainPreview: gainPreview,
+            duration: duration
         )
     }
 
@@ -195,7 +199,8 @@ struct TimelineRenderState: Sendable {
             selection: selection,
             selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
-            gainPreview: gainPreview
+            gainPreview: gainPreview,
+            duration: duration
         )
     }
 
@@ -216,7 +221,8 @@ struct TimelineRenderState: Sendable {
             selection: selection,
             selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
-            gainPreview: gainPreview
+            gainPreview: gainPreview,
+            duration: duration
         )
     }
 
@@ -234,7 +240,8 @@ struct TimelineRenderState: Sendable {
             selection: selection,
             selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
-            gainPreview: gainPreview
+            gainPreview: gainPreview,
+            duration: duration
         )
     }
 
@@ -252,7 +259,8 @@ struct TimelineRenderState: Sendable {
             selection: selection,
             selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
-            gainPreview: gainPreview
+            gainPreview: gainPreview,
+            duration: duration
         )
     }
 
@@ -271,7 +279,8 @@ struct TimelineRenderState: Sendable {
             selection: selection,
             selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
-            gainPreview: gainPreview
+            gainPreview: gainPreview,
+            duration: duration
         )
     }
 
@@ -289,7 +298,8 @@ struct TimelineRenderState: Sendable {
             selection: selection,
             selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
-            gainPreview: gainPreview
+            gainPreview: gainPreview,
+            duration: duration
         )
     }
 
@@ -307,7 +317,8 @@ struct TimelineRenderState: Sendable {
             selection: selection,
             selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
-            gainPreview: gainPreview
+            gainPreview: gainPreview,
+            duration: duration
         )
     }
 
@@ -325,7 +336,8 @@ struct TimelineRenderState: Sendable {
             selection: selection,
             selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
-            gainPreview: gainPreview
+            gainPreview: gainPreview,
+            duration: duration
         )
     }
 
@@ -343,7 +355,8 @@ struct TimelineRenderState: Sendable {
             selection: selection,
             selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
-            gainPreview: gainPreview
+            gainPreview: gainPreview,
+            duration: duration
         )
     }
 }
