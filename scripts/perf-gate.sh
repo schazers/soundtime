@@ -14,5 +14,8 @@ swift test
 echo "== Soundtime recording smoke =="
 swift run Soundtime --recording-smoke
 
+echo "== Soundtime project edit round-trip smoke =="
+swift run Soundtime --project-edit-roundtrip-smoke
+
 echo "== Soundtime timeline perf baseline =="
 swift run Soundtime --timeline-perf-baseline "${mode_args[@]}"

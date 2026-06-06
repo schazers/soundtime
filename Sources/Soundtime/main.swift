@@ -21,6 +21,16 @@ if CommandLine.arguments.contains("--recording-smoke") {
     }
 }
 
+if CommandLine.arguments.contains("--project-edit-roundtrip-smoke") {
+    do {
+        try ProjectEditRoundTripSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        exit(0)
+    } catch {
+        fputs("Soundtime project edit round-trip smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
 let app = NSApplication.shared
 let delegate = AppDelegate()
 
