@@ -36,6 +36,7 @@ final class WorkspaceView: NSView {
 
     private enum LastEffect {
         case gain(decibels: Double)
+        case normalize
         case fade(FadeEffect)
     }
 
@@ -416,6 +417,9 @@ final class WorkspaceView: NSView {
         }
         timelineSurface.onGainRequested = { [weak self] in
             self?.showGainEffect()
+        }
+        timelineSurface.onNormalizeRequested = { [weak self] in
+            self?.applyNormalizeEffect()
         }
         timelineSurface.onFadeInRequested = { [weak self] in
             self?.applyFadeEffect(.fadeIn)
@@ -2777,6 +2781,39 @@ final class WorkspaceView: NSView {
         return clampedProgress * clampedProgress * (3 - 2 * clampedProgress)
     }
 
+    private func selectedPeakMagnitude(for target: EditableSelectionTarget) -> Float? {
+        guard
+            projectTracks.indices.contains(target.trackIndex),
+            let overview = projectTracks[target.trackIndex].waveformOverview
+        else {
+            return nil
+        }
+
+        let sourceOverview = overviewForOptimisticEdit(overview)
+        let binCount = sourceOverview.bins.count
+        guard binCount > 0 else {
+            return nil
+        }
+
+        let startIndex = min(
+            max(Int((target.editSelection.startProgress * Double(binCount)).rounded(.down)), 0),
+            binCount
+        )
+        let endIndex = min(
+            max(Int((target.editSelection.endProgress * Double(binCount)).rounded(.up)), startIndex),
+            binCount
+        )
+        guard startIndex < endIndex else {
+            return nil
+        }
+
+        var peak: Float = 0
+        for index in startIndex..<endIndex {
+            peak = max(peak, sourceOverview.bins[index].peakMagnitude)
+        }
+        return peak
+    }
+
     private func overviewForOptimisticEdit(_ overview: WaveformOverview) -> WaveformOverview {
         guard overview.bins.count > optimisticEditPreviewBinLimit else {
             return overview
@@ -3529,9 +3566,35 @@ final class WorkspaceView: NSView {
         case let .gain(decibels):
             let gain = GainEffectOverlayView.linearGain(forDecibels: decibels)
             applyGainEffect(decibels: decibels, gain: gain)
+        case .normalize:
+            applyNormalizeEffect()
         case let .fade(fadeEffect):
             applyFadeEffect(fadeEffect)
         }
+    }
+
+    private func applyNormalizeEffect() {
+        guard
+            let target = currentEditableSelectionTarget(),
+            let selectedPeak = selectedPeakMagnitude(for: target)
+        else {
+            updateStatus("normalize failed: waveform peak unavailable")
+            return
+        }
+
+        guard selectedPeak > 0.000_001 else {
+            updateStatus("normalize skipped: selected audio is silent")
+            return
+        }
+
+        let gain = min(max(1 / selectedPeak, 0), 64)
+        let decibels = 20 * log10(Double(gain))
+        applyGainEffect(
+            decibels: decibels,
+            gain: gain,
+            status: String(format: "normalized %+.1f dB", decibels),
+            lastEffect: .normalize
+        )
     }
 
     private func previewSelectedGain(_ gain: Float) {
@@ -3553,7 +3616,12 @@ final class WorkspaceView: NSView {
         applyGainEffect(decibels: decibels, gain: gain)
     }
 
-    private func applyGainEffect(decibels: Double, gain: Float) {
+    private func applyGainEffect(
+        decibels: Double,
+        gain: Float,
+        status: String? = nil,
+        lastEffect: LastEffect? = nil
+    ) {
         guard
             let target = currentEditableSelectionTarget()
         else {
@@ -3640,7 +3708,8 @@ final class WorkspaceView: NSView {
                 to: selectionToApply
             )
         }
-        lastEffect = .gain(decibels: decibels)
+        let status = status ?? String(format: "gain %+.1f dB", decibels)
+        self.lastEffect = lastEffect ?? .gain(decibels: decibels)
         selectedTimelineRange = nil
         timelineSurface.displaySelection(nil)
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
@@ -3649,14 +3718,14 @@ final class WorkspaceView: NSView {
         updateProjectDisplayTiming()
         reloadPlaybackFromProjectTracks(preserveProgress: true)
         updateEffectCommandState()
-        updateStatus(String(format: "gain %+.1f dB", decibels))
+        updateStatus(status)
 
         if let editedAudioTimeline {
             materializeEditedTimeline(
                 trackID: trackID,
                 timeline: editedAudioTimeline,
                 editRevision: editRevision,
-                status: String(format: "gain %+.1f dB", decibels),
+                status: status,
                 preservePlaybackProgress: true,
                 startDelay: editMaterializationDelay
             )

@@ -44,6 +44,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onGainRequested: (() -> Void)?
     var onFadeInRequested: (() -> Void)?
     var onFadeOutRequested: (() -> Void)?
+    var onNormalizeRequested: (() -> Void)?
     var onReapplyLastEffect: (() -> Void)?
     var onSeekRequested: ((Float) -> Void)?
     var onPlayFromProgress: ((Float) -> Void)?
@@ -839,6 +840,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onFadeOutRequested?()
     }
 
+    @objc func normalizeTimelineSelection(_ sender: Any?) {
+        onNormalizeRequested?()
+    }
+
     @objc func reapplyLastEffect(_ sender: Any?) {
         onReapplyLastEffect?()
     }
@@ -849,6 +854,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return canApplyGainEffect
         case #selector(applyFadeInEffect(_:)), #selector(applyFadeOutEffect(_:)):
             return canApplyFadeEffect
+        case #selector(normalizeTimelineSelection(_:)):
+            return canApplyGainEffect
         case #selector(reapplyLastEffect(_:)):
             return canReapplyLastEffect
         case #selector(toggleDebugTools(_:)):
