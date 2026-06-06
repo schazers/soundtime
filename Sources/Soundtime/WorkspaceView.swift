@@ -249,6 +249,7 @@ final class WorkspaceView: NSView {
         return stackView
     }()
     private let timelineSurface = TimelineView()
+    private let addTrackButton = AddTrackButton()
     private let exportProgressOverlay = ExportProgressOverlayView()
     private let gainEffectOverlay = GainEffectOverlayView()
     private var metadataToDebugConstraint: NSLayoutConstraint?
@@ -273,6 +274,7 @@ final class WorkspaceView: NSView {
 
         timelineSurface.translatesAutoresizingMaskIntoConstraints = false
         frameRateHistoryView.translatesAutoresizingMaskIntoConstraints = false
+        addTrackButton.translatesAutoresizingMaskIntoConstraints = false
         timelineSurface.onAudioFileDropped = { [weak self] url in
             self?.loadDroppedAudioFile(at: url)
         }
@@ -345,6 +347,9 @@ final class WorkspaceView: NSView {
         timelineSurface.onTimelineInteractionBegan = { [weak self] in
             self?.clearSelectedTrack()
         }
+        addTrackButton.onPressed = { [weak self] in
+            self?.addEmptyTrack()
+        }
         volumeControl.onVolumeChanged = { [weak self] volume in
             self?.playbackController.setPerceptualVolume(volume)
         }
@@ -371,6 +376,7 @@ final class WorkspaceView: NSView {
         addSubview(loudnessMeter)
         addSubview(fisheyeControlsStack)
         addSubview(trackControlsStack)
+        addSubview(addTrackButton)
         addSubview(timelineSurface)
         addSubview(exportProgressOverlay)
         addSubview(gainEffectOverlay)
@@ -438,8 +444,13 @@ final class WorkspaceView: NSView {
 
             trackControlsBelowDebugConstraint,
             trackControlsStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 22),
-            trackControlsStack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -22),
+            trackControlsStack.bottomAnchor.constraint(equalTo: addTrackButton.topAnchor, constant: -10),
             trackControlsStack.widthAnchor.constraint(equalToConstant: 118),
+
+            addTrackButton.leadingAnchor.constraint(equalTo: trackControlsStack.leadingAnchor),
+            addTrackButton.trailingAnchor.constraint(equalTo: trackControlsStack.trailingAnchor),
+            addTrackButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -22),
+            addTrackButton.heightAnchor.constraint(equalToConstant: 36),
 
             timelineSurface.topAnchor.constraint(equalTo: trackControlsStack.topAnchor),
             timelineSurface.leadingAnchor.constraint(equalTo: trackControlsStack.trailingAnchor, constant: 10),
@@ -684,6 +695,45 @@ final class WorkspaceView: NSView {
             }
             trackControlsStack.addArrangedSubview(controlView)
         }
+    }
+
+    private func addEmptyTrack() {
+        let snapshot = ProjectTrackUndoSnapshot(
+            tracks: projectTracks,
+            activeTrackID: activeTrackID,
+            selectedTrackID: selectedTrackID,
+            selectedTimelineRange: selectedTimelineRange
+        )
+        editUndoStack.append(.projectTracks(snapshot))
+
+        let trackID = UUID()
+        let trackName = "Track \(projectTracks.count + 1)"
+        let track = ProjectTrack(
+            id: trackID,
+            name: trackName,
+            sourceURL: URL(fileURLWithPath: "/dev/null"),
+            durationHint: nil,
+            waveformOverview: nil,
+            decodedAudioBuffer: nil,
+            zeroCrossingIndex: nil,
+            zeroCrossingProbe: nil,
+            audioTimeline: nil,
+            volume: 1,
+            isMuted: false,
+            isSoloed: false,
+            importID: UUID(),
+            editRevision: 0
+        )
+
+        projectTracks.append(track)
+        activeTrackID = trackID
+        selectedTimelineRange = nil
+        refreshProjectTimelineDisplay()
+        selectTrack(trackID)
+        updateProjectDisplayTiming()
+        updateEffectCommandState()
+        window?.title = projectWindowTitle()
+        updateStatus("\(trackName) added")
     }
 
     private func selectTrack(_ trackID: UUID) {
@@ -2507,8 +2557,12 @@ final class WorkspaceView: NSView {
 
     private func currentProject() -> SoundtimeProject {
         SoundtimeProject(
-            tracks: projectTracks.map { track in
-                SoundtimeProject.Track(
+            tracks: projectTracks.compactMap { track in
+                guard WAVAudioDecoder.canDecode(track.sourceURL) else {
+                    return nil
+                }
+
+                return SoundtimeProject.Track(
                     id: track.id,
                     name: track.name,
                     filePath: track.sourceURL.path,
