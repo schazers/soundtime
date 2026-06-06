@@ -17,5 +17,8 @@ swift run Soundtime --recording-smoke
 echo "== Soundtime project edit round-trip smoke =="
 swift run Soundtime --project-edit-roundtrip-smoke
 
+echo "== Soundtime edit graph smoke =="
+swift run Soundtime --edit-graph-smoke
+
 echo "== Soundtime timeline perf baseline =="
 swift run Soundtime --timeline-perf-baseline "${mode_args[@]}"

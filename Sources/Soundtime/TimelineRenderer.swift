@@ -2445,26 +2445,35 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         renderState: TimelineRenderState,
         drawableSize: CGSize
     ) {
-        let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
-        let visibleRange = trackLayout.visibleRange(overscan: 1)
-        let visibleTracks = visibleRange.compactMap { trackIndex -> TimelineRenderState.Track? in
-            guard tracks.indices.contains(trackIndex) else {
-                return nil
-            }
+        let tracksToPrewarm: ArraySlice<TimelineRenderState.Track>
+        let binLimit: Int
+        if tracks.count <= maximumViewportPrewarmTrackCount {
+            let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
+            let visibleRange = trackLayout.visibleRange(overscan: 1)
+            let visibleTracks = visibleRange.compactMap { trackIndex -> TimelineRenderState.Track? in
+                guard tracks.indices.contains(trackIndex) else {
+                    return nil
+                }
 
-            return tracks[trackIndex]
+                return tracks[trackIndex]
+            }
+            tracksToPrewarm = visibleTracks.prefix(maximumViewportPrewarmTrackCount)
+            binLimit = viewportAwarePrewarmBinLimit(
+                renderState: renderState,
+                drawableSize: drawableSize
+            )
+        } else {
+            tracksToPrewarm = tracks[...]
+            binLimit = maximumBackgroundPrewarmedWaveformShaderBins
         }
-        let viewportAwareBinLimit = viewportAwarePrewarmBinLimit(
-            renderState: renderState,
-            drawableSize: drawableSize
-        )
-        let jobs = visibleTracks.prefix(maximumViewportPrewarmTrackCount).compactMap { track -> (TimelineRenderState.Track, WaveformMipLevel)? in
+
+        let jobs = tracksToPrewarm.compactMap { track -> (TimelineRenderState.Track, WaveformMipLevel)? in
             guard let mipLevels = trackWaveformMipLevels[track.id] else {
                 return nil
             }
 
             guard let interactiveMipLevel = mipLevels.first(where: {
-                $0.binCount <= viewportAwareBinLimit
+                $0.binCount <= binLimit
             }) else {
                 return nil
             }
