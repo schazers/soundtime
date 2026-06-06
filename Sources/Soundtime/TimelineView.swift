@@ -75,7 +75,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     )
     private var viewport = TimelineViewport.full
     private var isSelectionEnabled = false
-    private var selectionAnchorProgress: Float?
+    private var selectionAnchorProgress: Double?
     private var selectionAnchorPoint: CGPoint?
     private var selectionAnchorTrackID: UUID?
     private var activeDragMode: TimelineDragMode?
@@ -88,6 +88,12 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var rightPanVelocityProgressPerSecond: Float = 0
     private var rightPanMomentumTimer: Timer?
     private var rightPanMomentumLastTime: TimeInterval?
+    private var zoomMomentumAnchorProgress: Float?
+    private var zoomPreviousTime: TimeInterval?
+    private var zoomLastInputTime: TimeInterval?
+    private var zoomVelocityLogScalePerSecond: Float = 0
+    private var zoomMomentumTimer: Timer?
+    private var zoomMomentumLastTime: TimeInterval?
     private var scrollGestureMode: ScrollGestureMode?
     private var timelineDisplayLink: TimelineDisplayLink?
     private var transientRenderEndTime: CFTimeInterval?
@@ -107,6 +113,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private let rightPanStationaryDecayRate: Double = 18
     private let rightPanMomentumReleaseWindow: TimeInterval = 0.12
     private let rightPanMovementThreshold: CGFloat = 0.25
+    private let zoomVelocitySmoothing: Float = 0.38
+    private let zoomMomentumDecayRate: Double = 8.4
+    private let zoomMomentumMinimumVelocity: Float = 0.02
+    private let zoomMomentumMaximumVelocity: Float = 4.5
+    private let zoomMomentumMaximumStepLogScale: Float = 0.08
     private let transientRenderPulseDuration: CFTimeInterval = 0.18
     private let playbackStopTouchTrailRenderPulseDuration: CFTimeInterval = 1.25
     private let waveformTransitionRenderPulseDuration: CFTimeInterval = 0.24
@@ -184,6 +195,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             rightPanPreviousTime = nil
             rightPanLastMovementTime = nil
             stopRightPanMomentum()
+            stopZoomMomentum()
             displaySelection(nil)
             displayHoverProgress(nil)
             onSelectionChanged?(nil)
@@ -221,6 +233,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             rightPanPreviousTime = nil
             rightPanLastMovementTime = nil
             stopRightPanMomentum()
+            stopZoomMomentum()
             displaySelection(nil)
             displayHoverProgress(nil)
             onSelectionChanged?(nil)
@@ -606,6 +619,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return false
         }
 
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+        window?.makeFirstResponder(self)
         onAudioFileDropped?(url)
         return true
     }
@@ -797,16 +813,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
-        stopRightPanMomentum()
         let hasGesturePhase = !event.phase.isEmpty || !event.momentumPhase.isEmpty
+        let isGestureEnding =
+            event.phase.contains(.ended) ||
+            event.phase.contains(.cancelled) ||
+            event.momentumPhase.contains(.ended) ||
+            event.momentumPhase.contains(.cancelled)
         defer {
-            if
-                event.phase.contains(.ended) ||
-                event.phase.contains(.cancelled) ||
-                event.momentumPhase.contains(.ended) ||
-                event.momentumPhase.contains(.cancelled) ||
-                !hasGesturePhase
-            {
+            if isGestureEnding || !hasGesturePhase {
                 scrollGestureMode = nil
             }
         }
@@ -814,6 +828,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         let horizontalDelta = event.scrollingDeltaX
         let verticalDelta = event.scrollingDeltaY
         guard horizontalDelta != 0 || verticalDelta != 0 else {
+            if isGestureEnding, scrollGestureMode == .zoom, event.momentumPhase.isEmpty {
+                startZoomMomentumIfNeeded()
+            }
             return
         }
         let proposedGestureMode: ScrollGestureMode =
@@ -824,15 +841,25 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         scrollGestureMode = gestureMode
 
         if gestureMode == .zoom {
+            stopRightPanMomentum()
             guard verticalDelta != 0 else {
                 return
             }
             let anchorProgress = progress(for: convert(event.locationInWindow, from: nil))
-            let zoomFactor = exp(Float(verticalDelta) * scrollZoomSensitivity)
-            setViewport(viewport.zoomed(by: zoomFactor, around: anchorProgress))
+            let logScaleDelta = Float(verticalDelta) * scrollZoomSensitivity
+            applyZoomMomentumInput(
+                logScaleDelta: logScaleDelta,
+                anchorProgress: anchorProgress,
+                timestamp: event.timestamp,
+                recordsVelocity: event.momentumPhase.isEmpty
+            )
+            if !hasGesturePhase {
+                startZoomMomentumIfNeeded()
+            }
             return
         }
 
+        stopZoomMomentum()
         guard horizontalDelta != 0, bounds.width > 0 else {
             return
         }
@@ -849,12 +876,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         stopRightPanMomentum()
         let hasGesturePhase = !event.phase.isEmpty || !event.momentumPhase.isEmpty
+        let isGestureEnding =
+            event.phase.contains(.ended) ||
+            event.phase.contains(.cancelled) ||
+            event.momentumPhase.contains(.ended) ||
+            event.momentumPhase.contains(.cancelled)
         defer {
-            if
-                event.phase.contains(.ended) ||
-                event.phase.contains(.cancelled) ||
-                !hasGesturePhase
-            {
+            if isGestureEnding || !hasGesturePhase {
                 scrollGestureMode = nil
             }
         }
@@ -868,7 +896,18 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         let anchorProgress = progress(for: convert(event.locationInWindow, from: nil))
         let zoomFactor = max(1 + Float(event.magnification), 0.1)
-        setViewport(viewport.zoomed(by: zoomFactor, around: anchorProgress))
+        let logScaleDelta = log(zoomFactor)
+        if logScaleDelta != 0 {
+            applyZoomMomentumInput(
+                logScaleDelta: logScaleDelta,
+                anchorProgress: anchorProgress,
+                timestamp: event.timestamp,
+                recordsVelocity: event.momentumPhase.isEmpty
+            )
+        }
+        if isGestureEnding {
+            startZoomMomentumIfNeeded()
+        }
     }
 
     override func smartMagnify(with event: NSEvent) {
@@ -878,6 +917,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         stopRightPanMomentum()
+        stopZoomMomentum()
 
         let anchorProgress = progress(for: convert(event.locationInWindow, from: nil))
         if viewport.isFull {
@@ -895,6 +935,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         window?.makeFirstResponder(self)
         stopRightPanMomentum()
+        stopZoomMomentum()
         onTimelineInteractionBegan?()
         let point = currentDragPoint(for: event)
         let progress = progress(for: point)
@@ -915,7 +956,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         if let trimDragMode = trimDragMode(for: point) {
             displayHoverProgress(nil)
             activeDragMode = trimDragMode
-            selectionAnchorProgress = progress
+            selectionAnchorProgress = Double(progress)
             selectionAnchorPoint = point
             selectionAnchorTrackID = nil
             isDraggingSelection = false
@@ -926,7 +967,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         activeDragMode = .selection
-        selectionAnchorProgress = progress
+        selectionAnchorProgress = preciseProgress(for: point)
         selectionAnchorPoint = point
         selectionAnchorTrackID = trackID(at: point)
         isDraggingSelection = false
@@ -962,7 +1003,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         if isDraggingSelection {
-            updateSelection(from: selectionAnchorProgress, to: progress(for: point), notifyChange: false)
+                updateSelection(from: selectionAnchorProgress, to: preciseProgress(for: point), notifyChange: false)
         } else {
             displayHoverProgress(progress(for: point), isArmed: true)
         }
@@ -977,7 +1018,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
-        let progress = progress(for: currentDragPoint(for: event))
+        let point = currentDragPoint(for: event)
+        let progress = progress(for: point)
         if
             (activeDragMode == .trimStart || activeDragMode == .trimEnd),
             let activeDragMode
@@ -989,7 +1031,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                 onTrimRequested?(trimRange)
             }
         } else if isDraggingSelection {
-            updateSelection(from: selectionAnchorProgress, to: progress, notifyChange: true)
+            updateSelection(from: selectionAnchorProgress, to: preciseProgress(for: point), notifyChange: true)
         } else {
             displaySelection(nil)
             onSelectionChanged?(nil)
@@ -1013,6 +1055,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         window?.makeFirstResponder(self)
         stopRightPanMomentum()
+        stopZoomMomentum()
         onTimelineInteractionBegan?()
         rightPanPreviousPoint = currentDragPoint(for: event)
         rightPanPreviousTime = event.timestamp
@@ -1150,6 +1193,110 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
     }
 
+    private func applyZoomMomentumInput(
+        logScaleDelta: Float,
+        anchorProgress: Float,
+        timestamp: TimeInterval,
+        recordsVelocity: Bool
+    ) {
+        guard logScaleDelta != 0 else {
+            return
+        }
+
+        stopZoomMomentum(clearVelocity: false)
+        zoomMomentumAnchorProgress = anchorProgress
+        setViewport(viewport.zoomed(by: exp(logScaleDelta), around: anchorProgress))
+
+        guard recordsVelocity else {
+            return
+        }
+
+        let elapsedTime: TimeInterval
+        if let zoomPreviousTime {
+            elapsedTime = min(max(timestamp - zoomPreviousTime, 1 / 240), 1 / 12)
+        } else {
+            elapsedTime = 1 / 120
+        }
+
+        let instantVelocity = logScaleDelta / Float(elapsedTime)
+        let smoothedVelocity =
+            zoomVelocityLogScalePerSecond * (1 - zoomVelocitySmoothing) +
+            instantVelocity * zoomVelocitySmoothing
+        zoomVelocityLogScalePerSecond = min(
+            max(smoothedVelocity, -zoomMomentumMaximumVelocity),
+            zoomMomentumMaximumVelocity
+        )
+        zoomPreviousTime = timestamp
+        zoomLastInputTime = timestamp
+    }
+
+    private func startZoomMomentumIfNeeded() {
+        stopZoomMomentum(clearVelocity: false)
+
+        guard
+            isSelectionEnabled,
+            zoomMomentumAnchorProgress != nil,
+            abs(zoomVelocityLogScalePerSecond) >= zoomMomentumMinimumVelocity
+        else {
+            stopZoomMomentum()
+            return
+        }
+
+        zoomMomentumLastTime = CFAbsoluteTimeGetCurrent()
+        let frameRate = window?.screen?.maximumFramesPerSecond ?? NSScreen.main?.maximumFramesPerSecond ?? 120
+        let timer = Timer(timeInterval: 1 / Double(max(frameRate, 60)), repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.stepZoomMomentum()
+            }
+        }
+
+        zoomMomentumTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stepZoomMomentum() {
+        guard
+            isSelectionEnabled,
+            let anchorProgress = zoomMomentumAnchorProgress,
+            abs(zoomVelocityLogScalePerSecond) >= zoomMomentumMinimumVelocity
+        else {
+            stopZoomMomentum()
+            return
+        }
+
+        let currentTime = CFAbsoluteTimeGetCurrent()
+        let elapsedTime = min(max(currentTime - (zoomMomentumLastTime ?? currentTime), 1 / 240), 1 / 20)
+        zoomMomentumLastTime = currentTime
+
+        let unclampedLogScaleDelta = zoomVelocityLogScalePerSecond * Float(elapsedTime)
+        let logScaleDelta = min(
+            max(unclampedLogScaleDelta, -zoomMomentumMaximumStepLogScale),
+            zoomMomentumMaximumStepLogScale
+        )
+        let nextViewport = viewport.zoomed(by: exp(logScaleDelta), around: anchorProgress)
+        guard nextViewport != viewport else {
+            stopZoomMomentum()
+            return
+        }
+
+        setViewport(nextViewport)
+        let decay = Float(exp(-zoomMomentumDecayRate * elapsedTime))
+        zoomVelocityLogScalePerSecond *= decay
+    }
+
+    private func stopZoomMomentum(clearVelocity: Bool = true) {
+        zoomMomentumTimer?.invalidate()
+        zoomMomentumTimer = nil
+        zoomMomentumLastTime = nil
+
+        if clearVelocity {
+            zoomMomentumAnchorProgress = nil
+            zoomPreviousTime = nil
+            zoomLastInputTime = nil
+            zoomVelocityLogScalePerSecond = 0
+        }
+    }
+
     private func firstSupportedAudioURL(from pasteboard: NSPasteboard) -> URL? {
         let options: [NSPasteboard.ReadingOptionKey: Any] = [
             .urlReadingFileURLsOnly: true,
@@ -1191,6 +1338,18 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         let viewportProgress = Float(point.x / bounds.width)
         return viewport.timelineProgress(forViewportProgress: viewportProgress)
+    }
+
+    private func preciseProgress(for point: CGPoint) -> Double {
+        guard bounds.width > 0 else {
+            return 0
+        }
+
+        let viewportProgress = min(max(Double(point.x / bounds.width), 0), 1)
+        return min(
+            max(Double(viewport.startProgress) + viewportProgress * Double(viewport.durationProgress), 0),
+            1
+        )
     }
 
     private func setViewport(_ nextViewport: TimelineViewport) {
@@ -1273,13 +1432,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         displayHoverProgress(progress(for: point))
     }
 
-    private func updateSelection(from startProgress: Float, to endProgress: Float, notifyChange: Bool) {
+    private func updateSelection(from startProgress: Double, to endProgress: Double, notifyChange: Bool) {
         let selection = TimelineSelection(
             startProgress: startProgress,
             endProgress: endProgress,
             trackID: selectionAnchorTrackID
         )
-        let visibleSelection = selection.durationProgress > 0.001 ? selection : nil
+        let visibleSelection = selection.durationProgress > 0 ? selection : nil
 
         displaySelection(visibleSelection)
         if notifyChange {

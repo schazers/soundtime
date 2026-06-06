@@ -3,6 +3,14 @@ import QuartzCore
 import UniformTypeIdentifiers
 
 final class WorkspaceView: NSView {
+    private static var defaultDebugToolsVisible: Bool {
+        #if DEBUG
+        true
+        #else
+        false
+        #endif
+    }
+
     private enum FisheyeDefaults {
         static let radius = 0.080
         static let power = 0.50
@@ -533,7 +541,7 @@ final class WorkspaceView: NSView {
 
         updateEffectCommandState()
         updateWaveformFisheyeTuning()
-        setDebugToolsVisible(false)
+        setDebugToolsVisible(Self.defaultDebugToolsVisible)
         updateLoudnessMeter()
         startLoudnessMeterTimer()
     }
@@ -1061,6 +1069,7 @@ final class WorkspaceView: NSView {
         timelineSurface.displaySelectedTrack(trackID)
         refreshTrackControls()
         syncActiveTrackFields()
+        window?.makeFirstResponder(timelineSurface)
         updateEffectCommandState()
         updateStatus(currentPlaybackStatus)
     }
@@ -1902,8 +1911,8 @@ final class WorkspaceView: NSView {
             return replacementOverview ?? sourceOverview
         }
 
-        let startIndex = min(max(Int((selection.startProgress * Float(binCount)).rounded(.down)), 0), binCount)
-        let endIndex = min(max(Int((selection.endProgress * Float(binCount)).rounded(.up)), startIndex), binCount)
+        let startIndex = min(max(Int((selection.startProgress * Double(binCount)).rounded(.down)), 0), binCount)
+        let endIndex = min(max(Int((selection.endProgress * Double(binCount)).rounded(.up)), startIndex), binCount)
         var bins: [WaveformOverview.Bin] = []
         bins.reserveCapacity(binCount - (endIndex - startIndex) + (replacementOverview?.bins.count ?? 0))
         if startIndex > 0 {
@@ -1936,8 +1945,8 @@ final class WorkspaceView: NSView {
             return sourceOverview
         }
 
-        let startIndex = min(max(Int((selection.startProgress * Float(binCount)).rounded(.down)), 0), binCount)
-        let endIndex = min(max(Int((selection.endProgress * Float(binCount)).rounded(.up)), startIndex), binCount)
+        let startIndex = min(max(Int((selection.startProgress * Double(binCount)).rounded(.down)), 0), binCount)
+        let endIndex = min(max(Int((selection.endProgress * Double(binCount)).rounded(.up)), startIndex), binCount)
         guard startIndex < endIndex else {
             return sourceOverview
         }
@@ -2292,8 +2301,8 @@ final class WorkspaceView: NSView {
 
         let pasteSelection = selectedTimelineRange ??
             TimelineSelection(
-                startProgress: playbackController.snapshot().progress,
-                endProgress: playbackController.snapshot().progress,
+                startProgress: Double(playbackController.snapshot().progress),
+                endProgress: Double(playbackController.snapshot().progress),
                 trackID: projectTracks[trackIndex].id
             )
         let currentOverview = projectTracks[trackIndex].waveformOverview
@@ -2389,7 +2398,7 @@ final class WorkspaceView: NSView {
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
         stopPlaybackTimer()
         playbackController.clear()
-        displayPlaybackVisuals(progress: deletedStartProgress, isPlaying: false)
+        displayPlaybackVisuals(progress: Float(deletedStartProgress), isPlaying: false)
         refreshProjectTimelineDisplay(rebuildControls: false)
         updateProjectDisplayTiming()
         updateEffectCommandState()
@@ -2516,7 +2525,8 @@ final class WorkspaceView: NSView {
 
     private func applyFadeEffect(_ fadeEffect: FadeEffect) {
         guard
-            let currentTimeline = audioTimeline,
+            let trackIndex = activeProjectTrackIndex(),
+            let currentTimeline = projectTracks[trackIndex].audioTimeline,
             let selectedTimelineRange,
             selectedTimelineRange.durationProgress > 0
         else {
@@ -2525,11 +2535,11 @@ final class WorkspaceView: NSView {
 
         let renderedBuffer = currentTimeline.render()
         let startFrame = min(
-            max(Int((selectedTimelineRange.startProgress * Float(renderedBuffer.frameCount)).rounded(.down)), 0),
+            max(Int((selectedTimelineRange.startProgress * Double(renderedBuffer.frameCount)).rounded(.down)), 0),
             renderedBuffer.frameCount
         )
         let endFrame = min(
-            max(Int((selectedTimelineRange.endProgress * Float(renderedBuffer.frameCount)).rounded(.up)), startFrame),
+            max(Int((selectedTimelineRange.endProgress * Double(renderedBuffer.frameCount)).rounded(.up)), startFrame),
             renderedBuffer.frameCount
         )
         guard endFrame - startFrame > 1 else {
@@ -2570,7 +2580,9 @@ final class WorkspaceView: NSView {
             samplesByChannel: samplesByChannel
         )
         let editedTimeline = AudioEditTimeline(sourceBuffer: editedBuffer)
-        editUndoStack.append(.timeline(trackID: activeTrackID, timeline: currentTimeline))
+        let trackID = projectTracks[trackIndex].id
+        activeTrackID = trackID
+        editUndoStack.append(.timeline(trackID: trackID, timeline: currentTimeline))
         lastEffect = .fade(fadeEffect)
         applyTimeline(editedTimeline)
         updateStatus("\(fadeEffect.displayName) \(formatDuration(selectedTimelineRange.duration(in: renderedBuffer.duration)))")
@@ -3370,7 +3382,6 @@ final class WorkspaceView: NSView {
         guard
             let trackIndex = activeProjectTrackIndex(),
             projectTracks[trackIndex].audioTimeline != nil,
-            projectTracks[trackIndex].decodedAudioBuffer != nil,
             let selectedTimelineRange
         else {
             return false

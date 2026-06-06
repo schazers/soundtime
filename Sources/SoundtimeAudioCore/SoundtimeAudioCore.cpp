@@ -1,7 +1,5 @@
 #include "SoundtimeAudioCore.h"
 
-#include "third_party/ez/ez.hpp"
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -55,19 +53,18 @@ struct RenderGraph {
     std::vector<RenderTrack> tracks;
 };
 
-struct EngineConfig {
+struct AudioRenderConfig {
     uint64_t frameCount = 0;
     uint32_t channelCount = 0;
     double sampleRate = 0;
     float gain = 1;
     double transportRampDurationSeconds = 0.018;
     double trackGainRampDurationSeconds = 0.003;
-    std::shared_ptr<const AudioSource> source;
-    std::shared_ptr<const RenderGraph> graph;
+    const RenderGraph* graph = nullptr;
 };
 
 struct TrackGainRamp {
-    std::shared_ptr<const AudioSource> source;
+    const AudioSource* source = nullptr;
     float currentGain = 0;
     float targetGain = 0;
     float gainStep = 0;
@@ -162,7 +159,17 @@ struct SoundtimeAudioCoreEngine {
     std::atomic<bool> isPlaying{false};
     std::atomic<uint64_t> underrunCount{0};
     std::atomic<uint64_t> droppedCommandCount{0};
-    ez::sync<EngineConfig> config;
+    std::atomic<uint64_t> configFrameCount{0};
+    std::atomic<uint32_t> configChannelCount{0};
+    std::atomic<double> configSampleRate{0};
+    std::atomic<float> configGain{1};
+    std::atomic<double> configTransportRampDurationSeconds{0.018};
+    std::atomic<double> configTrackGainRampDurationSeconds{0.003};
+    std::atomic<const RenderGraph*> currentGraph{nullptr};
+    std::atomic<const RenderGraph*> renderGraphInUse{nullptr};
+    std::mutex graphLifetimeMutex;
+    std::shared_ptr<const RenderGraph> currentGraphOwner;
+    std::vector<std::shared_ptr<const RenderGraph>> retiredGraphs;
     SPSCQueue<EngineCommand, 256> commandQueue;
     SPSCQueue<ClockSample, 1024> clockSamples;
     SPSCQueue<MeterSample, 1024> meterSamples;
@@ -173,7 +180,7 @@ struct SoundtimeAudioCoreEngine {
     bool stopWhenTransportRampCompletes = false;
     uint64_t transportPauseFrameIndex = 0;
     bool hasTransportPauseFrameIndex = false;
-    std::shared_ptr<const RenderGraph> trackGainRampGraph;
+    const RenderGraph* trackGainRampGraph = nullptr;
     std::vector<TrackGainRamp> trackGainRamps;
 };
 
@@ -201,7 +208,7 @@ void complete_transport_stop(SoundtimeAudioCoreEngine& engine) {
 void begin_transport_ramp(
     SoundtimeAudioCoreEngine& engine,
     float targetGain,
-    const EngineConfig& config,
+    const AudioRenderConfig& config,
     bool stopWhenComplete
 ) {
     const auto rampFrames = config.transportRampDurationSeconds > 0 && config.sampleRate > 0 ?
@@ -244,7 +251,7 @@ float next_transport_gain(SoundtimeAudioCoreEngine& engine, bool& completedTrans
     return engine.transportGain;
 }
 
-uint64_t track_gain_ramp_frame_count(const EngineConfig& config) {
+uint64_t track_gain_ramp_frame_count(const AudioRenderConfig& config) {
     return config.trackGainRampDurationSeconds > 0 && config.sampleRate > 0 ?
         static_cast<uint64_t>(config.trackGainRampDurationSeconds * config.sampleRate + 0.5) :
         uint64_t{0};
@@ -441,7 +448,7 @@ uint64_t output_frame_count_for_source(const AudioSource& source, double outputS
 
 void reconcile_track_gain_ramps(
     SoundtimeAudioCoreEngine& engine,
-    const EngineConfig& config,
+    const AudioRenderConfig& config,
     const RenderGraph& graph
 ) {
     if (engine.trackGainRampGraph == config.graph &&
@@ -456,11 +463,12 @@ void reconcile_track_gain_ramps(
         const auto& track = graph.tracks[trackIndex];
         auto& ramp = engine.trackGainRamps[trackIndex];
         const auto targetGain = std::max(track.gain, 0.0f);
+        const auto* source = track.source.get();
 
-        if (trackIndex < previousRampCount && ramp.source == track.source) {
+        if (trackIndex < previousRampCount && ramp.source == source) {
             begin_track_gain_ramp(ramp, targetGain, rampFrames);
         } else {
-            ramp.source = track.source;
+            ramp.source = source;
             ramp.currentGain = targetGain;
             ramp.targetGain = targetGain;
             ramp.gainStep = 0;
@@ -471,7 +479,7 @@ void reconcile_track_gain_ramps(
     engine.trackGainRampGraph = config.graph;
 }
 
-void process_commands(SoundtimeAudioCoreEngine& engine, const EngineConfig& config) {
+void process_commands(SoundtimeAudioCoreEngine& engine, const AudioRenderConfig& config) {
     auto command = EngineCommand{};
     while (engine.commandQueue.pop(command)) {
         switch (command.type) {
@@ -527,11 +535,112 @@ void reset_engine_runtime(SoundtimeAudioCoreEngine& engine) {
     engine.stopWhenTransportRampCompletes = false;
     engine.transportPauseFrameIndex = 0;
     engine.hasTransportPauseFrameIndex = false;
-    engine.trackGainRampGraph.reset();
+    engine.trackGainRampGraph = nullptr;
     engine.trackGainRamps.clear();
     engine.commandQueue.clear();
     engine.clockSamples.clear();
     engine.meterSamples.clear();
+}
+
+void gc_retired_graphs_locked(SoundtimeAudioCoreEngine& engine) {
+    const auto* graphInUse = engine.renderGraphInUse.load(std::memory_order_acquire);
+    engine.retiredGraphs.erase(
+        std::remove_if(
+            engine.retiredGraphs.begin(),
+            engine.retiredGraphs.end(),
+            [graphInUse](const std::shared_ptr<const RenderGraph>& graph) {
+                return graph.get() != graphInUse;
+            }
+        ),
+        engine.retiredGraphs.end()
+    );
+}
+
+void publish_render_config(
+    SoundtimeAudioCoreEngine& engine,
+    uint64_t frameCount,
+    uint32_t channelCount,
+    double sampleRate,
+    std::shared_ptr<const RenderGraph> graph
+) {
+    std::lock_guard lock(engine.graphLifetimeMutex);
+
+    auto previousGraph = std::move(engine.currentGraphOwner);
+    engine.currentGraphOwner = std::move(graph);
+    if (previousGraph) {
+        engine.retiredGraphs.push_back(std::move(previousGraph));
+    }
+
+    engine.configFrameCount.store(frameCount, std::memory_order_release);
+    engine.configChannelCount.store(channelCount, std::memory_order_release);
+    engine.configSampleRate.store(sampleRate, std::memory_order_release);
+    engine.currentGraph.store(engine.currentGraphOwner.get(), std::memory_order_release);
+    gc_retired_graphs_locked(engine);
+}
+
+void clear_render_graph(
+    SoundtimeAudioCoreEngine& engine,
+    uint64_t frameCount,
+    uint32_t channelCount,
+    double sampleRate
+) {
+    std::lock_guard lock(engine.graphLifetimeMutex);
+
+    auto previousGraph = std::move(engine.currentGraphOwner);
+    engine.currentGraph.store(nullptr, std::memory_order_release);
+    if (previousGraph) {
+        engine.retiredGraphs.push_back(std::move(previousGraph));
+    }
+
+    engine.configFrameCount.store(frameCount, std::memory_order_release);
+    engine.configChannelCount.store(channelCount, std::memory_order_release);
+    engine.configSampleRate.store(sampleRate, std::memory_order_release);
+    gc_retired_graphs_locked(engine);
+}
+
+const RenderGraph* acquire_render_graph(SoundtimeAudioCoreEngine& engine) {
+    while (true) {
+        const auto* graph = engine.currentGraph.load(std::memory_order_acquire);
+        engine.renderGraphInUse.store(graph, std::memory_order_release);
+        if (graph == engine.currentGraph.load(std::memory_order_acquire)) {
+            return graph;
+        }
+    }
+}
+
+void release_render_graph(SoundtimeAudioCoreEngine& engine) {
+    engine.renderGraphInUse.store(nullptr, std::memory_order_release);
+}
+
+AudioRenderConfig make_audio_render_config(
+    const SoundtimeAudioCoreEngine& engine,
+    const RenderGraph* graph
+) {
+    if (graph != nullptr) {
+        return AudioRenderConfig{
+            .frameCount = graph->frameCount,
+            .channelCount = graph->channelCount,
+            .sampleRate = graph->sampleRate,
+            .gain = engine.configGain.load(std::memory_order_acquire),
+            .transportRampDurationSeconds =
+                engine.configTransportRampDurationSeconds.load(std::memory_order_acquire),
+            .trackGainRampDurationSeconds =
+                engine.configTrackGainRampDurationSeconds.load(std::memory_order_acquire),
+            .graph = graph,
+        };
+    }
+
+    return AudioRenderConfig{
+        .frameCount = engine.configFrameCount.load(std::memory_order_acquire),
+        .channelCount = engine.configChannelCount.load(std::memory_order_acquire),
+        .sampleRate = engine.configSampleRate.load(std::memory_order_acquire),
+        .gain = engine.configGain.load(std::memory_order_acquire),
+        .transportRampDurationSeconds =
+            engine.configTransportRampDurationSeconds.load(std::memory_order_acquire),
+        .trackGainRampDurationSeconds =
+            engine.configTrackGainRampDurationSeconds.load(std::memory_order_acquire),
+        .graph = nullptr,
+    };
 }
 
 void publish_graph(
@@ -542,15 +651,13 @@ void publish_graph(
     if (resetRuntime) {
         reset_engine_runtime(engine);
     }
-    engine.config.update_publish(ez::nort, [=](EngineConfig config) {
-        config.frameCount = graph->frameCount;
-        config.channelCount = graph->channelCount;
-        config.sampleRate = graph->sampleRate;
-        config.source = nullptr;
-        config.graph = graph;
-        return config;
-    });
-    engine.config.gc(ez::gc);
+    publish_render_config(
+        engine,
+        graph->frameCount,
+        graph->channelCount,
+        graph->sampleRate,
+        std::move(graph)
+    );
 }
 
 std::shared_ptr<RenderGraph> make_graph_from_track_configs(
@@ -833,8 +940,10 @@ void soundtime_audio_core_reset(SoundtimeAudioCoreEngine* engine) {
     }
 
     reset_engine_runtime(*engine);
-    engine->config.set_publish(ez::nort, EngineConfig{});
-    engine->config.gc(ez::gc);
+    engine->configGain.store(1, std::memory_order_release);
+    engine->configTransportRampDurationSeconds.store(0.018, std::memory_order_release);
+    engine->configTrackGainRampDurationSeconds.store(0.003, std::memory_order_release);
+    clear_render_graph(*engine, 0, 0, 0);
 }
 
 void soundtime_audio_core_set_source_info(
@@ -848,15 +957,7 @@ void soundtime_audio_core_set_source_info(
     }
 
     reset_engine_runtime(*engine);
-    engine->config.update_publish(ez::nort, [=](EngineConfig config) {
-        config.frameCount = frameCount;
-        config.channelCount = channelCount;
-        config.sampleRate = sampleRate;
-        config.source = nullptr;
-        config.graph = nullptr;
-        return config;
-    });
-    engine->config.gc(ez::gc);
+    clear_render_graph(*engine, frameCount, channelCount, sampleRate);
 }
 
 bool soundtime_audio_core_set_interleaved_source(
@@ -998,11 +1099,7 @@ void soundtime_audio_core_set_gain(SoundtimeAudioCoreEngine* engine, float gain)
         return;
     }
 
-    engine->config.update_publish(ez::nort, [=](EngineConfig config) {
-        config.gain = std::max(gain, 0.0f);
-        return config;
-    });
-    engine->config.gc(ez::gc);
+    engine->configGain.store(std::max(gain, 0.0f), std::memory_order_release);
 }
 
 void soundtime_audio_core_set_transport_ramp_duration(
@@ -1013,11 +1110,10 @@ void soundtime_audio_core_set_transport_ramp_duration(
         return;
     }
 
-    engine->config.update_publish(ez::nort, [=](EngineConfig config) {
-        config.transportRampDurationSeconds = std::max(durationSeconds, 0.0);
-        return config;
-    });
-    engine->config.gc(ez::gc);
+    engine->configTransportRampDurationSeconds.store(
+        std::max(durationSeconds, 0.0),
+        std::memory_order_release
+    );
 }
 
 SoundtimeAudioCoreSnapshot soundtime_audio_core_snapshot(const SoundtimeAudioCoreEngine* engine) {
@@ -1025,11 +1121,10 @@ SoundtimeAudioCoreSnapshot soundtime_audio_core_snapshot(const SoundtimeAudioCor
         return SoundtimeAudioCoreSnapshot{};
     }
 
-    const auto config = engine->config.read(ez::nort);
     return SoundtimeAudioCoreSnapshot{
         .frameIndex = engine->frameIndex.load(std::memory_order_acquire),
-        .frameCount = config.frameCount,
-        .sampleRate = config.sampleRate,
+        .frameCount = engine->configFrameCount.load(std::memory_order_acquire),
+        .sampleRate = engine->configSampleRate.load(std::memory_order_acquire),
         .hostTimestamp = engine->hostTimestamp.load(std::memory_order_acquire),
         .isPlaying = engine->isPlaying.load(std::memory_order_acquire),
         .renderedFrameCount = engine->renderedFrameCount.load(std::memory_order_acquire),
@@ -1145,12 +1240,14 @@ void soundtime_audio_core_render_at_host_time(
         return;
     }
 
-    auto config = ez::immutable<EngineConfig>{};
+    auto config = AudioRenderConfig{};
     auto blockStartFrameIndex = uint64_t{0};
+    const auto* graph = static_cast<const RenderGraph*>(nullptr);
     if (engine != nullptr) {
         engine->renderedFrameCount.fetch_add(frameCount, std::memory_order_acq_rel);
-        config = engine->config.read(ez::audio);
-        process_commands(*engine, *config);
+        graph = acquire_render_graph(*engine);
+        config = make_audio_render_config(*engine, graph);
+        process_commands(*engine, config);
         blockStartFrameIndex = engine->frameIndex.load(std::memory_order_acquire);
     }
 
@@ -1178,27 +1275,28 @@ void soundtime_audio_core_render_at_host_time(
             false
         );
         publish_clock_sample(*engine);
+        release_render_graph(*engine);
         return;
     }
 
-    const auto sourceFrameCount = config->frameCount;
+    const auto sourceFrameCount = config.frameCount;
     const auto currentFrameIndex = blockStartFrameIndex;
     const auto renderableFrameCount = sourceFrameCount > currentFrameIndex ?
         std::min<uint64_t>(frameCount, sourceFrameCount - currentFrameIndex) :
         0;
     uint64_t advancedFrameCount = 0;
     bool completedTransportStop = false;
-    if (const auto& graph = config->graph; graph && !graph->tracks.empty()) {
-        reconcile_track_gain_ramps(*engine, *config, *graph);
+    if (graph != nullptr && !graph->tracks.empty()) {
+        reconcile_track_gain_ramps(*engine, config, *graph);
         for (uint64_t frameOffset = 0; frameOffset < renderableFrameCount; frameOffset++) {
             const auto transportGain = next_transport_gain(*engine, completedTransportStop);
             const auto outputFrameIndex = currentFrameIndex + frameOffset;
-            const auto outputGainBase = config->gain * transportGain;
+            const auto outputGainBase = config.gain * transportGain;
 
             advancedFrameCount++;
             for (size_t trackIndex = 0; trackIndex < graph->tracks.size(); trackIndex++) {
                 const auto& track = graph->tracks[trackIndex];
-                const auto& source = track.source;
+                const auto* source = track.source.get();
                 const auto trackGain = next_track_gain(engine->trackGainRamps[trackIndex]);
                 if (!source || trackGain <= 0) {
                     continue;
@@ -1270,8 +1368,8 @@ void soundtime_audio_core_render_at_host_time(
         engine->isPlaying.store(false, std::memory_order_release);
     }
     auto finalHostTimestamp = hostTimestamp;
-    if (hostTimestamp > 0 && config->sampleRate > 0) {
-        const auto renderedDuration = static_cast<double>(advancedFrameCount) / config->sampleRate;
+    if (hostTimestamp > 0 && config.sampleRate > 0) {
+        const auto renderedDuration = static_cast<double>(advancedFrameCount) / config.sampleRate;
         finalHostTimestamp = hostTimestamp + renderedDuration;
         engine->hostTimestamp.store(finalHostTimestamp, std::memory_order_release);
     } else {
@@ -1287,4 +1385,5 @@ void soundtime_audio_core_render_at_host_time(
         engine->isPlaying.load(std::memory_order_acquire)
     );
     publish_clock_sample(*engine);
+    release_render_graph(*engine);
 }
