@@ -61,6 +61,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         var touch2: SIMD4<Float>
     }
 
+    private struct DeletionEffectUniform {
+        var rect: SIMD4<Float>
+        var overlayRect: SIMD4<Float>
+        var timing: SIMD4<Float>
+        var metrics: SIMD4<Float>
+    }
+
     private struct WaveformShaderBin {
         var minimumSample: Float
         var maximumSample: Float
@@ -452,7 +459,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     private struct DeletionEffect {
         let selection: TimelineSelection
-        let capturedBins: [WaveformOverview.Bin]
+        let capturedBinBuffer: MTLBuffer?
+        let capturedBinCount: Int
         var birthTimestamp: CFTimeInterval
         let seed: UInt64
     }
@@ -740,6 +748,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let waveformPipelineState: MTLRenderPipelineState
     private let rulerPipelineState: MTLRenderPipelineState
     private let additivePipelineState: MTLRenderPipelineState
+    private let deletionEffectPipelineState: MTLRenderPipelineState
+    private let deletionParticlePipelineState: MTLRenderPipelineState
     private let dynamicVertexBufferRing: DynamicVertexBufferRing
     private let waveformQuadVertexBuffer: MTLBuffer
     private let waveformGeometryQueue = DispatchQueue(
@@ -861,7 +871,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let playheadContactEventsPerTrackBudget = 8
     private let playheadContactMinimumSpawnInterval: CFTimeInterval = 1.0 / 90.0
     private let transientParticleMaximumCount = 260
-    private let maximumEffectVerticesPerFrame = 28_000
     private let maximumTransientParticleVerticesPerFrame = 10_000
     private let deletionEffectDuration: CFTimeInterval = 0.58
     private let deletionShardCount = 96
@@ -921,7 +930,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             let waveformVertexFunction = library.makeFunction(name: "waveform_vertex"),
             let waveformFragmentFunction = library.makeFunction(name: "waveform_fragment"),
             let rulerVertexFunction = library.makeFunction(name: "timeline_ruler_vertex"),
-            let rulerFragmentFunction = library.makeFunction(name: "timeline_ruler_fragment")
+            let rulerFragmentFunction = library.makeFunction(name: "timeline_ruler_fragment"),
+            let deletionEffectVertexFunction = library.makeFunction(name: "deletion_effect_vertex"),
+            let deletionEffectFragmentFunction = library.makeFunction(name: "deletion_effect_fragment"),
+            let deletionParticleVertexFunction = library.makeFunction(name: "deletion_particle_vertex"),
+            let deletionParticleFragmentFunction = library.makeFunction(name: "deletion_particle_fragment")
         else {
             throw RendererError.shaderFunctionUnavailable
         }
@@ -970,6 +983,28 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         additiveDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
         additiveDescriptor.colorAttachments[0].destinationRGBBlendFactor = .one
         additiveDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .one
+        let deletionEffectDescriptor = MTLRenderPipelineDescriptor()
+        deletionEffectDescriptor.vertexFunction = deletionEffectVertexFunction
+        deletionEffectDescriptor.fragmentFunction = deletionEffectFragmentFunction
+        deletionEffectDescriptor.colorAttachments[0].pixelFormat = pixelFormat
+        deletionEffectDescriptor.colorAttachments[0].isBlendingEnabled = true
+        deletionEffectDescriptor.colorAttachments[0].rgbBlendOperation = .add
+        deletionEffectDescriptor.colorAttachments[0].alphaBlendOperation = .add
+        deletionEffectDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        deletionEffectDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+        deletionEffectDescriptor.colorAttachments[0].destinationRGBBlendFactor = .one
+        deletionEffectDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .one
+        let deletionParticleDescriptor = MTLRenderPipelineDescriptor()
+        deletionParticleDescriptor.vertexFunction = deletionParticleVertexFunction
+        deletionParticleDescriptor.fragmentFunction = deletionParticleFragmentFunction
+        deletionParticleDescriptor.colorAttachments[0].pixelFormat = pixelFormat
+        deletionParticleDescriptor.colorAttachments[0].isBlendingEnabled = true
+        deletionParticleDescriptor.colorAttachments[0].rgbBlendOperation = .add
+        deletionParticleDescriptor.colorAttachments[0].alphaBlendOperation = .add
+        deletionParticleDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        deletionParticleDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+        deletionParticleDescriptor.colorAttachments[0].destinationRGBBlendFactor = .one
+        deletionParticleDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .one
 
         self.device = device
         self.commandQueue = commandQueue
@@ -983,6 +1018,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         waveformPipelineState = try device.makeRenderPipelineState(descriptor: waveformDescriptor)
         rulerPipelineState = try device.makeRenderPipelineState(descriptor: rulerDescriptor)
         additivePipelineState = try device.makeRenderPipelineState(descriptor: additiveDescriptor)
+        deletionEffectPipelineState = try device.makeRenderPipelineState(descriptor: deletionEffectDescriptor)
+        deletionParticlePipelineState = try device.makeRenderPipelineState(descriptor: deletionParticleDescriptor)
 
         super.init()
     }
@@ -1311,9 +1348,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         seed &+= UInt64((selection.startProgress * 1_000_000).rounded(.down))
         seed &*= 0x9E37_79B9_7F4A_7C15
         seed &+= UInt64((selection.endProgress * 1_000_000).rounded(.down))
+        let capturedBins = capturedDeletionBins(for: selection)
+        let capturedBinBuffer = makeDeletionWaveformBinBuffer(from: capturedBins)
         let effect = DeletionEffect(
             selection: selection,
-            capturedBins: capturedDeletionBins(for: selection),
+            capturedBinBuffer: capturedBinBuffer,
+            capturedBinCount: capturedBins.count,
             birthTimestamp: -1,
             seed: seed
         )
@@ -1374,6 +1414,29 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         return capturedBins
+    }
+
+    private func makeDeletionWaveformBinBuffer(from bins: [WaveformOverview.Bin]) -> MTLBuffer? {
+        guard
+            let shaderBins = makeWaveformShaderBins(from: bins),
+            !shaderBins.isEmpty
+        else {
+            return nil
+        }
+
+        return shaderBins.withUnsafeBytes { buffer in
+            guard let baseAddress = buffer.baseAddress else {
+                return nil
+            }
+
+            let metalBuffer = device.makeBuffer(
+                bytes: baseAddress,
+                length: buffer.count,
+                options: [.storageModeShared, .cpuCacheModeWriteCombined]
+            )
+            metalBuffer?.label = "Timeline deletion captured waveform bins"
+            return metalBuffer
+        }
     }
 
     func render(to target: TimelineRenderTarget) {
@@ -1528,13 +1591,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             maximumVertexCount: maximumTransientParticleVerticesPerFrame
         )
         frameStatsEffectVertexCount += transientParticleVertices.count
-        let deletionEffectVertices = makeDeletionEffectVertices(
-            drawableSize: viewportSize,
-            renderState: renderState,
-            displayTimestamp: displayTimestamp,
-            maximumVertexCount: remainingEffectVertexBudget()
-        )
-        frameStatsEffectVertexCount += deletionEffectVertices.count
         let hoverGuideVertices = makeHoverGuideVertices(
             drawableSize: viewportSize,
             backingScale: backingScale,
@@ -1630,12 +1686,18 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             )
         }
         draw(vertices: playheadTouchVertices, primitiveType: .triangle, encoder: encoder)
-        if !transientParticleVertices.isEmpty || !deletionEffectVertices.isEmpty {
+        if !transientParticleVertices.isEmpty {
             encoder.setRenderPipelineState(additivePipelineState)
             draw(vertices: transientParticleVertices, primitiveType: .triangle, encoder: encoder)
-            draw(vertices: deletionEffectVertices, primitiveType: .triangle, encoder: encoder)
             encoder.setRenderPipelineState(pipelineState)
         }
+        drawDeletionEffects(
+            drawableSize: viewportSize,
+            renderState: renderState,
+            displayTimestamp: displayTimestamp,
+            encoder: encoder
+        )
+        encoder.setRenderPipelineState(pipelineState)
         draw(vertices: trimPreviewVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: hoverGuideVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: playheadVertices, primitiveType: .triangle, encoder: encoder)
@@ -3502,18 +3564,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         return vertices
     }
 
-    private func makeDeletionEffectVertices(
-        drawableSize: CGSize,
-        renderState: TimelineRenderState,
-        displayTimestamp: CFTimeInterval,
-        maximumVertexCount: Int
-    ) -> [TimelineVertex] {
-        let width = Float(drawableSize.width)
-        let height = Float(drawableSize.height)
-        guard width > 0, height > 0, maximumVertexCount >= 3 else {
-            return []
-        }
-
+    private func activeDeletionEffects(at displayTimestamp: CFTimeInterval) -> [DeletionEffect] {
         deletionEffectLock.lock()
         for index in deletionEffects.indices {
             if deletionEffects[index].birthTimestamp < 0 {
@@ -3527,432 +3578,170 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let effects = deletionEffects
         deletionEffectLock.unlock()
         frameStatsDeletionEffectCount = effects.count
+        return effects
+    }
 
-        guard !effects.isEmpty else {
-            return []
+    private func drawDeletionEffects(
+        drawableSize: CGSize,
+        renderState: TimelineRenderState,
+        displayTimestamp: CFTimeInterval,
+        encoder: MTLRenderCommandEncoder
+    ) {
+        let width = Float(drawableSize.width)
+        let height = Float(drawableSize.height)
+        guard width > 0, height > 0 else {
+            frameStatsDeletionEffectCount = 0
+            return
         }
 
-        let drawableSize = SIMD2<Float>(width, height)
-        var vertices: [TimelineVertex] = []
-        vertices.reserveCapacity(min(
-            maximumVertexCount,
-            effects.count * (deletionShardCount * 12 + deletionEffectMaximumCapturedBins * 6)
-        ))
+        let effects = activeDeletionEffects(at: displayTimestamp)
+        guard !effects.isEmpty else {
+            return
+        }
 
+        encoder.setRenderPipelineState(deletionEffectPipelineState)
+        encoder.setVertexBuffer(waveformQuadVertexBuffer, offset: 0, index: 0)
         for effect in effects {
-            guard vertices.count < maximumVertexCount else {
-                frameStatsEffectDroppedVertexCount += deletionEffectEstimatedVertexCount(for: effect)
+            guard
+                let binBuffer = effect.capturedBinBuffer,
+                effect.capturedBinCount > 0,
+                var uniform = deletionEffectUniform(
+                    for: effect,
+                    drawableSize: drawableSize,
+                    renderState: renderState,
+                    displayTimestamp: displayTimestamp
+                )
+            else {
                 continue
             }
 
-            let birthTimestamp = effect.birthTimestamp >= 0 ? effect.birthTimestamp : displayTimestamp
-            let age = max(displayTimestamp - birthTimestamp, 0)
-            let progress = min(max(Float(age / deletionEffectDuration), 0), 1)
-            let selection = effect.selection
-            let leftViewport = renderState.viewport.viewportProgress(
-                forTimelineProgress: selection.startProgressFloat
+            encoder.setVertexBytes(
+                &uniform,
+                length: MemoryLayout<DeletionEffectUniform>.stride,
+                index: 1
             )
-            let rightViewport = renderState.viewport.viewportProgress(
-                forTimelineProgress: selection.endProgressFloat
+            encoder.setFragmentBuffer(binBuffer, offset: 0, index: 1)
+            encoder.setFragmentBytes(
+                &uniform,
+                length: MemoryLayout<DeletionEffectUniform>.stride,
+                index: 2
             )
-            guard rightViewport > -0.1, leftViewport < 1.1 else {
-                continue
-            }
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+        }
 
-            var leftX = leftViewport * width
-            var rightX = rightViewport * width
-            if rightX < leftX {
-                swap(&leftX, &rightX)
-            }
-            let minimumEffectWidth: Float = 18
-            if rightX - leftX < minimumEffectWidth {
-                let centerX = (leftX + rightX) * 0.5
-                leftX = centerX - minimumEffectWidth * 0.5
-                rightX = centerX + minimumEffectWidth * 0.5
-            }
-
-            guard let verticalRange = selectionVerticalRange(
-                for: selection,
+        encoder.setRenderPipelineState(deletionParticlePipelineState)
+        encoder.setVertexBuffer(waveformQuadVertexBuffer, offset: 0, index: 0)
+        for effect in effects {
+            guard var uniform = deletionEffectUniform(
+                for: effect,
+                drawableSize: drawableSize,
                 renderState: renderState,
-                drawableSize: CGSize(width: CGFloat(drawableSize.x), height: CGFloat(drawableSize.y))
+                displayTimestamp: displayTimestamp
             ) else {
                 continue
             }
-            let topY = verticalRange.top * height
-            let bottomY = verticalRange.bottom * height
-            let laneHeight = max(bottomY - topY, 1)
-            let centerY = (topY + bottomY) * 0.5
-            let joinX = min(max(leftX, -width * 0.2), width * 1.2)
-            let dissolve = 1 - smoothStep(progress)
-            let blast = 1 - pow(1 - progress, 2.2)
-            let shardAlpha = max(dissolve * dissolve, 0)
 
-            appendDeletedWaveformDissolve(
-                to: &vertices,
-                effect: effect,
-                leftX: leftX,
-                rightX: rightX,
-                topY: topY,
-                bottomY: bottomY,
-                centerY: centerY,
-                progress: progress,
-                blast: blast,
-                drawableSize: drawableSize
+            encoder.setVertexBytes(
+                &uniform,
+                length: MemoryLayout<DeletionEffectUniform>.stride,
+                index: 1
             )
-
-            appendDeletionFractureFlash(
-                to: &vertices,
-                leftX: leftX,
-                rightX: rightX,
-                topY: topY,
-                bottomY: bottomY,
-                centerY: centerY,
-                progress: progress,
-                drawableSize: drawableSize
+            encoder.setFragmentBytes(
+                &uniform,
+                length: MemoryLayout<DeletionEffectUniform>.stride,
+                index: 1
             )
-
-            if progress < 0.78, shardAlpha > 0.002 {
-                appendDeletionShards(
-                    to: &vertices,
-                    effect: effect,
-                    leftX: leftX,
-                    rightX: rightX,
-                    topY: topY,
-                    bottomY: bottomY,
-                    centerY: centerY,
-                    progress: progress,
-                    blast: blast,
-                    alpha: shardAlpha,
-                    drawableSize: drawableSize
-                )
-            }
-
-            appendDeletionConjoinStreaks(
-                to: &vertices,
-                effect: effect,
-                leftX: leftX,
-                rightX: rightX,
-                joinX: joinX,
-                topY: topY,
-                laneHeight: laneHeight,
-                progress: progress,
-                drawableSize: drawableSize
+            encoder.drawPrimitives(
+                type: .triangle,
+                vertexStart: 0,
+                vertexCount: 6,
+                instanceCount: deletionShardCount
             )
+        }
+    }
 
-            appendDeletionJoinFlare(
-                to: &vertices,
-                joinX: joinX,
-                centerY: centerY,
-                laneHeight: laneHeight,
-                progress: progress,
-                drawableSize: drawableSize
-            )
-
-            if vertices.count > maximumVertexCount {
-                frameStatsEffectDroppedVertexCount += vertices.count - maximumVertexCount
-                trimTriangleVertices(&vertices, toMaximumCount: maximumVertexCount)
-            }
+    private func deletionEffectUniform(
+        for effect: DeletionEffect,
+        drawableSize: CGSize,
+        renderState: TimelineRenderState,
+        displayTimestamp: CFTimeInterval
+    ) -> DeletionEffectUniform? {
+        let width = Float(drawableSize.width)
+        let height = Float(drawableSize.height)
+        guard width > 0, height > 0 else {
+            return nil
         }
 
-        return vertices
-    }
-
-    private func remainingEffectVertexBudget() -> Int {
-        max(maximumEffectVerticesPerFrame - frameStatsEffectVertexCount, 0)
-    }
-
-    private func trimTriangleVertices(_ vertices: inout [TimelineVertex], toMaximumCount maximumCount: Int) {
-        let triangleSafeCount = max(maximumCount / 3, 0) * 3
-        guard vertices.count > triangleSafeCount else {
-            return
+        let birthTimestamp = effect.birthTimestamp >= 0 ? effect.birthTimestamp : displayTimestamp
+        let age = max(displayTimestamp - birthTimestamp, 0)
+        let progress = min(max(Float(age / deletionEffectDuration), 0), 1)
+        let selection = effect.selection
+        let leftViewport = renderState.viewport.viewportProgress(
+            forTimelineProgress: selection.startProgressFloat
+        )
+        let rightViewport = renderState.viewport.viewportProgress(
+            forTimelineProgress: selection.endProgressFloat
+        )
+        guard rightViewport > -0.1, leftViewport < 1.1 else {
+            return nil
         }
 
-        vertices.removeSubrange(triangleSafeCount..<vertices.count)
-    }
-
-    private func deletionEffectEstimatedVertexCount(for effect: DeletionEffect) -> Int {
-        effect.capturedBins.count * 6 + deletionShardCount * 72 + 180
-    }
-
-    private func appendDeletedWaveformDissolve(
-        to vertices: inout [TimelineVertex],
-        effect: DeletionEffect,
-        leftX: Float,
-        rightX: Float,
-        topY: Float,
-        bottomY: Float,
-        centerY: Float,
-        progress: Float,
-        blast: Float,
-        drawableSize: SIMD2<Float>
-    ) {
-        guard
-            !effect.capturedBins.isEmpty,
-            rightX > leftX,
-            bottomY > topY
-        else {
-            return
+        var leftX = leftViewport * width
+        var rightX = rightViewport * width
+        if rightX < leftX {
+            swap(&leftX, &rightX)
+        }
+        let minimumEffectWidth: Float = 18
+        if rightX - leftX < minimumEffectWidth {
+            let centerX = (leftX + rightX) * 0.5
+            leftX = centerX - minimumEffectWidth * 0.5
+            rightX = centerX + minimumEffectWidth * 0.5
         }
 
-        let visibility = 1 - smoothStep(min(max(progress / 0.48, 0), 1))
-        guard visibility > 0.002 else {
-            return
+        guard let verticalRange = selectionVerticalRange(
+            for: selection,
+            renderState: renderState,
+            drawableSize: drawableSize
+        ) else {
+            return nil
+        }
+
+        let topY = verticalRange.top * height
+        let bottomY = verticalRange.bottom * height
+        guard bottomY > topY else {
+            return nil
         }
 
         let selectionWidth = max(rightX - leftX, 1)
-        let laneHeight = max(bottomY - topY, 1)
-        let amplitude = laneHeight * 0.39
-        let binCount = effect.capturedBins.count
-        let baseStep = selectionWidth / Float(max(binCount, 1))
-        let barHalfWidth = min(max(baseStep * 0.42, 0.75), 3.2)
-        let time = progress * Float(deletionEffectDuration)
-        let fade = visibility * visibility
-
-        for (binIndex, bin) in effect.capturedBins.enumerated() {
-            let seed = effect.seed &+ UInt64(binIndex) &* 0xD6E8_FD9D_A593_6D3D
-            let phase = (Float(binIndex) + 0.5) / Float(max(binCount, 1))
-            let sourceX = leftX + selectionWidth * phase
-            let topSampleY = centerY - bin.maximumSample * amplitude
-            let bottomSampleY = centerY - bin.minimumSample * amplitude
-            var top = min(topSampleY, bottomSampleY)
-            var bottom = max(topSampleY, bottomSampleY)
-            if bottom - top < 1.4 {
-                top = centerY - 0.7
-                bottom = centerY + 0.7
-            }
-
-            let outwardX = (phase - 0.5) * 2
-            let randomAngle = pseudoRandom01(seed &+ 41) * Float.pi * 2
-            let randomDirection = SIMD2<Float>(
-                cos(randomAngle) * 0.35 + outwardX * 0.92,
-                sin(randomAngle) * 0.72
+        let pullDistance = max(selectionWidth, 22)
+        let overlayRightX = rightX + 20 + min(pullDistance * 0.32, 90)
+        let overlayLeftX = leftX - 4
+        let seed = Float(UInt32(truncatingIfNeeded: effect.seed & 0x00FF_FFFF))
+        return DeletionEffectUniform(
+            rect: SIMD4<Float>(
+                leftX / width,
+                rightX / width,
+                topY / height,
+                bottomY / height
+            ),
+            overlayRect: SIMD4<Float>(
+                overlayLeftX / width,
+                overlayRightX / width,
+                topY / height,
+                bottomY / height
+            ),
+            timing: SIMD4<Float>(
+                progress,
+                1 - pow(1 - progress, 2.2),
+                seed,
+                Float(max(effect.capturedBinCount, 1))
+            ),
+            metrics: SIMD4<Float>(
+                width,
+                height,
+                max(bottomY - topY, 1),
+                Float(deletionEffectDuration)
             )
-            let speed = 26 + 150 * pseudoRandom01(seed &+ 53)
-            let offset = randomDirection * speed * time * (0.25 + blast * 1.05)
-            let stretch = 1 + blast * (0.22 + 0.36 * pseudoRandom01(seed &+ 67))
-            let center = SIMD2<Float>(sourceX, (top + bottom) * 0.5) + offset
-            let halfHeight = max((bottom - top) * 0.5 * stretch, 0.8)
-            let alpha = fade * (0.18 + 0.42 * bin.peakMagnitude)
-            let cold = pseudoRandom01(seed &+ 79)
-            let color = SIMD4<Float>(
-                0.70 + 0.22 * cold,
-                0.96 + 0.04 * cold,
-                0.94 + 0.06 * pseudoRandom01(seed &+ 83),
-                alpha
-            )
-
-            appendRectangle(
-                to: &vertices,
-                left: center.x - barHalfWidth,
-                right: center.x + barHalfWidth,
-                top: center.y - halfHeight,
-                bottom: center.y + halfHeight,
-                color: color,
-                drawableSize: drawableSize
-            )
-
-            if binIndex.isMultiple(of: 11) {
-                appendSoftParticle(
-                    to: &vertices,
-                    center: center,
-                    radius: 0.75 + 2.1 * bin.peakMagnitude,
-                    color: SIMD3<Float>(color.x, color.y, color.z),
-                    alpha: alpha * 0.22,
-                    drawableSize: drawableSize
-                )
-            }
-        }
-    }
-
-    private func appendDeletionFractureFlash(
-        to vertices: inout [TimelineVertex],
-        leftX: Float,
-        rightX: Float,
-        topY: Float,
-        bottomY: Float,
-        centerY: Float,
-        progress: Float,
-        drawableSize: SIMD2<Float>
-    ) {
-        let flash = 1 - smoothStep(min(max(progress / 0.15, 0), 1))
-        guard flash > 0.002 else {
-            return
-        }
-
-        let width = max(rightX - leftX, 1)
-        let laneHeight = max(bottomY - topY, 1)
-        let insetY = min(laneHeight * 0.10, 18)
-        let flashTop = min(topY + insetY, centerY)
-        let flashBottom = max(bottomY - insetY, centerY)
-        appendRectangle(
-            to: &vertices,
-            left: leftX,
-            right: rightX,
-            top: flashTop,
-            bottom: flashBottom,
-            color: SIMD4<Float>(0.34, 1.0, 0.94, 0.10 * flash),
-            drawableSize: drawableSize
-        )
-
-        appendThickLine(
-            to: &vertices,
-            start: SIMD2<Float>(leftX + width * 0.04, centerY),
-            end: SIMD2<Float>(rightX - width * 0.04, centerY),
-            width: 1.2 + 3.0 * flash,
-            color: SIMD4<Float>(0.82, 1.0, 0.98, 0.28 * flash),
-            drawableSize: drawableSize
-        )
-
-        let crackCount = 7
-        for crackIndex in 0..<crackCount {
-            let phase = Float(crackIndex) / Float(max(crackCount - 1, 1))
-            let x = leftX + width * (0.10 + phase * 0.80)
-            let height = laneHeight * (0.10 + 0.12 * sin(phase * Float.pi * 3.0))
-            appendThickLine(
-                to: &vertices,
-                start: SIMD2<Float>(x, centerY - height),
-                end: SIMD2<Float>(x + (phase - 0.5) * 12, centerY + height),
-                width: 0.9 + 1.4 * flash,
-                color: SIMD4<Float>(0.80, 1.0, 0.98, 0.20 * flash),
-                drawableSize: drawableSize
-            )
-        }
-    }
-
-    private func appendDeletionShards(
-        to vertices: inout [TimelineVertex],
-        effect: DeletionEffect,
-        leftX: Float,
-        rightX: Float,
-        topY: Float,
-        bottomY: Float,
-        centerY: Float,
-        progress: Float,
-        blast: Float,
-        alpha: Float,
-        drawableSize: SIMD2<Float>
-    ) {
-        let selectionWidth = max(rightX - leftX, 1)
-        let laneHeight = max(bottomY - topY, 1)
-        for shardIndex in 0..<deletionShardCount {
-            let seed = effect.seed &+ UInt64(shardIndex) &* 0xBF58_476D_1CE4_E5B9
-            let sourceX = leftX + pseudoRandom01(seed &+ 17) * selectionWidth
-            let yBias = pow(pseudoRandom01(seed &+ 31), 1.7)
-            let sourceY = centerY + (yBias * 2 - 1) * laneHeight * 0.39
-            let angle = pseudoRandom01(seed &+ 47) * Float.pi * 2
-            let direction = SIMD2<Float>(cos(angle), sin(angle))
-            let speed = 34 + 210 * pseudoRandom01(seed &+ 71)
-            let ageSeconds = progress * Float(deletionEffectDuration)
-            let center = SIMD2<Float>(sourceX, sourceY) +
-                direction * speed * ageSeconds * (0.35 + blast * 1.25)
-            let size = 0.55 + 2.25 * pseudoRandom01(seed &+ 89)
-            let rotation = angle + progress * (2.4 + 6.0 * pseudoRandom01(seed &+ 109))
-            let cold = pseudoRandom01(seed &+ 131)
-            let color = SIMD4<Float>(
-                0.70 + 0.30 * cold,
-                0.91 + 0.09 * cold,
-                0.92 + 0.08 * pseudoRandom01(seed &+ 149),
-                alpha * (0.40 + 0.34 * pseudoRandom01(seed &+ 167))
-            )
-
-            appendShardTriangle(
-                to: &vertices,
-                center: center,
-                radius: size,
-                rotation: rotation,
-                color: color,
-                drawableSize: drawableSize
-            )
-
-            if shardIndex.isMultiple(of: 5) {
-                appendSoftParticle(
-                    to: &vertices,
-                    center: center,
-                    radius: size * 1.12,
-                    color: SIMD3<Float>(color.x, color.y, color.z),
-                    alpha: color.w * 0.34,
-                    drawableSize: drawableSize
-                )
-            }
-        }
-    }
-
-    private func appendDeletionConjoinStreaks(
-        to vertices: inout [TimelineVertex],
-        effect: DeletionEffect,
-        leftX: Float,
-        rightX: Float,
-        joinX: Float,
-        topY: Float,
-        laneHeight: Float,
-        progress: Float,
-        drawableSize: SIMD2<Float>
-    ) {
-        let travelProgress = smoothStep(min(max(progress / 0.34, 0), 1))
-        let fadeOut = 1 - smoothStep(min(max((progress - 0.24) / 0.28, 0), 1))
-        let alpha = 0.34 * travelProgress * fadeOut
-        guard alpha > 0.002 else {
-            return
-        }
-
-        let pullDistance = max(rightX - leftX, 22)
-        for streakIndex in 0..<9 {
-            let seed = effect.seed &+ UInt64(streakIndex) &* 0x94D0_49BB_1331_11EB
-            let y = topY + (0.20 + 0.60 * pseudoRandom01(seed &+ 19)) * laneHeight
-            let jitter = (pseudoRandom01(seed &+ 29) - 0.5) * laneHeight * 0.08
-            let rightStart = rightX + 18 + pseudoRandom01(seed &+ 41) * min(pullDistance * 0.32, 90)
-            let rightNow = rightStart + (joinX - rightStart) * travelProgress
-            let color = SIMD4<Float>(0.70, 0.98, 0.96, alpha * (0.55 + pseudoRandom01(seed &+ 73) * 0.45))
-
-            appendThickLine(
-                to: &vertices,
-                start: SIMD2<Float>(rightNow, y + jitter),
-                end: SIMD2<Float>(joinX, y + jitter * 0.35),
-                width: 1.2 + 1.4 * pseudoRandom01(seed &+ 89),
-                color: color,
-                drawableSize: drawableSize
-            )
-        }
-    }
-
-    private func appendDeletionJoinFlare(
-        to vertices: inout [TimelineVertex],
-        joinX: Float,
-        centerY: Float,
-        laneHeight: Float,
-        progress: Float,
-        drawableSize: SIMD2<Float>
-    ) {
-        let flareProgress = min(max((progress - 0.16) / 0.30, 0), 1)
-        let flareEnergy = sin(flareProgress * Float.pi)
-        guard flareEnergy > 0.002 else {
-            return
-        }
-
-        let coreRadius = (6 + laneHeight * 0.07) * (0.70 + flareProgress * 1.25)
-        appendSoftParticle(
-            to: &vertices,
-            center: SIMD2<Float>(joinX, centerY),
-            radius: coreRadius,
-            color: SIMD3<Float>(0.78, 1.0, 0.96),
-            alpha: 0.28 * flareEnergy,
-            drawableSize: drawableSize
-        )
-        appendSoftParticle(
-            to: &vertices,
-            center: SIMD2<Float>(joinX, centerY),
-            radius: coreRadius * 1.65,
-            color: SIMD3<Float>(0.38, 0.96, 1.0),
-            alpha: 0.075 * flareEnergy,
-            drawableSize: drawableSize
-        )
-        appendThickLine(
-            to: &vertices,
-            start: SIMD2<Float>(joinX, centerY - laneHeight * 0.42),
-            end: SIMD2<Float>(joinX, centerY + laneHeight * 0.42),
-            width: 1.2 + 4.2 * flareEnergy,
-            color: SIMD4<Float>(0.72, 1.0, 0.96, 0.18 * flareEnergy),
-            drawableSize: drawableSize
         )
     }
 
@@ -6789,6 +6578,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float4 touch2;
     };
 
+    struct DeletionEffectUniform {
+        float4 rect;
+        float4 overlayRect;
+        float4 timing;
+        float4 metrics;
+    };
+
     struct TimelineRulerUniform {
         float4 viewport;
         float4 metrics;
@@ -6834,6 +6630,22 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float4 fisheye;
         float4 touch;
         float4 touch2;
+    };
+
+    struct DeletionEffectRasterizedVertex {
+        float4 position [[position]];
+        float2 normalizedPosition;
+        float2 localPosition;
+        float4 rect;
+        float4 overlayRect;
+        float4 timing;
+        float4 metrics;
+    };
+
+    struct DeletionParticleRasterizedVertex {
+        float4 position [[position]];
+        float2 localPosition;
+        float4 color;
     };
 
     float fisheye_focus_weight(float normalizedDistance) {
@@ -7219,6 +7031,241 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         color.a *= coverage;
         return color;
+    }
+
+    static float hash11(float value) {
+        return fract(sin(value * 12.9898) * 43758.5453123);
+    }
+
+    static float hash21(float2 value) {
+        return fract(sin(dot(value, float2(127.1, 311.7))) * 43758.5453123);
+    }
+
+    static float deletion_line_coverage(float2 point, float2 start, float2 end, float halfWidth, float aa) {
+        float2 segment = end - start;
+        float lengthSquared = max(dot(segment, segment), 0.000001);
+        float t = clamp(dot(point - start, segment) / lengthSquared, 0.0, 1.0);
+        float distance = length(point - (start + segment * t));
+        return 1.0 - smoothstep(halfWidth, halfWidth + aa, distance);
+    }
+
+    vertex DeletionEffectRasterizedVertex deletion_effect_vertex(
+        uint vertexID [[vertex_id]],
+        constant WaveformShaderQuadVertex *vertices [[buffer(0)]],
+        constant DeletionEffectUniform &effect [[buffer(1)]]
+    ) {
+        float2 localPosition = vertices[vertexID].position.xy;
+        float2 normalizedPosition = float2(
+            mix(effect.overlayRect.x, effect.overlayRect.y, localPosition.x),
+            mix(effect.overlayRect.z, effect.overlayRect.w, localPosition.y)
+        );
+
+        DeletionEffectRasterizedVertex out;
+        out.position = float4(
+            normalizedPosition.x * 2.0 - 1.0,
+            1.0 - normalizedPosition.y * 2.0,
+            0.0,
+            1.0
+        );
+        out.normalizedPosition = normalizedPosition;
+        out.localPosition = localPosition;
+        out.rect = effect.rect;
+        out.overlayRect = effect.overlayRect;
+        out.timing = effect.timing;
+        out.metrics = effect.metrics;
+        return out;
+    }
+
+    fragment float4 deletion_effect_fragment(
+        DeletionEffectRasterizedVertex in [[stage_in]],
+        constant WaveformShaderBin *bins [[buffer(1)]],
+        constant DeletionEffectUniform &effect [[buffer(2)]]
+    ) {
+        float width = max(effect.metrics.x, 1.0);
+        float height = max(effect.metrics.y, 1.0);
+        float laneHeightPixels = max(effect.metrics.z, 1.0);
+        float progress = clamp(effect.timing.x, 0.0, 1.0);
+        float blast = clamp(effect.timing.y, 0.0, 1.0);
+        float seed = effect.timing.z;
+        uint binCount = uint(max(effect.timing.w, 1.0));
+        float left = effect.rect.x;
+        float right = effect.rect.y;
+        float top = effect.rect.z;
+        float bottom = effect.rect.w;
+        float centerY = (top + bottom) * 0.5;
+        float2 point = in.normalizedPosition;
+        float2 pixelPoint = point * float2(width, height);
+        float4 color = float4(0.0);
+
+        if (point.x >= left && point.x <= right && point.y >= top && point.y <= bottom) {
+            float localX = clamp((point.x - left) / max(right - left, 0.000001), 0.0, 1.0);
+            float localY = clamp((point.y - top) / max(bottom - top, 0.000001), 0.0, 1.0);
+            WaveformShaderBin bin = sample_waveform_bin(localX, bins, binCount, 0u, 0.72);
+            float peakTop = 0.5 - bin.maximumSample * 0.39;
+            float peakBottom = 0.5 - bin.minimumSample * 0.39;
+            if (peakBottom - peakTop < 0.006) {
+                float midpoint = (peakTop + peakBottom) * 0.5;
+                peakTop = midpoint - 0.003;
+                peakBottom = midpoint + 0.003;
+            }
+
+            float yAA = max(fwidth(localY) * 0.75, 0.000001);
+            float waveformCoverage = rectangle_coverage(localY, peakTop, peakBottom, yAA);
+            float visibility = 1.0 - smoothstep(0.0, 0.48, progress);
+            float dissolveNoise = hash21(float2(
+                floor(localX * float(binCount) * 1.7) + seed,
+                floor(localY * 86.0)
+            ));
+            float dissolveMask = 1.0 - smoothstep(progress * 1.15, progress * 1.15 + 0.22, dissolveNoise);
+            float waveformAlpha = visibility * visibility *
+                waveformCoverage *
+                dissolveMask *
+                (0.18 + 0.42 * bin.peakMagnitude);
+            if (waveformAlpha > 0.0) {
+                float cold = hash11(seed + floor(localX * float(binCount)) * 79.0);
+                float3 waveformColor = float3(
+                    0.70 + 0.22 * cold,
+                    0.96 + 0.04 * cold,
+                    0.94 + 0.06 * hash11(seed + floor(localX * float(binCount)) * 83.0)
+                );
+                color += float4(waveformColor, waveformAlpha);
+            }
+
+            float flash = 1.0 - smoothstep(0.0, 0.15, progress);
+            if (flash > 0.001) {
+                float inset = min(0.10, 18.0 / laneHeightPixels);
+                float flashCoverage = rectangle_coverage(localY, inset, 1.0 - inset, yAA);
+                color += float4(0.34, 1.0, 0.94, 0.10 * flash * flashCoverage);
+
+                float centerCoverage = 1.0 - smoothstep(
+                    1.2 + 3.0 * flash,
+                    2.2 + 3.0 * flash,
+                    abs((localY - 0.5) * laneHeightPixels)
+                );
+                color += float4(0.82, 1.0, 0.98, 0.28 * flash * max(centerCoverage, 0.0));
+            }
+        }
+
+        float travelProgress = smoothstep(0.0, 1.0, clamp(progress / 0.34, 0.0, 1.0));
+        float fadeOut = 1.0 - smoothstep(0.0, 1.0, clamp((progress - 0.24) / 0.28, 0.0, 1.0));
+        float streakAlpha = 0.34 * travelProgress * fadeOut;
+        if (streakAlpha > 0.001) {
+            float joinX = left * width;
+            float rightX = right * width;
+            float topY = top * height;
+            float pullDistance = max(rightX - joinX, 22.0);
+            for (uint index = 0; index < 9; ++index) {
+                float localSeed = seed + float(index) * 153.31;
+                float y = topY + (0.20 + 0.60 * hash11(localSeed + 19.0)) * laneHeightPixels;
+                float jitter = (hash11(localSeed + 29.0) - 0.5) * laneHeightPixels * 0.08;
+                float rightStart = rightX + 18.0 + hash11(localSeed + 41.0) * min(pullDistance * 0.32, 90.0);
+                float rightNow = mix(rightStart, joinX, travelProgress);
+                float coverage = deletion_line_coverage(
+                    pixelPoint,
+                    float2(rightNow, y + jitter),
+                    float2(joinX, y + jitter * 0.35),
+                    0.65 + 0.70 * hash11(localSeed + 89.0),
+                    1.1
+                );
+                color += float4(
+                    0.70,
+                    0.98,
+                    0.96,
+                    coverage * streakAlpha * (0.55 + hash11(localSeed + 73.0) * 0.45)
+                );
+            }
+        }
+
+        float flareProgress = clamp((progress - 0.16) / 0.30, 0.0, 1.0);
+        float flareEnergy = sin(flareProgress * 3.14159265);
+        if (flareEnergy > 0.001) {
+            float2 flareCenter = float2(left * width, centerY * height);
+            float distance = length(pixelPoint - flareCenter);
+            float coreRadius = (6.0 + laneHeightPixels * 0.07) * (0.70 + flareProgress * 1.25);
+            float coreCoverage = 1.0 - smoothstep(coreRadius, coreRadius + 10.0, distance);
+            float haloCoverage = 1.0 - smoothstep(coreRadius * 1.65, coreRadius * 1.65 + 18.0, distance);
+            color += float4(0.78, 1.0, 0.96, max(coreCoverage, 0.0) * 0.28 * flareEnergy);
+            color += float4(0.38, 0.96, 1.0, max(haloCoverage, 0.0) * 0.075 * flareEnergy);
+
+            float verticalCoverage = 1.0 - smoothstep(
+                0.6 + 2.1 * flareEnergy,
+                1.8 + 2.1 * flareEnergy,
+                abs(pixelPoint.x - flareCenter.x)
+            );
+            float verticalSpan = rectangle_coverage(
+                pixelPoint.y,
+                flareCenter.y - laneHeightPixels * 0.42,
+                flareCenter.y + laneHeightPixels * 0.42,
+                1.2
+            );
+            color += float4(0.72, 1.0, 0.96, verticalCoverage * verticalSpan * 0.18 * flareEnergy);
+        }
+
+        return color;
+    }
+
+    vertex DeletionParticleRasterizedVertex deletion_particle_vertex(
+        uint vertexID [[vertex_id]],
+        uint instanceID [[instance_id]],
+        constant WaveformShaderQuadVertex *vertices [[buffer(0)]],
+        constant DeletionEffectUniform &effect [[buffer(1)]]
+    ) {
+        float2 unit = vertices[vertexID].position.xy;
+        float2 corner = unit * 2.0 - 1.0;
+        float width = max(effect.metrics.x, 1.0);
+        float height = max(effect.metrics.y, 1.0);
+        float laneHeightPixels = max(effect.metrics.z, 1.0);
+        float duration = max(effect.metrics.w, 0.000001);
+        float progress = clamp(effect.timing.x, 0.0, 1.0);
+        float blast = clamp(effect.timing.y, 0.0, 1.0);
+        float seed = effect.timing.z + float(instanceID) * 917.37;
+        float leftX = effect.rect.x * width;
+        float rightX = effect.rect.y * width;
+        float topY = effect.rect.z * height;
+        float bottomY = effect.rect.w * height;
+        float centerY = (topY + bottomY) * 0.5;
+        float sourceX = mix(leftX, rightX, hash11(seed + 17.0));
+        float yBias = pow(hash11(seed + 31.0), 1.7);
+        float sourceY = centerY + (yBias * 2.0 - 1.0) * laneHeightPixels * 0.39;
+        float angle = hash11(seed + 47.0) * 6.2831853;
+        float2 direction = float2(cos(angle), sin(angle));
+        float speed = 34.0 + 210.0 * hash11(seed + 71.0);
+        float ageSeconds = progress * duration;
+        float2 center = float2(sourceX, sourceY) +
+            direction * speed * ageSeconds * (0.35 + blast * 1.25);
+        float radius = 0.62 + 2.5 * hash11(seed + 89.0);
+        float dissolve = 1.0 - smoothstep(0.0, 1.0, progress);
+        float alpha = progress < 0.78 ?
+            dissolve * dissolve * (0.16 + 0.14 * hash11(seed + 167.0)) :
+            0.0;
+        float3 color = float3(
+            0.70 + 0.30 * hash11(seed + 131.0),
+            0.91 + 0.09 * hash11(seed + 137.0),
+            0.92 + 0.08 * hash11(seed + 149.0)
+        );
+
+        float2 normalizedPosition = (center + corner * radius) / float2(width, height);
+        DeletionParticleRasterizedVertex out;
+        out.position = float4(
+            normalizedPosition.x * 2.0 - 1.0,
+            1.0 - normalizedPosition.y * 2.0,
+            0.0,
+            1.0
+        );
+        out.localPosition = corner;
+        out.color = float4(color, alpha);
+        return out;
+    }
+
+    fragment float4 deletion_particle_fragment(
+        DeletionParticleRasterizedVertex in [[stage_in]],
+        constant DeletionEffectUniform &effect [[buffer(1)]]
+    ) {
+        float distance = length(in.localPosition);
+        float coverage = 1.0 - smoothstep(0.15, 1.0, distance);
+        float softCore = 1.0 - smoothstep(0.0, 0.38, distance);
+        float alpha = in.color.a * max(coverage, 0.0) * (0.72 + 0.28 * max(softCore, 0.0));
+        return float4(in.color.rgb, alpha);
     }
 
     fragment float4 waveform_fragment(
