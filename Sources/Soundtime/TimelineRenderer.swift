@@ -881,8 +881,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let playheadContactMinimumSpawnInterval: CFTimeInterval = 1.0 / 90.0
     private let transientParticleMaximumCount = 260
     private let maximumTransientParticleVerticesPerFrame = 10_000
-    private let deletionEffectDuration: CFTimeInterval = 0.44
-    private let deletionShardCount = 96
+    private let deletionEffectDuration: CFTimeInterval = 0.28
+    private let deletionShardCount = 56
     private let deletionEffectMaximumCount = 8
     private let deletionEffectMaximumCapturedBins = 512
     private let deletionRippleMaximumCapturedBins = 1_024
@@ -2222,7 +2222,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 mipLevels: mipLevels,
                 drawableSize: drawableSize,
                 renderState: renderState,
-                fallbackPolicy: .allowFallbacks
+                fallbackPolicy: .preferredOnly
             ) != nil else {
                 return false
             }
@@ -7582,7 +7582,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             float rightX = right * width;
             float topY = top * height;
             float pullDistance = max(rightX - joinX, 22.0);
-            for (uint index = 0; index < 9; ++index) {
+            for (uint index = 0; index < 5; ++index) {
                 float localSeed = seed + float(index) * 153.31;
                 float y = topY + (0.20 + 0.60 * hash11(localSeed + 19.0)) * laneHeightPixels;
                 float jitter = (hash11(localSeed + 29.0) - 0.5) * laneHeightPixels * 0.08;
@@ -7609,16 +7609,16 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         if (flareEnergy > 0.001) {
             float2 flareCenter = float2(left * width, centerY * height);
             float distance = length(pixelPoint - flareCenter);
-            float coreRadius = (6.0 + laneHeightPixels * 0.07) * (0.70 + flareProgress * 1.25);
-            float coreCoverage = 1.0 - smoothstep(coreRadius, coreRadius + 10.0, distance);
-            float haloCoverage = 1.0 - smoothstep(coreRadius * 1.65, coreRadius * 1.65 + 18.0, distance);
+            float coreRadius = (5.0 + laneHeightPixels * 0.045) * (0.72 + flareProgress * 1.10);
+            float coreCoverage = 1.0 - smoothstep(coreRadius, coreRadius + 7.0, distance);
+            float haloCoverage = 1.0 - smoothstep(coreRadius * 1.45, coreRadius * 1.45 + 12.0, distance);
             color = source_over(
                 color,
-                float4(0.78, 1.0, 0.96, max(coreCoverage, 0.0) * 0.28 * flareEnergy)
+                float4(0.78, 1.0, 0.96, max(coreCoverage, 0.0) * 0.22 * flareEnergy)
             );
             color = source_over(
                 color,
-                float4(0.38, 0.96, 1.0, max(haloCoverage, 0.0) * 0.075 * flareEnergy)
+                float4(0.38, 0.96, 1.0, max(haloCoverage, 0.0) * 0.045 * flareEnergy)
             );
 
             float verticalCoverage = 1.0 - smoothstep(
@@ -7628,13 +7628,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             );
             float verticalSpan = rectangle_coverage(
                 pixelPoint.y,
-                flareCenter.y - laneHeightPixels * 0.42,
-                flareCenter.y + laneHeightPixels * 0.42,
+                flareCenter.y - laneHeightPixels * 0.34,
+                flareCenter.y + laneHeightPixels * 0.34,
                 1.2
             );
             color = source_over(
                 color,
-                float4(0.72, 1.0, 0.96, verticalCoverage * verticalSpan * 0.18 * flareEnergy)
+                float4(0.72, 1.0, 0.96, verticalCoverage * verticalSpan * 0.12 * flareEnergy)
             );
         }
 
@@ -7670,10 +7670,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float ageSeconds = progress * duration;
         float2 center = float2(sourceX, sourceY) +
             direction * speed * ageSeconds * (0.35 + blast * 1.25);
-        float radius = 0.62 + 2.5 * hash11(seed + 89.0);
+        float radius = 0.45 + 1.35 * hash11(seed + 89.0);
         float dissolve = 1.0 - smoothstep(0.0, 1.0, progress);
         float alpha = progress < 0.78 ?
-            dissolve * dissolve * (0.16 + 0.14 * hash11(seed + 167.0)) :
+            dissolve * dissolve * (0.13 + 0.11 * hash11(seed + 167.0)) :
             0.0;
         float3 color = float3(
             0.70 + 0.30 * hash11(seed + 131.0),
