@@ -12,8 +12,10 @@ enum TimelinePerfBaselineHarness {
         let isPlaybackActive: Bool
         let pansDuringRun: Bool
         let zoomsDuringRun: Bool
+        let scrollsTracksDuringRun: Bool
         let showsSelection: Bool
         let showsGainPreview: Bool
+        let targetsVisibleTrack: Bool
         let deletionBurstInterval: Int?
     }
 
@@ -23,6 +25,8 @@ enum TimelinePerfBaselineHarness {
         let gpuFrameMilliseconds: [Double]
         let rendererStats: TimelineFrameStats
         let rendererStatsSamples: [TimelineFrameStats]
+        let visibleLaneCounts: [Int]
+        let visibleLaneBudget: Int
 
         var frameCount: Int {
             cpuFrameMilliseconds.count
@@ -47,6 +51,19 @@ enum TimelinePerfBaselineHarness {
         var maximumShaderBufferUploadInFlightCount: Int {
             rendererStatsSamples.map(\.shaderBufferUploadInFlightCount).max() ??
                 rendererStats.shaderBufferUploadInFlightCount
+        }
+
+        var maximumVisibleLaneCount: Int {
+            visibleLaneCounts.max() ?? 0
+        }
+
+        var averageVisibleLaneCount: Double {
+            guard !visibleLaneCounts.isEmpty else {
+                return 0
+            }
+
+            let total = visibleLaneCounts.reduce(0, +)
+            return Double(total) / Double(visibleLaneCounts.count)
         }
     }
 
@@ -142,6 +159,7 @@ enum TimelinePerfBaselineHarness {
 
             let result = run(
                 scenario: scenario,
+                tracks: tracks,
                 renderer: renderer,
                 texture: texture,
                 viewportSize: viewportSize,
@@ -176,8 +194,10 @@ enum TimelinePerfBaselineHarness {
                     isPlaybackActive: true,
                     pansDuringRun: false,
                     zoomsDuringRun: false,
+                    scrollsTracksDuringRun: false,
                     showsSelection: false,
                     showsGainPreview: false,
+                    targetsVisibleTrack: false,
                     deletionBurstInterval: nil
                 ),
                 Scenario(
@@ -189,8 +209,10 @@ enum TimelinePerfBaselineHarness {
                     isPlaybackActive: true,
                     pansDuringRun: false,
                     zoomsDuringRun: false,
+                    scrollsTracksDuringRun: false,
                     showsSelection: false,
                     showsGainPreview: false,
+                    targetsVisibleTrack: false,
                     deletionBurstInterval: nil
                 ),
                 Scenario(
@@ -202,8 +224,10 @@ enum TimelinePerfBaselineHarness {
                     isPlaybackActive: false,
                     pansDuringRun: true,
                     zoomsDuringRun: false,
+                    scrollsTracksDuringRun: false,
                     showsSelection: false,
                     showsGainPreview: false,
+                    targetsVisibleTrack: false,
                     deletionBurstInterval: nil
                 ),
                 Scenario(
@@ -215,8 +239,10 @@ enum TimelinePerfBaselineHarness {
                     isPlaybackActive: true,
                     pansDuringRun: true,
                     zoomsDuringRun: true,
+                    scrollsTracksDuringRun: false,
                     showsSelection: false,
                     showsGainPreview: false,
+                    targetsVisibleTrack: false,
                     deletionBurstInterval: nil
                 ),
                 Scenario(
@@ -228,8 +254,10 @@ enum TimelinePerfBaselineHarness {
                     isPlaybackActive: true,
                     pansDuringRun: true,
                     zoomsDuringRun: false,
+                    scrollsTracksDuringRun: false,
                     showsSelection: true,
                     showsGainPreview: true,
+                    targetsVisibleTrack: false,
                     deletionBurstInterval: nil
                 ),
                 Scenario(
@@ -241,8 +269,55 @@ enum TimelinePerfBaselineHarness {
                     isPlaybackActive: false,
                     pansDuringRun: true,
                     zoomsDuringRun: false,
+                    scrollsTracksDuringRun: false,
                     showsSelection: false,
                     showsGainPreview: false,
+                    targetsVisibleTrack: false,
+                    deletionBurstInterval: isQuick ? 30 : 45
+                ),
+                Scenario(
+                    name: "track scroll playback",
+                    trackCount: trackCount,
+                    frames: frames,
+                    warmupFrames: warmupFrames,
+                    viewportDuration: 0.12,
+                    isPlaybackActive: true,
+                    pansDuringRun: true,
+                    zoomsDuringRun: false,
+                    scrollsTracksDuringRun: true,
+                    showsSelection: false,
+                    showsGainPreview: false,
+                    targetsVisibleTrack: false,
+                    deletionBurstInterval: nil
+                ),
+                Scenario(
+                    name: "visible track edit overlays",
+                    trackCount: trackCount,
+                    frames: frames,
+                    warmupFrames: warmupFrames,
+                    viewportDuration: 0.10,
+                    isPlaybackActive: true,
+                    pansDuringRun: true,
+                    zoomsDuringRun: false,
+                    scrollsTracksDuringRun: true,
+                    showsSelection: true,
+                    showsGainPreview: true,
+                    targetsVisibleTrack: true,
+                    deletionBurstInterval: nil
+                ),
+                Scenario(
+                    name: "visible track delete bursts",
+                    trackCount: trackCount,
+                    frames: frames,
+                    warmupFrames: warmupFrames,
+                    viewportDuration: 0.16,
+                    isPlaybackActive: false,
+                    pansDuringRun: true,
+                    zoomsDuringRun: false,
+                    scrollsTracksDuringRun: true,
+                    showsSelection: false,
+                    showsGainPreview: false,
+                    targetsVisibleTrack: true,
                     deletionBurstInterval: isQuick ? 30 : 45
                 ),
             ]
@@ -251,6 +326,7 @@ enum TimelinePerfBaselineHarness {
 
     private static func run(
         scenario: Scenario,
+        tracks: [TimelineRenderState.Track],
         renderer: TimelineRenderer,
         texture: MTLTexture,
         viewportSize: CGSize,
@@ -260,9 +336,11 @@ enum TimelinePerfBaselineHarness {
         var cpuMilliseconds: [Double] = []
         var gpuMilliseconds: [Double] = []
         var rendererStatsSamples: [TimelineFrameStats] = []
+        var visibleLaneCounts: [Int] = []
         cpuMilliseconds.reserveCapacity(scenario.frames)
         gpuMilliseconds.reserveCapacity(scenario.frames)
         rendererStatsSamples.reserveCapacity(scenario.frames)
+        visibleLaneCounts.reserveCapacity(scenario.frames)
 
         let totalFrames = scenario.warmupFrames + scenario.frames
         let maximumSettleFrames = 240
@@ -274,8 +352,15 @@ enum TimelinePerfBaselineHarness {
                 let displayTimestamp = baseTimestamp + Double(frame) / 144.0
                 let viewport = viewport(for: scenario, frame: frame, totalFrames: totalFrames)
                 let playheadProgress = playheadProgress(for: scenario, frame: frame, totalFrames: totalFrames)
+                let trackLayout = trackLayout(
+                    for: scenario,
+                    frame: frame,
+                    totalFrames: totalFrames,
+                    viewportHeight: Float(viewportSize.height)
+                )
 
                 renderer.displayViewport(viewport)
+                renderer.displayTrackLayout(trackLayout)
                 renderer.displayPlayheadProgress(
                     playheadProgress,
                     force: true,
@@ -286,7 +371,10 @@ enum TimelinePerfBaselineHarness {
                     scenario: scenario,
                     renderer: renderer,
                     frame: frame,
-                    totalFrames: totalFrames
+                    totalFrames: totalFrames,
+                    tracks: tracks,
+                    trackLayout: trackLayout,
+                    viewportHeight: Float(viewportSize.height)
                 )
 
                 let renderPassDescriptor = makeRenderPassDescriptor(texture: texture)
@@ -317,6 +405,11 @@ enum TimelinePerfBaselineHarness {
                         gpuMilliseconds.append(gpuMillisecondsForFrame)
                     }
                     rendererStatsSamples.append(statsAfterFrame)
+                    visibleLaneCounts.append(visibleLaneCount(
+                        trackLayout: trackLayout,
+                        trackCount: scenario.trackCount,
+                        viewportHeight: Float(viewportSize.height)
+                    ))
                 }
             }
             frame += 1
@@ -327,7 +420,12 @@ enum TimelinePerfBaselineHarness {
             cpuFrameMilliseconds: cpuMilliseconds,
             gpuFrameMilliseconds: gpuMilliseconds,
             rendererStats: rendererStats(),
-            rendererStatsSamples: rendererStatsSamples
+            rendererStatsSamples: rendererStatsSamples,
+            visibleLaneCounts: visibleLaneCounts,
+            visibleLaneBudget: visibleLaneBudget(
+                trackCount: scenario.trackCount,
+                viewportHeight: Float(viewportSize.height)
+            )
         )
     }
 
@@ -387,11 +485,64 @@ enum TimelinePerfBaselineHarness {
         return min(max(viewport.startProgress + progressThroughViewport * viewport.durationProgress, 0), 1)
     }
 
+    private static func trackLayout(
+        for scenario: Scenario,
+        frame: Int,
+        totalFrames: Int,
+        viewportHeight: Float
+    ) -> TimelineTrackLayout {
+        let baseLayout = TimelineTrackLayout.default
+        guard scenario.scrollsTracksDuringRun else {
+            return baseLayout
+        }
+
+        let resolvedLayout = baseLayout.resolved(
+            totalTrackCount: scenario.trackCount,
+            viewportHeight: viewportHeight
+        )
+        guard resolvedLayout.maximumScrollOffset > 0 else {
+            return baseLayout
+        }
+
+        let phase = Float(frame % max(totalFrames, 1)) / Float(max(totalFrames - 1, 1))
+        let sweep = phase <= 0.5 ? phase * 2 : (1 - phase) * 2
+        return TimelineTrackLayout(
+            scrollOffset: resolvedLayout.maximumScrollOffset * sweep,
+            preferredTrackHeight: baseLayout.preferredTrackHeight
+        )
+    }
+
+    private static func visibleLaneCount(
+        trackLayout: TimelineTrackLayout,
+        trackCount: Int,
+        viewportHeight: Float
+    ) -> Int {
+        trackLayout.resolved(
+            totalTrackCount: trackCount,
+            viewportHeight: viewportHeight
+        ).visibleRange(overscan: 0).count
+    }
+
+    private static func visibleLaneBudget(
+        trackCount: Int,
+        viewportHeight: Float
+    ) -> Int {
+        let layout = TimelineTrackLayout.default.resolved(
+            totalTrackCount: trackCount,
+            viewportHeight: viewportHeight
+        )
+        let screenful = Int(ceil(viewportHeight / max(layout.trackHeight, 1)))
+        return min(max(trackCount, 0), screenful + 2)
+    }
+
     private static func displayEditOverlays(
         scenario: Scenario,
         renderer: TimelineRenderer,
         frame: Int,
-        totalFrames: Int
+        totalFrames: Int,
+        tracks: [TimelineRenderState.Track],
+        trackLayout: TimelineTrackLayout,
+        viewportHeight: Float
     ) {
         guard scenario.showsSelection || scenario.showsGainPreview || scenario.deletionBurstInterval != nil else {
             renderer.displaySelection(nil)
@@ -402,10 +553,17 @@ enum TimelinePerfBaselineHarness {
         let viewport = viewport(for: scenario, frame: frame, totalFrames: totalFrames)
         let startProgress = min(max(Double(viewport.startProgress + viewport.durationProgress * 0.32), 0), 0.98)
         let endProgress = min(max(startProgress + Double(viewport.durationProgress * 0.18), startProgress), 1)
+        let trackID = targetedTrackID(
+            scenario: scenario,
+            tracks: tracks,
+            trackLayout: trackLayout,
+            viewportHeight: viewportHeight,
+            frame: frame
+        )
         let selection = TimelineSelection(
             startProgress: startProgress,
             endProgress: endProgress,
-            trackID: nil
+            trackID: trackID
         )
 
         if scenario.showsSelection {
@@ -428,6 +586,34 @@ enum TimelinePerfBaselineHarness {
         {
             renderer.triggerDeletionEffect(selection: selection)
         }
+    }
+
+    private static func targetedTrackID(
+        scenario: Scenario,
+        tracks: [TimelineRenderState.Track],
+        trackLayout: TimelineTrackLayout,
+        viewportHeight: Float,
+        frame: Int
+    ) -> UUID? {
+        guard scenario.targetsVisibleTrack, !tracks.isEmpty else {
+            return nil
+        }
+
+        let layout = trackLayout.resolved(
+            totalTrackCount: tracks.count,
+            viewportHeight: viewportHeight
+        )
+        let visibleRange = layout.visibleRange(overscan: 0)
+        guard !visibleRange.isEmpty else {
+            return nil
+        }
+
+        let localIndex = (frame / 18) % visibleRange.count
+        let trackIndex = visibleRange.lowerBound + localIndex
+        guard tracks.indices.contains(trackIndex) else {
+            return nil
+        }
+        return tracks[trackIndex].id
     }
 
     private static func pulse(frame: Int, period: Int) -> Float {
@@ -513,6 +699,11 @@ enum TimelinePerfBaselineHarness {
             "selection": result.scenario.showsSelection,
             "gain_preview": result.scenario.showsGainPreview,
             "delete_bursts": result.scenario.deletionBurstInterval != nil,
+            "track_scroll": result.scenario.scrollsTracksDuringRun,
+            "target_visible_track": result.scenario.targetsVisibleTrack,
+            "visible_lanes_avg": rounded(result.averageVisibleLaneCount),
+            "visible_lanes_max": result.maximumVisibleLaneCount,
+            "visible_lanes_budget": result.visibleLaneBudget,
             "gpu_waveform_draws": stats.gpuWaveformDrawCount,
             "cpu_waveform_vertices": result.maximumCPUWaveformVertexCount,
             "shader_uploads": result.maximumShaderBufferUploadCount,
@@ -569,6 +760,12 @@ enum TimelinePerfBaselineHarness {
         }
         if result.maximumCPUWaveformVertexCount > 0 {
             failures.append("\(label) generated \(result.maximumCPUWaveformVertexCount) CPU waveform vertices")
+        }
+        if result.maximumVisibleLaneCount > result.visibleLaneBudget {
+            failures.append(
+                "\(label) saw \(result.maximumVisibleLaneCount) visible lanes, " +
+                "budget \(result.visibleLaneBudget)"
+            )
         }
         if result.maximumShaderBufferUploadCount > 0 || result.maximumShaderBufferUploadInFlightCount > 0 {
             failures.append(
