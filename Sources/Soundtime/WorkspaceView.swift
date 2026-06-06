@@ -167,6 +167,7 @@ final class WorkspaceView: NSView {
     private var playbackTimer: Timer?
     private var loudnessMeterTimer: Timer?
     private var keyDownMonitor: Any?
+    private var audioDevicePreferencesObserver: NSObjectProtocol?
     private var debugToolsVisible = false
     private let editMaterializationDelay: TimeInterval = 0.75
     private var editMaterializationTasks: [UUID: Task<Void, Never>] = [:]
@@ -453,6 +454,7 @@ final class WorkspaceView: NSView {
             self?.handleTransportAction(action)
         }
         configureFisheyeTuningControls()
+        installAudioDevicePreferencesObserver()
         gainEffectOverlay.onGainChanged = { [weak self] _, gain in
             self?.previewSelectedGain(gain)
         }
@@ -610,6 +612,10 @@ final class WorkspaceView: NSView {
             NSEvent.removeMonitor(keyDownMonitor)
             self.keyDownMonitor = nil
         }
+        if let audioDevicePreferencesObserver {
+            NotificationCenter.default.removeObserver(audioDevicePreferencesObserver)
+            self.audioDevicePreferencesObserver = nil
+        }
         stopPlaybackTimer()
         loudnessMeterTimer?.invalidate()
         loudnessMeterTimer = nil
@@ -738,6 +744,39 @@ final class WorkspaceView: NSView {
             }
 
             return self.handleWindowKeyDown(event)
+        }
+    }
+
+    private func installAudioDevicePreferencesObserver() {
+        guard audioDevicePreferencesObserver == nil else {
+            return
+        }
+
+        audioDevicePreferencesObserver = NotificationCenter.default.addObserver(
+            forName: AudioDevicePreferences.didChangeNotification,
+            object: AudioDevicePreferences.shared,
+            queue: .main
+        ) { [weak self] notification in
+            let changedDeviceKind = notification.userInfo?[
+                AudioDevicePreferences.changedDeviceKindUserInfoKey
+            ] as? String
+            Task { @MainActor in
+                self?.handleAudioDevicePreferencesChanged(changedDeviceKind: changedDeviceKind)
+            }
+        }
+    }
+
+    private func handleAudioDevicePreferencesChanged(changedDeviceKind: String?) {
+        if changedDeviceKind == "input", recordingTrackID != nil {
+            stopRecording()
+        }
+
+        do {
+            try playbackController.refreshOutputDevice()
+            updateStatus("audio device updated")
+        } catch {
+            stopPlaybackTimer()
+            updateStatus("audio device failed: \(error.localizedDescription)")
         }
     }
 

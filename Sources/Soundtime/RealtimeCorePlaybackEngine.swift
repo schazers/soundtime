@@ -199,6 +199,23 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         core.setGain(masterGain)
     }
 
+    func refreshOutputDevice() throws {
+        guard sourceLoaded, sampleRate > 0 else {
+            return
+        }
+
+        let shouldResume = isPlaying
+        if shouldResume {
+            outputDevice.stop()
+        }
+
+        try configureOutputDevice(sampleRate: sampleRate)
+
+        if shouldResume {
+            try outputDevice.start()
+        }
+    }
+
     func replaceWithDecodedSource(
         _ decodedAudioBuffer: DecodedAudioBuffer,
         zeroCrossingIndex: AudioZeroCrossingIndex? = nil
