@@ -461,6 +461,12 @@ final class WorkspaceView: NSView {
         agentCommandBar.onSubmit = { [weak self] prompt in
             self?.agentCommandController.submit(prompt: prompt)
         }
+        agentCommandBar.onBlurRequested = { [weak self] in
+            guard let self else {
+                return
+            }
+            self.window?.makeFirstResponder(self.timelineSurface)
+        }
         agentCommandController.onStateChanged = { [weak self] state in
             self?.agentCommandBar.presentationState = state
         }
