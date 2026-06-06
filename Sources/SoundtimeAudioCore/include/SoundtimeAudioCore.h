@@ -10,6 +10,7 @@ extern "C" {
 
 typedef struct SoundtimeAudioCoreEngine SoundtimeAudioCoreEngine;
 typedef struct SoundtimeAudioCoreSource SoundtimeAudioCoreSource;
+typedef struct SoundtimeAudioCoreRecordingRing SoundtimeAudioCoreRecordingRing;
 
 typedef struct SoundtimeAudioCoreSnapshot {
     uint64_t frameIndex;
@@ -172,6 +173,40 @@ void soundtime_audio_core_render_at_host_time(
     uint32_t channelCount,
     uint32_t frameCount,
     double hostTimestamp
+);
+
+SoundtimeAudioCoreRecordingRing* soundtime_audio_core_recording_ring_create(
+    uint32_t channelCount,
+    uint64_t frameCapacity,
+    double sampleRate
+);
+void soundtime_audio_core_recording_ring_destroy(SoundtimeAudioCoreRecordingRing* ring);
+void soundtime_audio_core_recording_ring_reset(SoundtimeAudioCoreRecordingRing* ring);
+uint32_t soundtime_audio_core_recording_ring_push_planar(
+    SoundtimeAudioCoreRecordingRing* ring,
+    const float* const* channels,
+    uint32_t channelCount,
+    uint32_t frameCount,
+    double hostTimestamp
+);
+uint32_t soundtime_audio_core_recording_ring_pop_planar(
+    SoundtimeAudioCoreRecordingRing* ring,
+    float* const* channels,
+    uint32_t channelCount,
+    uint32_t maxFrameCount,
+    double* hostTimestamp
+);
+uint64_t soundtime_audio_core_recording_ring_available_frame_count(
+    const SoundtimeAudioCoreRecordingRing* ring
+);
+uint64_t soundtime_audio_core_recording_ring_dropped_frame_count(
+    const SoundtimeAudioCoreRecordingRing* ring
+);
+uint32_t soundtime_audio_core_recording_ring_channel_count(
+    const SoundtimeAudioCoreRecordingRing* ring
+);
+double soundtime_audio_core_recording_ring_sample_rate(
+    const SoundtimeAudioCoreRecordingRing* ring
 );
 
 #ifdef __cplusplus
