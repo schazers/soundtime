@@ -1445,6 +1445,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         deletionEffectLock.unlock()
     }
 
+    func clearDeletionEffects() {
+        deletionEffectLock.lock()
+        deletionEffects.removeAll()
+        frameStatsDeletionEffectCount = 0
+        deletionEffectLock.unlock()
+    }
+
     private func capturedDeletionBins(for selection: TimelineSelection) -> [WaveformOverview.Bin] {
         guard let overview = deletionCaptureOverview(for: selection) else {
             return []
