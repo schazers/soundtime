@@ -168,6 +168,13 @@ final class WorkspaceView: NSView {
     private var recordingAccumulator: LiveRecordingWaveformAccumulator?
     private var lastRecordingVisualUpdateTimestamp = CACurrentMediaTime()
     private var trackControlViewsByID: [UUID: TrackControlView] = [:]
+    private var trackControlReusePool: [TrackControlView] = []
+    private var currentTrackLaneLayout = ResolvedTimelineTrackLayout(
+        totalTrackCount: 0,
+        viewportHeight: 1,
+        preferredTrackHeight: TimelineTrackLayout.defaultPreferredTrackHeight,
+        requestedScrollOffset: 0
+    )
     private let playbackController: PlaybackEngine = PlaybackEngineFactory.makeDefault()
     private let playbackRefreshRate: TimeInterval = 10
     private let loudnessMeterRefreshRate: TimeInterval = 60
@@ -310,14 +317,10 @@ final class WorkspaceView: NSView {
         stackView.translatesAutoresizingMaskIntoConstraints = false
         return stackView
     }()
-    private let trackControlsStack: NSStackView = {
-        let stackView = NSStackView()
-        stackView.orientation = .vertical
-        stackView.alignment = .width
-        stackView.distribution = .fillEqually
-        stackView.spacing = 0
-        stackView.translatesAutoresizingMaskIntoConstraints = false
-        return stackView
+    private let trackControlsStack: TrackControlsViewportView = {
+        let view = TrackControlsViewportView()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        return view
     }()
     private let timelineSurface = TimelineView()
     private let addTrackButton = AddTrackButton()
@@ -419,8 +422,14 @@ final class WorkspaceView: NSView {
         timelineSurface.onTimelineInteractionBegan = { [weak self] in
             self?.clearSelectedTrack()
         }
+        timelineSurface.onTrackLaneLayoutChanged = { [weak self] layout in
+            self?.updateTrackLaneLayout(layout)
+        }
         addTrackButton.onPressed = { [weak self] in
             self?.addEmptyTrack()
+        }
+        trackControlsStack.onVerticalScroll = { [weak self] deltaPixels in
+            self?.timelineSurface.scrollTracks(byPixels: deltaPixels)
         }
         volumeControl.onVolumeChanged = { [weak self] volume in
             self?.playbackController.setPerceptualVolume(volume)
@@ -572,6 +581,7 @@ final class WorkspaceView: NSView {
     override func layout() {
         super.layout()
         updateResponsiveChromeVisibilityIfNeeded()
+        layoutTrackControlViews()
     }
 
     override func viewDidMoveToWindow() {
@@ -837,21 +847,36 @@ final class WorkspaceView: NSView {
     }
 
     private func refreshTrackControls() {
-        let visibleTrackIDs = Set(projectTracks.map(\.id))
+        let visibleRange = currentTrackLaneLayout.visibleRange(overscan: 1)
+        let visibleLowerBound = min(max(visibleRange.lowerBound, 0), projectTracks.count)
+        let visibleUpperBound = min(max(visibleRange.upperBound, visibleLowerBound), projectTracks.count)
+        let visibleTracks = projectTracks[visibleLowerBound..<visibleUpperBound]
+        let visibleTrackIDs = Set(visibleTracks.map(\.id))
         for (trackID, controlView) in trackControlViewsByID where !visibleTrackIDs.contains(trackID) {
-            trackControlsStack.removeArrangedSubview(controlView)
             controlView.removeFromSuperview()
+            controlView.onTrackSelected = nil
+            controlView.onMuteChanged = nil
+            controlView.onSoloChanged = nil
+            controlView.onRecordRequested = nil
+            controlView.onVolumeChanged = nil
+            controlView.onVolumeEditingEnded = nil
+            trackControlReusePool.append(controlView)
             trackControlViewsByID[trackID] = nil
         }
 
-        var orderedControlViews: [TrackControlView] = []
-        for track in projectTracks {
+        for track in visibleTracks {
             let controlView: TrackControlView
             if let cachedControlView = trackControlViewsByID[track.id] {
                 controlView = cachedControlView
+            } else if let reusedControlView = trackControlReusePool.popLast() {
+                controlView = reusedControlView
+                trackControlViewsByID[track.id] = controlView
             } else {
                 controlView = TrackControlView(title: track.name)
                 trackControlViewsByID[track.id] = controlView
+            }
+            if controlView.superview !== trackControlsStack {
+                trackControlsStack.addSubview(controlView)
             }
 
             controlView.configure(
@@ -880,26 +905,45 @@ final class WorkspaceView: NSView {
             controlView.onVolumeEditingEnded = { [weak self] in
                 self?.updateProjectPlaybackTrackMix()
             }
-            orderedControlViews.append(controlView)
         }
 
-        let desiredObjectIDs = Set(orderedControlViews.map(ObjectIdentifier.init))
-        for subview in trackControlsStack.arrangedSubviews
-            where !desiredObjectIDs.contains(ObjectIdentifier(subview)) {
-            trackControlsStack.removeArrangedSubview(subview)
-            subview.removeFromSuperview()
+        layoutTrackControlViews()
+    }
+
+    private func updateTrackLaneLayout(_ layout: ResolvedTimelineTrackLayout) {
+        guard currentTrackLaneLayout != layout else {
+            layoutTrackControlViews()
+            return
         }
 
-        for (index, controlView) in orderedControlViews.enumerated() {
-            let arrangedSubviews = trackControlsStack.arrangedSubviews
-            if index < arrangedSubviews.count, arrangedSubviews[index] === controlView {
+        currentTrackLaneLayout = layout
+        refreshTrackControls()
+    }
+
+    private func layoutTrackControlViews() {
+        let viewportHeight = max(trackControlsStack.bounds.height, 1)
+        let viewportWidth = max(trackControlsStack.bounds.width, 1)
+        for (trackID, controlView) in trackControlViewsByID {
+            guard
+                let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }),
+                let laneFrame = currentTrackLaneLayout.laneFrame(forTrackIndex: trackIndex)
+            else {
+                controlView.isHidden = true
                 continue
             }
 
-            if arrangedSubviews.contains(where: { $0 === controlView }) {
-                trackControlsStack.removeArrangedSubview(controlView)
-            }
-            trackControlsStack.insertArrangedSubview(controlView, at: index)
+            let top = CGFloat(laneFrame.top) * viewportHeight
+            let bottom = CGFloat(laneFrame.bottom) * viewportHeight
+            let clampedTop = min(max(top, 0), viewportHeight)
+            let clampedBottom = min(max(bottom, 0), viewportHeight)
+            let height = max(clampedBottom - clampedTop, 1)
+            controlView.isHidden = clampedBottom <= 0 || clampedTop >= viewportHeight
+            controlView.frame = NSRect(
+                x: 0,
+                y: viewportHeight - clampedBottom,
+                width: viewportWidth,
+                height: height
+            )
         }
     }
 
