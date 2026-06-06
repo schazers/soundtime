@@ -49,6 +49,7 @@ final class WorkspaceView: NSView {
         var zeroCrossingIndex: AudioZeroCrossingIndex?
         var zeroCrossingProbe: WAVZeroCrossingProbe?
         var audioTimeline: AudioEditTimeline?
+        var ownsSourceFile: Bool
         var volume: Float
         var isMuted: Bool
         var isSoloed: Bool
@@ -590,7 +591,14 @@ final class WorkspaceView: NSView {
         loudnessMeterTimer?.invalidate()
         loudnessMeterTimer = nil
         inputRecorder.stop()
+        inputRecorder.onChunk = nil
+        recordingTakeWriter?.cancel()
+        recordingTakeWriter = nil
+        recordingTrackID = nil
+        recordingSampleRate = 0
+        recordingAccumulator = nil
         playbackController.clear()
+        deleteAllOwnedSourceFiles()
         ImportWorkBudget.shared.setPlaybackActive(false)
     }
 
@@ -884,6 +892,7 @@ final class WorkspaceView: NSView {
             zeroCrossingIndex: nil,
             zeroCrossingProbe: nil,
             audioTimeline: nil,
+            ownsSourceFile: false,
             volume: 1,
             isMuted: false,
             isSoloed: false,
@@ -971,6 +980,7 @@ final class WorkspaceView: NSView {
         projectTracks[trackIndex].zeroCrossingIndex = nil
         projectTracks[trackIndex].zeroCrossingProbe = nil
         projectTracks[trackIndex].audioTimeline = nil
+        projectTracks[trackIndex].ownsSourceFile = false
         projectTracks[trackIndex].editRevision += 1
         activeTrackID = trackID
         selectedTrackID = nil
@@ -1047,6 +1057,7 @@ final class WorkspaceView: NSView {
         projectTracks[trackIndex].zeroCrossingIndex = nil
         projectTracks[trackIndex].zeroCrossingProbe = zeroCrossingProbe
         projectTracks[trackIndex].audioTimeline = nil
+        projectTracks[trackIndex].ownsSourceFile = true
         projectTracks[trackIndex].importID = importID
         projectTracks[trackIndex].editRevision = 0
         activeTrackID = trackID
@@ -1169,13 +1180,7 @@ final class WorkspaceView: NSView {
     }
 
     private func recordingFileURL(trackName: String) -> URL {
-        let baseDirectory = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        let recordingsDirectory = baseDirectory
-            .appendingPathComponent("Soundtime", isDirectory: true)
-            .appendingPathComponent("Recordings", isDirectory: true)
+        let recordingsDirectory = recordingsDirectoryURL()
         try? FileManager.default.createDirectory(
             at: recordingsDirectory,
             withIntermediateDirectories: true
@@ -1187,6 +1192,86 @@ final class WorkspaceView: NSView {
             .joined(separator: "-")
         let fileName = "\(safeTrackName.isEmpty ? "Recording" : safeTrackName)-\(UUID().uuidString).wav"
         return recordingsDirectory.appendingPathComponent(fileName)
+    }
+
+    private func recordingsDirectoryURL() -> URL {
+        let baseDirectory = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        return baseDirectory
+            .appendingPathComponent("Soundtime", isDirectory: true)
+            .appendingPathComponent("Recordings", isDirectory: true)
+            .standardizedFileURL
+    }
+
+    private func normalizedOwnedURL(_ url: URL) -> URL {
+        url.standardizedFileURL
+    }
+
+    private func isOwnedRecordingURL(_ url: URL) -> Bool {
+        let recordingsDirectory = recordingsDirectoryURL()
+        let candidate = normalizedOwnedURL(url)
+        return candidate.path.hasPrefix(recordingsDirectory.path + "/")
+            && candidate.pathExtension.lowercased() == "wav"
+    }
+
+    private func ownedSourceURLs(in tracks: [ProjectTrack]) -> Set<URL> {
+        Set(
+            tracks.compactMap { track in
+                guard track.ownsSourceFile, isOwnedRecordingURL(track.sourceURL) else {
+                    return nil
+                }
+                return normalizedOwnedURL(track.sourceURL)
+            }
+        )
+    }
+
+    private func ownedSourceURLs(in undoStack: [UndoAction]) -> Set<URL> {
+        undoStack.reduce(into: Set<URL>()) { urls, action in
+            guard case let .projectTracks(snapshot) = action else {
+                return
+            }
+            urls.formUnion(ownedSourceURLs(in: snapshot.tracks))
+        }
+    }
+
+    private func deleteOwnedSourceFiles(_ urls: Set<URL>) {
+        for url in urls where isOwnedRecordingURL(url) {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    private func cleanupOwnedSourceFiles(replacedTracks: [ProjectTrack]) {
+        let candidateURLs = ownedSourceURLs(in: replacedTracks)
+        guard candidateURLs.isEmpty == false else {
+            return
+        }
+
+        var protectedURLs = ownedSourceURLs(in: projectTracks)
+        protectedURLs.formUnion(ownedSourceURLs(in: editUndoStack))
+        deleteOwnedSourceFiles(candidateURLs.subtracting(protectedURLs))
+    }
+
+    private func deleteAllOwnedSourceFiles() {
+        var urls = ownedSourceURLs(in: projectTracks)
+        urls.formUnion(ownedSourceURLs(in: editUndoStack))
+        deleteOwnedSourceFiles(urls)
+    }
+
+    private func markProjectSourceFilesAsSaved() {
+        for index in projectTracks.indices where projectTracks[index].ownsSourceFile {
+            projectTracks[index].ownsSourceFile = false
+        }
+        for undoIndex in editUndoStack.indices {
+            guard case var .projectTracks(snapshot) = editUndoStack[undoIndex] else {
+                continue
+            }
+            for trackIndex in snapshot.tracks.indices where snapshot.tracks[trackIndex].ownsSourceFile {
+                snapshot.tracks[trackIndex].ownsSourceFile = false
+            }
+            editUndoStack[undoIndex] = .projectTracks(snapshot)
+        }
     }
 
     private func selectTrack(_ trackID: UUID) {
@@ -1382,6 +1467,7 @@ final class WorkspaceView: NSView {
             zeroCrossingIndex: nil,
             zeroCrossingProbe: nil,
             audioTimeline: nil,
+            ownsSourceFile: false,
             volume: settings?.volume ?? 1,
             isMuted: settings?.isMuted ?? false,
             isSoloed: settings?.isSoloed ?? false,
@@ -1547,6 +1633,7 @@ final class WorkspaceView: NSView {
             stopRecording()
         }
 
+        let replacedTracks = projectTracks
         projectTracks.removeAll { $0.id == trackID }
         if activeTrackID == trackID {
             activeTrackID = projectTracks.last?.id
@@ -1559,6 +1646,7 @@ final class WorkspaceView: NSView {
         refreshProjectTimelineDisplay()
         updateProjectDisplayTiming()
         reloadPlaybackFromProjectTracks(preserveProgress: false)
+        cleanupOwnedSourceFiles(replacedTracks: replacedTracks)
     }
 
     private func applyTrackPreview(trackID: UUID, previewResult: WAVPreviewImportResult) {
@@ -2818,6 +2906,7 @@ final class WorkspaceView: NSView {
     }
 
     private func restoreProjectTracks(from snapshot: ProjectTrackUndoSnapshot) {
+        let replacedTracks = projectTracks
         projectTracks = snapshot.tracks
         activeTrackID = snapshot.activeTrackID.flatMap { activeID in
             projectTracks.contains(where: { $0.id == activeID }) ? activeID : nil
@@ -2834,6 +2923,7 @@ final class WorkspaceView: NSView {
         updateProjectDisplayTiming()
         reloadPlaybackFromProjectTracks(preserveProgress: true)
         updateEffectCommandState()
+        cleanupOwnedSourceFiles(replacedTracks: replacedTracks)
         updateStatus("undo track delete")
     }
 
@@ -3019,6 +3109,7 @@ final class WorkspaceView: NSView {
             let projectURL = normalizedProjectURL(url)
             try SoundtimeProjectStore.save(currentProject(), to: projectURL)
             currentProjectURL = projectURL
+            markProjectSourceFilesAsSaved()
             SoundtimeProjectStore.rememberLastProjectURL(projectURL)
             window?.title = projectWindowTitle()
             updateLoadedProjectSummary()
@@ -3035,6 +3126,7 @@ final class WorkspaceView: NSView {
 
         do {
             try SoundtimeProjectStore.save(currentProject(), to: currentProjectURL)
+            markProjectSourceFilesAsSaved()
         } catch {
             updateStatus("project window save failed: \(error.localizedDescription)")
         }
@@ -3071,6 +3163,7 @@ final class WorkspaceView: NSView {
     }
 
     private func clearProjectForLoad() {
+        deleteAllOwnedSourceFiles()
         playbackController.clear()
         projectTracks.removeAll()
         activeTrackID = nil
