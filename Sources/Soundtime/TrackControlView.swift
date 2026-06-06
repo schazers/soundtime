@@ -159,6 +159,7 @@ private final class TrackIconButton: NSControl {
 
     var isSelected = false {
         didSet {
+            updateBlinkTimer()
             needsDisplay = true
         }
     }
@@ -171,6 +172,8 @@ private final class TrackIconButton: NSControl {
 
     private let image: NSImage?
     private var trackingArea: NSTrackingArea?
+    private var blinkTimer: Timer?
+    private var showsRecordingFill = true
 
     init(systemSymbolName: String) {
         image = NSImage(
@@ -187,6 +190,16 @@ private final class TrackIconButton: NSControl {
 
     override var mouseDownCanMoveWindow: Bool {
         false
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            blinkTimer?.invalidate()
+            blinkTimer = nil
+        } else if isSelected, blinkTimer == nil {
+            updateBlinkTimer()
+        }
     }
 
     override func updateTrackingAreas() {
@@ -217,6 +230,31 @@ private final class TrackIconButton: NSControl {
         onPressed?()
     }
 
+    private func updateBlinkTimer() {
+        blinkTimer?.invalidate()
+        blinkTimer = nil
+        showsRecordingFill = true
+
+        guard isSelected else {
+            return
+        }
+
+        let timer = Timer(
+            timeInterval: 1,
+            target: self,
+            selector: #selector(toggleRecordingBlink),
+            userInfo: nil,
+            repeats: true
+        )
+        RunLoop.main.add(timer, forMode: .common)
+        blinkTimer = timer
+    }
+
+    @objc private func toggleRecordingBlink() {
+        showsRecordingFill.toggle()
+        needsDisplay = true
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
 
@@ -225,17 +263,23 @@ private final class TrackIconButton: NSControl {
         let stroke: NSColor
         let symbolColor: NSColor
         if isSelected {
-            fill = NSColor(calibratedRed: 0.84, green: 0.10, blue: 0.12, alpha: 1)
-            stroke = NSColor(calibratedRed: 1.0, green: 0.36, blue: 0.36, alpha: 1)
-            symbolColor = NSColor.white
+            if showsRecordingFill {
+                fill = NSColor(calibratedRed: 0.84, green: 0.10, blue: 0.12, alpha: 1)
+                stroke = NSColor(calibratedRed: 1.0, green: 0.36, blue: 0.36, alpha: 1)
+                symbolColor = NSColor.white
+            } else {
+                fill = NSColor(white: 0.08, alpha: 1)
+                stroke = NSColor(calibratedRed: 0.84, green: 0.10, blue: 0.12, alpha: 1)
+                symbolColor = NSColor(calibratedRed: 0.96, green: 0.12, blue: 0.14, alpha: 1)
+            }
         } else if isHovered {
             fill = NSColor(white: 0.19, alpha: 1)
             stroke = NSColor(white: 0.42, alpha: 1)
-            symbolColor = NSColor(white: 0.88, alpha: 1)
+            symbolColor = NSColor.white
         } else {
             fill = NSColor(white: 0.12, alpha: 1)
             stroke = NSColor(white: 0.25, alpha: 1)
-            symbolColor = NSColor(white: 0.64, alpha: 1)
+            symbolColor = NSColor.white
         }
 
         let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
