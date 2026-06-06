@@ -168,7 +168,9 @@ final class WorkspaceView: NSView {
     private var loudnessMeterTimer: Timer?
     private var keyDownMonitor: Any?
     private var debugToolsVisible = false
-    private let deleteMaterializationDelay: TimeInterval = 0.75
+    private let editMaterializationDelay: TimeInterval = 0.75
+    private var editMaterializationTasks: [UUID: Task<Void, Never>] = [:]
+    private var editMaterializationRequestIDs: [UUID: UUID] = [:]
     private let inputRecorder = AudioInputRecorder()
     private var recordingTrackID: UUID?
     private var recordingTakeWriter: StreamingWAVTakeWriter?
@@ -2253,12 +2255,17 @@ final class WorkspaceView: NSView {
         preservePlaybackProgress: Bool = false,
         startDelay: TimeInterval = 0
     ) {
-        Task { [weak self, trackID, timeline, editRevision, status, preservePlaybackProgress, startDelay] in
+        editMaterializationTasks[trackID]?.cancel()
+        let requestID = UUID()
+        editMaterializationRequestIDs[trackID] = requestID
+
+        let task = Task { [weak self, trackID, timeline, editRevision, status, preservePlaybackProgress, startDelay, requestID] in
             if startDelay > 0 {
                 try? await Task.sleep(nanoseconds: UInt64(startDelay * 1_000_000_000))
             }
 
             guard !Task.isCancelled else {
+                self?.clearEditMaterializationTask(trackID: trackID, requestID: requestID)
                 return
             }
 
@@ -2270,6 +2277,15 @@ final class WorkspaceView: NSView {
                 return
             }
 
+            guard
+                !Task.isCancelled,
+                self.editMaterializationRequestIDs[trackID] == requestID
+            else {
+                self.clearEditMaterializationTask(trackID: trackID, requestID: requestID)
+                return
+            }
+
+            self.clearEditMaterializationTask(trackID: trackID, requestID: requestID)
             self.applyMaterializedTrackEdit(
                 trackID: trackID,
                 editRevision: editRevision,
@@ -2278,6 +2294,16 @@ final class WorkspaceView: NSView {
                 preservePlaybackProgress: preservePlaybackProgress
             )
         }
+        editMaterializationTasks[trackID] = task
+    }
+
+    private func clearEditMaterializationTask(trackID: UUID, requestID: UUID) {
+        guard editMaterializationRequestIDs[trackID] == requestID else {
+            return
+        }
+
+        editMaterializationTasks[trackID] = nil
+        editMaterializationRequestIDs[trackID] = nil
     }
 
     private func applyMaterializedTrackEdit(
@@ -2799,6 +2825,7 @@ final class WorkspaceView: NSView {
         editUndoStack.append(.projectTracks(snapshot))
 
         let deletedTrackName = projectTracks[trackIndex].name
+        cancelEditMaterialization(for: selectedTrackID)
         projectTracks.remove(at: trackIndex)
         if projectTracks.isEmpty {
             activeTrackID = nil
@@ -3110,7 +3137,7 @@ final class WorkspaceView: NSView {
                 editRevision: editRevision,
                 status: "\(copyBeforeDeleting ? "cut" : "deleted") \(formatDuration(deletedDuration))",
                 preservePlaybackProgress: true,
-                startDelay: deleteMaterializationDelay
+                startDelay: editMaterializationDelay
             )
         }
     }
@@ -3257,7 +3284,8 @@ final class WorkspaceView: NSView {
                 timeline: editedAudioTimeline,
                 editRevision: editRevision,
                 status: String(format: "gain %+.1f dB", decibels),
-                preservePlaybackProgress: true
+                preservePlaybackProgress: true,
+                startDelay: editMaterializationDelay
             )
         }
     }
@@ -3353,7 +3381,8 @@ final class WorkspaceView: NSView {
                 timeline: editedAudioTimeline,
                 editRevision: editRevision,
                 status: status,
-                preservePlaybackProgress: true
+                preservePlaybackProgress: true,
+                startDelay: editMaterializationDelay
             )
         }
     }
@@ -3377,6 +3406,7 @@ final class WorkspaceView: NSView {
 
     private func restoreProjectTracks(from snapshot: ProjectTrackUndoSnapshot) {
         let replacedTracks = projectTracks
+        cancelAllEditMaterialization()
         projectTracks = snapshot.tracks
         activeTrackID = snapshot.activeTrackID.flatMap { activeID in
             projectTracks.contains(where: { $0.id == activeID }) ? activeID : nil
@@ -3398,6 +3428,20 @@ final class WorkspaceView: NSView {
         updateEffectCommandState()
         cleanupOwnedSourceFiles(replacedTracks: replacedTracks)
         updateStatus(snapshot.restoreProgress == nil ? "undo track delete" : "undo")
+    }
+
+    private func cancelEditMaterialization(for trackID: UUID) {
+        editMaterializationTasks[trackID]?.cancel()
+        editMaterializationTasks[trackID] = nil
+        editMaterializationRequestIDs[trackID] = nil
+    }
+
+    private func cancelAllEditMaterialization() {
+        for task in editMaterializationTasks.values {
+            task.cancel()
+        }
+        editMaterializationTasks.removeAll()
+        editMaterializationRequestIDs.removeAll()
     }
 
     private func togglePlayback() {
@@ -4334,7 +4378,8 @@ final class WorkspaceView: NSView {
                 trackID: activeTrackID,
                 timeline: audioTimeline,
                 editRevision: editRevision,
-                status: "track ready"
+                status: "track ready",
+                startDelay: editMaterializationDelay
             )
         } else {
             decodedAudioBuffer = nil
