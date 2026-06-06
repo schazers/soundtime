@@ -6,6 +6,7 @@ enum TimelinePerfBaselineHarness {
     private struct Scenario {
         let name: String
         let trackCount: Int
+        let waveformBinCount: Int?
         let frames: Int
         let warmupFrames: Int
         let viewportDuration: Float
@@ -17,6 +18,11 @@ enum TimelinePerfBaselineHarness {
         let showsGainPreview: Bool
         let targetsVisibleTrack: Bool
         let deletionBurstInterval: Int?
+    }
+
+    private struct TrackCacheKey: Hashable {
+        let trackCount: Int
+        let waveformBinCount: Int
     }
 
     private struct ScenarioResult {
@@ -175,19 +181,24 @@ enum TimelinePerfBaselineHarness {
         print("Soundtime timeline perf baseline")
         print("device=\(device.name) mode=\(isQuick ? "quick" : "full") viewport=\(Int(viewportSize.width))x\(Int(viewportSize.height)) scale=\(backingScale) bins=\(syntheticBinCount)")
 
-        var trackCache: [Int: [TimelineRenderState.Track]] = [:]
+        var trackCache: [TrackCacheKey: [TimelineRenderState.Track]] = [:]
         var budgetFailures: [String] = []
         for scenario in scenarios {
+            let scenarioBinCount = scenario.waveformBinCount ?? syntheticBinCount
+            let cacheKey = TrackCacheKey(
+                trackCount: scenario.trackCount,
+                waveformBinCount: scenarioBinCount
+            )
             let tracks: [TimelineRenderState.Track]
-            if let cachedTracks = trackCache[scenario.trackCount] {
+            if let cachedTracks = trackCache[cacheKey] {
                 tracks = cachedTracks
             } else {
                 tracks = makeSyntheticTracks(
                     count: scenario.trackCount,
                     duration: 360,
-                    binCount: syntheticBinCount
+                    binCount: scenarioBinCount
                 )
-                trackCache[scenario.trackCount] = tracks
+                trackCache[cacheKey] = tracks
             }
 
             renderer.displayTracks(tracks)
@@ -224,6 +235,7 @@ enum TimelinePerfBaselineHarness {
                 Scenario(
                     name: "zoomed-out playback",
                     trackCount: trackCount,
+                    waveformBinCount: nil,
                     frames: frames,
                     warmupFrames: warmupFrames,
                     viewportDuration: 1,
@@ -239,6 +251,7 @@ enum TimelinePerfBaselineHarness {
                 Scenario(
                     name: "zoomed-in playback",
                     trackCount: trackCount,
+                    waveformBinCount: nil,
                     frames: frames,
                     warmupFrames: warmupFrames,
                     viewportDuration: 0.035,
@@ -254,6 +267,7 @@ enum TimelinePerfBaselineHarness {
                 Scenario(
                     name: "pan sweep",
                     trackCount: trackCount,
+                    waveformBinCount: nil,
                     frames: frames,
                     warmupFrames: warmupFrames,
                     viewportDuration: 0.12,
@@ -269,6 +283,7 @@ enum TimelinePerfBaselineHarness {
                 Scenario(
                     name: "zoom pulse",
                     trackCount: trackCount,
+                    waveformBinCount: nil,
                     frames: frames,
                     warmupFrames: warmupFrames,
                     viewportDuration: 0.18,
@@ -284,6 +299,7 @@ enum TimelinePerfBaselineHarness {
                 Scenario(
                     name: "edit overlays",
                     trackCount: trackCount,
+                    waveformBinCount: nil,
                     frames: frames,
                     warmupFrames: warmupFrames,
                     viewportDuration: 0.10,
@@ -299,6 +315,7 @@ enum TimelinePerfBaselineHarness {
                 Scenario(
                     name: "delete bursts",
                     trackCount: trackCount,
+                    waveformBinCount: nil,
                     frames: frames,
                     warmupFrames: warmupFrames,
                     viewportDuration: 0.16,
@@ -314,6 +331,7 @@ enum TimelinePerfBaselineHarness {
                 Scenario(
                     name: "track scroll playback",
                     trackCount: trackCount,
+                    waveformBinCount: nil,
                     frames: frames,
                     warmupFrames: warmupFrames,
                     viewportDuration: 0.12,
@@ -329,6 +347,7 @@ enum TimelinePerfBaselineHarness {
                 Scenario(
                     name: "visible track edit overlays",
                     trackCount: trackCount,
+                    waveformBinCount: nil,
                     frames: frames,
                     warmupFrames: warmupFrames,
                     viewportDuration: 0.10,
@@ -344,6 +363,7 @@ enum TimelinePerfBaselineHarness {
                 Scenario(
                     name: "visible track delete bursts",
                     trackCount: trackCount,
+                    waveformBinCount: nil,
                     frames: frames,
                     warmupFrames: warmupFrames,
                     viewportDuration: 0.16,
@@ -364,6 +384,7 @@ enum TimelinePerfBaselineHarness {
                 Scenario(
                     name: "hundreds visible culling",
                     trackCount: 250,
+                    waveformBinCount: nil,
                     frames: max(frames / 2, 36),
                     warmupFrames: max(warmupFrames / 2, 12),
                     viewportDuration: 0.12,
@@ -374,6 +395,24 @@ enum TimelinePerfBaselineHarness {
                     showsSelection: true,
                     showsGainPreview: true,
                     targetsVisibleTrack: true,
+                    deletionBurstInterval: nil
+                )
+            )
+            scenarios.append(
+                Scenario(
+                    name: "high-res zoom fidelity",
+                    trackCount: 1,
+                    waveformBinCount: 1_048_576,
+                    frames: max(frames / 2, 36),
+                    warmupFrames: max(warmupFrames * 3, 72),
+                    viewportDuration: 0.012,
+                    isPlaybackActive: true,
+                    pansDuringRun: true,
+                    zoomsDuringRun: false,
+                    scrollsTracksDuringRun: false,
+                    showsSelection: false,
+                    showsGainPreview: false,
+                    targetsVisibleTrack: false,
                     deletionBurstInterval: nil
                 )
             )
@@ -750,6 +789,7 @@ enum TimelinePerfBaselineHarness {
             "scenario": result.scenario.name,
             "device": deviceName,
             "tracks": result.scenario.trackCount,
+            "waveform_bins": result.scenario.waveformBinCount ?? 0,
             "frames": result.frameCount,
             "cpu_submit_p50_ms": rounded(percentile(cpu, 0.50)),
             "cpu_submit_p95_ms": rounded(percentile(cpu, 0.95)),
@@ -837,10 +877,13 @@ enum TimelinePerfBaselineHarness {
                 "budget \(result.visibleLaneBudget)"
             )
         }
-        if result.maximumGPUWaveformDrawCount > max(result.visibleLaneBudget, 1) {
+        let waveformDrawBudget = result.scenario.waveformBinCount == nil ?
+            max(result.visibleLaneBudget, 1) :
+            max(result.visibleLaneBudget, 2)
+        if result.maximumGPUWaveformDrawCount > waveformDrawBudget {
             failures.append(
                 "\(label) issued \(result.maximumGPUWaveformDrawCount) waveform draw calls, " +
-                "visible-lane budget \(result.visibleLaneBudget)"
+                "visible-lane budget \(waveformDrawBudget)"
             )
         }
         if result.maximumShaderBufferUploadCount > 0 || result.maximumShaderBufferUploadInFlightCount > 0 {
