@@ -162,7 +162,7 @@ final class WorkspaceView: NSView {
     private var debugToolsVisible = false
     private let inputRecorder = AudioInputRecorder()
     private var recordingTrackID: UUID?
-    private var recordingSamplesByChannel: [[Float]] = []
+    private var recordingTakeWriter: StreamingWAVTakeWriter?
     private var recordingSampleRate: Double = 0
     private var recordingAccumulator: LiveRecordingWaveformAccumulator?
     private var lastRecordingVisualUpdateTimestamp = CACurrentMediaTime()
@@ -419,11 +419,6 @@ final class WorkspaceView: NSView {
         }
         addTrackButton.onPressed = { [weak self] in
             self?.addEmptyTrack()
-        }
-        inputRecorder.onChunk = { [weak self] chunk in
-            Task { @MainActor in
-                self?.appendRecordingChunk(chunk)
-            }
         }
         volumeControl.onVolumeChanged = { [weak self] volume in
             self?.playbackController.setPerceptualVolume(volume)
@@ -930,9 +925,27 @@ final class WorkspaceView: NSView {
             stopPlaybackTimer()
         }
 
+        let recordingURL = recordingFileURL(trackName: projectTracks[trackIndex].name)
+        let takeWriter: StreamingWAVTakeWriter
+        do {
+            takeWriter = try StreamingWAVTakeWriter(url: recordingURL)
+        } catch {
+            updateStatus("recording failed: \(error.localizedDescription)")
+            return
+        }
+
+        inputRecorder.onChunk = { [weak self, takeWriter] chunk in
+            takeWriter.append(chunk)
+            Task { @MainActor in
+                self?.appendRecordingChunk(chunk)
+            }
+        }
+
         do {
             try inputRecorder.start()
         } catch {
+            inputRecorder.onChunk = nil
+            takeWriter.cancel()
             updateStatus("recording failed: \(error.localizedDescription)")
             return
         }
@@ -946,7 +959,7 @@ final class WorkspaceView: NSView {
         editUndoStack.append(.projectTracks(snapshot))
 
         recordingTrackID = trackID
-        recordingSamplesByChannel = []
+        recordingTakeWriter = takeWriter
         recordingSampleRate = 0
         recordingAccumulator = nil
         lastRecordingVisualUpdateTimestamp = 0
@@ -986,6 +999,9 @@ final class WorkspaceView: NSView {
 
         inputRecorder.stop()
         applyLiveRecordingOverview(force: true)
+        let takeWriter = recordingTakeWriter
+        recordingTakeWriter = nil
+        inputRecorder.onChunk = nil
 
         recordingTrackID = nil
         timelineSurface.displayRecordingActive(false)
@@ -995,11 +1011,8 @@ final class WorkspaceView: NSView {
 
         guard
             let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }),
-            recordingSampleRate > 0,
-            let frameCount = recordingSamplesByChannel.map(\.count).min(),
-            frameCount > 0
+            let takeWriter
         else {
-            recordingSamplesByChannel = []
             recordingSampleRate = 0
             recordingAccumulator = nil
             updateProjectDisplayTiming()
@@ -1007,54 +1020,46 @@ final class WorkspaceView: NSView {
             return
         }
 
-        let samplesByChannel = recordingSamplesByChannel.map { samples in
-            Array(samples.prefix(frameCount))
-        }
-        var buffer = DecodedAudioBuffer(
-            url: URL(fileURLWithPath: "/dev/null"),
-            sampleRate: recordingSampleRate,
-            channelCount: samplesByChannel.count,
-            frameCount: frameCount,
-            samplesByChannel: samplesByChannel
-        )
-        let recordingURL = recordingFileURL(trackName: projectTracks[trackIndex].name)
+        let recordedTake: RecordedTakeFile
         do {
-            try WAVFileWriter.write(buffer, to: recordingURL)
-            buffer = DecodedAudioBuffer(
-                url: recordingURL,
-                sampleRate: buffer.sampleRate,
-                channelCount: buffer.channelCount,
-                frameCount: buffer.frameCount,
-                samplesByChannel: buffer.samplesByChannel
-            )
-            projectTracks[trackIndex].sourceURL = recordingURL
+            recordedTake = try takeWriter.finish()
         } catch {
-            projectTracks[trackIndex].sourceURL = buffer.url
-            updateStatus("recorded in memory - WAV save failed: \(error.localizedDescription)")
+            takeWriter.cancel()
+            recordingSampleRate = 0
+            recordingAccumulator = nil
+            updateProjectDisplayTiming()
+            updateStatus("recording failed: \(error.localizedDescription)")
+            return
         }
 
-        let waveformOverview = recordingAccumulator?.makeOverview(sampleRate: recordingSampleRate) ??
-            WaveformOverviewBuilder.build(from: buffer)
-        let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: buffer)
+        let fileInfo = try? WAVAudioDecoder.inspect(url: recordedTake.url)
+        let zeroCrossingProbe = fileInfo.flatMap {
+            try? WAVAudioDecoder.makeZeroCrossingProbe(url: recordedTake.url, fileInfo: $0)
+        }
+        let waveformOverview = recordingAccumulator?.makeOverview(sampleRate: recordedTake.sampleRate) ??
+            (try? WAVAudioDecoder.buildSparsePreview(url: recordedTake.url).1)
+        let importID = UUID()
 
-        projectTracks[trackIndex].durationHint = buffer.duration
+        projectTracks[trackIndex].sourceURL = recordedTake.url
+        projectTracks[trackIndex].durationHint = fileInfo?.duration ?? recordedTake.duration
         projectTracks[trackIndex].waveformOverview = waveformOverview
-        projectTracks[trackIndex].decodedAudioBuffer = buffer
-        projectTracks[trackIndex].zeroCrossingIndex = zeroCrossingIndex
-        projectTracks[trackIndex].zeroCrossingProbe = nil
-        projectTracks[trackIndex].audioTimeline = AudioEditTimeline(sourceBuffer: buffer)
-        projectTracks[trackIndex].editRevision += 1
+        projectTracks[trackIndex].decodedAudioBuffer = nil
+        projectTracks[trackIndex].zeroCrossingIndex = nil
+        projectTracks[trackIndex].zeroCrossingProbe = zeroCrossingProbe
+        projectTracks[trackIndex].audioTimeline = nil
+        projectTracks[trackIndex].importID = importID
+        projectTracks[trackIndex].editRevision = 0
         activeTrackID = trackID
 
-        recordingSamplesByChannel = []
         recordingSampleRate = 0
         recordingAccumulator = nil
         syncActiveTrackFields()
         refreshProjectTimelineDisplay()
-        updateProjectDisplayTiming(sampleRateHint: buffer.sampleRate)
+        updateProjectDisplayTiming(sampleRateHint: recordedTake.sampleRate)
         reloadPlaybackFromProjectTracks(preserveProgress: false)
+        startRecordedTakePreviewRefinement(trackID: trackID, importID: importID, url: recordedTake.url)
         updateEffectCommandState()
-        updateStatus("recorded \(formatDuration(buffer.duration))")
+        updateStatus("recorded \(formatDuration(recordedTake.duration))")
     }
 
     private func appendRecordingChunk(_ chunk: AudioRecordingChunk) {
@@ -1070,16 +1075,9 @@ final class WorkspaceView: NSView {
             return
         }
 
-        if recordingSamplesByChannel.isEmpty || recordingSampleRate != chunk.sampleRate {
+        if recordingAccumulator == nil || recordingSampleRate != chunk.sampleRate {
             recordingSampleRate = chunk.sampleRate
-            let channelCount = max(chunk.channelCount, 1)
-            recordingSamplesByChannel = (0..<channelCount).map { _ in [] }
             recordingAccumulator = LiveRecordingWaveformAccumulator(sampleRate: chunk.sampleRate)
-        }
-
-        for channelIndex in recordingSamplesByChannel.indices {
-            let sourceSamples = chunk.samplesByChannel[min(channelIndex, chunk.samplesByChannel.count - 1)]
-            recordingSamplesByChannel[channelIndex].append(contentsOf: sourceSamples.prefix(frameCount))
         }
 
         recordingAccumulator?.append(
@@ -1126,6 +1124,48 @@ final class WorkspaceView: NSView {
         )
         timelineSurface.displayRecordingActive(true)
         updateTimeReadout()
+    }
+
+    private func startRecordedTakePreviewRefinement(trackID: UUID, importID: UUID, url: URL) {
+        let wavPreviewLevels = wavPreviewLevels
+        Task { [weak self, trackID, importID, url, wavPreviewLevels] in
+            var latestPreviewBinCount = 0
+            for previewLevel in wavPreviewLevels {
+                guard let self, self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
+                    return
+                }
+                guard await self.waitForImportWorkBudget(trackID: trackID, importID: importID) else {
+                    return
+                }
+
+                do {
+                    let (fileInfo, waveformOverview) = try await AudioImportPipeline.loadWAVPreviewOverview(
+                        at: url,
+                        targetBinCount: previewLevel.targetBinCount,
+                        samplesPerBin: previewLevel.samplesPerBin
+                    )
+                    guard self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
+                        return
+                    }
+                    guard waveformOverview.bins.count > latestPreviewBinCount else {
+                        continue
+                    }
+
+                    latestPreviewBinCount = waveformOverview.bins.count
+                    self.applyTrackPreviewRefinement(
+                        trackID: trackID,
+                        fileInfo: fileInfo,
+                        waveformOverview: waveformOverview
+                    )
+                } catch {
+                    guard self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
+                        return
+                    }
+                    self.updateStatus("recording preview refinement failed: \(error.localizedDescription)")
+                    return
+                }
+            }
+        }
     }
 
     private func recordingFileURL(trackName: String) -> URL {
