@@ -206,6 +206,8 @@ final class WorkspaceView: NSView {
     private let playbackController: PlaybackEngine = PlaybackEngineFactory.makeDefault()
     private let playbackRefreshRate: TimeInterval = 10
     private let loudnessMeterRefreshRate: TimeInterval = 60
+    private let fallbackLoudnessMaximumAudibleTracks = 32
+    private let fallbackLoudnessMaximumFrameCount = 384
     private let trackMixCoalescingInterval: TimeInterval = 1.0 / 72.0
     private var visualPlayheadProgress: Float = 0
     private var visualPlayheadAnchorTimestamp = CACurrentMediaTime()
@@ -4714,11 +4716,21 @@ final class WorkspaceView: NSView {
         }
 
         let outputSampleRate = max(displayedSampleRate, 44_100)
-        let windowFrameCount = min(max(Int(outputSampleRate * 0.025), 384), 1_024)
+        let windowFrameCount = min(
+            max(Int(outputSampleRate * 0.025), 192),
+            fallbackLoudnessMaximumFrameCount
+        )
         let windowDuration = Double(windowFrameCount - 1) / outputSampleRate
         let startTime = max(playheadTime - windowDuration, 0)
         let anySoloedTrack = projectTracks.contains { $0.isSoloed }
         let masterGain = volumeControl.perceptualVolume * volumeControl.perceptualVolume
+        let audibleTracks = Array(projectTracks.lazy.filter { track in
+            self.isProjectTrackAudible(track, anySoloedTrack: anySoloedTrack) &&
+                track.volume > 0
+        }.prefix(fallbackLoudnessMaximumAudibleTracks))
+        guard !audibleTracks.isEmpty else {
+            return .silence
+        }
 
         var leftSquareSum: Double = 0
         var rightSquareSum: Double = 0
@@ -4731,14 +4743,7 @@ final class WorkspaceView: NSView {
             var leftSample: Float = 0
             var rightSample: Float = 0
 
-            for track in projectTracks {
-                guard
-                    isProjectTrackAudible(track, anySoloedTrack: anySoloedTrack),
-                    track.volume > 0
-                else {
-                    continue
-                }
-
+            for track in audibleTracks {
                 let trackGain = masterGain * track.volume * track.volume
                 let trackSamples = loudnessSamples(
                     for: track,
