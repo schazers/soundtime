@@ -405,6 +405,24 @@ enum TimelinePerfBaselineHarness {
             )
             scenarios.append(
                 Scenario(
+                    name: "five hundred visible culling",
+                    trackCount: 500,
+                    waveformBinCount: nil,
+                    frames: max(frames / 3, 24),
+                    warmupFrames: max(warmupFrames / 2, 12),
+                    viewportDuration: 0.12,
+                    isPlaybackActive: true,
+                    pansDuringRun: true,
+                    zoomsDuringRun: true,
+                    scrollsTracksDuringRun: true,
+                    showsSelection: true,
+                    showsGainPreview: true,
+                    targetsVisibleTrack: true,
+                    deletionBurstInterval: nil
+                )
+            )
+            scenarios.append(
+                Scenario(
                     name: "high-res zoom fidelity",
                     trackCount: 1,
                     waveformBinCount: 2_097_152,
