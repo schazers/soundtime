@@ -68,6 +68,15 @@ final class AgentCommandBarView: NSView, NSTextViewDelegate {
         super.mouseDown(with: event)
     }
 
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let textRect = convert(textBackgroundView.bounds, from: textBackgroundView).insetBy(dx: -2, dy: -2)
+        if textRect.contains(point) {
+            return textView
+        }
+
+        return super.hitTest(point)
+    }
+
     func focusPrompt() {
         window?.makeFirstResponder(textView)
     }
