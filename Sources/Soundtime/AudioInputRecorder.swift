@@ -51,6 +51,7 @@ final class AudioInputRecorder: @unchecked Sendable {
     private var isRunning = false
     private let chunkQueue = DispatchQueue(label: "Soundtime.audio.input.chunks", qos: .userInteractive)
     private let drainChunkFrameCapacity = 4_096
+    private let maximumDrainChunksPerTick = 6
 
     init() {
         chunkQueue.setSpecific(key: Self.chunkQueueKey, value: true)
@@ -372,7 +373,11 @@ final class AudioInputRecorder: @unchecked Sendable {
             frameCapacity: drainChunkFrameCapacity
         )
 
-        while soundtime_audio_core_recording_ring_available_frame_count(recordingRing) > 0 {
+        var drainedChunkCount = 0
+        while
+            drainedChunkCount < maximumDrainChunksPerTick,
+            soundtime_audio_core_recording_ring_available_frame_count(recordingRing) > 0
+        {
             var hostTimestamp: Double = 0
             let framesRead = drainOutputChannelPointers.withUnsafeBufferPointer { pointerBuffer in
                 soundtime_audio_core_recording_ring_pop_planar(
@@ -398,6 +403,7 @@ final class AudioInputRecorder: @unchecked Sendable {
                 frameCount: frameCount,
                 hostTimestamp: hostTimestamp
             ))
+            drainedChunkCount += 1
         }
     }
 
