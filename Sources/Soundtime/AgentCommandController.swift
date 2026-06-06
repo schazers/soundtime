@@ -23,6 +23,20 @@ struct AgentCommandResult: Sendable {
     let message: String
 }
 
+enum AgentResolvedCommand: Sendable, Equatable {
+    case play
+    case pause
+    case togglePlayback
+    case deleteSelection
+    case cutSelection
+    case copySelection
+    case pasteAudio
+    case showGain
+    case normalizeSelection
+    case fadeInSelection
+    case fadeOutSelection
+}
+
 @MainActor
 final class AgentCommandRegistry {
     private(set) var capabilities: [AgentCommandCapability] = []
@@ -58,7 +72,28 @@ final class AgentCommandRegistry {
             AgentCommandCapability(
                 identifier: "timeline.applyGain",
                 title: "Apply Gain",
-                summary: "Apply gain to the active selection without blocking playback or rendering."
+                summary: "Open or apply gain to the active selection without blocking playback or rendering."
+            )
+        )
+        register(
+            AgentCommandCapability(
+                identifier: "timeline.fadeIn",
+                title: "Fade In Selection",
+                summary: "Apply a fade-in to the active audio selection."
+            )
+        )
+        register(
+            AgentCommandCapability(
+                identifier: "timeline.fadeOut",
+                title: "Fade Out Selection",
+                summary: "Apply a fade-out to the active audio selection."
+            )
+        )
+        register(
+            AgentCommandCapability(
+                identifier: "timeline.copyPaste",
+                title: "Copy, Cut, Paste",
+                summary: "Use the current selection and edit insertion point for clipboard edits."
             )
         )
         register(
@@ -97,6 +132,7 @@ final class AgentCommandController {
 
     var onStateChanged: ((PresentationState) -> Void)?
     var onRequestSubmitted: ((AgentCommandRequest) -> Void)?
+    var onCommandRequested: ((AgentResolvedCommand) -> AgentCommandResult)?
     var onResult: ((AgentCommandResult) -> Void)?
 
     private var state: PresentationState = .idle {
@@ -129,6 +165,7 @@ final class AgentCommandController {
             availableCapabilities: registry.capabilities
         )
         onRequestSubmitted?(request)
+        let resolvedCommand = Self.resolveCommand(prompt)
 
         activeTask = Task { [weak self] in
             guard let self else {
@@ -136,12 +173,23 @@ final class AgentCommandController {
             }
 
             state = .thinking
-            try? await Task.sleep(nanoseconds: 220_000_000)
+            try? await Task.sleep(nanoseconds: resolvedCommand == nil ? 220_000_000 : 90_000_000)
             guard Task.isCancelled == false else {
                 return
             }
 
             state = .acting
+            if let resolvedCommand {
+                let result = onCommandRequested?(resolvedCommand) ??
+                    AgentCommandResult(
+                        status: .failed,
+                        message: "Agent command unavailable"
+                    )
+                onResult?(result)
+                state = .idle
+                return
+            }
+
             try? await Task.sleep(nanoseconds: 520_000_000)
             guard Task.isCancelled == false else {
                 return
@@ -155,5 +203,53 @@ final class AgentCommandController {
             )
             state = .idle
         }
+    }
+
+    private static func resolveCommand(_ prompt: String) -> AgentResolvedCommand? {
+        let normalized = prompt
+            .lowercased()
+            .replacingOccurrences(of: "-", with: " ")
+            .replacingOccurrences(of: "_", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if normalized == "play" || normalized == "start playback" {
+            return .play
+        }
+        if normalized == "pause" || normalized == "stop playback" {
+            return .pause
+        }
+        if normalized == "toggle playback" || normalized == "play pause" {
+            return .togglePlayback
+        }
+        if normalized.contains("delete") || normalized == "remove selection" {
+            return .deleteSelection
+        }
+        if normalized == "cut" || normalized.contains("cut selection") {
+            return .cutSelection
+        }
+        if normalized == "copy" || normalized.contains("copy selection") {
+            return .copySelection
+        }
+        if normalized == "paste" || normalized.contains("paste audio") {
+            return .pasteAudio
+        }
+        if normalized.contains("normalize") {
+            return .normalizeSelection
+        }
+        if normalized.contains("fade in") {
+            return .fadeInSelection
+        }
+        if normalized.contains("fade out") {
+            return .fadeOutSelection
+        }
+        if normalized == "gain" ||
+            normalized == "open gain" ||
+            normalized.contains("show gain") ||
+            normalized.contains("adjust gain")
+        {
+            return .showGain
+        }
+
+        return nil
     }
 }
