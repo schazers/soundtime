@@ -490,6 +490,13 @@ final class WorkspaceView: NSView {
         agentCommandController.onRequestSubmitted = { [weak self] request in
             self?.updateStatus("agent: \(request.prompt)")
         }
+        agentCommandController.onCommandRequested = { [weak self] command in
+            self?.performAgentCommand(command) ??
+                AgentCommandResult(
+                    status: .failed,
+                    message: "Agent command unavailable"
+                )
+        }
         agentCommandController.onResult = { [weak self] result in
             self?.updateStatus(result.message)
         }
@@ -3116,6 +3123,82 @@ final class WorkspaceView: NSView {
         updateLoadedAudioSummary(for: decodedAudioBuffer)
         currentPlaybackStatus = playbackController.isPlaying ? "playing" : "press Space to play"
         updateStatus(currentPlaybackStatus)
+    }
+
+    private func performAgentCommand(_ command: AgentResolvedCommand) -> AgentCommandResult {
+        switch command {
+        case .play:
+            guard playbackController.hasSource else {
+                return AgentCommandResult(status: .failed, message: "Agent: no audio loaded")
+            }
+            if !playbackController.isPlaying {
+                togglePlayback()
+            }
+            return AgentCommandResult(status: .accepted, message: "Agent: playing")
+        case .pause:
+            if recordingTrackID != nil {
+                stopRecording()
+                return AgentCommandResult(status: .accepted, message: "Agent: recording stopped")
+            }
+            if playbackController.isPlaying {
+                togglePlayback()
+            }
+            return AgentCommandResult(status: .accepted, message: "Agent: paused")
+        case .togglePlayback:
+            guard playbackController.hasSource || recordingTrackID != nil else {
+                return AgentCommandResult(status: .failed, message: "Agent: no audio loaded")
+            }
+            togglePlayback()
+            return AgentCommandResult(status: .accepted, message: "Agent: playback toggled")
+        case .deleteSelection:
+            guard selectedTrackID != nil || currentEditableSelectionTarget() != nil else {
+                return AgentCommandResult(status: .failed, message: "Agent: select audio or a track first")
+            }
+            deleteSelectedTrackOrSelection()
+            return AgentCommandResult(status: .accepted, message: "Agent: delete requested")
+        case .cutSelection:
+            guard currentEditableSelectionTarget() != nil else {
+                return AgentCommandResult(status: .failed, message: "Agent: select audio to cut")
+            }
+            cutSelection()
+            return AgentCommandResult(status: .accepted, message: "Agent: cut requested")
+        case .copySelection:
+            guard currentEditableSelectionTarget() != nil else {
+                return AgentCommandResult(status: .failed, message: "Agent: select audio to copy")
+            }
+            copySelection()
+            return AgentCommandResult(status: .accepted, message: "Agent: copy requested")
+        case .pasteAudio:
+            guard audioClipboard != nil else {
+                return AgentCommandResult(status: .failed, message: "Agent: clipboard is empty")
+            }
+            pasteAudio()
+            return AgentCommandResult(status: .accepted, message: "Agent: paste requested")
+        case .showGain:
+            guard canApplyGainEffect else {
+                return AgentCommandResult(status: .failed, message: "Agent: select audio for gain")
+            }
+            showGainEffect()
+            return AgentCommandResult(status: .accepted, message: "Agent: gain opened")
+        case .normalizeSelection:
+            guard canApplyGainEffect else {
+                return AgentCommandResult(status: .failed, message: "Agent: select audio to normalize")
+            }
+            applyNormalizeEffect()
+            return AgentCommandResult(status: .accepted, message: "Agent: normalize requested")
+        case .fadeInSelection:
+            guard canApplyGainEffect else {
+                return AgentCommandResult(status: .failed, message: "Agent: select audio for fade in")
+            }
+            applyFadeEffect(.fadeIn)
+            return AgentCommandResult(status: .accepted, message: "Agent: fade in requested")
+        case .fadeOutSelection:
+            guard canApplyGainEffect else {
+                return AgentCommandResult(status: .failed, message: "Agent: select audio for fade out")
+            }
+            applyFadeEffect(.fadeOut)
+            return AgentCommandResult(status: .accepted, message: "Agent: fade out requested")
+        }
     }
 
     private func deleteSelection() {
