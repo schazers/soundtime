@@ -134,6 +134,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let binOffset: Int
     }
 
+    private struct WaveformShaderBatch {
+        let buffer: MTLBuffer
+        var uniforms: [WaveformShaderUniform]
+    }
+
     private enum WaveformShaderFallbackPolicy {
         case allowFallbacks
         case preferredOnly
@@ -1388,6 +1393,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let laneHeight = Float(1) / Float(trackCount)
         let anySolo = renderState.tracks.contains { $0.isSoloed }
         let style = waveformVisualStyle(renderState: renderState, projectDuration: projectDuration)
+        var batches: [ObjectIdentifier: WaveformShaderBatch] = [:]
+        var batchOrder: [ObjectIdentifier] = []
 
         for (trackIndex, track) in renderState.tracks.enumerated() {
             guard
@@ -1450,9 +1457,25 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 renderState: renderState
             )
 
-            drawWaveformShader(
-                uniform: uniform,
-                binBuffer: shaderDrawable.buffer,
+            let batchKey = ObjectIdentifier(shaderDrawable.buffer)
+            if batches[batchKey] == nil {
+                batches[batchKey] = WaveformShaderBatch(
+                    buffer: shaderDrawable.buffer,
+                    uniforms: []
+                )
+                batchOrder.append(batchKey)
+            }
+            batches[batchKey]?.uniforms.append(uniform)
+        }
+
+        for batchKey in batchOrder {
+            guard let batch = batches[batchKey] else {
+                continue
+            }
+
+            drawWaveformShaderBatch(
+                uniforms: batch.uniforms,
+                binBuffer: batch.buffer,
                 opacity: 1,
                 encoder: encoder
             )
@@ -1768,19 +1791,45 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
     }
 
-    private func drawWaveformShader(
-        uniform: WaveformShaderUniform,
+    private func drawWaveformShaderBatch(
+        uniforms: [WaveformShaderUniform],
         binBuffer: MTLBuffer,
         opacity: Float,
         encoder: MTLRenderCommandEncoder
     ) {
+        guard !uniforms.isEmpty else {
+            return
+        }
+
         frameStatsGPUWaveformDrawCount += 1
         setWaveformFragmentOpacity(opacity, encoder: encoder)
-        var uniform = uniform
         encoder.setVertexBuffer(waveformQuadVertexBuffer, offset: 0, index: 0)
-        encoder.setVertexBytes(&uniform, length: MemoryLayout<WaveformShaderUniform>.stride, index: 1)
-        encoder.setFragmentBuffer(binBuffer, offset: 0, index: 1)
-        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+        uniforms.withUnsafeBytes { buffer in
+            if let stagedUniforms = dynamicVertexBufferRing.stage(buffer) {
+                encoder.setVertexBuffer(stagedUniforms.buffer, offset: stagedUniforms.offset, index: 1)
+            } else {
+                guard
+                    let baseAddress = buffer.baseAddress,
+                    let uniformBuffer = device.makeBuffer(
+                        bytes: baseAddress,
+                        length: buffer.count,
+                        options: [.storageModeShared, .cpuCacheModeWriteCombined]
+                    )
+                else {
+                    return
+                }
+
+                encoder.setVertexBuffer(uniformBuffer, offset: 0, index: 1)
+            }
+
+            encoder.setFragmentBuffer(binBuffer, offset: 0, index: 1)
+            encoder.drawPrimitives(
+                type: .triangle,
+                vertexStart: 0,
+                vertexCount: 6,
+                instanceCount: uniforms.count
+            )
+        }
     }
 
     private func waveformMipLevelSnapshot() -> WaveformMipLevelSnapshot {
@@ -5629,11 +5678,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     vertex WaveformRasterizedVertex waveform_vertex(
         uint vertexID [[vertex_id]],
+        uint instanceID [[instance_id]],
         constant WaveformShaderQuadVertex *vertices [[buffer(0)]],
-        constant WaveformShaderUniform &uniforms [[buffer(1)]]
+        constant WaveformShaderUniform *uniforms [[buffer(1)]]
     ) {
+        WaveformShaderUniform uniform = uniforms[instanceID];
         float2 normalizedPosition = vertices[vertexID].position.xy;
-        normalizedPosition.y = mix(uniforms.lane.x, uniforms.lane.y, normalizedPosition.y);
+        normalizedPosition.y = mix(uniform.lane.x, uniform.lane.y, normalizedPosition.y);
 
         WaveformRasterizedVertex out;
         out.position = float4(
@@ -5643,16 +5694,16 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             1.0
         );
         out.normalizedPosition = normalizedPosition;
-        out.baseColor = uniforms.baseColor;
-        out.lane = uniforms.lane;
-        out.track = uniforms.track;
-        out.viewport = uniforms.viewport;
-        out.style = uniforms.style;
-        out.style2 = uniforms.style2;
-        out.gainPreview = uniforms.gainPreview;
-        out.fisheye = uniforms.fisheye;
-        out.touch = uniforms.touch;
-        out.touch2 = uniforms.touch2;
+        out.baseColor = uniform.baseColor;
+        out.lane = uniform.lane;
+        out.track = uniform.track;
+        out.viewport = uniform.viewport;
+        out.style = uniform.style;
+        out.style2 = uniform.style2;
+        out.gainPreview = uniform.gainPreview;
+        out.fisheye = uniform.fisheye;
+        out.touch = uniform.touch;
+        out.touch2 = uniform.touch2;
         return out;
     }
 
