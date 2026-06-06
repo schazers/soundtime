@@ -4279,6 +4279,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let baseWidth = pixelLength(4.0, backingScale: backingScale)
         let halfBaseWidth = baseWidth * 0.5
         updatePlayheadContactEvents(
+            drawableSize: size,
             playheadProgress: playheadProgress,
             renderState: renderState,
             mipLevelSnapshot: mipLevelSnapshot,
@@ -4424,6 +4425,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
 
     private func updatePlayheadContactEvents(
+        drawableSize: SIMD2<Float>,
         playheadProgress: Float,
         renderState: TimelineRenderState,
         mipLevelSnapshot: WaveformMipLevelSnapshot,
@@ -4432,7 +4434,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         playheadContactEvents.removeAll { event in
             displayTimestamp - event.timestamp >= playheadContactFadeDuration
         }
-        trimPlayheadContactEvents(to: playheadContactEventBudget(trackCount: renderState.tracks.count))
+        let contactBudget = playheadContactEventBudget(
+            trackCount: renderState.tracks.count,
+            drawableHeight: drawableSize.y
+        )
+        trimPlayheadContactEvents(to: contactBudget)
+
+        guard contactBudget > 0 else {
+            return
+        }
 
         guard
             renderState.isPlaybackActive,
@@ -4462,13 +4472,28 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             )
         })
 
-        trimPlayheadContactEvents(to: playheadContactEventBudget(trackCount: renderState.tracks.count))
+        trimPlayheadContactEvents(to: contactBudget)
     }
 
-    private func playheadContactEventBudget(trackCount: Int) -> Int {
-        min(
+    private func playheadContactEventBudget(trackCount: Int, drawableHeight: Float) -> Int {
+        let trackCount = max(trackCount, 1)
+        let lanePixelHeight = drawableHeight / Float(trackCount)
+        guard lanePixelHeight >= 14 else {
+            return 0
+        }
+
+        let perTrackBudget: Int
+        if lanePixelHeight < 24 {
+            perTrackBudget = 3
+        } else if lanePixelHeight < 42 {
+            perTrackBudget = 5
+        } else {
+            perTrackBudget = playheadContactEventsPerTrackBudget
+        }
+
+        return min(
             playheadContactMaximumEventCount,
-            max(48, max(trackCount, 1) * playheadContactEventsPerTrackBudget)
+            max(48, trackCount * perTrackBudget)
         )
     }
 
