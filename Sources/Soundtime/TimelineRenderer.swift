@@ -822,6 +822,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var frameStatsTransientParticleCount = 0
     private var frameStatsDeletionEffectCount = 0
     private var frameStatsPlayheadContactEventCount = 0
+    private var lastRenderViewportSize = CGSize(width: 1600, height: 900)
     var onFrameStatsChanged: ((TimelineFrameStats) -> Void)?
     var onRenderDataPrepared: (() -> Void)?
 
@@ -903,6 +904,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let maximumCachedWaveformShaderBinBuffers = 768
     private let maximumCachedWaveformShaderBinBufferBytes = 1_024 * 1_024 * 1_024
     private let maximumBackgroundPrewarmedWaveformShaderBins = 16_384
+    private let maximumViewportPrewarmedWaveformShaderBins = 524_288
+    private let maximumViewportPrewarmTrackCount = 24
     private let maximumInFlightWaveformShaderBufferUploads = 8
     private let maximumSynchronousWaveformShaderBinBufferBins = 4_096
     private let maximumCachedTransientParticleScoreProfiles = 512
@@ -1095,7 +1098,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         )
         prewarmInteractiveWaveformShaderBuffers(
             tracks: renderTracks,
-            trackWaveformMipLevels: nextTrackWaveformMipLevels
+            trackWaveformMipLevels: nextTrackWaveformMipLevels,
+            renderState: renderState.withTracks(renderTracks),
+            drawableSize: lastRenderViewportSize
         )
         gridCache = nil
         if hasNextWaveforms {
@@ -1615,6 +1620,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
 
     func render(to target: TimelineRenderTarget) {
+        lastRenderViewportSize = target.viewportSize
         guard
             let commandBuffer = commandQueue.makeCommandBuffer(),
             let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: target.renderPassDescriptor)
@@ -2435,15 +2441,30 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     private func prewarmInteractiveWaveformShaderBuffers(
         tracks: [TimelineRenderState.Track],
-        trackWaveformMipLevels: [UUID: [WaveformMipLevel]]
+        trackWaveformMipLevels: [UUID: [WaveformMipLevel]],
+        renderState: TimelineRenderState,
+        drawableSize: CGSize
     ) {
-        let jobs = tracks.compactMap { track -> (TimelineRenderState.Track, WaveformMipLevel)? in
+        let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
+        let visibleRange = trackLayout.visibleRange(overscan: 1)
+        let visibleTracks = visibleRange.compactMap { trackIndex -> TimelineRenderState.Track? in
+            guard tracks.indices.contains(trackIndex) else {
+                return nil
+            }
+
+            return tracks[trackIndex]
+        }
+        let viewportAwareBinLimit = viewportAwarePrewarmBinLimit(
+            renderState: renderState,
+            drawableSize: drawableSize
+        )
+        let jobs = visibleTracks.prefix(maximumViewportPrewarmTrackCount).compactMap { track -> (TimelineRenderState.Track, WaveformMipLevel)? in
             guard let mipLevels = trackWaveformMipLevels[track.id] else {
                 return nil
             }
 
             guard let interactiveMipLevel = mipLevels.first(where: {
-                $0.binCount <= maximumBackgroundPrewarmedWaveformShaderBins
+                $0.binCount <= viewportAwareBinLimit
             }) else {
                 return nil
             }
@@ -2500,6 +2521,21 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             )
             self.onRenderDataPrepared?()
         }
+    }
+
+    private func viewportAwarePrewarmBinLimit(
+        renderState: TimelineRenderState,
+        drawableSize: CGSize
+    ) -> Int {
+        let viewportDurationProgress = max(renderState.viewport.durationProgress, 0.000_001)
+        let drawableWidth = max(Float(drawableSize.width), 1)
+        let binsForVisibleViewport = Int(
+            ceil(Double(drawableWidth * waveformMipTargetBinsPerPoint / viewportDurationProgress))
+        )
+        return min(
+            max(maximumBackgroundPrewarmedWaveformShaderBins, binsForVisibleViewport),
+            maximumViewportPrewarmedWaveformShaderBins
+        )
     }
 
     private func drawWaveformShaderBatch(
