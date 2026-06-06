@@ -2949,6 +2949,45 @@ final class WorkspaceView: NSView {
         return peak
     }
 
+    private nonisolated static func selectionsMatch(
+        _ lhs: TimelineSelection,
+        _ rhs: TimelineSelection
+    ) -> Bool {
+        let epsilon = 0.000_001
+        return lhs.trackID == rhs.trackID &&
+            abs(lhs.startProgress - rhs.startProgress) <= epsilon &&
+            abs(lhs.endProgress - rhs.endProgress) <= epsilon
+    }
+
+    private nonisolated static func exactPeakMagnitude(
+        audioTimeline: AudioEditTimeline?,
+        fileTimeline: AudioFileEditTimeline?,
+        sourceURL: URL,
+        selection: TimelineSelection
+    ) throws -> Float {
+        if let audioTimeline {
+            return peakMagnitude(in: audioTimeline.render(selection: selection))
+        }
+
+        if let fileTimeline {
+            let sourceBuffer = try WAVAudioDecoder.decode(url: sourceURL)
+            let audioTimeline = fileTimeline.audioTimeline(sourceBuffer: sourceBuffer)
+            return peakMagnitude(in: audioTimeline.render(selection: selection))
+        }
+
+        throw PlaybackError.noAudioLoaded
+    }
+
+    private nonisolated static func peakMagnitude(in buffer: DecodedAudioBuffer) -> Float {
+        var peak: Float = 0
+        for samples in buffer.samplesByChannel {
+            for sample in samples {
+                peak = max(peak, abs(sample))
+            }
+        }
+        return peak
+    }
+
     private func overviewForOptimisticEdit(_ overview: WaveformOverview) -> WaveformOverview {
         guard overview.bins.count > optimisticEditPreviewBinLimit else {
             return overview
@@ -3794,12 +3833,62 @@ final class WorkspaceView: NSView {
     private func applyNormalizeEffect() {
         guard
             let target = currentEditableSelectionTarget(),
-            let selectedPeak = selectedPeakMagnitude(for: target)
+            projectTracks.indices.contains(target.trackIndex)
         else {
-            updateStatus("normalize failed: waveform peak unavailable")
+            updateStatus("select audio to normalize")
             return
         }
 
+        if let selectedPeak = selectedPeakMagnitude(for: target) {
+            applyNormalizeEffect(withPeak: selectedPeak)
+            return
+        }
+
+        let trackIndex = target.trackIndex
+        let trackID = projectTracks[trackIndex].id
+        let editRevision = projectTracks[trackIndex].editRevision
+        let sourceURL = projectTracks[trackIndex].sourceURL
+        let audioTimeline = projectTracks[trackIndex].audioTimeline
+        let fileTimeline = try? preferredFileTimelineForEditing(trackIndex: trackIndex)
+        let selectionToNormalize = target.editSelection
+        let displaySelection = target.displaySelection
+        updateStatus("normalizing")
+        Task { [weak self, trackID, editRevision, sourceURL, audioTimeline, fileTimeline, selectionToNormalize, displaySelection] in
+            let peakResult = await Task.detached(priority: .userInitiated) {
+                try Self.exactPeakMagnitude(
+                    audioTimeline: audioTimeline,
+                    fileTimeline: fileTimeline,
+                    sourceURL: sourceURL,
+                    selection: selectionToNormalize
+                )
+            }.result
+
+            guard let self else {
+                return
+            }
+
+            guard
+                let currentTarget = self.currentEditableSelectionTarget(),
+                self.projectTracks.indices.contains(currentTarget.trackIndex),
+                self.projectTracks[currentTarget.trackIndex].id == trackID,
+                self.projectTracks[currentTarget.trackIndex].editRevision == editRevision,
+                Self.selectionsMatch(currentTarget.displaySelection, displaySelection),
+                Self.selectionsMatch(currentTarget.editSelection, selectionToNormalize)
+            else {
+                self.updateStatus("normalize skipped: selection changed")
+                return
+            }
+
+            switch peakResult {
+            case let .success(selectedPeak):
+                self.applyNormalizeEffect(withPeak: selectedPeak)
+            case let .failure(error):
+                self.updateStatus("normalize failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func applyNormalizeEffect(withPeak selectedPeak: Float) {
         guard selectedPeak > 0.000_001 else {
             updateStatus("normalize skipped: selected audio is silent")
             return
