@@ -227,6 +227,10 @@ final class WorkspaceView: NSView {
         WAVPreviewLevel(targetBinCount: 524_288, samplesPerBin: 6),
         WAVPreviewLevel(targetBinCount: 786_432, samplesPerBin: 4),
         WAVPreviewLevel(targetBinCount: 1_048_576, samplesPerBin: 4),
+        WAVPreviewLevel(targetBinCount: 1_572_864, samplesPerBin: 3),
+        WAVPreviewLevel(targetBinCount: 2_097_152, samplesPerBin: 3),
+        WAVPreviewLevel(targetBinCount: 3_145_728, samplesPerBin: 2),
+        WAVPreviewLevel(targetBinCount: 4_194_304, samplesPerBin: 2),
     ]
     private let optimisticEditPreviewBinLimit = 65_536
     private let optimisticEditPreviewSamplesPerBin = 4
