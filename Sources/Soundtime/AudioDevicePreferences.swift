@@ -203,6 +203,7 @@ enum AudioDeviceRegistry {
 final class AudioDevicePreferences: @unchecked Sendable {
     static let shared = AudioDevicePreferences()
     static let didChangeNotification = Notification.Name("SoundtimeAudioDevicePreferencesDidChange")
+    static let changedDeviceKindUserInfoKey = "SoundtimeAudioDevicePreferencesChangedDeviceKind"
 
     private let selectedInputDeviceIDKey = "Soundtime.selectedInputDeviceID"
     private let selectedOutputDeviceIDKey = "Soundtime.selectedOutputDeviceID"
@@ -225,11 +226,11 @@ final class AudioDevicePreferences: @unchecked Sendable {
     }
 
     func setSelectedInputDeviceID(_ deviceID: AudioDeviceID?) {
-        setSelectedDeviceID(deviceID, key: selectedInputDeviceIDKey)
+        setSelectedDeviceID(deviceID, key: selectedInputDeviceIDKey, changedDeviceKind: "input")
     }
 
     func setSelectedOutputDeviceID(_ deviceID: AudioDeviceID?) {
-        setSelectedDeviceID(deviceID, key: selectedOutputDeviceIDKey)
+        setSelectedDeviceID(deviceID, key: selectedOutputDeviceIDKey, changedDeviceKind: "output")
     }
 
     func explicitlySelectedInputDeviceID() -> AudioDeviceID? {
@@ -268,13 +269,21 @@ final class AudioDevicePreferences: @unchecked Sendable {
         return AudioDeviceID(value)
     }
 
-    private func setSelectedDeviceID(_ deviceID: AudioDeviceID?, key: String) {
+    private func setSelectedDeviceID(
+        _ deviceID: AudioDeviceID?,
+        key: String,
+        changedDeviceKind: String
+    ) {
         if let deviceID {
             userDefaults.set(Int(deviceID), forKey: key)
         } else {
             userDefaults.removeObject(forKey: key)
         }
 
-        NotificationCenter.default.post(name: Self.didChangeNotification, object: self)
+        NotificationCenter.default.post(
+            name: Self.didChangeNotification,
+            object: self,
+            userInfo: [Self.changedDeviceKindUserInfoKey: changedDeviceKind]
+        )
     }
 }
