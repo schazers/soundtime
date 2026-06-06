@@ -41,6 +41,16 @@ if CommandLine.arguments.contains("--edit-graph-smoke") {
     }
 }
 
+if CommandLine.arguments.contains("--edit-preview-smoke") {
+    do {
+        try EditPreviewSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        exit(0)
+    } catch {
+        fputs("Soundtime edit preview smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
 let app = NSApplication.shared
 let delegate = AppDelegate()
 
