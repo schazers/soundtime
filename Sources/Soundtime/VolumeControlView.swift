@@ -36,8 +36,8 @@ final class VolumeControlView: NSView {
         iconView.image = NSImage(
             systemSymbolName: "speaker.wave.2.fill",
             accessibilityDescription: "Volume"
-        )?.withSymbolConfiguration(.init(pointSize: 13, weight: .medium))
-        iconView.contentTintColor = NSColor.secondaryLabelColor
+        )?.withSymbolConfiguration(.init(pointSize: 17, weight: .medium))
+        iconView.contentTintColor = NSColor(white: 0.78, alpha: 1)
         iconView.translatesAutoresizingMaskIntoConstraints = false
 
         sliderView.translatesAutoresizingMaskIntoConstraints = false
@@ -54,13 +54,13 @@ final class VolumeControlView: NSView {
         NSLayoutConstraint.activate([
             iconView.leadingAnchor.constraint(equalTo: leadingAnchor),
             iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
-            iconView.widthAnchor.constraint(equalToConstant: 18),
-            iconView.heightAnchor.constraint(equalToConstant: 18),
+            iconView.widthAnchor.constraint(equalToConstant: 24),
+            iconView.heightAnchor.constraint(equalToConstant: 24),
 
-            sliderView.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
+            sliderView.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 5),
             sliderView.trailingAnchor.constraint(equalTo: trailingAnchor),
             sliderView.centerYAnchor.constraint(equalTo: centerYAnchor),
-            sliderView.heightAnchor.constraint(equalToConstant: 24),
+            sliderView.heightAnchor.constraint(equalToConstant: 30),
         ])
     }
 }
@@ -82,7 +82,7 @@ private final class VolumeSliderView: NSView {
     private var isHovering = false
     private var isDragging = false
     private var trackingArea: NSTrackingArea?
-    private let maximumKnobRadius: CGFloat = 7
+    private let maximumKnobRadius: CGFloat = 8
 
     override var acceptsFirstResponder: Bool {
         true
@@ -144,7 +144,7 @@ private final class VolumeSliderView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
 
-        let trackHeight: CGFloat = 5
+        let trackHeight: CGFloat = 6
         let trackLeft = maximumKnobRadius
         let trackRight = max(bounds.width - maximumKnobRadius, trackLeft)
         let trackWidth = max(trackRight - trackLeft, 1)
@@ -177,7 +177,7 @@ private final class VolumeSliderView: NSView {
             yRadius: trackHeight * 0.5
         ).fill()
 
-        let knobRadius: CGFloat = isDragging ? 6.4 : (isHovering ? 6 : 5.4)
+        let knobRadius: CGFloat = isDragging ? 7.2 : (isHovering ? 6.8 : 6.1)
         let knobRect = NSRect(
             x: knobX - knobRadius,
             y: bounds.midY - knobRadius,

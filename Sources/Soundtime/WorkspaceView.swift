@@ -259,7 +259,7 @@ final class WorkspaceView: NSView {
 
     private let timeReadoutLabel: NSTextField = {
         let label = NSTextField(labelWithString: "00:00.000 / 00:00.000")
-        label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        label.font = .monospacedDigitSystemFont(ofSize: 14, weight: .medium)
         label.alignment = .right
         label.textColor = NSColor.white
         label.lineBreakMode = .byClipping
@@ -285,6 +285,8 @@ final class WorkspaceView: NSView {
     private let volumeControl = VolumeControlView()
     private let loudnessMeter = LoudnessMeterView()
     private let transportControlPanel = TransportControlPanelView()
+    private let agentCommandController = AgentCommandController()
+    private let agentCommandBar = AgentCommandBarView()
     private let fisheyeRadiusControl = TimelineTuningSliderView(
         title: "Fish Radius",
         value: FisheyeDefaults.radius,
@@ -455,6 +457,18 @@ final class WorkspaceView: NSView {
         transportControlPanel.onAction = { [weak self] action in
             self?.handleTransportAction(action)
         }
+        agentCommandBar.onSubmit = { [weak self] prompt in
+            self?.agentCommandController.submit(prompt: prompt)
+        }
+        agentCommandController.onStateChanged = { [weak self] state in
+            self?.agentCommandBar.presentationState = state
+        }
+        agentCommandController.onRequestSubmitted = { [weak self] request in
+            self?.updateStatus("agent: \(request.prompt)")
+        }
+        agentCommandController.onResult = { [weak self] result in
+            self?.updateStatus(result.message)
+        }
         configureFisheyeTuningControls()
         installAudioDevicePreferencesObserver()
         gainEffectOverlay.onGainChanged = { [weak self] _, gain in
@@ -479,6 +493,7 @@ final class WorkspaceView: NSView {
         addSubview(trackControlsStack)
         addSubview(addTrackButton)
         addSubview(timelineSurface)
+        addSubview(agentCommandBar)
         addSubview(exportProgressOverlay)
         addSubview(gainEffectOverlay)
 
@@ -492,21 +507,23 @@ final class WorkspaceView: NSView {
             constant: -18
         )
         metadataToTransportConstraint.priority = .defaultLow
-        let volumeToDebugConstraint = volumeControl.trailingAnchor.constraint(
-            lessThanOrEqualTo: framesPerSecondLabel.leadingAnchor,
+        let volumeToLoudnessConstraint = volumeControl.trailingAnchor.constraint(
+            lessThanOrEqualTo: loudnessMeter.leadingAnchor,
             constant: -18
         )
-        volumeToDebugConstraint.priority = .defaultLow
-        let framesPerSecondWidthConstraint = framesPerSecondLabel.widthAnchor.constraint(equalToConstant: 330)
+        volumeToLoudnessConstraint.priority = .defaultLow
+        let framesPerSecondWidthConstraint = framesPerSecondLabel.widthAnchor.constraint(equalToConstant: 390)
         framesPerSecondWidthConstraint.priority = .defaultLow
         let frameRateHistoryWidthConstraint = frameRateHistoryView.widthAnchor.constraint(equalToConstant: 132)
         frameRateHistoryWidthConstraint.priority = .defaultLow
-        let transportPanelWidthConstraint = transportControlPanel.widthAnchor.constraint(equalToConstant: 96)
+        let transportPanelWidthConstraint = transportControlPanel.widthAnchor.constraint(equalToConstant: 104)
         transportPanelWidthConstraint.priority = .defaultHigh
         let volumeControlWidthConstraint = volumeControl.widthAnchor.constraint(equalToConstant: 150)
         volumeControlWidthConstraint.priority = .defaultLow
         let loudnessMeterWidthConstraint = loudnessMeter.widthAnchor.constraint(equalToConstant: 292)
         loudnessMeterWidthConstraint.priority = .defaultLow
+        let agentCommandBarWidthConstraint = agentCommandBar.widthAnchor.constraint(equalToConstant: 620)
+        agentCommandBarWidthConstraint.priority = .defaultHigh
         let trackControlsBelowDebugConstraint = trackControlsStack.topAnchor.constraint(
             equalTo: fisheyeControlsStack.bottomAnchor,
             constant: 14
@@ -520,38 +537,38 @@ final class WorkspaceView: NSView {
         self.trackControlsBelowHeaderConstraint = trackControlsBelowHeaderConstraint
 
         NSLayoutConstraint.activate([
-            titleLabel.topAnchor.constraint(equalTo: topAnchor, constant: 30),
+            titleLabel.centerYAnchor.constraint(equalTo: topAnchor, constant: 66),
             titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 84),
 
             metadataLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
             metadataLabel.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 14),
             metadataToTransportConstraint,
 
-            framesPerSecondLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
-            framesPerSecondLabel.trailingAnchor.constraint(equalTo: frameRateHistoryView.leadingAnchor, constant: -10),
+            framesPerSecondLabel.centerYAnchor.constraint(equalTo: frameRateHistoryView.centerYAnchor),
+            framesPerSecondLabel.trailingAnchor.constraint(equalTo: frameRateHistoryView.leadingAnchor, constant: -8),
             framesPerSecondWidthConstraint,
 
-            frameRateHistoryView.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
-            frameRateHistoryView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -22),
+            frameRateHistoryView.bottomAnchor.constraint(equalTo: loudnessMeter.topAnchor, constant: -6),
+            frameRateHistoryView.trailingAnchor.constraint(equalTo: loudnessMeter.trailingAnchor),
             frameRateHistoryWidthConstraint,
             frameRateHistoryView.heightAnchor.constraint(equalToConstant: 24),
 
             transportControlPanel.centerXAnchor.constraint(equalTo: centerXAnchor),
             transportControlPanel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
             transportPanelWidthConstraint,
-            transportControlPanel.heightAnchor.constraint(equalToConstant: 82),
+            transportControlPanel.heightAnchor.constraint(equalToConstant: 96),
 
             volumeControl.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
-            volumeControl.leadingAnchor.constraint(equalTo: transportControlPanel.trailingAnchor, constant: 16),
+            volumeControl.leadingAnchor.constraint(equalTo: transportControlPanel.trailingAnchor, constant: 20),
             volumeControlWidthConstraint,
-            volumeControl.heightAnchor.constraint(equalToConstant: 24),
-            volumeToDebugConstraint,
+            volumeControl.heightAnchor.constraint(equalToConstant: 30),
+            volumeToLoudnessConstraint,
 
             timeReadoutLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
             timeReadoutLabel.trailingAnchor.constraint(equalTo: transportControlPanel.leadingAnchor, constant: -16),
 
-            loudnessMeter.topAnchor.constraint(equalTo: frameRateHistoryView.bottomAnchor, constant: 6),
-            loudnessMeter.trailingAnchor.constraint(equalTo: frameRateHistoryView.trailingAnchor),
+            loudnessMeter.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
+            loudnessMeter.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -22),
             loudnessMeterWidthConstraint,
             loudnessMeter.heightAnchor.constraint(equalToConstant: 34),
 
@@ -562,18 +579,24 @@ final class WorkspaceView: NSView {
 
             trackControlsBelowDebugConstraint,
             trackControlsStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 22),
-            trackControlsStack.bottomAnchor.constraint(equalTo: addTrackButton.topAnchor, constant: -10),
+            trackControlsStack.bottomAnchor.constraint(equalTo: agentCommandBar.topAnchor, constant: -22),
             trackControlsStack.widthAnchor.constraint(equalToConstant: 158),
 
             addTrackButton.leadingAnchor.constraint(equalTo: trackControlsStack.leadingAnchor),
             addTrackButton.trailingAnchor.constraint(equalTo: trackControlsStack.trailingAnchor),
-            addTrackButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -22),
+            addTrackButton.centerYAnchor.constraint(equalTo: agentCommandBar.centerYAnchor),
             addTrackButton.heightAnchor.constraint(equalToConstant: 36),
 
             timelineSurface.topAnchor.constraint(equalTo: trackControlsStack.topAnchor),
             timelineSurface.leadingAnchor.constraint(equalTo: trackControlsStack.trailingAnchor, constant: 10),
             timelineSurface.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -22),
             timelineSurface.bottomAnchor.constraint(equalTo: trackControlsStack.bottomAnchor),
+
+            agentCommandBar.centerXAnchor.constraint(equalTo: centerXAnchor),
+            agentCommandBar.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -22),
+            agentCommandBar.leadingAnchor.constraint(greaterThanOrEqualTo: addTrackButton.trailingAnchor, constant: 24),
+            agentCommandBar.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -28),
+            agentCommandBarWidthConstraint,
 
             exportProgressOverlay.topAnchor.constraint(equalTo: topAnchor),
             exportProgressOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -684,7 +707,7 @@ final class WorkspaceView: NSView {
         let showsLoudness = width >= 760
         let showsFrameHistory = width >= 380
         let showsDebugText = debugToolsVisible && width >= 760
-        let showsDebugSliders = debugToolsVisible && width >= 980
+        let showsDebugSliders = SoundtimeFeatureFlags.waveformFisheye && debugToolsVisible && width >= 980
 
         titleLabel.isHidden = !showsTitle
         metadataLabel.isHidden = !showsMetadata
@@ -694,7 +717,7 @@ final class WorkspaceView: NSView {
         frameRateHistoryView.isHidden = !showsFrameHistory
         framesPerSecondLabel.isHidden = !showsDebugText
         fisheyeControlsStack.isHidden = !showsDebugSliders
-        framesPerSecondWidthConstraint?.constant = showsDebugText ? 330 : 0
+        framesPerSecondWidthConstraint?.constant = showsDebugText ? 390 : 0
         trackControlsBelowDebugConstraint?.isActive = showsDebugSliders
         trackControlsBelowHeaderConstraint?.isActive = !showsDebugSliders
     }
@@ -784,6 +807,10 @@ final class WorkspaceView: NSView {
 
     private func handleWindowKeyDown(_ event: NSEvent) -> NSEvent? {
         guard event.window === window else {
+            return event
+        }
+
+        if window?.firstResponder is NSTextView {
             return event
         }
 

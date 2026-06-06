@@ -19,7 +19,8 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
     }
 
     private let historyDuration: CFTimeInterval = 15
-    private let maximumSampleCount = 96
+    private let historyExitDuration: CFTimeInterval = 1.25
+    private let maximumSampleCount = 192
     private let renderRefreshRate: TimeInterval = 30
     private let sampleLock = NSLock()
     private let timeOrigin = CACurrentMediaTime()
@@ -212,8 +213,8 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
     }
 
     private func trimSamples(now: Float) {
-        let oldestVisibleTimestamp = now - Float(historyDuration)
-        while samples.count > maximumSampleCount || (samples.first?.timestamp ?? now) < oldestVisibleTimestamp {
+        let oldestRetainedTimestamp = now - Float(historyDuration + historyExitDuration)
+        while samples.count > maximumSampleCount || (samples.first?.timestamp ?? now) < oldestRetainedTimestamp {
             samples.removeFirst()
         }
     }
@@ -265,11 +266,11 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
         return out;
     }
 
-    static float rounded_rect_alpha(float2 p, float2 center, float2 halfSize, float radius) {
-        float2 q = abs(p - center) - halfSize + radius;
-        float distance = length(max(q, float2(0.0))) + min(max(q.x, q.y), 0.0) - radius;
-        float aa = max(fwidth(distance), 0.0015);
-        return 1.0 - smoothstep(0.0, aa, distance);
+    static float rect_alpha(float2 p, float left, float right, float bottom, float top) {
+        float2 distance = min(p - float2(left, bottom), float2(right, top) - p);
+        float edgeDistance = min(distance.x, distance.y);
+        float aa = max(max(fwidth(p.x), fwidth(p.y)), 0.001);
+        return smoothstep(0.0, aa, edgeDistance);
     }
 
     static float line_alpha(float value, float target, float width) {
@@ -286,7 +287,7 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
     }
 
     static float sample_x(HistorySample sample, float now, float duration) {
-        return 1.0 - clamp((now - sample.timestamp) / max(duration, 0.001), 0.0, 1.2);
+        return 1.0 - ((now - sample.timestamp) / max(duration, 0.001));
     }
 
     static float sample_y(HistorySample sample, float maxFPS, float bottom, float top) {
@@ -305,21 +306,15 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
         float maxFPS = max(uniforms.viewport.w, 1.0);
         float now = uniforms.timing.x;
         float duration = max(uniforms.timing.y, 0.001);
-        uint sampleCount = min(uint(max(uniforms.timing.z, 0.0)), 96u);
+        uint sampleCount = min(uint(max(uniforms.timing.z, 0.0)), 192u);
 
         float left = 0.035;
         float right = 0.985;
         float bottom = 0.18;
         float top = 0.86;
-        float2 graphCenter = float2((left + right) * 0.5, (bottom + top) * 0.5);
-        float2 graphHalfSize = float2((right - left) * 0.5, (top - bottom) * 0.5);
-        float background = rounded_rect_alpha(uv, graphCenter, graphHalfSize, 0.055);
+        float background = rect_alpha(uv, left, right, bottom, top);
         float3 color = float3(0.055, 0.057, 0.058);
         color = mix(color, float3(0.082, 0.092, 0.096), background);
-
-        float border = rounded_rect_alpha(uv, graphCenter, graphHalfSize, 0.055) -
-            rounded_rect_alpha(uv, graphCenter, max(graphHalfSize - float2(0.014, 0.035), float2(0.0)), 0.035);
-        color = mix(color, float3(0.18, 0.27, 0.29), clamp(border * 0.65, 0.0, 1.0));
 
         float gridAlpha = 0.0;
         for (float fps = 60.0; fps < maxFPS + 1.0; fps += 60.0) {
@@ -334,6 +329,7 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
         float glow = 0.0;
         float fill = 0.0;
         float latestDot = 0.0;
+        float leftFade = smoothstep(left, left + 0.060, uv.x);
 
         if (sampleCount >= 2u) {
             for (uint i = 1u; i < sampleCount; ++i) {
@@ -352,8 +348,8 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
                 float distance = segment_distance(scaledUV, p0, p1);
                 float lineWidth = 1.45 / height;
                 float glowWidth = 7.5 / height;
-                line = max(line, 1.0 - smoothstep(lineWidth, lineWidth + 1.4 / height, distance));
-                glow = max(glow, 1.0 - smoothstep(lineWidth, glowWidth, distance));
+                line = max(line, (1.0 - smoothstep(lineWidth, lineWidth + 1.4 / height, distance)) * leftFade);
+                glow = max(glow, (1.0 - smoothstep(lineWidth, glowWidth, distance)) * leftFade);
 
                 float segmentLeft = min(x0, x1);
                 float segmentRight = max(x0, x1);
@@ -361,7 +357,7 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
                 float inSegmentX = smoothstep(segmentLeft, segmentLeft + 0.004, uv.x) *
                     (1.0 - smoothstep(segmentRight - 0.004, segmentRight, uv.x));
                 fill = max(fill, inSegmentX * smoothstep(bottom, yOnSegment, uv.y) *
-                    (1.0 - smoothstep(yOnSegment, yOnSegment + 0.01, uv.y)) * 0.10);
+                    (1.0 - smoothstep(yOnSegment, yOnSegment + 0.01, uv.y)) * 0.10 * leftFade);
             }
 
             HistorySample latestSample = samples[sampleCount - 1u];

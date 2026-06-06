@@ -25,6 +25,7 @@ final class TransportControlPanelView: TimelineMetalLayerView {
             guard oldValue != isTransportEnabled else {
                 return
             }
+            window?.invalidateCursorRects(for: self)
             render()
         }
     }
@@ -108,7 +109,13 @@ final class TransportControlPanelView: TimelineMetalLayerView {
 
     override func resetCursorRects() {
         super.resetCursorRects()
-        addCursorRect(bounds, cursor: isTransportEnabled ? .pointingHand : .arrow)
+        guard isTransportEnabled else {
+            return
+        }
+
+        for rect in buttonLayout() {
+            addCursorRect(rect, cursor: .pointingHand)
+        }
     }
 
     override func mouseEntered(with event: NSEvent) {
@@ -290,7 +297,7 @@ final class TransportControlPanelView: TimelineMetalLayerView {
     }
 
     private func buttonLayout() -> [NSRect] {
-        let buttonSize: CGFloat = 34
+        let buttonSize: CGFloat = 58
         let y = bounds.midY - buttonSize * 0.5
         return [
             NSRect(
@@ -723,11 +730,6 @@ private final class TransportControlPanelRenderer {
 
         float4 color = float4(0.0);
         float2 center = size * 0.5;
-        float panelSDF = rounded_box_sdf(p - center, float2(26.0, 21.0), 17.0);
-        float panelCoverage = coverage_from_sdf(panelSDF, aa);
-        float panelStroke = smoothstep(2.2, 0.0, abs(panelSDF));
-        color = source_over(color, float4(0.077, 0.084, 0.089, 0.27 * panelCoverage));
-        color = source_over(color, float4(accent * 0.30, 0.060 * panelStroke));
 
         for (int buttonIndex = 0; buttonIndex < 1; ++buttonIndex) {
             float selected = isPlaying;
@@ -739,7 +741,7 @@ private final class TransportControlPanelRenderer {
             float depth = enabled * (0.08 * activeEnergy + 0.13 * pressed + 0.13 * pointerPressed);
 
             float2 buttonCenter = center + float2(0.0, depth * 0.95);
-            float buttonRadius = 18.0 - depth * 0.45;
+            float buttonRadius = 22.0 - depth * 0.45;
             float2 halfSize = float2(buttonRadius - depth * 0.55, buttonRadius - depth * 0.35);
             float buttonSDF = rounded_box_sdf(p - buttonCenter, halfSize, buttonRadius);
             float buttonCoverage = coverage_from_sdf(buttonSDF, aa);
@@ -750,8 +752,8 @@ private final class TransportControlPanelRenderer {
             float pulse = 0.5 + 0.5 * sin(time * 1.45 + activeEnergy * 2.1);
             float bloom = glow * (0.020 + 0.028 * hot + 0.036 * pressed + 0.015 * audioEnergy + statePulse * 0.65) * enabled;
             float broadBloom = broadGlow * (0.0025 + 0.0045 * hot + 0.0055 * pressed + 0.004 * pulse * activeEnergy) * enabled;
-            color = source_over(color, float4(mix(accent, float3(0.68, 0.98, 0.92), 0.22), broadBloom));
-            color = source_over(color, float4(mix(accent, float3(0.78, 1.0, 0.96), 0.28), bloom));
+            color = source_over(color, float4(mix(accent, float3(0.68, 0.98, 0.92), 0.22), broadBloom * buttonCoverage));
+            color = source_over(color, float4(mix(accent, float3(0.78, 1.0, 0.96), 0.28), bloom * buttonCoverage));
 
             float innerShine = exp(-length(p - buttonCenter) * length(p - buttonCenter) / 940.0);
             float2 local = (p - buttonCenter) / max(buttonRadius, 0.001);
