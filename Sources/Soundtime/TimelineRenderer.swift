@@ -156,6 +156,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
 
     private struct WaveformShaderBatch {
+        let key: ObjectIdentifier
         let buffer: MTLBuffer
         var uniforms: [WaveformShaderUniform]
     }
@@ -765,6 +766,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var waveformMipLevelBuildsInFlight: Set<WaveformMipCacheKey> = []
     private let waveformMipLevelCacheLock = NSLock()
     private let waveformShaderBufferStore: WaveformShaderBufferStore
+    private var waveformShaderBatchScratch: [WaveformShaderBatch] = []
     private var gridCache: GridCache?
     private var waveformTransitionStartTime: CFTimeInterval?
     private var previousRenderedPlayheadX: Float?
@@ -1740,8 +1742,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         let anySolo = renderState.tracks.contains { $0.isSoloed }
         let style = waveformVisualStyle(renderState: renderState, projectDuration: projectDuration)
-        var batches: [ObjectIdentifier: WaveformShaderBatch] = [:]
-        var batchOrder: [ObjectIdentifier] = []
+        waveformShaderBatchScratch.removeAll(keepingCapacity: true)
 
         for (trackIndex, track) in renderState.tracks.enumerated() {
             guard
@@ -1816,21 +1817,21 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             )
 
             let batchKey = ObjectIdentifier(shaderDrawable.buffer)
-            if batches[batchKey] == nil {
-                batches[batchKey] = WaveformShaderBatch(
+            if let batchIndex = waveformShaderBatchScratch.firstIndex(where: { $0.key == batchKey }) {
+                waveformShaderBatchScratch[batchIndex].uniforms.append(uniform)
+            } else {
+                var batch = WaveformShaderBatch(
+                    key: batchKey,
                     buffer: shaderDrawable.buffer,
                     uniforms: []
                 )
-                batchOrder.append(batchKey)
+                batch.uniforms.reserveCapacity(8)
+                batch.uniforms.append(uniform)
+                waveformShaderBatchScratch.append(batch)
             }
-            batches[batchKey]?.uniforms.append(uniform)
         }
 
-        for batchKey in batchOrder {
-            guard let batch = batches[batchKey] else {
-                continue
-            }
-
+        for batch in waveformShaderBatchScratch {
             drawWaveformShaderBatch(
                 uniforms: batch.uniforms,
                 binBuffer: batch.buffer,
@@ -1838,6 +1839,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 encoder: encoder
             )
         }
+
+        waveformShaderBatchScratch.removeAll(keepingCapacity: true)
     }
 
     private static func makeWaveformQuadVertices() -> [WaveformShaderQuadVertex] {
