@@ -83,6 +83,26 @@ struct AudioEditTimeline: Sendable {
         }
     }
 
+    init(sourceBuffer: DecodedAudioBuffer, playbackSegments: [PlaybackSegment]) {
+        self.sourceBuffer = sourceBuffer
+        sourceID = UUID()
+        segments = playbackSegments.compactMap { playbackSegment in
+            let sourceStartFrame = min(max(playbackSegment.sourceStartFrame, 0), sourceBuffer.frameCount)
+            let frameCount = min(max(playbackSegment.frameCount, 0), max(sourceBuffer.frameCount - sourceStartFrame, 0))
+            guard frameCount > 0 else {
+                return nil
+            }
+
+            return Segment(
+                sourceStartFrame: sourceStartFrame,
+                frameCount: frameCount,
+                gainStart: max(playbackSegment.gainStart, 0),
+                gainEnd: max(playbackSegment.gainEnd, 0)
+            )
+        }
+        segments = coalescedSegments(segments)
+    }
+
     var frameCount: Int {
         segments.reduce(0) { total, segment in
             total + segment.frameCount

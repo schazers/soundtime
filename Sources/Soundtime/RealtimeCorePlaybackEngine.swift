@@ -487,6 +487,31 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             segments = []
             zeroCrossingIndex = nil
             zeroCrossingProbe = sourceZeroCrossingProbe
+        case let .fileTimeline(url, audioFileTimeline, sourceZeroCrossingProbe):
+            if let existingPreparedTrack = preparedProjectTracks.first(where: { existingTrack in
+                existingTrack.id == track.id &&
+                    existingTrack.sourceRevision == track.sourceRevision &&
+                    existingTrack.source.frameCount > 0
+            }) {
+                preparedSource = existingPreparedTrack.source
+            } else {
+                guard let source = try PreparedRealtimeAudioSource.makeMappedWAV(url: url) else {
+                    throw PlaybackError.invalidFormat
+                }
+                preparedSource = source
+            }
+            segments = audioFileTimeline.playbackSegments.map { segment in
+                PreparedRealtimeAudioSegment(
+                    outputStartFrame: segment.outputStartFrame,
+                    sourceStartFrame: segment.sourceStartFrame,
+                    frameCount: segment.frameCount,
+                    sourceFrameScale: segment.sourceFrameScale,
+                    gainStart: segment.gainStart,
+                    gainEnd: segment.gainEnd
+                )
+            }
+            zeroCrossingIndex = nil
+            zeroCrossingProbe = sourceZeroCrossingProbe
         case let .timeline(audioTimeline, sourceZeroCrossingIndex):
             let sourceBuffer = audioTimeline.sourceAudioBuffer
             if let existingPreparedTrack = preparedProjectTracks.first(where: { existingTrack in

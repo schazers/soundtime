@@ -49,6 +49,7 @@ final class WorkspaceView: NSView {
         var zeroCrossingIndex: AudioZeroCrossingIndex?
         var zeroCrossingProbe: WAVZeroCrossingProbe?
         var audioTimeline: AudioEditTimeline?
+        var fileTimeline: AudioFileEditTimeline?
         var ownsSourceFile: Bool
         var volume: Float
         var isMuted: Bool
@@ -62,6 +63,7 @@ final class WorkspaceView: NSView {
         var activeTrackID: UUID?
         var selectedTrackID: UUID?
         var selectedTimelineRange: TimelineSelection?
+        var restoreProgress: Float?
     }
 
     private enum UndoAction {
@@ -802,7 +804,11 @@ final class WorkspaceView: NSView {
                 id: track.id,
                 waveformVersion: waveformVersion(for: track),
                 waveformOverview: track.waveformOverview,
-                durationHint: track.waveformOverview?.duration ?? track.decodedAudioBuffer?.duration ?? track.durationHint,
+                durationHint: track.waveformOverview?.duration ??
+                    track.audioTimeline?.duration ??
+                    track.fileTimeline?.duration ??
+                    track.decodedAudioBuffer?.duration ??
+                    track.durationHint,
                 volume: track.volume,
                 isMuted: track.isMuted,
                 isSoloed: track.isSoloed
@@ -952,7 +958,8 @@ final class WorkspaceView: NSView {
             tracks: projectTracks,
             activeTrackID: activeTrackID,
             selectedTrackID: selectedTrackID,
-            selectedTimelineRange: selectedTimelineRange
+            selectedTimelineRange: selectedTimelineRange,
+            restoreProgress: nil
         )
         editUndoStack.append(.projectTracks(snapshot))
 
@@ -968,6 +975,7 @@ final class WorkspaceView: NSView {
             zeroCrossingIndex: nil,
             zeroCrossingProbe: nil,
             audioTimeline: nil,
+            fileTimeline: nil,
             ownsSourceFile: false,
             volume: 1,
             isMuted: false,
@@ -1039,7 +1047,8 @@ final class WorkspaceView: NSView {
             tracks: projectTracks,
             activeTrackID: activeTrackID,
             selectedTrackID: selectedTrackID,
-            selectedTimelineRange: selectedTimelineRange
+            selectedTimelineRange: selectedTimelineRange,
+            restoreProgress: nil
         )
         editUndoStack.append(.projectTracks(snapshot))
 
@@ -1543,6 +1552,7 @@ final class WorkspaceView: NSView {
             zeroCrossingIndex: nil,
             zeroCrossingProbe: nil,
             audioTimeline: nil,
+            fileTimeline: nil,
             ownsSourceFile: false,
             volume: settings?.volume ?? 1,
             isMuted: settings?.isMuted ?? false,
@@ -1769,11 +1779,19 @@ final class WorkspaceView: NSView {
             return
         }
 
+        let existingFileTimeline = projectTracks[trackIndex].fileTimeline
+        let existingEditedOverview = projectTracks[trackIndex].editRevision > 0 ?
+            projectTracks[trackIndex].waveformOverview :
+            nil
+        let decodedTimeline = existingFileTimeline?.audioTimeline(sourceBuffer: decodedAudioBuffer) ??
+            AudioEditTimeline(sourceBuffer: decodedAudioBuffer)
+
         projectTracks[trackIndex].decodedAudioBuffer = decodedAudioBuffer
-        projectTracks[trackIndex].waveformOverview = waveformOverview
+        projectTracks[trackIndex].waveformOverview = existingEditedOverview ?? waveformOverview
         projectTracks[trackIndex].durationHint = decodedAudioBuffer.duration
         projectTracks[trackIndex].zeroCrossingIndex = zeroCrossingIndex
-        projectTracks[trackIndex].audioTimeline = AudioEditTimeline(sourceBuffer: decodedAudioBuffer)
+        projectTracks[trackIndex].audioTimeline = decodedTimeline
+        projectTracks[trackIndex].fileTimeline = nil
         let shouldReloadPlayback = projectTracks[trackIndex].editRevision != 0 || !playbackController.hasSource
         activeTrackID = trackID
         syncActiveTrackFields()
@@ -1786,6 +1804,17 @@ final class WorkspaceView: NSView {
         }
         updateEffectCommandState()
         updateStatus("track ready")
+
+        if existingFileTimeline?.hasEdits == true {
+            let editRevision = projectTracks[trackIndex].editRevision
+            materializeEditedTimeline(
+                trackID: trackID,
+                timeline: decodedTimeline,
+                editRevision: editRevision,
+                status: "track ready",
+                preservePlaybackProgress: true
+            )
+        }
     }
 
     private func syncActiveTrackFields() {
@@ -1920,7 +1949,13 @@ final class WorkspaceView: NSView {
     private func projectPlaybackTracks() -> [ProjectPlaybackTrack] {
         return projectTracks.compactMap { track -> ProjectPlaybackTrack? in
             let source: ProjectPlaybackTrack.Source
-            if track.editRevision == 0, WAVAudioDecoder.canDecode(track.sourceURL) {
+            if let fileTimeline = track.fileTimeline, WAVAudioDecoder.canDecode(track.sourceURL) {
+                source = .fileTimeline(
+                    url: track.sourceURL,
+                    timeline: fileTimeline,
+                    zeroCrossingProbe: track.zeroCrossingProbe
+                )
+            } else if track.editRevision == 0, WAVAudioDecoder.canDecode(track.sourceURL) {
                 source = .file(
                     url: track.sourceURL,
                     zeroCrossingProbe: track.zeroCrossingProbe
@@ -2116,6 +2151,7 @@ final class WorkspaceView: NSView {
 
         projectTracks[trackIndex].decodedAudioBuffer = materialized.buffer
         projectTracks[trackIndex].audioTimeline = materialized.timeline
+        projectTracks[trackIndex].fileTimeline = nil
         projectTracks[trackIndex].waveformOverview = materialized.waveformOverview
         projectTracks[trackIndex].zeroCrossingIndex = materialized.zeroCrossingIndex
         activeTrackID = trackID
@@ -2597,7 +2633,8 @@ final class WorkspaceView: NSView {
             tracks: projectTracks,
             activeTrackID: activeTrackID,
             selectedTrackID: selectedTrackID,
-            selectedTimelineRange: selectedTimelineRange
+            selectedTimelineRange: selectedTimelineRange,
+            restoreProgress: nil
         )
         editUndoStack.append(.projectTracks(snapshot))
 
@@ -2738,40 +2775,83 @@ final class WorkspaceView: NSView {
             return
         }
 
-        guard let currentTimeline = projectTracks[trackIndex].audioTimeline else {
-            updateStatus("track still resolving - delete available when ready")
-            return
-        }
+        let trackID = projectTracks[trackIndex].id
+        let undoSnapshot = ProjectTrackUndoSnapshot(
+            tracks: projectTracks,
+            activeTrackID: activeTrackID,
+            selectedTrackID: selectedTrackID,
+            selectedTimelineRange: selectedTimelineRange,
+            restoreProgress: selectionToDelete.startProgressFloat
+        )
 
         if copyBeforeDeleting {
             copySelection()
         }
 
-        var editedTimeline = currentTimeline
-        let deletedStartTime = selectionToDelete.startProgress * currentTimeline.duration
-        let deletedDuration = selectionToDelete.duration(in: currentTimeline.duration)
-        let deletedFrameCount = editedTimeline.delete(selectionToDelete)
-        guard deletedFrameCount > 0 else {
-            return
-        }
-        let targetPlaybackProgress = editedTimeline.duration > 0 ?
-            min(max(Float(deletedStartTime / editedTimeline.duration), 0), 1) :
-            0
+        let deletedStartTime: TimeInterval
+        let deletedDuration: TimeInterval
+        let targetPlaybackProgress: Float
+        let editedAudioTimeline: AudioEditTimeline?
+        let editedFileTimeline: AudioFileEditTimeline?
 
-        let trackID = projectTracks[trackIndex].id
-        editUndoStack.append(.timeline(trackID: trackID, timeline: currentTimeline))
+        if let currentTimeline = projectTracks[trackIndex].audioTimeline {
+            var timeline = currentTimeline
+            deletedStartTime = selectionToDelete.startProgress * currentTimeline.duration
+            deletedDuration = selectionToDelete.duration(in: currentTimeline.duration)
+            let deletedFrameCount = timeline.delete(selectionToDelete)
+            guard deletedFrameCount > 0 else {
+                return
+            }
+            targetPlaybackProgress = timeline.duration > 0 ?
+                min(max(Float(deletedStartTime / timeline.duration), 0), 1) :
+                0
+            editedAudioTimeline = timeline
+            editedFileTimeline = nil
+        } else {
+            let currentFileTimeline: AudioFileEditTimeline
+            if let fileTimeline = projectTracks[trackIndex].fileTimeline {
+                currentFileTimeline = fileTimeline
+            } else {
+                do {
+                    currentFileTimeline = AudioFileEditTimeline(
+                        fileInfo: try WAVAudioDecoder.inspect(url: projectTracks[trackIndex].sourceURL)
+                    )
+                } catch {
+                    updateStatus("delete failed: \(error.localizedDescription)")
+                    return
+                }
+            }
+
+            var timeline = currentFileTimeline
+            deletedStartTime = selectionToDelete.startProgress * currentFileTimeline.duration
+            deletedDuration = selectionToDelete.duration(in: currentFileTimeline.duration)
+            let deletedFrameCount = timeline.delete(selectionToDelete)
+            guard deletedFrameCount > 0 else {
+                return
+            }
+            targetPlaybackProgress = timeline.duration > 0 ?
+                min(max(Float(deletedStartTime / timeline.duration), 0), 1) :
+                0
+            editedAudioTimeline = nil
+            editedFileTimeline = timeline
+        }
+
+        timelineSurface.triggerDeletionEffect(selection: selectionToDelete)
+        editUndoStack.append(.projectTracks(undoSnapshot))
         projectTracks[trackIndex].editRevision += 1
         let editRevision = projectTracks[trackIndex].editRevision
-        projectTracks[trackIndex].audioTimeline = editedTimeline
+        projectTracks[trackIndex].audioTimeline = editedAudioTimeline
+        projectTracks[trackIndex].fileTimeline = editedFileTimeline
         projectTracks[trackIndex].decodedAudioBuffer = nil
-        projectTracks[trackIndex].zeroCrossingIndex = nil
+        if editedAudioTimeline != nil {
+            projectTracks[trackIndex].zeroCrossingIndex = nil
+        }
         projectTracks[trackIndex].waveformOverview = optimisticWaveformOverview(
             projectTracks[trackIndex].waveformOverview,
             replacing: selectionToDelete,
             with: nil
         )
 
-        timelineSurface.triggerDeletionEffect(selection: selectionToDelete)
         selectedTimelineRange = nil
         timelineSurface.displaySelection(nil)
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
@@ -2785,13 +2865,15 @@ final class WorkspaceView: NSView {
         updateEffectCommandState()
         updateStatus("\(copyBeforeDeleting ? "cut" : "deleted") \(formatDuration(deletedDuration))")
 
-        materializeEditedTimeline(
-            trackID: trackID,
-            timeline: editedTimeline,
-            editRevision: editRevision,
-            status: "\(copyBeforeDeleting ? "cut" : "deleted") \(formatDuration(deletedDuration))",
-            preservePlaybackProgress: true
-        )
+        if let editedAudioTimeline {
+            materializeEditedTimeline(
+                trackID: trackID,
+                timeline: editedAudioTimeline,
+                editRevision: editRevision,
+                status: "\(copyBeforeDeleting ? "cut" : "deleted") \(formatDuration(deletedDuration))",
+                preservePlaybackProgress: true
+            )
+        }
     }
 
     private func trimTimeline(to trimRange: TimelineTrimRange) {
@@ -2997,10 +3079,13 @@ final class WorkspaceView: NSView {
         timelineSurface.displaySelectedTrack(selectedTrackID)
         refreshProjectTimelineDisplay()
         updateProjectDisplayTiming()
-        reloadPlaybackFromProjectTracks(preserveProgress: true)
+        reloadPlaybackFromProjectTracks(
+            preserveProgress: snapshot.restoreProgress == nil,
+            targetProgress: snapshot.restoreProgress
+        )
         updateEffectCommandState()
         cleanupOwnedSourceFiles(replacedTracks: replacedTracks)
-        updateStatus("undo track delete")
+        updateStatus(snapshot.restoreProgress == nil ? "undo track delete" : "undo")
     }
 
     private func togglePlayback() {

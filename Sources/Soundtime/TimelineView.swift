@@ -977,7 +977,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         stopZoomMomentum()
         onTimelineInteractionBegan?()
         let point = currentDragPoint(for: event)
-        let progress = progress(for: point)
+        let timelineProgress = progress(for: point)
         if event.clickCount >= 2 {
             displayHoverProgress(nil)
             displaySelection(nil)
@@ -988,14 +988,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             activeDragMode = nil
             isDraggingSelection = false
             isDraggingTrim = false
-            onPlayFromProgress?(progress)
+            onPlayFromProgress?(timelineProgress)
             return
         }
 
         if let trimDragMode = trimDragMode(for: point) {
             displayHoverProgress(nil)
             activeDragMode = trimDragMode
-            selectionAnchorProgress = Double(progress)
+            selectionAnchorProgress = Double(progress(for: point, followsVisualFisheye: false))
             selectionAnchorPoint = point
             selectionAnchorTrackID = nil
             isDraggingSelection = false
@@ -1011,7 +1011,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         selectionAnchorTrackID = trackID(at: point)
         isDraggingSelection = false
         isDraggingTrim = false
-        displayHoverProgress(progress, isArmed: true)
+        displayHoverProgress(timelineProgress, isArmed: true)
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -1031,7 +1031,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             }
 
             if isDraggingTrim, let activeDragMode {
-                updateTrimPreview(for: activeDragMode, progress: progress(for: point))
+                updateTrimPreview(for: activeDragMode, progress: progress(for: point, followsVisualFisheye: false))
             }
             return
         }
@@ -1042,7 +1042,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         if isDraggingSelection {
-                updateSelection(from: selectionAnchorProgress, to: preciseProgress(for: point), notifyChange: false)
+            updateSelection(from: selectionAnchorProgress, to: preciseProgress(for: point), notifyChange: false)
         } else {
             displayHoverProgress(progress(for: point), isArmed: true)
         }
@@ -1058,12 +1058,15 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         let point = currentDragPoint(for: event)
-        let progress = progress(for: point)
+        let timelineProgress = progress(for: point)
         if
             (activeDragMode == .trimStart || activeDragMode == .trimEnd),
             let activeDragMode
         {
-            let trimRange = trimRange(for: activeDragMode, progress: progress)
+            let trimRange = trimRange(
+                for: activeDragMode,
+                progress: progress(for: point, followsVisualFisheye: false)
+            )
             displayTrimPreview(nil)
 
             if isDraggingTrim, trimRange.trimsAudio, trimRange.durationProgress > 0.001 {
@@ -1074,7 +1077,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         } else {
             displaySelection(nil)
             onSelectionChanged?(nil)
-            onSeekRequested?(progress)
+            onSeekRequested?(timelineProgress)
         }
 
         self.selectionAnchorProgress = nil
@@ -1370,24 +1373,44 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         return convert(windowPoint, from: nil)
     }
 
-    private func progress(for point: CGPoint) -> Float {
+    private func progress(for point: CGPoint, followsVisualFisheye: Bool = true) -> Float {
         guard bounds.width > 0 else {
             return 0
         }
 
-        let viewportProgress = Float(point.x / bounds.width)
+        let viewportProgress = viewportProgress(for: point, followsVisualFisheye: followsVisualFisheye)
         return viewport.timelineProgress(forViewportProgress: viewportProgress)
     }
 
-    private func preciseProgress(for point: CGPoint) -> Double {
+    private func preciseProgress(for point: CGPoint, followsVisualFisheye: Bool = true) -> Double {
         guard bounds.width > 0 else {
             return 0
         }
 
-        let viewportProgress = min(max(Double(point.x / bounds.width), 0), 1)
+        let viewportProgress = Double(viewportProgress(for: point, followsVisualFisheye: followsVisualFisheye))
         return min(
             max(Double(viewport.startProgress) + viewportProgress * Double(viewport.durationProgress), 0),
             1
+        )
+    }
+
+    private func viewportProgress(for point: CGPoint, followsVisualFisheye: Bool) -> Float {
+        guard bounds.width > 0 else {
+            return 0
+        }
+
+        let visualViewportProgress = min(max(Float(point.x / bounds.width), 0), 1)
+        guard
+            followsVisualFisheye,
+            let timelineRenderer
+        else {
+            return visualViewportProgress
+        }
+
+        return timelineRenderer.inverseFisheyeViewportProgress(
+            visualViewportProgress,
+            trackID: trackID(at: point),
+            timestamp: CACurrentMediaTime()
         )
     }
 

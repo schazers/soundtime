@@ -63,6 +63,11 @@ struct ProjectPlaybackTrack: Sendable {
             url: URL,
             zeroCrossingProbe: WAVZeroCrossingProbe?
         )
+        case fileTimeline(
+            url: URL,
+            timeline: AudioFileEditTimeline,
+            zeroCrossingProbe: WAVZeroCrossingProbe?
+        )
         case timeline(
             audioTimeline: AudioEditTimeline,
             zeroCrossingIndex: AudioZeroCrossingIndex?
@@ -119,6 +124,8 @@ extension PlaybackEngine {
         case let .decoded(decodedAudioBuffer, zeroCrossingIndex):
             try load(decodedAudioBuffer, zeroCrossingIndex: zeroCrossingIndex)
         case let .file(url, zeroCrossingProbe):
+            try loadFile(at: url, zeroCrossingProbe: zeroCrossingProbe)
+        case let .fileTimeline(url, _, zeroCrossingProbe):
             try loadFile(at: url, zeroCrossingProbe: zeroCrossingProbe)
         case let .timeline(audioTimeline, zeroCrossingIndex):
             try load(audioTimeline.render(), zeroCrossingIndex: zeroCrossingIndex)
