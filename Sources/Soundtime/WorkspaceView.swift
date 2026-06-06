@@ -1938,8 +1938,9 @@ final class WorkspaceView: NSView {
 
         projectTracks[trackIndex].decodedAudioBuffer = decodedAudioBuffer
         projectTracks[trackIndex].sourceWaveformOverview = waveformOverview
-        projectTracks[trackIndex].waveformOverview = existingEditedOverview ??
+        projectTracks[trackIndex].waveformOverview =
             existingFileTimeline?.waveformOverview(from: waveformOverview) ??
+            existingEditedOverview ??
             waveformOverview
         projectTracks[trackIndex].durationHint = decodedTimeline.duration
         projectTracks[trackIndex].zeroCrossingIndex = zeroCrossingIndex

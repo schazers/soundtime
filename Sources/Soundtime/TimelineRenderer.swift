@@ -895,8 +895,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let maximumInFlightWaveformMipBuilds = 4
     private let maximumGeneratedWaveformMipBins = 262_144
     private let generatedWaveformMipSamplesPerBin = 4
-    private let highResolutionWaveformVisibleDurationThreshold: TimeInterval = 30
-    private let waveformMipTargetBinsPerPoint: Float = 48
+    private let highResolutionWaveformVisibleDurationThreshold: TimeInterval = 90
+    private let waveformMipTargetBinsPerPoint: Float = 96
     private let maximumCachedWaveformMipPyramids = 512
     private let maximumCachedWaveformShaderBinBuffers = 768
     private let maximumCachedWaveformShaderBinBufferBytes = 512 * 1_024 * 1_024
@@ -2192,12 +2192,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 let trackDuration = track.durationHint,
                 trackDuration.isFinite,
                 trackDuration > 0,
-                let mipLevels = trackWaveformMipLevels[track.id],
-                let preferredIndex = waveformMipLevelIndex(
-                    for: drawableSize,
-                    renderState: renderState,
-                    mipLevels: mipLevels
-                )
+                let mipLevels = trackWaveformMipLevels[track.id]
             else {
                 return false
             }
@@ -2208,17 +2203,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             }
 
             checkedRenderableTrack = true
-            let preferredMipLevel = mipLevels[preferredIndex]
-            if waveformShaderAllocation(track: track, mipLevel: preferredMipLevel) != nil {
-                continue
-            }
-
-            prepareWaveformShaderBinBuffer(
+            guard waveformShaderDrawable(
                 track: track,
-                mipLevel: preferredMipLevel,
-                allowsSynchronousUpload: false
-            )
-            guard waveformShaderAllocation(track: track, mipLevel: preferredMipLevel) != nil else {
+                mipLevels: mipLevels,
+                drawableSize: drawableSize,
+                renderState: renderState,
+                fallbackPolicy: .allowFallbacks
+            ) != nil else {
                 return false
             }
         }
