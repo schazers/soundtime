@@ -902,6 +902,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let maximumCachedWaveformMipPyramids = 512
     private let maximumCachedWaveformShaderBinBuffers = 768
     private let maximumCachedWaveformShaderBinBufferBytes = 1_024 * 1_024 * 1_024
+    private let maximumBackgroundPrewarmedWaveformShaderBins = 16_384
     private let maximumInFlightWaveformShaderBufferUploads = 8
     private let maximumSynchronousWaveformShaderBinBufferBins = 4_096
     private let maximumCachedTransientParticleScoreProfiles = 512
@@ -1089,6 +1090,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         currentPrimaryWaveformTrackID = renderTracks.first?.id
         waveformMipLevelStateLock.unlock()
         prewarmInitialWaveformShaderBuffers(
+            tracks: renderTracks,
+            trackWaveformMipLevels: nextTrackWaveformMipLevels
+        )
+        prewarmInteractiveWaveformShaderBuffers(
             tracks: renderTracks,
             trackWaveformMipLevels: nextTrackWaveformMipLevels
         )
@@ -2425,6 +2430,75 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 mipLevel: lowestCostMipLevel,
                 allowsSynchronousUpload: true
             )
+        }
+    }
+
+    private func prewarmInteractiveWaveformShaderBuffers(
+        tracks: [TimelineRenderState.Track],
+        trackWaveformMipLevels: [UUID: [WaveformMipLevel]]
+    ) {
+        let jobs = tracks.compactMap { track -> (TimelineRenderState.Track, WaveformMipLevel)? in
+            guard let mipLevels = trackWaveformMipLevels[track.id] else {
+                return nil
+            }
+
+            guard let interactiveMipLevel = mipLevels.first(where: {
+                $0.binCount <= maximumBackgroundPrewarmedWaveformShaderBins
+            }) else {
+                return nil
+            }
+
+            return (track, interactiveMipLevel)
+        }
+
+        guard !jobs.isEmpty else {
+            return
+        }
+
+        waveformGeometryQueue.async { [weak self] in
+            guard let self else {
+                return
+            }
+
+            var publishedCount = 0
+            for (track, mipLevel) in jobs {
+                let key = self.waveformShaderBufferKey(track: track, mipLevel: mipLevel)
+                if self.waveformShaderBufferStore.allocation(for: key) != nil {
+                    continue
+                }
+
+                guard self.waveformShaderBufferStore.beginPreparing(
+                    key,
+                    maximumInFlightCount: Int.max
+                ) else {
+                    continue
+                }
+
+                let shaderBins = self.makeWaveformShaderBins(
+                    from: mipLevel.overview.bins,
+                    shouldYieldForPlayback: true
+                )
+                self.waveformShaderBufferStore.publish(shaderBins, for: key)
+                publishedCount += 1
+
+                if publishedCount.isMultiple(of: 16) {
+                    self.waveformShaderBufferStore.trim(
+                        toMaximumCount: self.maximumCachedWaveformShaderBinBuffers,
+                        maximumByteCount: self.maximumCachedWaveformShaderBinBufferBytes
+                    )
+                    self.onRenderDataPrepared?()
+                }
+            }
+
+            guard publishedCount > 0 else {
+                return
+            }
+
+            self.waveformShaderBufferStore.trim(
+                toMaximumCount: self.maximumCachedWaveformShaderBinBuffers,
+                maximumByteCount: self.maximumCachedWaveformShaderBinBufferBytes
+            )
+            self.onRenderDataPrepared?()
         }
     }
 

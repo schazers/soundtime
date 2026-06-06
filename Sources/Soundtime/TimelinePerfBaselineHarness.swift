@@ -44,8 +44,20 @@ enum TimelinePerfBaselineHarness {
             rendererStatsSamples.map(\.cpuWaveformVertexCount).max() ?? rendererStats.cpuWaveformVertexCount
         }
 
+        var maximumGPUWaveformDrawCount: Int {
+            rendererStatsSamples.map(\.gpuWaveformDrawCount).max() ?? rendererStats.gpuWaveformDrawCount
+        }
+
         var maximumShaderBufferUploadCount: Int {
             rendererStatsSamples.map(\.shaderBufferUploadCount).max() ?? rendererStats.shaderBufferUploadCount
+        }
+
+        var maximumShaderBufferCount: Int {
+            rendererStatsSamples.map(\.shaderBufferCount).max() ?? rendererStats.shaderBufferCount
+        }
+
+        var maximumShaderBufferByteCount: Int {
+            rendererStatsSamples.map(\.shaderBufferByteCount).max() ?? rendererStats.shaderBufferByteCount
         }
 
         var maximumShaderBufferUploadInFlightCount: Int {
@@ -71,6 +83,10 @@ enum TimelinePerfBaselineHarness {
 
         var maximumPlayheadContactEventCount: Int {
             rendererStatsSamples.map(\.playheadContactEventCount).max() ?? rendererStats.playheadContactEventCount
+        }
+
+        var maximumWaveformMipCacheCount: Int {
+            rendererStatsSamples.map(\.waveformMipCacheCount).max() ?? rendererStats.waveformMipCacheCount
         }
 
         var maximumVisibleLaneCount: Int {
@@ -203,7 +219,7 @@ enum TimelinePerfBaselineHarness {
         warmupFrames: Int
     ) -> [Scenario] {
         let trackCounts = isQuick ? [10, 50, 100] : [10, 50, 100, 250]
-        return trackCounts.flatMap { trackCount in
+        var scenarios = trackCounts.flatMap { trackCount in
             [
                 Scenario(
                     name: "zoomed-out playback",
@@ -342,6 +358,28 @@ enum TimelinePerfBaselineHarness {
                 ),
             ]
         }
+
+        if isQuick {
+            scenarios.append(
+                Scenario(
+                    name: "hundreds visible culling",
+                    trackCount: 250,
+                    frames: max(frames / 2, 36),
+                    warmupFrames: max(warmupFrames / 2, 12),
+                    viewportDuration: 0.12,
+                    isPlaybackActive: true,
+                    pansDuringRun: true,
+                    zoomsDuringRun: true,
+                    scrollsTracksDuringRun: true,
+                    showsSelection: true,
+                    showsGainPreview: true,
+                    targetsVisibleTrack: true,
+                    deletionBurstInterval: nil
+                )
+            )
+        }
+
+        return scenarios
     }
 
     private static func run(
@@ -707,7 +745,6 @@ enum TimelinePerfBaselineHarness {
         let gpu = result.gpuFrameMilliseconds
         let dropped144 = cpu.filter { $0 > 1_000.0 / 144.0 }.count
         let dropped60 = cpu.filter { $0 > 1_000.0 / 60.0 }.count
-        let stats = result.rendererStats
         let waveformRenderers = result.waveformRenderers
         let payload: [String: Any] = [
             "scenario": result.scenario.name,
@@ -732,7 +769,7 @@ enum TimelinePerfBaselineHarness {
             "visible_lanes_avg": rounded(result.averageVisibleLaneCount),
             "visible_lanes_max": result.maximumVisibleLaneCount,
             "visible_lanes_budget": result.visibleLaneBudget,
-            "gpu_waveform_draws": stats.gpuWaveformDrawCount,
+            "gpu_waveform_draws": result.maximumGPUWaveformDrawCount,
             "cpu_waveform_vertices": result.maximumCPUWaveformVertexCount,
             "effect_vertices": result.maximumEffectVertexCount,
             "effect_vertices_dropped": result.maximumEffectDroppedVertexCount,
@@ -741,9 +778,9 @@ enum TimelinePerfBaselineHarness {
             "playhead_contact_events": result.maximumPlayheadContactEventCount,
             "shader_uploads": result.maximumShaderBufferUploadCount,
             "shader_uploads_in_flight": result.maximumShaderBufferUploadInFlightCount,
-            "shader_buffers": stats.shaderBufferCount,
-            "shader_mb": rounded(Double(stats.shaderBufferByteCount) / (1_024 * 1_024)),
-            "mip_cache_entries": stats.waveformMipCacheCount,
+            "shader_buffers": result.maximumShaderBufferCount,
+            "shader_mb": rounded(Double(result.maximumShaderBufferByteCount) / (1_024 * 1_024)),
+            "mip_cache_entries": result.maximumWaveformMipCacheCount,
         ]
 
         guard
@@ -798,6 +835,12 @@ enum TimelinePerfBaselineHarness {
             failures.append(
                 "\(label) saw \(result.maximumVisibleLaneCount) visible lanes, " +
                 "budget \(result.visibleLaneBudget)"
+            )
+        }
+        if result.maximumGPUWaveformDrawCount > max(result.visibleLaneBudget, 1) {
+            failures.append(
+                "\(label) issued \(result.maximumGPUWaveformDrawCount) waveform draw calls, " +
+                "visible-lane budget \(result.visibleLaneBudget)"
             )
         }
         if result.maximumShaderBufferUploadCount > 0 || result.maximumShaderBufferUploadInFlightCount > 0 {
