@@ -1,11 +1,11 @@
 import Foundation
 
 struct TimelineSelection: Equatable, Sendable {
-    let startProgress: Float
-    let endProgress: Float
+    let startProgress: Double
+    let endProgress: Double
     let trackID: UUID?
 
-    init(startProgress: Float, endProgress: Float, trackID: UUID? = nil) {
+    init(startProgress: Double, endProgress: Double, trackID: UUID? = nil) {
         let clampedStart = min(max(startProgress, 0), 1)
         let clampedEnd = min(max(endProgress, 0), 1)
 
@@ -14,11 +14,23 @@ struct TimelineSelection: Equatable, Sendable {
         self.trackID = trackID
     }
 
-    var durationProgress: Float {
+    var durationProgress: Double {
         endProgress - startProgress
     }
 
+    var startProgressFloat: Float {
+        Float(startProgress)
+    }
+
+    var endProgressFloat: Float {
+        Float(endProgress)
+    }
+
+    var durationProgressFloat: Float {
+        Float(durationProgress)
+    }
+
     func duration(in totalDuration: TimeInterval) -> TimeInterval {
-        TimeInterval(durationProgress) * totalDuration
+        durationProgress * totalDuration
     }
 }

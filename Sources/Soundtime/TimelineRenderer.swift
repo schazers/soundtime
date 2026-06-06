@@ -133,6 +133,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let buffer: MTLBuffer
     }
 
+    private enum WaveformShaderFallbackPolicy {
+        case allowFallbacks
+        case preferredOnly
+    }
+
     private final class WaveformShaderBufferStore: @unchecked Sendable {
         private let lock = NSLock()
         private var buffers: [WaveformMipCacheKey: MTLBuffer] = [:]
@@ -605,7 +610,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     var onRenderDataPrepared: (() -> Void)?
     private let playheadTouchGeometryAheadDuration: TimeInterval = 0.055
     private let playheadTouchLightAheadDuration: TimeInterval = 0.08
-    private var playheadTouchTrailDuration: TimeInterval = 0.44
+    private var playheadTouchTrailDuration: TimeInterval = 0.56
     private var playheadTouchTrailFalloffSteepness: Float = 1.30
     private var waveformBaseGray: Float = 0.88
     private let waveformTransitionDuration: CFTimeInterval = 0.2
@@ -1058,7 +1063,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             drawableSize: viewportSize,
             renderState: renderState
         )
-        let previousShaderRenderState = hasPreviousWaveformTransition ?
+        let hasWaveformTransition = hasPreviousWaveformTransition
+        let previousShaderRenderState = hasWaveformTransition ?
             renderState.replacingTracks(previousTransitionTracks(withCurrentMixFrom: renderState.tracks)) :
             nil
         let usesPreviousWaveformShader = previousShaderRenderState.map {
@@ -1081,16 +1087,22 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 renderState: renderState,
                 mipLevelSnapshot: mipLevelSnapshot
             )
-        let previousWaveformVertices = hasPreviousWaveformTransition && !usesPreviousWaveformShader ?
+        let previousWaveformVertices = hasWaveformTransition && !usesPreviousWaveformShader ?
             cachedPreviousWaveformVertices(
                 drawableSize: viewportSize,
                 renderState: renderState,
                 mipLevelSnapshot: mipLevelSnapshot
             ) :
             nil
+        let currentShaderWaveformsReady = usesWaveformShader &&
+            (!hasWaveformTransition || preferredShaderWaveformsAreReady(
+                drawableSize: viewportSize,
+                renderState: renderState,
+                trackWaveformMipLevels: mipLevelSnapshot.currentByTrack
+            ))
         let waveformTransitionOpacities = waveformTransitionOpacities(
             at: displayTimestamp,
-            hasCurrent: usesWaveformShader || waveformVertices != nil,
+            hasCurrent: currentShaderWaveformsReady || waveformVertices != nil,
             hasPrevious: usesPreviousWaveformShader || previousWaveformVertices != nil
         )
         let trimPreviewVertices = makeTrimPreviewVertices(
@@ -1153,6 +1165,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 touchParameters: waveformTouchParameters,
                 opacity: waveformTransitionOpacities.previous,
                 displayTimestamp: displayTimestamp,
+                fallbackPolicy: .allowFallbacks,
                 encoder: encoder
             )
             encoder.setRenderPipelineState(pipelineState)
@@ -1184,6 +1197,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 touchParameters: waveformTouchParameters,
                 opacity: waveformTransitionOpacities.current,
                 displayTimestamp: displayTimestamp,
+                fallbackPolicy: hasWaveformTransition ? .preferredOnly : .allowFallbacks,
                 encoder: encoder
             )
             encoder.setRenderPipelineState(pipelineState)
@@ -1297,6 +1311,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         touchParameters: (touch: SIMD4<Float>, touch2: SIMD4<Float>),
         opacity: Float,
         displayTimestamp: CFTimeInterval,
+        fallbackPolicy: WaveformShaderFallbackPolicy,
         encoder: MTLRenderCommandEncoder
     ) {
         guard
@@ -1328,7 +1343,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                     track: track,
                     mipLevels: mipLevels,
                     drawableSize: drawableSize,
-                    renderState: renderState
+                    renderState: renderState,
+                    fallbackPolicy: fallbackPolicy
                 )
             else {
                 continue
@@ -1426,8 +1442,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             preview.selection.trackID == nil || preview.selection.trackID == trackID
         {
             gainPreview = SIMD4<Float>(
-                preview.selection.startProgress,
-                preview.selection.endProgress,
+                preview.selection.startProgressFloat,
+                preview.selection.endProgressFloat,
                 max(preview.gain, 0),
                 1
             )
@@ -1463,11 +1479,61 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         )
     }
 
+    private func preferredShaderWaveformsAreReady(
+        drawableSize: CGSize,
+        renderState: TimelineRenderState,
+        trackWaveformMipLevels: [UUID: [WaveformMipLevel]]
+    ) -> Bool {
+        guard
+            let projectDuration = renderState.duration,
+            projectDuration.isFinite,
+            projectDuration > 0
+        else {
+            return false
+        }
+
+        var checkedRenderableTrack = false
+        for track in renderState.tracks where track.hasWaveform {
+            guard
+                let trackDuration = track.durationHint,
+                trackDuration.isFinite,
+                trackDuration > 0,
+                let mipLevels = trackWaveformMipLevels[track.id],
+                let preferredIndex = waveformMipLevelIndex(
+                    for: drawableSize,
+                    renderState: renderState,
+                    mipLevels: mipLevels
+                )
+            else {
+                return false
+            }
+
+            let trackDurationProgress = min(max(Float(trackDuration / projectDuration), 0), 1)
+            guard trackDurationProgress > 0 else {
+                return false
+            }
+
+            checkedRenderableTrack = true
+            let preferredMipLevel = mipLevels[preferredIndex]
+            guard waveformShaderBuffer(track: track, mipLevel: preferredMipLevel) != nil else {
+                prepareWaveformShaderBinBuffer(
+                    track: track,
+                    mipLevel: preferredMipLevel,
+                    allowsSynchronousUpload: false
+                )
+                return false
+            }
+        }
+
+        return checkedRenderableTrack
+    }
+
     private func waveformShaderDrawable(
         track: TimelineRenderState.Track,
         mipLevels: [WaveformMipLevel],
         drawableSize: CGSize,
-        renderState: TimelineRenderState
+        renderState: TimelineRenderState,
+        fallbackPolicy: WaveformShaderFallbackPolicy = .allowFallbacks
     ) -> WaveformShaderDrawable? {
         guard
             !mipLevels.isEmpty,
@@ -1492,6 +1558,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         )
         if let buffer = waveformShaderBuffer(track: track, mipLevel: preferredMipLevel) {
             return WaveformShaderDrawable(mipLevel: preferredMipLevel, buffer: buffer)
+        }
+
+        guard fallbackPolicy == .allowFallbacks else {
+            return nil
         }
 
         if preferredIndex + 1 < mipLevels.count {
@@ -2162,8 +2232,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let gainSelectionEnd: Float
         let gain: Float
         if let gainPreview = renderState.gainPreview {
-            gainSelectionStart = gainPreview.selection.startProgress
-            gainSelectionEnd = gainPreview.selection.endProgress
+            gainSelectionStart = gainPreview.selection.startProgressFloat
+            gainSelectionEnd = gainPreview.selection.endProgressFloat
             gain = gainPreview.gain
         } else {
             gainSelectionStart = -1
@@ -2795,14 +2865,16 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         guard
             let selection = renderState.selection,
             renderState.hasWaveforms,
-            selection.durationProgress > 0.001
+            selection.durationProgress > 0
         else {
             return []
         }
 
         let viewport = renderState.viewport
-        let left = viewport.viewportProgress(forTimelineProgress: selection.startProgress)
-        let right = viewport.viewportProgress(forTimelineProgress: selection.endProgress)
+        let viewportStart = Double(viewport.startProgress)
+        let viewportDuration = max(Double(viewport.durationProgress), 0.000_000_001)
+        let left = Float((selection.startProgress - viewportStart) / viewportDuration)
+        let right = Float((selection.endProgress - viewportStart) / viewportDuration)
         guard right > 0, left < 1 else {
             return []
         }
@@ -3089,7 +3161,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return 1
         }
 
-        guard binEnd > selection.startProgress, binStart < selection.endProgress else {
+        guard Double(binEnd) > selection.startProgress, Double(binStart) < selection.endProgress else {
             return 1
         }
 
@@ -3812,7 +3884,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 }
 
                 let geometryInfluence = geometryInfluenceRaw * audibleEnergy
-                let expansion = 1 + 0.22 * geometryInfluence
+                let expansion = 1 + 0.30 * geometryInfluence
                 let gain = previewGain(forBinStart: timelineX0, end: timelineX1, trackID: track.id, renderState: renderState)
                 var y0 = centerY - clampAudioSample(bin.maximumSample * gain) * amplitudeHeight * expansion
                 var y1 = centerY - clampAudioSample(bin.minimumSample * gain) * amplitudeHeight * expansion
@@ -4637,24 +4709,26 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             if shouldYieldForPlayback, targetIndex.isMultiple(of: 1_024) {
                 try? ImportWorkBudget.shared.waitIfPlaybackActive()
             }
-            let sourceStartIndex = targetIndex * sourceBinCount / targetBinCount
-            let sourceEndIndex = max(
+            let unclampedStartIndex = targetIndex * sourceBinCount / targetBinCount
+            let sourceStartIndex = min(max(unclampedStartIndex, 0), sourceBinCount - 1)
+            let unclampedEndIndex = max(
                 sourceStartIndex + 1,
                 (targetIndex + 1) * sourceBinCount / targetBinCount
             )
+            let sourceEndIndex = min(max(unclampedEndIndex, sourceStartIndex + 1), sourceBinCount)
             let sourceSpan = sourceEndIndex - sourceStartIndex
             let stride = max(sourceSpan / samplesPerBin, 1)
             var accumulator = WaveformBinAccumulator()
             var sampledIndex = sourceStartIndex
             var sampledCount = 0
 
-            while sampledIndex < sourceEndIndex, sampledCount < samplesPerBin {
+            while sampledIndex < sourceEndIndex, sampledIndex < sourceBinCount, sampledCount < samplesPerBin {
                 accumulator.addBin(sourceBins[sampledIndex])
                 sampledIndex += stride
                 sampledCount += 1
             }
 
-            if sourceSpan > 1 {
+            if sourceSpan > 1, sourceEndIndex > sourceStartIndex, sourceEndIndex <= sourceBinCount {
                 accumulator.addBin(sourceBins[sourceEndIndex - 1])
             }
 
@@ -5697,7 +5771,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 in.touch2.w
             ) * touchEnergy;
         }
-        float expansion = 1.0 + 0.22 * geometryInfluence;
+        float expansion = 1.0 + 0.30 * geometryInfluence;
 
         float peakTop = centerY - maximumSample * amplitudeHeight * expansion;
         float peakBottom = centerY - minimumSample * amplitudeHeight * expansion;
@@ -5761,6 +5835,21 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                     yAA
                 )
             );
+        }
+
+        if (lightInfluence > 0.001) {
+            float touchExpansion = max(in.style2.w * 1.45, yAA * 2.0);
+            float touchGlowTop = max(peakTop - touchExpansion, laneTop);
+            float touchGlowBottom = min(peakBottom + touchExpansion, laneBottom);
+            float touchGlowCoverage = rectangle_coverage(y, touchGlowTop, touchGlowBottom, yAA);
+            float touchCoreCoverage = rectangle_coverage(y, peakTop, peakBottom, yAA);
+            float touchCoverage = max(touchCoreCoverage, touchGlowCoverage * 0.42);
+            if (touchCoverage > 0.0) {
+                float shapedLight = smoothstep(0.0, 1.0, clamp(lightInfluence, 0.0, 1.0));
+                float touchAlpha = alphaScale * touchCoverage * min(shapedLight * 0.92, 0.94);
+                float3 touchRGB = mix(baseColor.rgb, float3(1.0), 0.82 + shapedLight * 0.16);
+                color = source_over(color, float4(touchRGB, touchAlpha));
+            }
         }
 
         float transientStrength = max(bin.highEnergy - in.style2.y, 0.0) /
