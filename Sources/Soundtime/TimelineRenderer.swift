@@ -875,7 +875,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let playheadContactMinimumSpawnInterval: CFTimeInterval = 1.0 / 90.0
     private let transientParticleMaximumCount = 260
     private let maximumTransientParticleVerticesPerFrame = 10_000
-    private let deletionEffectDuration: CFTimeInterval = 0.58
+    private let deletionEffectDuration: CFTimeInterval = 0.44
     private let deletionShardCount = 96
     private let deletionEffectMaximumCount = 8
     private let deletionEffectMaximumCapturedBins = 512
@@ -3874,8 +3874,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         let selectionWidth = max(rightX - leftX, 1)
         let pullDistance = max(selectionWidth, 22)
-        let slideTime = min(max(progress / 0.42, 0), 1)
-        let slideProgress = pow(slideTime, 2.35)
+        let slideTime = min(max(progress / 0.34, 0), 1)
+        let easedSlideTime = smoothStep(slideTime)
+        let slideProgress = 1 - pow(1 - easedSlideTime, 2.45)
         let overlayRightX = max(
             rightX + 20 + min(pullDistance * 0.32, 90),
             trailingEndX + 6
