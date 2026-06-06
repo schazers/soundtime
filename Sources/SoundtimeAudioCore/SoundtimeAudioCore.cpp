@@ -189,6 +189,17 @@ struct SoundtimeAudioCoreSource {
     std::shared_ptr<const AudioSource> source;
 };
 
+struct SoundtimeAudioCoreRecordingRing {
+    uint32_t channelCount = 0;
+    uint64_t frameCapacity = 0;
+    double sampleRate = 0;
+    std::vector<float> planarSamples;
+    std::atomic<uint64_t> writeFrame{0};
+    std::atomic<uint64_t> readFrame{0};
+    std::atomic<uint64_t> droppedFrameCount{0};
+    std::atomic<double> lastHostTimestamp{0};
+};
+
 namespace {
 
 void submit_command(SoundtimeAudioCoreEngine& engine, EngineCommand command) {
@@ -1534,4 +1545,176 @@ void soundtime_audio_core_render_at_host_time(
     );
     publish_clock_sample(*engine);
     release_render_graph(*engine);
+}
+
+SoundtimeAudioCoreRecordingRing* soundtime_audio_core_recording_ring_create(
+    uint32_t channelCount,
+    uint64_t frameCapacity,
+    double sampleRate
+) {
+    if (channelCount == 0 || frameCapacity == 0 || !std::isfinite(sampleRate) || sampleRate <= 0) {
+        return nullptr;
+    }
+
+    auto ring = std::make_unique<SoundtimeAudioCoreRecordingRing>();
+    ring->channelCount = std::min<uint32_t>(channelCount, 8);
+    ring->frameCapacity = std::max<uint64_t>(frameCapacity, 1);
+    ring->sampleRate = sampleRate;
+    ring->planarSamples.resize(static_cast<size_t>(ring->channelCount * ring->frameCapacity), 0.0f);
+    return ring.release();
+}
+
+void soundtime_audio_core_recording_ring_destroy(SoundtimeAudioCoreRecordingRing* ring) {
+    delete ring;
+}
+
+void soundtime_audio_core_recording_ring_reset(SoundtimeAudioCoreRecordingRing* ring) {
+    if (ring == nullptr) {
+        return;
+    }
+
+    const auto writeFrame = ring->writeFrame.load(std::memory_order_acquire);
+    ring->readFrame.store(writeFrame, std::memory_order_release);
+    ring->droppedFrameCount.store(0, std::memory_order_release);
+    ring->lastHostTimestamp.store(0, std::memory_order_release);
+}
+
+uint32_t soundtime_audio_core_recording_ring_push_planar(
+    SoundtimeAudioCoreRecordingRing* ring,
+    const float* const* channels,
+    uint32_t channelCount,
+    uint32_t frameCount,
+    double hostTimestamp
+) {
+    if (
+        ring == nullptr ||
+        channels == nullptr ||
+        channelCount == 0 ||
+        frameCount == 0 ||
+        ring->frameCapacity == 0 ||
+        ring->channelCount == 0
+    ) {
+        return 0;
+    }
+
+    const auto writeFrame = ring->writeFrame.load(std::memory_order_relaxed);
+    const auto readFrame = ring->readFrame.load(std::memory_order_acquire);
+    const auto usedFrameCount = std::min<uint64_t>(writeFrame - readFrame, ring->frameCapacity);
+    const auto freeFrameCount = ring->frameCapacity - usedFrameCount;
+    const auto framesToWrite = static_cast<uint32_t>(
+        std::min<uint64_t>(frameCount, freeFrameCount)
+    );
+    if (framesToWrite < frameCount) {
+        ring->droppedFrameCount.fetch_add(frameCount - framesToWrite, std::memory_order_acq_rel);
+    }
+    if (framesToWrite == 0) {
+        return 0;
+    }
+
+    const auto inputChannelCount = std::min<uint32_t>(channelCount, ring->channelCount);
+    for (uint32_t channelIndex = 0; channelIndex < ring->channelCount; channelIndex++) {
+        const auto sourceChannelIndex = std::min<uint32_t>(channelIndex, inputChannelCount - 1);
+        const auto* source = channels[sourceChannelIndex];
+        auto* destination = ring->planarSamples.data() +
+            static_cast<size_t>(channelIndex) * static_cast<size_t>(ring->frameCapacity);
+        for (uint32_t frameOffset = 0; frameOffset < framesToWrite; frameOffset++) {
+            const auto ringFrame = (writeFrame + frameOffset) % ring->frameCapacity;
+            destination[ringFrame] = source != nullptr ? source[frameOffset] : 0.0f;
+        }
+    }
+
+    ring->lastHostTimestamp.store(hostTimestamp, std::memory_order_release);
+    ring->writeFrame.store(writeFrame + framesToWrite, std::memory_order_release);
+    return framesToWrite;
+}
+
+uint32_t soundtime_audio_core_recording_ring_pop_planar(
+    SoundtimeAudioCoreRecordingRing* ring,
+    float* const* channels,
+    uint32_t channelCount,
+    uint32_t maxFrameCount,
+    double* hostTimestamp
+) {
+    if (
+        ring == nullptr ||
+        channels == nullptr ||
+        channelCount == 0 ||
+        maxFrameCount == 0 ||
+        ring->frameCapacity == 0 ||
+        ring->channelCount == 0
+    ) {
+        return 0;
+    }
+
+    const auto readFrame = ring->readFrame.load(std::memory_order_relaxed);
+    const auto writeFrame = ring->writeFrame.load(std::memory_order_acquire);
+    const auto availableFrameCount = std::min<uint64_t>(writeFrame - readFrame, ring->frameCapacity);
+    const auto framesToRead = static_cast<uint32_t>(
+        std::min<uint64_t>(maxFrameCount, availableFrameCount)
+    );
+    if (framesToRead == 0) {
+        return 0;
+    }
+
+    const auto outputChannelCount = std::min<uint32_t>(channelCount, ring->channelCount);
+    for (uint32_t channelIndex = 0; channelIndex < outputChannelCount; channelIndex++) {
+        auto* destination = channels[channelIndex];
+        if (destination == nullptr) {
+            continue;
+        }
+
+        const auto* source = ring->planarSamples.data() +
+            static_cast<size_t>(channelIndex) * static_cast<size_t>(ring->frameCapacity);
+        for (uint32_t frameOffset = 0; frameOffset < framesToRead; frameOffset++) {
+            const auto ringFrame = (readFrame + frameOffset) % ring->frameCapacity;
+            destination[frameOffset] = source[ringFrame];
+        }
+    }
+
+    for (uint32_t channelIndex = outputChannelCount; channelIndex < channelCount; channelIndex++) {
+        auto* destination = channels[channelIndex];
+        if (destination != nullptr) {
+            std::fill(destination, destination + framesToRead, 0.0f);
+        }
+    }
+
+    if (hostTimestamp != nullptr) {
+        *hostTimestamp = ring->lastHostTimestamp.load(std::memory_order_acquire);
+    }
+    ring->readFrame.store(readFrame + framesToRead, std::memory_order_release);
+    return framesToRead;
+}
+
+uint64_t soundtime_audio_core_recording_ring_available_frame_count(
+    const SoundtimeAudioCoreRecordingRing* ring
+) {
+    if (ring == nullptr || ring->frameCapacity == 0) {
+        return 0;
+    }
+
+    const auto writeFrame = ring->writeFrame.load(std::memory_order_acquire);
+    const auto readFrame = ring->readFrame.load(std::memory_order_acquire);
+    return std::min<uint64_t>(writeFrame - readFrame, ring->frameCapacity);
+}
+
+uint64_t soundtime_audio_core_recording_ring_dropped_frame_count(
+    const SoundtimeAudioCoreRecordingRing* ring
+) {
+    if (ring == nullptr) {
+        return 0;
+    }
+
+    return ring->droppedFrameCount.load(std::memory_order_acquire);
+}
+
+uint32_t soundtime_audio_core_recording_ring_channel_count(
+    const SoundtimeAudioCoreRecordingRing* ring
+) {
+    return ring != nullptr ? ring->channelCount : 0;
+}
+
+double soundtime_audio_core_recording_ring_sample_rate(
+    const SoundtimeAudioCoreRecordingRing* ring
+) {
+    return ring != nullptr ? ring->sampleRate : 0;
 }

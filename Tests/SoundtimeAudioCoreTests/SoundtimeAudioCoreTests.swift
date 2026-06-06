@@ -925,6 +925,96 @@ final class SoundtimeAudioCoreTests: XCTestCase {
         XCTAssertFalse(secondSample.isPlaying)
     }
 
+    func testRecordingRingRoundTripsPlanarSamples() throws {
+        let ring = try XCTUnwrap(soundtime_audio_core_recording_ring_create(2, 8, 48_000))
+        defer {
+            soundtime_audio_core_recording_ring_destroy(ring)
+        }
+
+        let left: [Float] = [1, 2, 3, 4]
+        let right: [Float] = [10, 20, 30, 40]
+        let written = left.withUnsafeBufferPointer { leftSamples in
+            right.withUnsafeBufferPointer { rightSamples in
+                let inputPointers = [
+                    leftSamples.baseAddress,
+                    rightSamples.baseAddress,
+                ]
+                return inputPointers.withUnsafeBufferPointer { inputs in
+                    soundtime_audio_core_recording_ring_push_planar(
+                        ring,
+                        inputs.baseAddress,
+                        2,
+                        4,
+                        123.0
+                    )
+                }
+            }
+        }
+        XCTAssertEqual(written, 4)
+        XCTAssertEqual(soundtime_audio_core_recording_ring_available_frame_count(ring), 4)
+        XCTAssertEqual(soundtime_audio_core_recording_ring_channel_count(ring), 2)
+        XCTAssertEqual(soundtime_audio_core_recording_ring_sample_rate(ring), 48_000)
+
+        let output = popRecordingRing(ring: ring, channelCount: 2, frameCount: 4)
+        XCTAssertEqual(output.samples[0], [1, 2, 3, 4])
+        XCTAssertEqual(output.samples[1], [10, 20, 30, 40])
+        XCTAssertEqual(output.hostTimestamp, 123.0)
+        XCTAssertEqual(soundtime_audio_core_recording_ring_available_frame_count(ring), 0)
+    }
+
+    func testRecordingRingCountsDroppedFramesInsteadOfBlocking() throws {
+        let ring = try XCTUnwrap(soundtime_audio_core_recording_ring_create(1, 4, 48_000))
+        defer {
+            soundtime_audio_core_recording_ring_destroy(ring)
+        }
+
+        let samples: [Float] = [1, 2, 3, 4, 5, 6]
+        let written = samples.withUnsafeBufferPointer { sampleBuffer in
+            let inputPointers = [sampleBuffer.baseAddress]
+            return inputPointers.withUnsafeBufferPointer { inputs in
+                soundtime_audio_core_recording_ring_push_planar(
+                    ring,
+                    inputs.baseAddress,
+                    1,
+                    6,
+                    1.0
+                )
+            }
+        }
+
+        XCTAssertEqual(written, 4)
+        XCTAssertEqual(soundtime_audio_core_recording_ring_dropped_frame_count(ring), 2)
+        XCTAssertEqual(popRecordingRing(ring: ring, channelCount: 1, frameCount: 6).samples[0], [1, 2, 3, 4])
+    }
+
+    func testRecordingRingResetClearsPendingAndDroppedFrames() throws {
+        let ring = try XCTUnwrap(soundtime_audio_core_recording_ring_create(1, 4, 48_000))
+        defer {
+            soundtime_audio_core_recording_ring_destroy(ring)
+        }
+
+        let samples: [Float] = [1, 2, 3, 4, 5]
+        _ = samples.withUnsafeBufferPointer { sampleBuffer in
+            let inputPointers = [sampleBuffer.baseAddress]
+            return inputPointers.withUnsafeBufferPointer { inputs in
+                soundtime_audio_core_recording_ring_push_planar(
+                    ring,
+                    inputs.baseAddress,
+                    1,
+                    5,
+                    1.0
+                )
+            }
+        }
+
+        XCTAssertGreaterThan(soundtime_audio_core_recording_ring_available_frame_count(ring), 0)
+        XCTAssertGreaterThan(soundtime_audio_core_recording_ring_dropped_frame_count(ring), 0)
+
+        soundtime_audio_core_recording_ring_reset(ring)
+        XCTAssertEqual(soundtime_audio_core_recording_ring_available_frame_count(ring), 0)
+        XCTAssertEqual(soundtime_audio_core_recording_ring_dropped_frame_count(ring), 0)
+    }
+
     private func XCTAssertTimestamp(
         _ actual: Double,
         _ expected: Double,
@@ -979,6 +1069,38 @@ final class SoundtimeAudioCoreTests: XCTestCase {
         }
 
         return [left, right]
+    }
+
+    private func popRecordingRing(
+        ring: OpaquePointer,
+        channelCount: Int,
+        frameCount: Int
+    ) -> (samples: [[Float]], hostTimestamp: Double) {
+        let outputPointers = (0..<channelCount).map { _ in
+            UnsafeMutablePointer<Float>.allocate(capacity: frameCount)
+        }
+        defer {
+            for pointer in outputPointers {
+                pointer.deallocate()
+            }
+        }
+
+        var hostTimestamp = 0.0
+        let optionalOutputPointers: [UnsafeMutablePointer<Float>?] = outputPointers
+        let framesRead = optionalOutputPointers.withUnsafeBufferPointer { pointerBuffer in
+            soundtime_audio_core_recording_ring_pop_planar(
+                ring,
+                pointerBuffer.baseAddress,
+                UInt32(channelCount),
+                UInt32(frameCount),
+                &hostTimestamp
+            )
+        }
+        let samples = outputPointers.map { pointer in
+            Array(UnsafeBufferPointer(start: pointer, count: Int(framesRead)))
+        }
+
+        return (samples, hostTimestamp)
     }
 }
 

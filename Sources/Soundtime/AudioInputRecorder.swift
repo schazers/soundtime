@@ -1,6 +1,7 @@
 import AudioToolbox
 import CoreAudio
 import Foundation
+import SoundtimeAudioCore
 
 struct AudioRecordingChunk: Sendable {
     let samplesByChannel: [[Float]]
@@ -15,6 +16,7 @@ final class AudioInputRecorder: @unchecked Sendable {
         case noInputDevice
         case audioUnitUnavailable
         case audioUnitFailed(OSStatus)
+        case recordingRingUnavailable
 
         var errorDescription: String? {
             switch self {
@@ -24,20 +26,35 @@ final class AudioInputRecorder: @unchecked Sendable {
                 "Soundtime could not create an audio input unit."
             case let .audioUnitFailed(status):
                 "The audio input unit failed with status \(status)."
+            case .recordingRingUnavailable:
+                "Soundtime could not create the realtime recording ring."
             }
         }
     }
 
+    private static let chunkQueueKey = DispatchSpecificKey<Bool>()
+
     var onChunk: (@Sendable (AudioRecordingChunk) -> Void)?
 
     private var audioUnit: AudioUnit?
+    private var recordingRing: OpaquePointer?
     private var renderAudioBufferList: UnsafeMutableAudioBufferListPointer?
     private var renderChannelPointers: [UnsafeMutablePointer<Float>] = []
+    private var renderConstChannelPointers: [UnsafePointer<Float>?] = []
     private var renderFrameCapacity = 0
+    private var drainChannelPointers: [UnsafeMutablePointer<Float>] = []
+    private var drainOutputChannelPointers: [UnsafeMutablePointer<Float>?] = []
+    private var drainFrameCapacity = 0
+    private var ringDrainTimer: DispatchSourceTimer?
     private var sampleRate: Double = 44_100
     private var channelCount = 1
     private var isRunning = false
     private let chunkQueue = DispatchQueue(label: "Soundtime.audio.input.chunks", qos: .userInteractive)
+    private let drainChunkFrameCapacity = 4_096
+
+    init() {
+        chunkQueue.setSpecific(key: Self.chunkQueueKey, value: true)
+    }
 
     deinit {
         stop()
@@ -101,25 +118,46 @@ final class AudioInputRecorder: @unchecked Sendable {
         prepareRenderBuffers(
             frameCapacity: max(Int(maximumFramesPerSlice(for: audioUnit)), 16_384)
         )
+        try prepareRecordingRing()
 
-        try check(AudioUnitInitialize(audioUnit))
-        try check(AudioOutputUnitStart(audioUnit))
-        isRunning = true
+        do {
+            try check(AudioUnitInitialize(audioUnit))
+            try check(AudioOutputUnitStart(audioUnit))
+            isRunning = true
+            startRingDrainTimer()
+        } catch {
+            stop()
+            throw error
+        }
     }
 
     func stop() {
-        guard let audioUnit else {
-            return
-        }
-
-        if isRunning {
+        if let audioUnit, isRunning {
             _ = AudioOutputUnitStop(audioUnit)
             isRunning = false
         }
 
-        _ = AudioUnitUninitialize(audioUnit)
-        AudioComponentInstanceDispose(audioUnit)
-        self.audioUnit = nil
+        if let audioUnit {
+            _ = AudioUnitUninitialize(audioUnit)
+            AudioComponentInstanceDispose(audioUnit)
+            self.audioUnit = nil
+        }
+
+        ringDrainTimer?.cancel()
+        ringDrainTimer = nil
+        let drainAndReleaseRing = {
+            self.drainRecordingRing()
+            if let recordingRing = self.recordingRing {
+                soundtime_audio_core_recording_ring_destroy(recordingRing)
+                self.recordingRing = nil
+            }
+            self.releaseDrainBuffers()
+        }
+        if DispatchQueue.getSpecific(key: Self.chunkQueueKey) == true {
+            drainAndReleaseRing()
+        } else {
+            chunkQueue.sync(execute: drainAndReleaseRing)
+        }
         releaseRenderBuffers()
     }
 
@@ -162,23 +200,22 @@ final class AudioInputRecorder: @unchecked Sendable {
             return status
         }
 
-        let samplesByChannel = renderChannelPointers.prefix(currentChannelCount).map { pointer in
-            Array(UnsafeBufferPointer(start: pointer, count: frameCount))
-        }
         let hostTime = timestamp.pointee.mHostTime
         let hostTimestamp = hostTime > 0 ?
             Double(AudioConvertHostTimeToNanos(hostTime)) / 1_000_000_000 :
             0
-        let chunk = AudioRecordingChunk(
-            samplesByChannel: samplesByChannel,
-            sampleRate: sampleRate,
-            channelCount: currentChannelCount,
-            frameCount: frameCount,
-            hostTimestamp: hostTimestamp
-        )
+        guard let recordingRing else {
+            return noErr
+        }
 
-        chunkQueue.async { [weak self] in
-            self?.onChunk?(chunk)
+        renderConstChannelPointers.withUnsafeBufferPointer { pointerBuffer in
+            _ = soundtime_audio_core_recording_ring_push_planar(
+                recordingRing,
+                pointerBuffer.baseAddress,
+                UInt32(currentChannelCount),
+                UInt32(frameCount),
+                hostTimestamp
+            )
         }
 
         return noErr
@@ -266,6 +303,7 @@ final class AudioInputRecorder: @unchecked Sendable {
         renderChannelPointers = (0..<max(channelCount, 1)).map { _ in
             UnsafeMutablePointer<Float>.allocate(capacity: renderFrameCapacity)
         }
+        renderConstChannelPointers = renderChannelPointers.map { UnsafePointer($0) }
         renderAudioBufferList = AudioBufferList.allocate(maximumBuffers: renderChannelPointers.count)
     }
 
@@ -274,9 +312,120 @@ final class AudioInputRecorder: @unchecked Sendable {
             pointer.deallocate()
         }
         renderChannelPointers = []
+        renderConstChannelPointers = []
         renderAudioBufferList?.unsafeMutablePointer.deallocate()
         renderAudioBufferList = nil
         renderFrameCapacity = 0
+    }
+
+    private func prepareRecordingRing() throws {
+        if let recordingRing {
+            soundtime_audio_core_recording_ring_destroy(recordingRing)
+            self.recordingRing = nil
+        }
+
+        let secondsOfRingCapacity = 15
+        let frameCapacity = max(
+            Int(max(sampleRate, 1).rounded()) * secondsOfRingCapacity,
+            renderFrameCapacity * 16
+        )
+        guard let ring = soundtime_audio_core_recording_ring_create(
+            UInt32(max(channelCount, 1)),
+            UInt64(max(frameCapacity, 1)),
+            sampleRate
+        ) else {
+            throw RecorderError.recordingRingUnavailable
+        }
+
+        recordingRing = ring
+    }
+
+    private func startRingDrainTimer() {
+        ringDrainTimer?.cancel()
+
+        let timer = DispatchSource.makeTimerSource(queue: chunkQueue)
+        timer.schedule(
+            deadline: .now(),
+            repeating: .milliseconds(8),
+            leeway: .milliseconds(2)
+        )
+        timer.setEventHandler { [weak self] in
+            self?.drainRecordingRing()
+        }
+        ringDrainTimer = timer
+        timer.resume()
+    }
+
+    private func drainRecordingRing() {
+        guard let recordingRing else {
+            return
+        }
+
+        let ringChannelCount = Int(soundtime_audio_core_recording_ring_channel_count(recordingRing))
+        let ringSampleRate = soundtime_audio_core_recording_ring_sample_rate(recordingRing)
+        guard ringChannelCount > 0, ringSampleRate > 0 else {
+            return
+        }
+
+        prepareDrainBuffers(
+            channelCount: ringChannelCount,
+            frameCapacity: drainChunkFrameCapacity
+        )
+
+        while soundtime_audio_core_recording_ring_available_frame_count(recordingRing) > 0 {
+            var hostTimestamp: Double = 0
+            let framesRead = drainOutputChannelPointers.withUnsafeBufferPointer { pointerBuffer in
+                soundtime_audio_core_recording_ring_pop_planar(
+                    recordingRing,
+                    pointerBuffer.baseAddress,
+                    UInt32(ringChannelCount),
+                    UInt32(drainFrameCapacity),
+                    &hostTimestamp
+                )
+            }
+            guard framesRead > 0 else {
+                return
+            }
+
+            let frameCount = Int(framesRead)
+            let samplesByChannel = drainChannelPointers.prefix(ringChannelCount).map { pointer in
+                Array(UnsafeBufferPointer(start: pointer, count: frameCount))
+            }
+            onChunk?(AudioRecordingChunk(
+                samplesByChannel: samplesByChannel,
+                sampleRate: ringSampleRate,
+                channelCount: ringChannelCount,
+                frameCount: frameCount,
+                hostTimestamp: hostTimestamp
+            ))
+        }
+    }
+
+    private func prepareDrainBuffers(channelCount: Int, frameCapacity: Int) {
+        let clampedChannelCount = max(channelCount, 1)
+        let clampedFrameCapacity = max(frameCapacity, 1)
+        guard
+            drainChannelPointers.count != clampedChannelCount ||
+            drainFrameCapacity != clampedFrameCapacity
+        else {
+            return
+        }
+
+        releaseDrainBuffers()
+        drainFrameCapacity = clampedFrameCapacity
+        drainChannelPointers = (0..<clampedChannelCount).map { _ in
+            UnsafeMutablePointer<Float>.allocate(capacity: clampedFrameCapacity)
+        }
+        drainOutputChannelPointers = drainChannelPointers.map { $0 }
+    }
+
+    private func releaseDrainBuffers() {
+        for pointer in drainChannelPointers {
+            pointer.deallocate()
+        }
+        drainChannelPointers = []
+        drainOutputChannelPointers = []
+        drainFrameCapacity = 0
     }
 
     private func check(_ status: OSStatus) throws {
