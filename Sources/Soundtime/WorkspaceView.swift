@@ -4008,6 +4008,7 @@ final class WorkspaceView: NSView {
 
     private func writeProject(to url: URL) {
         do {
+            prepareProjectForSerialization()
             let projectURL = normalizedProjectURL(url)
             try SoundtimeProjectStore.save(currentProject(), to: projectURL)
             currentProjectURL = projectURL
@@ -4027,6 +4028,7 @@ final class WorkspaceView: NSView {
         }
 
         do {
+            prepareProjectForSerialization()
             try SoundtimeProjectStore.save(currentProject(), to: currentProjectURL)
             markProjectSourceFilesAsSaved()
         } catch {
@@ -4088,6 +4090,12 @@ final class WorkspaceView: NSView {
         displayPlaybackVisuals(progress: 0, isPlaying: false)
         updateTimeReadout()
         updateEffectCommandState()
+    }
+
+    private func prepareProjectForSerialization() {
+        if recordingTrackID != nil {
+            stopRecording()
+        }
     }
 
     private func currentProject() -> SoundtimeProject {
