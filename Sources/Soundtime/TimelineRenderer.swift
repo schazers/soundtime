@@ -104,6 +104,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let viewportStart: Float
         let viewportDuration: Float
         let trackCount: Int
+        let trackHeight: Float
+        let trackScrollOffset: Float
     }
 
     private struct GridCache {
@@ -1287,8 +1289,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             playheadProgress: renderedPlayheadProgress,
             displayTimestamp: displayTimestamp
         )
-        let selectedTrackVertices = makeSelectedTrackVertices(renderState: renderState)
-        let selectionVertices = makeSelectionVertices(renderState: renderState)
+        let selectedTrackVertices = makeSelectedTrackVertices(
+            drawableSize: viewportSize,
+            renderState: renderState
+        )
+        let selectionVertices = makeSelectionVertices(
+            drawableSize: viewportSize,
+            renderState: renderState
+        )
         let usesWaveformShader = shouldRenderShaderWaveforms(
             drawableSize: viewportSize,
             renderState: renderState
@@ -1566,12 +1574,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return
         }
 
-        let trackCount = renderState.tracks.count
-        guard trackCount > 0 else {
+        guard !renderState.tracks.isEmpty else {
             return
         }
 
-        let laneHeight = Float(1) / Float(trackCount)
         let anySolo = renderState.tracks.contains { $0.isSoloed }
         let style = waveformVisualStyle(renderState: renderState, projectDuration: projectDuration)
         var batches: [ObjectIdentifier: WaveformShaderBatch] = [:]
@@ -1600,10 +1606,18 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 continue
             }
 
-            let laneTop = Float(trackIndex) * laneHeight
-            let laneBottom = laneTop + laneHeight
-            let centerY = laneTop + laneHeight * 0.5
-            let amplitudeHeight = laneHeight * 0.39 * min(max(track.volume, 0), 1.8)
+            guard let laneFrame = laneFrame(
+                forTrackIndex: trackIndex,
+                renderState: renderState,
+                drawableSize: drawableSize
+            ) else {
+                continue
+            }
+
+            let laneTop = laneFrame.top
+            let laneBottom = laneFrame.bottom
+            let centerY = laneFrame.center
+            let amplitudeHeight = laneFrame.height * 0.39 * min(max(track.volume, 0), 1.8)
             let isAudible = isTrackAudible(track, anySolo: anySolo)
             let trackAlpha = (isAudible ? Float(1) : Float(0.26)) * min(max(opacity, 0), 1)
             let gray = waveformBaseGray * (isAudible ? 1.0 : 0.68)
@@ -2326,6 +2340,28 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         worstFrameInterval = 0
     }
 
+    private func resolvedTrackLayout(
+        renderState: TimelineRenderState,
+        drawableSize: CGSize
+    ) -> ResolvedTimelineTrackLayout {
+        renderState.trackLayout.resolved(
+            totalTrackCount: renderState.tracks.count,
+            viewportHeight: Float(max(drawableSize.height, 1))
+        )
+    }
+
+    private func laneFrame(
+        forTrackIndex trackIndex: Int,
+        renderState: TimelineRenderState,
+        drawableSize: CGSize
+    ) -> TimelineTrackLaneFrame? {
+        let layout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
+        guard let laneFrame = layout.laneFrame(forTrackIndex: trackIndex), laneFrame.isVisible else {
+            return nil
+        }
+        return laneFrame
+    }
+
     private func cachedGridVertices(
         drawableSize: CGSize,
         backingScale: Float,
@@ -2338,13 +2374,16 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return nil
         }
 
+        let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
         let key = GridCacheKey(
             width: width,
             height: height,
             backingScale: backingScale,
             viewportStart: renderState.viewport.startProgress,
             viewportDuration: renderState.viewport.durationProgress,
-            trackCount: max(renderState.tracks.count, 1)
+            trackCount: max(renderState.tracks.count, 1),
+            trackHeight: trackLayout.trackHeight,
+            trackScrollOffset: trackLayout.scrollOffset
         )
         if let gridCache, gridCache.key == key {
             return gridCache.vertices
@@ -2777,24 +2816,33 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             gridProgress += progressStep
         }
 
-        let trackCount = max(renderState.tracks.count, 1)
-        let laneHeight = height / Float(trackCount)
-        for trackIndex in 0..<trackCount {
-            let laneTop = Float(trackIndex) * laneHeight
-            if trackIndex > 0 {
-                let separatorY = pixelAligned(laneTop, backingScale: backingScale)
-                appendRectangle(
-                    to: &vertices,
-                    left: 0,
-                    right: width,
-                    top: separatorY,
-                    bottom: min(separatorY + lineWidth, height),
-                    color: SIMD4<Float>(0.18, 0.19, 0.20, 1.0),
-                    drawableSize: size
-                )
+        let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
+        for trackIndex in trackLayout.visibleRange(overscan: 0) {
+            guard let laneFrame = trackLayout.laneFrame(forTrackIndex: trackIndex), laneFrame.isVisible else {
+                continue
             }
 
-            let centerY = pixelAligned(laneTop + laneHeight * 0.5, backingScale: backingScale)
+            let laneTop = laneFrame.top * height
+            let laneBottom = laneFrame.bottom * height
+            if trackIndex > 0 {
+                let separatorY = pixelAligned(laneTop, backingScale: backingScale)
+                if separatorY >= 0, separatorY <= height {
+                    appendRectangle(
+                        to: &vertices,
+                        left: 0,
+                        right: width,
+                        top: separatorY,
+                        bottom: min(separatorY + lineWidth, height),
+                        color: SIMD4<Float>(0.18, 0.19, 0.20, 1.0),
+                        drawableSize: size
+                    )
+                }
+            }
+
+            let centerY = pixelAligned((laneTop + laneBottom) * 0.5, backingScale: backingScale)
+            guard centerY >= 0, centerY <= height else {
+                continue
+            }
             appendRectangle(
                 to: &vertices,
                 left: 0,
@@ -2864,7 +2912,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         let anySolo = renderState.tracks.contains { $0.isSoloed }
-        let laneHeight = Float(1) / Float(max(renderState.tracks.count, 1))
         let viewport = renderState.viewport
 
         for (trackIndex, track) in renderState.tracks.enumerated() {
@@ -2912,11 +2959,18 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             let previousTriggeredBin = lastTransientParticleBins[track.id] ?? -minimumSpacingBins * 2
             var latestTriggeredBin = previousTriggeredBin
 
-            let laneTop = Float(trackIndex) * laneHeight
-            let laneBottom = laneTop + laneHeight
-            let centerY = laneTop + laneHeight * 0.5
-            let amplitudeHeight = laneHeight * 0.39 * min(max(track.volume, 0), 1.8)
-            let originEdgePadding = min(max(laneHeight * 0.120, 0.022), 0.075)
+            guard let laneFrame = laneFrame(
+                forTrackIndex: trackIndex,
+                renderState: renderState,
+                drawableSize: drawableSize
+            ) else {
+                continue
+            }
+            let laneTop = laneFrame.top
+            let laneBottom = laneFrame.bottom
+            let centerY = laneFrame.center
+            let amplitudeHeight = laneFrame.height * 0.39 * min(max(track.volume, 0), 1.8)
+            let originEdgePadding = min(max(laneFrame.height * 0.120, 0.022), 0.075)
             let neighborhoodRadius = max(min(Int((binsPerSecond * 0.035).rounded(.up)), 24), 3)
 
             for index in firstIndex...lastIndex {
@@ -3307,10 +3361,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 rightX = centerX + minimumEffectWidth * 0.5
             }
 
-            let verticalRange = selectionVerticalRange(
+            guard let verticalRange = selectionVerticalRange(
                 for: selection,
-                tracks: renderState.tracks
-            )
+                renderState: renderState,
+                drawableSize: CGSize(width: CGFloat(drawableSize.x), height: CGFloat(drawableSize.y))
+            ) else {
+                continue
+            }
             let topY = verticalRange.top * height
             let bottomY = verticalRange.bottom * height
             let laneHeight = max(bottomY - topY, 1)
@@ -3574,7 +3631,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         )
     }
 
-    private func makeSelectionVertices(renderState: TimelineRenderState) -> [TimelineVertex] {
+    private func makeSelectionVertices(
+        drawableSize: CGSize,
+        renderState: TimelineRenderState
+    ) -> [TimelineVertex] {
         guard
             let selection = renderState.selection,
             renderState.hasWaveforms,
@@ -3593,10 +3653,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         let color = SIMD4<Float>(0.0, 0.84, 0.78, 0.22)
-        let verticalRange = selectionVerticalRange(
+        guard let verticalRange = selectionVerticalRange(
             for: selection,
-            tracks: renderState.tracks
-        )
+            renderState: renderState,
+            drawableSize: drawableSize
+        ) else {
+            return []
+        }
         var vertices: [TimelineVertex] = []
         vertices.reserveCapacity(6)
 
@@ -3612,7 +3675,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         return vertices
     }
 
-    private func makeSelectedTrackVertices(renderState: TimelineRenderState) -> [TimelineVertex] {
+    private func makeSelectedTrackVertices(
+        drawableSize: CGSize,
+        renderState: TimelineRenderState
+    ) -> [TimelineVertex] {
         guard
             let selectedTrackID = renderState.selectedTrackID,
             let trackIndex = renderState.tracks.firstIndex(where: { $0.id == selectedTrackID }),
@@ -3629,17 +3695,21 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return []
         }
 
-        let laneHeight = Float(1) / Float(renderState.tracks.count)
-        let laneTop = Float(trackIndex) * laneHeight
-        let laneBottom = laneTop + laneHeight
+        guard let laneFrame = laneFrame(
+            forTrackIndex: trackIndex,
+            renderState: renderState,
+            drawableSize: drawableSize
+        ) else {
+            return []
+        }
         var vertices: [TimelineVertex] = []
         vertices.reserveCapacity(6)
         appendRectangle(
             to: &vertices,
             left: 0,
             right: 1,
-            top: laneTop,
-            bottom: laneBottom,
+            top: max(laneFrame.top, 0),
+            bottom: min(laneFrame.bottom, 1),
             color: SIMD4<Float>(0.78, 0.78, 0.78, 0.075)
         )
         return vertices
@@ -3647,19 +3717,25 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     private func selectionVerticalRange(
         for selection: TimelineSelection,
-        tracks: [TimelineRenderState.Track]
-    ) -> (top: Float, bottom: Float) {
+        renderState: TimelineRenderState,
+        drawableSize: CGSize
+    ) -> (top: Float, bottom: Float)? {
         guard
             let trackID = selection.trackID,
-            let trackIndex = tracks.firstIndex(where: { $0.id == trackID }),
-            !tracks.isEmpty
+            let trackIndex = renderState.tracks.firstIndex(where: { $0.id == trackID }),
+            !renderState.tracks.isEmpty
         else {
             return (0, 1)
         }
 
-        let laneHeight = Float(1) / Float(tracks.count)
-        let top = Float(trackIndex) * laneHeight
-        return (top, top + laneHeight)
+        guard let laneFrame = laneFrame(
+            forTrackIndex: trackIndex,
+            renderState: renderState,
+            drawableSize: drawableSize
+        ) else {
+            return nil
+        }
+        return (max(laneFrame.top, 0), min(laneFrame.bottom, 1))
     }
 
     private func makeWaveformVertices(
@@ -3747,8 +3823,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return []
         }
 
-        let laneHeight = Float(1) / Float(trackCount)
-        let minimumVisualHeight = laneHeight * 0.006
         let anySolo = tracks.contains { $0.isSoloed }
         let style = waveformVisualStyle(renderState: renderState, projectDuration: projectDuration)
         var vertices: [TimelineVertex] = []
@@ -3776,10 +3850,19 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 continue
             }
 
-            let laneTop = Float(trackIndex) * laneHeight
-            let laneBottom = laneTop + laneHeight
-            let centerY = laneTop + laneHeight * 0.5
-            let amplitudeHeight = laneHeight * 0.39 * min(max(track.volume, 0), 1.8)
+            guard let laneFrame = laneFrame(
+                forTrackIndex: trackIndex,
+                renderState: renderState,
+                drawableSize: drawableSize
+            ) else {
+                continue
+            }
+
+            let laneTop = laneFrame.top
+            let laneBottom = laneFrame.bottom
+            let centerY = laneFrame.center
+            let amplitudeHeight = laneFrame.height * 0.39 * min(max(track.volume, 0), 1.8)
+            let minimumVisualHeight = laneFrame.height * 0.006
             let isAudible = isTrackAudible(track, anySolo: anySolo)
             let alpha: Float = isAudible ? 1.0 : 0.26
             let gray = waveformBaseGray * (isAudible ? 1.0 : 0.68)
@@ -4471,12 +4554,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         let tracks = renderState.tracks
-        let trackCount = tracks.count
-        guard trackCount > 0 else {
+        guard !tracks.isEmpty else {
             return []
         }
 
-        let laneHeight = Float(1) / Float(trackCount)
         let clampedPlayhead = min(max(playheadProgress, 0), 1)
         let geometryAheadRadius = playheadTouchGeometryAheadRadiusProgress(forDuration: projectDuration)
         let lightAheadRadius = playheadTouchLightAheadRadiusProgress(forDuration: projectDuration)
@@ -4566,11 +4647,18 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 continue
             }
 
-            let laneTop = Float(trackIndex) * laneHeight
-            let laneBottom = laneTop + laneHeight
-            let centerY = laneTop + laneHeight * 0.5
-            let amplitudeHeight = laneHeight * 0.39 * min(max(track.volume, 0), 1.8)
-            let minimumVisualHeight = laneHeight * 0.004
+            guard let laneFrame = laneFrame(
+                forTrackIndex: trackIndex,
+                renderState: renderState,
+                drawableSize: drawableSize
+            ) else {
+                continue
+            }
+            let laneTop = laneFrame.top
+            let laneBottom = laneFrame.bottom
+            let centerY = laneFrame.center
+            let amplitudeHeight = laneFrame.height * 0.39 * min(max(track.volume, 0), 1.8)
+            let minimumVisualHeight = laneFrame.height * 0.004
             guard isTrackAudible(track, anySolo: anySolo) else {
                 continue
             }
@@ -4627,7 +4715,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
                 if y1 - y0 < minimumVisualHeight {
                     let midpoint = (y0 + y1) * 0.5
-                    let visualHeight = minimumVisualHeight + laneHeight * 0.014 * geometryInfluence
+                    let visualHeight = minimumVisualHeight + laneFrame.height * 0.014 * geometryInfluence
                     y0 = midpoint - visualHeight * 0.5
                     y1 = midpoint + visualHeight * 0.5
                 }
@@ -5128,6 +5216,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             renderState.isPlaybackActive,
             let contacts = playheadWaveformContacts(
                 at: playheadProgress,
+                drawableSize: drawableSize,
                 renderState: renderState,
                 mipLevelSnapshot: mipLevelSnapshot
             )
@@ -5187,6 +5276,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     private func playheadWaveformContacts(
         at playheadProgress: Float,
+        drawableSize: SIMD2<Float>,
         renderState: TimelineRenderState,
         mipLevelSnapshot: WaveformMipLevelSnapshot
     ) -> [(centerY: Float, laneTop: Float, laneBottom: Float, strength: Float)]? {
@@ -5206,10 +5296,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         let clampedProgress = min(max(playheadProgress, 0), 1)
-        let laneHeight = Float(1) / Float(trackCount)
         let anySolo = tracks.contains { $0.isSoloed }
         var contacts: [(centerY: Float, laneTop: Float, laneBottom: Float, strength: Float)] = []
-        contacts.reserveCapacity(trackCount * 2)
+        contacts.reserveCapacity(min(trackCount, 16) * 2)
 
         for (trackIndex, track) in tracks.enumerated() {
             guard isTrackAudible(track, anySolo: anySolo) else {
@@ -5248,16 +5337,23 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             let gain = previewGain(forBinStart: timelineX0, end: timelineX1, trackID: track.id, renderState: renderState)
             let minimumSample = clampAudioSample(bin.minimumSample * gain)
             let maximumSample = clampAudioSample(bin.maximumSample * gain)
-            let laneTop = Float(trackIndex) * laneHeight
-            let laneBottom = laneTop + laneHeight
-            let centerY = laneTop + laneHeight * 0.5
-            let amplitudeHeight = laneHeight * 0.39 * min(max(track.volume, 0), 1.8)
+            guard let laneFrame = laneFrame(
+                forTrackIndex: trackIndex,
+                renderState: renderState,
+                drawableSize: CGSize(width: CGFloat(drawableSize.x), height: CGFloat(drawableSize.y))
+            ) else {
+                continue
+            }
+            let laneTop = laneFrame.top
+            let laneBottom = laneFrame.bottom
+            let centerY = laneFrame.center
+            let amplitudeHeight = laneFrame.height * 0.39 * min(max(track.volume, 0), 1.8)
             let topY = min(max(centerY - maximumSample * amplitudeHeight, laneTop), laneBottom)
             let bottomY = min(max(centerY - minimumSample * amplitudeHeight, laneTop), laneBottom)
             let amplitude = max(abs(minimumSample), abs(maximumSample))
             let strength = min(max(0.38 + amplitude * 0.62, 0), 1)
 
-            if abs(bottomY - topY) < laneHeight * 0.012 {
+            if abs(bottomY - topY) < laneFrame.height * 0.012 {
                 contacts.append((
                     centerY: min(max((topY + bottomY) * 0.5, laneTop), laneBottom),
                     laneTop: laneTop,
