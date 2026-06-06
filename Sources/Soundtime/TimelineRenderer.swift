@@ -342,6 +342,17 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return (allocations.count, totalSlabByteCount, inFlightKeys.count)
         }
 
+        func containsAllAllocatedOrInFlight(_ keys: [WaveformMipCacheKey]) -> Bool {
+            lock.lock()
+            defer {
+                lock.unlock()
+            }
+
+            return keys.allSatisfy { key in
+                allocations[key] != nil || inFlightKeys.contains(key)
+            }
+        }
+
         func trim(toMaximumCount maximumCount: Int, maximumByteCount: Int) {
             lock.lock()
             if allocations.count > maximumCount || diagnosticsByteCountLocked() > maximumByteCount {
@@ -781,6 +792,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let waveformMipLevelCacheLock = NSLock()
     private let waveformShaderBufferStore: WaveformShaderBufferStore
     private var waveformShaderBatchScratch: [WaveformShaderBatch] = []
+    private var lastInteractiveWaveformPrewarmKeys: [WaveformMipCacheKey] = []
     private var selectedTrackVertexScratch: [TimelineVertex] = []
     private var selectionVertexScratch: [TimelineVertex] = []
     private var gridCache: GridCache?
@@ -896,7 +908,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let maximumInFlightTransientParticleScoreProfileBuilds = 4
     private let maximumSynchronousGeneratedWaveformMipBins = 8_192
     private let maximumInFlightWaveformMipBuilds = 4
-    private let maximumGeneratedWaveformMipBins = 1_048_576
+    private let maximumGeneratedWaveformMipBins = 2_097_152
     private let generatedWaveformMipSamplesPerBin = 4
     private let highResolutionWaveformVisibleDurationThreshold: TimeInterval = 90
     private let waveformMipTargetBinsPerPoint: Float = 96
@@ -1096,6 +1108,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         currentTrackWaveformMipKeys = nextTrackWaveformMipKeys
         currentPrimaryWaveformTrackID = renderTracks.first?.id
         waveformMipLevelStateLock.unlock()
+        lastInteractiveWaveformPrewarmKeys.removeAll()
         prewarmInitialWaveformShaderBuffers(
             tracks: renderTracks,
             trackWaveformMipLevels: nextTrackWaveformMipLevels,
@@ -2492,6 +2505,16 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return (track, interactiveMipLevel)
         }
 
+        let jobKeys = visibleJobs.map { track, mipLevel in
+            waveformShaderBufferKey(track: track, mipLevel: mipLevel)
+        }
+        if
+            jobKeys == lastInteractiveWaveformPrewarmKeys,
+            waveformShaderBufferStore.containsAllAllocatedOrInFlight(jobKeys)
+        {
+            return
+        }
+        lastInteractiveWaveformPrewarmKeys = jobKeys
         enqueueWaveformShaderPrewarmJobs(visibleJobs)
     }
 
