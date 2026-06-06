@@ -3,6 +3,11 @@ import Foundation
 import QuartzCore
 
 enum TimelinePerfBaselineHarness {
+    private static let maximumVisualEffectVerticesPerFrame = 10_000
+    private static let maximumTransientParticlesPerFrame = 260
+    private static let maximumDeletionEffectsPerFrame = 8
+    private static let maximumPlayheadContactEventsPerFrame = 384
+
     private struct Scenario {
         let name: String
         let trackCount: Int
@@ -895,6 +900,33 @@ enum TimelinePerfBaselineHarness {
         }
         if result.maximumEffectDroppedVertexCount > 0 {
             failures.append("\(label) dropped \(result.maximumEffectDroppedVertexCount) visual effect vertices")
+        }
+        if result.maximumEffectVertexCount > maximumVisualEffectVerticesPerFrame {
+            failures.append(
+                "\(label) generated \(result.maximumEffectVertexCount) visual effect vertices, " +
+                "budget \(maximumVisualEffectVerticesPerFrame)"
+            )
+        }
+        if result.maximumTransientParticleCount > maximumTransientParticlesPerFrame {
+            failures.append(
+                "\(label) kept \(result.maximumTransientParticleCount) transient particles, " +
+                "budget \(maximumTransientParticlesPerFrame)"
+            )
+        }
+        if result.maximumDeletionEffectCount > maximumDeletionEffectsPerFrame {
+            failures.append(
+                "\(label) kept \(result.maximumDeletionEffectCount) deletion effects, " +
+                "budget \(maximumDeletionEffectsPerFrame)"
+            )
+        }
+        if result.maximumPlayheadContactEventCount > maximumPlayheadContactEventsPerFrame {
+            failures.append(
+                "\(label) kept \(result.maximumPlayheadContactEventCount) playhead contact events, " +
+                "budget \(maximumPlayheadContactEventsPerFrame)"
+            )
+        }
+        if result.scenario.deletionBurstInterval != nil, result.maximumDeletionEffectCount == 0 {
+            failures.append("\(label) did not exercise deletion effects")
         }
 
         return failures
