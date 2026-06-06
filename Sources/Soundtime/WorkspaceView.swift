@@ -40,6 +40,11 @@ final class WorkspaceView: NSView {
         case fade(FadeEffect)
     }
 
+    private enum ProjectTrackMixPublication {
+        case immediate
+        case coalesced
+    }
+
     private struct ProjectTrack {
         var id: UUID
         var name: String
@@ -169,6 +174,9 @@ final class WorkspaceView: NSView {
     private var currentPlaybackStatus = "idle"
     private var playbackTimer: Timer?
     private var loudnessMeterTimer: Timer?
+    private var pendingProjectTrackMixUpdate = false
+    private var scheduledProjectTrackMixWorkItem: DispatchWorkItem?
+    private var lastProjectTrackMixPublishTimestamp = CACurrentMediaTime()
     private var keyDownMonitor: Any?
     private var audioDevicePreferencesObserver: NSObjectProtocol?
     private var debugToolsVisible = false
@@ -195,6 +203,7 @@ final class WorkspaceView: NSView {
     private let playbackController: PlaybackEngine = PlaybackEngineFactory.makeDefault()
     private let playbackRefreshRate: TimeInterval = 10
     private let loudnessMeterRefreshRate: TimeInterval = 60
+    private let trackMixCoalescingInterval: TimeInterval = 1.0 / 72.0
     private var visualPlayheadProgress: Float = 0
     private var visualPlayheadAnchorTimestamp = CACurrentMediaTime()
     private var visualPlaybackActive = false
@@ -657,6 +666,9 @@ final class WorkspaceView: NSView {
             self.audioDevicePreferencesObserver = nil
         }
         stopPlaybackTimer()
+        scheduledProjectTrackMixWorkItem?.cancel()
+        scheduledProjectTrackMixWorkItem = nil
+        pendingProjectTrackMixUpdate = false
         loudnessMeterTimer?.invalidate()
         loudnessMeterTimer = nil
         inputRecorder.stop()
@@ -1007,10 +1019,10 @@ final class WorkspaceView: NSView {
                 self?.toggleRecording(on: trackID)
             }
             controlView.onVolumeChanged = { [weak self, trackID = track.id] volume in
-                self?.updateTrack(trackID) { $0.volume = volume }
+                self?.updateTrack(trackID, mixPublication: .coalesced) { $0.volume = volume }
             }
             controlView.onVolumeEditingEnded = { [weak self] in
-                self?.updateProjectPlaybackTrackMix()
+                self?.publishProjectTrackMixImmediately()
             }
         }
 
@@ -1538,6 +1550,7 @@ final class WorkspaceView: NSView {
 
     private func updateTrack(
         _ trackID: UUID,
+        mixPublication: ProjectTrackMixPublication = .immediate,
         update: (inout ProjectTrack) -> Void
     ) {
         guard let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }) else {
@@ -1547,7 +1560,12 @@ final class WorkspaceView: NSView {
         update(&projectTracks[trackIndex])
         activeTrackID = trackID
         refreshProjectTrackMixDisplay()
-        updateProjectPlaybackTrackMix()
+        switch mixPublication {
+        case .immediate:
+            publishProjectTrackMixImmediately()
+        case .coalesced:
+            scheduleProjectTrackMixUpdate()
+        }
         updateStatus(currentPlaybackStatus)
     }
 
@@ -2110,6 +2128,41 @@ final class WorkspaceView: NSView {
 
     private func updateProjectPlaybackTrackMix() {
         playbackController.updateProjectTrackMix(projectPlaybackTracks())
+        lastProjectTrackMixPublishTimestamp = CACurrentMediaTime()
+    }
+
+    private func scheduleProjectTrackMixUpdate() {
+        pendingProjectTrackMixUpdate = true
+        guard scheduledProjectTrackMixWorkItem == nil else {
+            return
+        }
+
+        let elapsed = CACurrentMediaTime() - lastProjectTrackMixPublishTimestamp
+        let delay = max(trackMixCoalescingInterval - elapsed, 0)
+        let workItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                self?.flushScheduledProjectTrackMixUpdate()
+            }
+        }
+        scheduledProjectTrackMixWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func flushScheduledProjectTrackMixUpdate() {
+        scheduledProjectTrackMixWorkItem = nil
+        guard pendingProjectTrackMixUpdate else {
+            return
+        }
+
+        pendingProjectTrackMixUpdate = false
+        updateProjectPlaybackTrackMix()
+    }
+
+    private func publishProjectTrackMixImmediately() {
+        scheduledProjectTrackMixWorkItem?.cancel()
+        scheduledProjectTrackMixWorkItem = nil
+        pendingProjectTrackMixUpdate = false
+        updateProjectPlaybackTrackMix()
     }
 
     private func projectMixBuffer() -> DecodedAudioBuffer? {
