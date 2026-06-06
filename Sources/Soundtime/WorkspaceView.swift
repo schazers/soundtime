@@ -2402,13 +2402,24 @@ final class WorkspaceView: NSView {
         editRevision: Int,
         status: String,
         preservePlaybackProgress: Bool = false,
-        startDelay: TimeInterval = 0
+        startDelay: TimeInterval = 0,
+        animateWaveformTransition: Bool = true
     ) {
         editMaterializationTasks[trackID]?.cancel()
         let requestID = UUID()
         editMaterializationRequestIDs[trackID] = requestID
 
-        let task = Task { [weak self, trackID, timeline, editRevision, status, preservePlaybackProgress, startDelay, requestID] in
+        let task = Task { [
+            weak self,
+            trackID,
+            timeline,
+            editRevision,
+            status,
+            preservePlaybackProgress,
+            startDelay,
+            animateWaveformTransition,
+            requestID
+        ] in
             if startDelay > 0 {
                 try? await Task.sleep(nanoseconds: UInt64(startDelay * 1_000_000_000))
             }
@@ -2440,7 +2451,8 @@ final class WorkspaceView: NSView {
                 editRevision: editRevision,
                 materialized: materialized,
                 status: status,
-                preservePlaybackProgress: preservePlaybackProgress
+                preservePlaybackProgress: preservePlaybackProgress,
+                animateWaveformTransition: animateWaveformTransition
             )
         }
         editMaterializationTasks[trackID] = task
@@ -2467,7 +2479,8 @@ final class WorkspaceView: NSView {
         status: String,
         preservePlaybackProgress: Bool = false,
         reloadPlaybackSource: Bool = false,
-        preserveTimelineSource: Bool = true
+        preserveTimelineSource: Bool = true,
+        animateWaveformTransition: Bool = true
     ) {
         guard
             let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }),
@@ -2490,7 +2503,10 @@ final class WorkspaceView: NSView {
         activeTrackID = trackID
         syncActiveTrackFields()
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
-        refreshProjectTimelineDisplay(rebuildControls: false)
+        refreshProjectTimelineDisplay(
+            rebuildControls: false,
+            animateWaveformTransition: animateWaveformTransition
+        )
         updateProjectDisplayTiming(sampleRateHint: materialized.buffer.sampleRate)
         if !shouldPreserveTimelineSource || reloadPlaybackSource {
             if playbackController.isPlaying, !reloadPlaybackSource {
@@ -3284,7 +3300,8 @@ final class WorkspaceView: NSView {
                 editRevision: editRevision,
                 status: "\(copyBeforeDeleting ? "cut" : "deleted") \(formatDuration(deletedDuration))",
                 preservePlaybackProgress: true,
-                startDelay: deleteMaterializationDelay
+                startDelay: deleteMaterializationDelay,
+                animateWaveformTransition: false
             )
         }
     }
