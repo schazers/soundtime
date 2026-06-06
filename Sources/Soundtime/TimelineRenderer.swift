@@ -131,6 +131,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private struct WaveformShaderDrawable {
         let mipLevel: WaveformMipLevel
         let buffer: MTLBuffer
+        let binOffset: Int
     }
 
     private enum WaveformShaderFallbackPolicy {
@@ -1436,6 +1437,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 centerY: centerY,
                 amplitudeHeight: amplitudeHeight,
                 binCount: shaderDrawable.mipLevel.binCount,
+                binOffset: shaderDrawable.binOffset,
                 trackDurationProgress: trackDurationProgress,
                 baseGray: gray,
                 alpha: trackAlpha,
@@ -1474,6 +1476,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         centerY: Float,
         amplitudeHeight: Float,
         binCount: Int,
+        binOffset: Int,
         trackDurationProgress: Float,
         baseGray: Float,
         alpha: Float,
@@ -1507,7 +1510,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             gainPreview = SIMD4<Float>(-1, -1, 1, 0)
         }
         let commonLane = SIMD4<Float>(laneTop, laneBottom, centerY, max(amplitudeHeight, 0))
-        let commonTrack = SIMD4<Float>(trackDurationProgress, Float(max(binCount, 1)), 0, 0)
+        let commonTrack = SIMD4<Float>(
+            trackDurationProgress,
+            Float(max(binCount, 1)),
+            Float(max(binOffset, 0)),
+            0
+        )
         let commonStyle = SIMD4<Float>(
             style.spectralAmount,
             style.peakAlpha,
@@ -1604,7 +1612,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         let preferredMipLevel = mipLevels[preferredIndex]
         if let buffer = waveformShaderBuffer(track: track, mipLevel: preferredMipLevel) {
-            return WaveformShaderDrawable(mipLevel: preferredMipLevel, buffer: buffer)
+            return WaveformShaderDrawable(mipLevel: preferredMipLevel, buffer: buffer, binOffset: 0)
         }
 
         prepareWaveformShaderBinBuffer(
@@ -1613,7 +1621,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             allowsSynchronousUpload: false
         )
         if let buffer = waveformShaderBuffer(track: track, mipLevel: preferredMipLevel) {
-            return WaveformShaderDrawable(mipLevel: preferredMipLevel, buffer: buffer)
+            return WaveformShaderDrawable(mipLevel: preferredMipLevel, buffer: buffer, binOffset: 0)
         }
 
         guard fallbackPolicy == .allowFallbacks else {
@@ -1624,7 +1632,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             for fallbackIndex in (preferredIndex + 1)..<mipLevels.count {
                 let fallbackMipLevel = mipLevels[fallbackIndex]
                 if let buffer = waveformShaderBuffer(track: track, mipLevel: fallbackMipLevel) {
-                    return WaveformShaderDrawable(mipLevel: fallbackMipLevel, buffer: buffer)
+                    return WaveformShaderDrawable(mipLevel: fallbackMipLevel, buffer: buffer, binOffset: 0)
                 }
             }
         }
@@ -1633,7 +1641,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             for fallbackIndex in stride(from: preferredIndex - 1, through: 0, by: -1) {
                 let fallbackMipLevel = mipLevels[fallbackIndex]
                 if let buffer = waveformShaderBuffer(track: track, mipLevel: fallbackMipLevel) {
-                    return WaveformShaderDrawable(mipLevel: fallbackMipLevel, buffer: buffer)
+                    return WaveformShaderDrawable(mipLevel: fallbackMipLevel, buffer: buffer, binOffset: 0)
                 }
             }
         }
@@ -5659,12 +5667,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float localProgress,
         constant WaveformShaderBin *bins,
         uint binCount,
+        uint binOffset,
         float smoothAmount
     ) {
         uint count = max(binCount, 1u);
         float clampedProgress = clamp(localProgress, 0.0, 0.999999);
         uint nearestIndex = min(uint(floor(clampedProgress * float(count))), count - 1u);
-        WaveformShaderBin nearestBin = bins[nearestIndex];
+        WaveformShaderBin nearestBin = bins[binOffset + nearestIndex];
         if (smoothAmount <= 0.001 || count <= 1u) {
             return nearestBin;
         }
@@ -5673,8 +5682,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         uint leftIndex = uint(floor(scaledIndex));
         uint rightIndex = min(leftIndex + 1u, count - 1u);
         float amount = fract(scaledIndex);
-        WaveformShaderBin leftBin = bins[leftIndex];
-        WaveformShaderBin rightBin = bins[rightIndex];
+        WaveformShaderBin leftBin = bins[binOffset + leftIndex];
+        WaveformShaderBin rightBin = bins[binOffset + rightIndex];
         WaveformShaderBin linearBin;
         linearBin.minimumSample = mix(leftBin.minimumSample, rightBin.minimumSample, amount);
         linearBin.maximumSample = mix(leftBin.maximumSample, rightBin.maximumSample, amount);
@@ -5836,6 +5845,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float amplitudeHeight = in.lane.w;
         float trackDurationProgress = max(in.track.x, 0.000001);
         uint binCount = uint(max(in.track.y, 1.0));
+        uint binOffset = uint(max(in.track.z, 0.0));
         float sampleX = inverse_fisheye_x(in.normalizedPosition.x, in.fisheye);
         float timelineProgress = in.viewport.x + sampleX * in.viewport.y;
 
@@ -5848,7 +5858,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         float localProgress = timelineProgress / trackDurationProgress;
         float smoothAmount = fisheye_sample_smoothing(in.normalizedPosition.x, in.fisheye);
-        WaveformShaderBin bin = sample_waveform_bin(localProgress, bins, binCount, smoothAmount);
+        WaveformShaderBin bin = sample_waveform_bin(localProgress, bins, binCount, binOffset, smoothAmount);
         float gain = waveform_gain(timelineProgress, in.gainPreview);
         float minimumSample = clamp(bin.minimumSample * gain, -1.0, 1.0);
         float maximumSample = clamp(bin.maximumSample * gain, -1.0, 1.0);
