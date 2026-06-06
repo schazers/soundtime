@@ -906,6 +906,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let maximumBackgroundPrewarmedWaveformShaderBins = 16_384
     private let maximumViewportPrewarmedWaveformShaderBins = 2_097_152
     private let maximumViewportPrewarmTrackCount = 24
+    private let maximumSynchronousInitialPrewarmTracks = 12
+    private let waveformPrewarmJobBatchSize = 8
     private let maximumInFlightWaveformShaderBufferUploads = 8
     private let maximumSynchronousWaveformShaderBinBufferBins = 4_096
     private let maximumCachedTransientParticleScoreProfiles = 512
@@ -1070,7 +1072,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             }
         }
         let nextWaveformMipLevels = tracks.first.flatMap { nextTrackWaveformMipLevels[$0.id] } ?? []
-        if animateWaveformTransition, renderState.hasWaveforms, hasNextWaveforms {
+        let previousTrackIDs = Set(previousTracks.map(\.id))
+        let nextTrackIDs = Set(renderTracks.map(\.id))
+        let hasSharedTransitionTracks = !previousTrackIDs.isDisjoint(with: nextTrackIDs)
+        if animateWaveformTransition, renderState.hasWaveforms, hasNextWaveforms, hasSharedTransitionTracks {
             waveformMipLevelStateLock.lock()
             previousTrackWaveformMipLevels = trackWaveformMipLevels
             waveformMipLevelStateLock.unlock()
@@ -1094,7 +1099,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         waveformMipLevelStateLock.unlock()
         prewarmInitialWaveformShaderBuffers(
             tracks: renderTracks,
-            trackWaveformMipLevels: nextTrackWaveformMipLevels
+            trackWaveformMipLevels: nextTrackWaveformMipLevels,
+            renderState: renderState.withTracks(renderTracks),
+            drawableSize: lastRenderViewportSize
         )
         prewarmInteractiveWaveformShaderBuffers(
             tracks: renderTracks,
@@ -2424,19 +2431,36 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     private func prewarmInitialWaveformShaderBuffers(
         tracks: [TimelineRenderState.Track],
-        trackWaveformMipLevels: [UUID: [WaveformMipLevel]]
+        trackWaveformMipLevels: [UUID: [WaveformMipLevel]],
+        renderState: TimelineRenderState,
+        drawableSize: CGSize
     ) {
-        for track in tracks {
+        let visibleIDs = visiblePrewarmTrackIDs(
+            tracks: tracks,
+            renderState: renderState,
+            drawableSize: drawableSize
+        )
+        let orderedTracks = tracks.filter { visibleIDs.contains($0.id) }
+        let jobs = orderedTracks.compactMap { track -> (TimelineRenderState.Track, WaveformMipLevel)? in
             guard let lowestCostMipLevel = trackWaveformMipLevels[track.id]?.last else {
-                continue
+                return nil
             }
 
+            return (track, lowestCostMipLevel)
+        }
+        guard !jobs.isEmpty else {
+            return
+        }
+
+        let synchronousJobCount = min(maximumSynchronousInitialPrewarmTracks, jobs.count)
+        for (track, mipLevel) in jobs.prefix(synchronousJobCount) {
             prepareWaveformShaderBinBuffer(
                 track: track,
-                mipLevel: lowestCostMipLevel,
+                mipLevel: mipLevel,
                 allowsSynchronousUpload: true
             )
         }
+
     }
 
     private func prewarmInteractiveWaveformShaderBuffers(
@@ -2445,35 +2469,25 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         renderState: TimelineRenderState,
         drawableSize: CGSize
     ) {
-        let tracksToPrewarm: ArraySlice<TimelineRenderState.Track>
-        let binLimit: Int
-        if tracks.count <= maximumViewportPrewarmTrackCount {
-            let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
-            let visibleRange = trackLayout.visibleRange(overscan: 1)
-            let visibleTracks = visibleRange.compactMap { trackIndex -> TimelineRenderState.Track? in
-                guard tracks.indices.contains(trackIndex) else {
-                    return nil
-                }
-
-                return tracks[trackIndex]
+        let visibleIDs = visiblePrewarmTrackIDs(
+            tracks: tracks,
+            renderState: renderState,
+            drawableSize: drawableSize
+        )
+        let viewportBinLimit = viewportAwarePrewarmBinLimit(
+            renderState: renderState,
+            drawableSize: drawableSize
+        )
+        let visibleJobs = tracks.compactMap { track -> (TimelineRenderState.Track, WaveformMipLevel)? in
+            guard visibleIDs.contains(track.id) else {
+                return nil
             }
-            tracksToPrewarm = visibleTracks.prefix(maximumViewportPrewarmTrackCount)
-            binLimit = viewportAwarePrewarmBinLimit(
-                renderState: renderState,
-                drawableSize: drawableSize
-            )
-        } else {
-            tracksToPrewarm = tracks[...]
-            binLimit = maximumBackgroundPrewarmedWaveformShaderBins
-        }
-
-        let jobs = tracksToPrewarm.compactMap { track -> (TimelineRenderState.Track, WaveformMipLevel)? in
             guard let mipLevels = trackWaveformMipLevels[track.id] else {
                 return nil
             }
 
             guard let interactiveMipLevel = mipLevels.first(where: {
-                $0.binCount <= binLimit
+                $0.binCount <= viewportBinLimit
             }) else {
                 return nil
             }
@@ -2481,7 +2495,45 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return (track, interactiveMipLevel)
         }
 
+        enqueueWaveformShaderPrewarmJobs(visibleJobs)
+    }
+
+    private func visiblePrewarmTrackIDs(
+        tracks: [TimelineRenderState.Track],
+        renderState: TimelineRenderState,
+        drawableSize: CGSize
+    ) -> Set<UUID> {
+        guard !tracks.isEmpty else {
+            return []
+        }
+
+        let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
+        let visibleRange = trackLayout.visibleRange(overscan: 1)
+        let visibleTracks = visibleRange.compactMap { trackIndex -> TimelineRenderState.Track? in
+            guard tracks.indices.contains(trackIndex) else {
+                return nil
+            }
+
+            return tracks[trackIndex]
+        }
+        return Set(visibleTracks.prefix(maximumViewportPrewarmTrackCount).map(\.id))
+    }
+
+    private func enqueueWaveformShaderPrewarmJobs(
+        _ jobs: [(TimelineRenderState.Track, WaveformMipLevel)]
+    ) {
         guard !jobs.isEmpty else {
+            return
+        }
+
+        enqueueWaveformShaderPrewarmJobs(jobs, startIndex: 0)
+    }
+
+    private func enqueueWaveformShaderPrewarmJobs(
+        _ jobs: [(TimelineRenderState.Track, WaveformMipLevel)],
+        startIndex: Int
+    ) {
+        guard startIndex < jobs.count else {
             return
         }
 
@@ -2491,7 +2543,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             }
 
             var publishedCount = 0
-            for (track, mipLevel) in jobs {
+            let endIndex = min(startIndex + self.waveformPrewarmJobBatchSize, jobs.count)
+            for jobIndex in startIndex..<endIndex {
+                let (track, mipLevel) = jobs[jobIndex]
                 let key = self.waveformShaderBufferKey(track: track, mipLevel: mipLevel)
                 if self.waveformShaderBufferStore.allocation(for: key) != nil {
                     continue
@@ -2511,7 +2565,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 self.waveformShaderBufferStore.publish(shaderBins, for: key)
                 publishedCount += 1
 
-                if publishedCount.isMultiple(of: 16) {
+                if publishedCount.isMultiple(of: self.waveformPrewarmJobBatchSize) {
                     self.waveformShaderBufferStore.trim(
                         toMaximumCount: self.maximumCachedWaveformShaderBinBuffers,
                         maximumByteCount: self.maximumCachedWaveformShaderBinBufferBytes
@@ -2520,15 +2574,17 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 }
             }
 
-            guard publishedCount > 0 else {
-                return
+            if publishedCount > 0 {
+                self.waveformShaderBufferStore.trim(
+                    toMaximumCount: self.maximumCachedWaveformShaderBinBuffers,
+                    maximumByteCount: self.maximumCachedWaveformShaderBinBufferBytes
+                )
+                self.onRenderDataPrepared?()
             }
 
-            self.waveformShaderBufferStore.trim(
-                toMaximumCount: self.maximumCachedWaveformShaderBinBuffers,
-                maximumByteCount: self.maximumCachedWaveformShaderBinBufferBytes
-            )
-            self.onRenderDataPrepared?()
+            if endIndex < jobs.count {
+                self.enqueueWaveformShaderPrewarmJobs(jobs, startIndex: endIndex)
+            }
         }
     }
 
