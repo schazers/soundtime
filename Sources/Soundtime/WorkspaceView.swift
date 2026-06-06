@@ -4177,11 +4177,16 @@ final class WorkspaceView: NSView {
 
         let shaderBufferMegabytes = Int((Double(frameStats.shaderBufferByteCount) / 1_048_576).rounded())
         framesPerSecondLabel.stringValue = String(
-            format: "%d fps %@ c%d g%d b%d/%dMB u%d/%d m%d +/-%.1f max %.1f",
+            format: "%d fps %@ c%d g%d fx%d/%d p%d d%d k%d b%d/%dMB u%d/%d m%d +/-%.1f max %.1f",
             frameStats.framesPerSecond,
             frameStats.waveformRenderer,
             frameStats.cpuWaveformVertexCount,
             frameStats.gpuWaveformDrawCount,
+            frameStats.effectVertexCount,
+            frameStats.effectDroppedVertexCount,
+            frameStats.transientParticleCount,
+            frameStats.deletionEffectCount,
+            frameStats.playheadContactEventCount,
             frameStats.shaderBufferCount,
             shaderBufferMegabytes,
             frameStats.shaderBufferUploadCount,
