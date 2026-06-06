@@ -1930,10 +1930,14 @@ final class WorkspaceView: NSView {
         }
 
         do {
-            try playbackController.loadProjectTracks(playbackTracks)
+            if playbackController.hasSource {
+                try playbackController.updateProjectTracks(playbackTracks)
+            } else {
+                try playbackController.loadProjectTracks(playbackTracks)
+            }
             if preserveProgress || targetProgress != nil {
                 try playbackController.seek(toProgress: previousProgress)
-                if shouldResume {
+                if shouldResume && !playbackController.isPlaying {
                     try playbackController.play()
                 }
             } else if playbackController.hasSource {

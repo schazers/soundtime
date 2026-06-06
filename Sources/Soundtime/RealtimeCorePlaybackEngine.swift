@@ -6,6 +6,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
     private struct PreparedProjectTrack {
         let id: UUID
         let sourceRevision: Int
+        let sourceIdentity: String?
         let sourceID: UUID?
         let source: PreparedRealtimeAudioSource
         let segments: [PreparedRealtimeAudioSegment]
@@ -128,15 +129,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             throw PlaybackError.invalidFormat
         }
 
-        let didLoad = core.setPreparedTracks(
-            preparedTracks.map { preparedTrack in
-                PreparedRealtimeAudioTrack(
-                    source: preparedTrack.source,
-                    gain: effectiveTrackGain(preparedTrack, in: preparedTracks),
-                    segments: preparedTrack.segments
-                )
-            }
-        )
+        let didLoad = core.setPreparedTracks(realtimeTracks(from: preparedTracks))
         guard didLoad else {
             throw PlaybackError.invalidFormat
         }
@@ -155,6 +148,55 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         sourceLoaded = true
         core.setGain(masterGain)
         try configureOutputDevice(sampleRate: sampleRate)
+    }
+
+    func updateProjectTracks(_ tracks: [ProjectPlaybackTrack]) throws {
+        guard !tracks.isEmpty else {
+            clear()
+            return
+        }
+
+        guard !preparedProjectTracks.isEmpty, sourceLoaded else {
+            try loadProjectTracks(tracks)
+            return
+        }
+
+        let previousSnapshot = snapshot()
+        let preparedTracks = try tracks.map { track in
+            try preparedProjectTrack(from: track)
+        }
+
+        let sampleRate = preparedTracks[0].source.sampleRate
+        guard sampleRate > 0, preparedTracks.allSatisfy({ $0.source.sampleRate > 0 }) else {
+            throw PlaybackError.invalidFormat
+        }
+
+        if abs(sampleRate - self.sampleRate) > 0.000_001 {
+            let previousProgress = previousSnapshot.progress
+            let shouldResume = previousSnapshot.isPlaying
+            try loadProjectTracks(tracks)
+            try seek(toProgress: previousProgress)
+            if shouldResume {
+                try play()
+            }
+            return
+        }
+
+        let didPublish = core.updatePreparedTracks(realtimeTracks(from: preparedTracks))
+        guard didPublish else {
+            throw PlaybackError.invalidFormat
+        }
+
+        frameCount = projectFrameCount(for: preparedTracks, sampleRate: sampleRate)
+        self.sampleRate = sampleRate
+        mirroredFrameIndex = min(max(mirroredFrameIndex, 0), frameCount)
+        mirroredFrameCount = frameCount
+        preparedProjectTracks = preparedTracks
+        let referenceTrack = zeroCrossingReferenceTrack(in: preparedTracks)
+        zeroCrossingIndex = referenceTrack?.zeroCrossingIndex
+        zeroCrossingProbe = referenceTrack?.zeroCrossingProbe
+        sourceLoaded = true
+        core.setGain(masterGain)
     }
 
     func replaceWithDecodedSource(
@@ -331,15 +373,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             updatedPreparedTracks[preparedTrackIndex].isSoloed = track.isSoloed
         }
 
-        let didPublish = core.updatePreparedTracks(
-            updatedPreparedTracks.map { preparedTrack in
-                PreparedRealtimeAudioTrack(
-                    source: preparedTrack.source,
-                    gain: effectiveTrackGain(preparedTrack, in: updatedPreparedTracks),
-                    segments: preparedTrack.segments
-                )
-            }
-        )
+        let didPublish = core.updatePreparedTracks(realtimeTracks(from: updatedPreparedTracks))
         if didPublish {
             preparedProjectTracks = updatedPreparedTracks
         }
@@ -438,11 +472,22 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         try outputDevice.configure(corePointer: corePointer, sampleRate: sampleRate)
     }
 
+    private func realtimeTracks(from preparedTracks: [PreparedProjectTrack]) -> [PreparedRealtimeAudioTrack] {
+        preparedTracks.map { preparedTrack in
+            PreparedRealtimeAudioTrack(
+                source: preparedTrack.source,
+                gain: effectiveTrackGain(preparedTrack, in: preparedTracks),
+                segments: preparedTrack.segments
+            )
+        }
+    }
+
     private func preparedProjectTrack(from track: ProjectPlaybackTrack) throws -> PreparedProjectTrack {
         let preparedSource: PreparedRealtimeAudioSource
         let segments: [PreparedRealtimeAudioSegment]
         let zeroCrossingIndex: AudioZeroCrossingIndex?
         let zeroCrossingProbe: WAVZeroCrossingProbe?
+        let stableSourceIdentity = sourceIdentity(for: track.source)
 
         switch track.source {
         case let .decoded(decodedAudioBuffer, sourceZeroCrossingIndex):
@@ -470,11 +515,11 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         case let .file(url, sourceZeroCrossingProbe):
             if let existingPreparedTrack = preparedProjectTracks.first(where: { existingTrack in
                 existingTrack.id == track.id &&
-                    existingTrack.sourceRevision == track.sourceRevision &&
+                    existingTrack.sourceIdentity == stableSourceIdentity &&
                     existingTrack.source.frameCount > 0
             }) {
                 preparedSource = existingPreparedTrack.source
-                segments = existingPreparedTrack.segments
+                segments = []
                 zeroCrossingIndex = nil
                 zeroCrossingProbe = sourceZeroCrossingProbe
                 break
@@ -490,7 +535,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         case let .fileTimeline(url, audioFileTimeline, sourceZeroCrossingProbe):
             if let existingPreparedTrack = preparedProjectTracks.first(where: { existingTrack in
                 existingTrack.id == track.id &&
-                    existingTrack.sourceRevision == track.sourceRevision &&
+                    existingTrack.sourceIdentity == stableSourceIdentity &&
                     existingTrack.source.frameCount > 0
             }) {
                 preparedSource = existingPreparedTrack.source
@@ -516,7 +561,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             let sourceBuffer = audioTimeline.sourceAudioBuffer
             if let existingPreparedTrack = preparedProjectTracks.first(where: { existingTrack in
                 existingTrack.id == track.id &&
-                    existingTrack.sourceID == audioTimeline.sourceID &&
+                    existingTrack.sourceIdentity == stableSourceIdentity &&
                     existingTrack.source.frameCount == sourceBuffer.frameCount &&
                     existingTrack.source.channelCount == sourceBuffer.channelCount &&
                     existingTrack.source.sampleRate == sourceBuffer.sampleRate
@@ -545,6 +590,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         return PreparedProjectTrack(
             id: track.id,
             sourceRevision: track.sourceRevision,
+            sourceIdentity: stableSourceIdentity,
             sourceID: sourceID(for: track.source),
             source: preparedSource,
             segments: segments,
@@ -554,6 +600,17 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             isMuted: track.isMuted,
             isSoloed: track.isSoloed
         )
+    }
+
+    private func sourceIdentity(for source: ProjectPlaybackTrack.Source) -> String? {
+        switch source {
+        case .decoded:
+            return nil
+        case let .file(url, _), let .fileTimeline(url, _, _):
+            return "file:\(url.standardizedFileURL.path)"
+        case let .timeline(audioTimeline, _):
+            return "timeline:\(audioTimeline.sourceID.uuidString)"
+        }
     }
 
     private func sourceID(for source: ProjectPlaybackTrack.Source) -> UUID? {

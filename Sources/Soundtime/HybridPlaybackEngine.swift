@@ -165,6 +165,22 @@ final class HybridPlaybackEngine: PlaybackEngine {
         activeEngine = .multitrack
     }
 
+    func updateProjectTracks(_ tracks: [ProjectPlaybackTrack]) throws {
+        cancelSourcePreparation()
+        guard !tracks.isEmpty else {
+            clear()
+            return
+        }
+
+        if activeEngine == .realtime, let realtimeEngine {
+            try realtimeEngine.updateProjectTracks(tracks)
+            realtimeEngine.setPerceptualVolume(perceptualVolume)
+            return
+        }
+
+        try loadProjectTracks(tracks)
+    }
+
     func updateProjectTrackMix(_ tracks: [ProjectPlaybackTrack]) {
         switch activeEngine {
         case .realtime:
