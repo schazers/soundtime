@@ -1977,11 +1977,18 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return
         }
 
-        let anySolo = renderState.tracks.contains { $0.isSoloed }
+        let tracks = renderState.tracks
+        let anySolo = tracks.contains { $0.isSoloed }
         let style = waveformVisualStyle(renderState: renderState, projectDuration: projectDuration)
+        let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
         waveformShaderBatchScratch.removeAll(keepingCapacity: true)
 
-        for (trackIndex, track) in renderState.tracks.enumerated() {
+        for trackIndex in trackLayout.visibleRange(overscan: 1) {
+            guard tracks.indices.contains(trackIndex) else {
+                continue
+            }
+
+            let track = tracks[trackIndex]
             guard
                 track.hasWaveform,
                 let trackDuration = track.durationHint,
@@ -2004,11 +2011,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 continue
             }
 
-            guard let laneFrame = laneFrame(
-                forTrackIndex: trackIndex,
-                renderState: renderState,
-                drawableSize: drawableSize
-            ) else {
+            guard let laneFrame = trackLayout.laneFrame(forTrackIndex: trackIndex), laneFrame.isVisible else {
                 continue
             }
 
@@ -2186,8 +2189,19 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return false
         }
 
+        let tracks = renderState.tracks
+        let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
         var checkedRenderableTrack = false
-        for track in renderState.tracks where track.hasWaveform {
+        for trackIndex in trackLayout.visibleRange(overscan: 1) {
+            guard tracks.indices.contains(trackIndex) else {
+                continue
+            }
+
+            let track = tracks[trackIndex]
+            guard track.hasWaveform else {
+                continue
+            }
+
             guard
                 let trackDuration = track.durationHint,
                 trackDuration.isFinite,
@@ -4124,9 +4138,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         let anySolo = tracks.contains { $0.isSoloed }
         let style = waveformVisualStyle(renderState: renderState, projectDuration: projectDuration)
+        let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
         var vertices: [TimelineVertex] = []
 
-        for (trackIndex, track) in tracks.enumerated() {
+        for trackIndex in trackLayout.visibleRange(overscan: 1) {
+            guard tracks.indices.contains(trackIndex) else {
+                continue
+            }
+
+            let track = tracks[trackIndex]
             guard
                 track.hasWaveform,
                 let trackDuration = track.durationHint,
@@ -4149,11 +4169,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 continue
             }
 
-            guard let laneFrame = laneFrame(
-                forTrackIndex: trackIndex,
-                renderState: renderState,
-                drawableSize: drawableSize
-            ) else {
+            guard let laneFrame = trackLayout.laneFrame(forTrackIndex: trackIndex), laneFrame.isVisible else {
                 continue
             }
 
@@ -4221,8 +4237,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         renderState: TimelineRenderState,
         trackWaveformMipLevels: [UUID: [WaveformMipLevel]]
     ) -> Int {
+        let tracks = renderState.tracks
+        let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
         var hasher = Hasher()
-        for track in renderState.tracks {
+        for trackIndex in trackLayout.visibleRange(overscan: 1) {
+            guard tracks.indices.contains(trackIndex) else {
+                continue
+            }
+
+            let track = tracks[trackIndex]
             hasher.combine(track.id)
             hasher.combine(trackWaveformMipLevels[track.id]?.count ?? 0)
             if let mipLevels = trackWaveformMipLevels[track.id],
