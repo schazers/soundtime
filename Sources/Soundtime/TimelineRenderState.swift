@@ -40,6 +40,7 @@ struct TimelineRenderState: Sendable {
     static let empty = TimelineRenderState(
         tracks: [],
         viewport: .full,
+        trackLayout: .default,
         playheadProgress: 0,
         playheadAnchorTimestamp: 0,
         isPlaybackActive: false,
@@ -54,6 +55,7 @@ struct TimelineRenderState: Sendable {
 
     let tracks: [Track]
     let viewport: TimelineViewport
+    let trackLayout: TimelineTrackLayout
     let playheadProgress: Float
     let playheadAnchorTimestamp: CFTimeInterval
     let isPlaybackActive: Bool
@@ -64,6 +66,36 @@ struct TimelineRenderState: Sendable {
     let selectedTrackID: UUID?
     let trimPreview: TimelineTrimRange?
     let gainPreview: GainPreview?
+
+    init(
+        tracks: [Track],
+        viewport: TimelineViewport,
+        trackLayout: TimelineTrackLayout = .default,
+        playheadProgress: Float,
+        playheadAnchorTimestamp: CFTimeInterval,
+        isPlaybackActive: Bool,
+        isRecordingActive: Bool,
+        hoverProgress: Float?,
+        isHoverGuideArmed: Bool,
+        selection: TimelineSelection?,
+        selectedTrackID: UUID?,
+        trimPreview: TimelineTrimRange?,
+        gainPreview: GainPreview?
+    ) {
+        self.tracks = tracks
+        self.viewport = viewport
+        self.trackLayout = trackLayout
+        self.playheadProgress = playheadProgress
+        self.playheadAnchorTimestamp = playheadAnchorTimestamp
+        self.isPlaybackActive = isPlaybackActive
+        self.isRecordingActive = isRecordingActive
+        self.hoverProgress = hoverProgress
+        self.isHoverGuideArmed = isHoverGuideArmed
+        self.selection = selection
+        self.selectedTrackID = selectedTrackID
+        self.trimPreview = trimPreview
+        self.gainPreview = gainPreview
+    }
 
     var waveformOverview: WaveformOverview? {
         tracks.first?.waveformOverview
@@ -99,6 +131,7 @@ struct TimelineRenderState: Sendable {
         TimelineRenderState(
             tracks: tracks,
             viewport: viewport,
+            trackLayout: trackLayout,
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
@@ -116,6 +149,25 @@ struct TimelineRenderState: Sendable {
         TimelineRenderState(
             tracks: tracks,
             viewport: viewport,
+            trackLayout: trackLayout,
+            playheadProgress: playheadProgress,
+            playheadAnchorTimestamp: playheadAnchorTimestamp,
+            isPlaybackActive: isPlaybackActive,
+            isRecordingActive: isRecordingActive,
+            hoverProgress: hoverProgress,
+            isHoverGuideArmed: isHoverGuideArmed,
+            selection: selection,
+            selectedTrackID: selectedTrackID,
+            trimPreview: trimPreview,
+            gainPreview: gainPreview
+        )
+    }
+
+    func withTrackLayout(_ trackLayout: TimelineTrackLayout) -> TimelineRenderState {
+        TimelineRenderState(
+            tracks: tracks,
+            viewport: viewport,
+            trackLayout: trackLayout,
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
@@ -133,6 +185,7 @@ struct TimelineRenderState: Sendable {
         TimelineRenderState(
             tracks: tracks,
             viewport: viewport,
+            trackLayout: trackLayout,
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
@@ -153,6 +206,7 @@ struct TimelineRenderState: Sendable {
         TimelineRenderState(
             tracks: tracks,
             viewport: viewport,
+            trackLayout: trackLayout,
             playheadProgress: min(max(playheadProgress, 0), 1),
             playheadAnchorTimestamp: anchorTimestamp ?? playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
@@ -170,6 +224,7 @@ struct TimelineRenderState: Sendable {
         TimelineRenderState(
             tracks: tracks,
             viewport: viewport,
+            trackLayout: trackLayout,
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
@@ -187,6 +242,7 @@ struct TimelineRenderState: Sendable {
         TimelineRenderState(
             tracks: tracks,
             viewport: viewport,
+            trackLayout: trackLayout,
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
@@ -205,6 +261,7 @@ struct TimelineRenderState: Sendable {
         return TimelineRenderState(
             tracks: tracks,
             viewport: viewport,
+            trackLayout: trackLayout,
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
@@ -222,6 +279,7 @@ struct TimelineRenderState: Sendable {
         TimelineRenderState(
             tracks: tracks,
             viewport: viewport,
+            trackLayout: trackLayout,
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
@@ -239,6 +297,7 @@ struct TimelineRenderState: Sendable {
         TimelineRenderState(
             tracks: tracks,
             viewport: viewport,
+            trackLayout: trackLayout,
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
@@ -256,6 +315,7 @@ struct TimelineRenderState: Sendable {
         TimelineRenderState(
             tracks: tracks,
             viewport: viewport,
+            trackLayout: trackLayout,
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
@@ -273,6 +333,7 @@ struct TimelineRenderState: Sendable {
         TimelineRenderState(
             tracks: tracks,
             viewport: viewport,
+            trackLayout: trackLayout,
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
