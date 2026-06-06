@@ -896,7 +896,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let maximumInFlightTransientParticleScoreProfileBuilds = 4
     private let maximumSynchronousGeneratedWaveformMipBins = 8_192
     private let maximumInFlightWaveformMipBuilds = 4
-    private let maximumGeneratedWaveformMipBins = 262_144
+    private let maximumGeneratedWaveformMipBins = 1_048_576
     private let generatedWaveformMipSamplesPerBin = 4
     private let highResolutionWaveformVisibleDurationThreshold: TimeInterval = 90
     private let waveformMipTargetBinsPerPoint: Float = 96
@@ -904,7 +904,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let maximumCachedWaveformShaderBinBuffers = 768
     private let maximumCachedWaveformShaderBinBufferBytes = 1_024 * 1_024 * 1_024
     private let maximumBackgroundPrewarmedWaveformShaderBins = 16_384
-    private let maximumViewportPrewarmedWaveformShaderBins = 524_288
+    private let maximumViewportPrewarmedWaveformShaderBins = 1_048_576
     private let maximumViewportPrewarmTrackCount = 24
     private let maximumInFlightWaveformShaderBufferUploads = 8
     private let maximumSynchronousWaveformShaderBinBufferBins = 4_096
