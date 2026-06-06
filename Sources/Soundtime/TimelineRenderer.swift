@@ -872,10 +872,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let maximumInFlightTransientParticleScoreProfileBuilds = 4
     private let maximumSynchronousGeneratedWaveformMipBins = 8_192
     private let maximumInFlightWaveformMipBuilds = 4
-    private let maximumGeneratedWaveformMipBins = 65_536
+    private let maximumGeneratedWaveformMipBins = 262_144
     private let generatedWaveformMipSamplesPerBin = 4
     private let highResolutionWaveformVisibleDurationThreshold: TimeInterval = 30
-    private let waveformMipTargetBinsPerPoint: Float = 24
+    private let waveformMipTargetBinsPerPoint: Float = 48
     private let maximumCachedWaveformMipPyramids = 512
     private let maximumCachedWaveformShaderBinBuffers = 768
     private let maximumCachedWaveformShaderBinBufferBytes = 512 * 1_024 * 1_024
@@ -1995,7 +1995,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         )
         let visibleBins = max(Float(max(binCount, 1)) * trackViewportProgress, 1)
         let pointsPerBin = Float(max(drawableSize.width, 1)) / visibleBins
-        return min(max((pointsPerBin - 0.35) / 2.75, 0), 0.92)
+        let adaptiveSmoothing = min(max((pointsPerBin - 0.08) / 1.65, 0), 0.88)
+        return min(max(adaptiveSmoothing, 0.18), 0.96)
     }
 
     private func waveformShaderDrawable(
