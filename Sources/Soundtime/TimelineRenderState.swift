@@ -43,6 +43,7 @@ struct TimelineRenderState: Sendable {
         playheadProgress: 0,
         playheadAnchorTimestamp: 0,
         isPlaybackActive: false,
+        isRecordingActive: false,
         hoverProgress: nil,
         isHoverGuideArmed: false,
         selection: nil,
@@ -56,6 +57,7 @@ struct TimelineRenderState: Sendable {
     let playheadProgress: Float
     let playheadAnchorTimestamp: CFTimeInterval
     let isPlaybackActive: Bool
+    let isRecordingActive: Bool
     let hoverProgress: Float?
     let isHoverGuideArmed: Bool
     let selection: TimelineSelection?
@@ -100,6 +102,7 @@ struct TimelineRenderState: Sendable {
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
+            isRecordingActive: isRecordingActive,
             hoverProgress: hoverProgress,
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
@@ -116,6 +119,7 @@ struct TimelineRenderState: Sendable {
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
+            isRecordingActive: isRecordingActive,
             hoverProgress: hoverProgress,
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
@@ -132,6 +136,7 @@ struct TimelineRenderState: Sendable {
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
+            isRecordingActive: isRecordingActive,
             hoverProgress: hoverProgress,
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
@@ -151,6 +156,7 @@ struct TimelineRenderState: Sendable {
             playheadProgress: min(max(playheadProgress, 0), 1),
             playheadAnchorTimestamp: anchorTimestamp ?? playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
+            isRecordingActive: isRecordingActive,
             hoverProgress: hoverProgress,
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
@@ -167,6 +173,24 @@ struct TimelineRenderState: Sendable {
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
+            isRecordingActive: isRecordingActive,
+            hoverProgress: hoverProgress,
+            isHoverGuideArmed: isHoverGuideArmed,
+            selection: selection,
+            selectedTrackID: selectedTrackID,
+            trimPreview: trimPreview,
+            gainPreview: gainPreview
+        )
+    }
+
+    func withRecordingActive(_ isRecordingActive: Bool) -> TimelineRenderState {
+        TimelineRenderState(
+            tracks: tracks,
+            viewport: viewport,
+            playheadProgress: playheadProgress,
+            playheadAnchorTimestamp: playheadAnchorTimestamp,
+            isPlaybackActive: isPlaybackActive,
+            isRecordingActive: isRecordingActive,
             hoverProgress: hoverProgress,
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
@@ -184,6 +208,7 @@ struct TimelineRenderState: Sendable {
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
+            isRecordingActive: isRecordingActive,
             hoverProgress: clampedProgress,
             isHoverGuideArmed: clampedProgress != nil && isArmed,
             selection: selection,
@@ -200,6 +225,7 @@ struct TimelineRenderState: Sendable {
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
+            isRecordingActive: isRecordingActive,
             hoverProgress: hoverProgress,
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
@@ -216,6 +242,7 @@ struct TimelineRenderState: Sendable {
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
+            isRecordingActive: isRecordingActive,
             hoverProgress: hoverProgress,
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
@@ -232,6 +259,7 @@ struct TimelineRenderState: Sendable {
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
+            isRecordingActive: isRecordingActive,
             hoverProgress: hoverProgress,
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
@@ -248,6 +276,7 @@ struct TimelineRenderState: Sendable {
             playheadProgress: playheadProgress,
             playheadAnchorTimestamp: playheadAnchorTimestamp,
             isPlaybackActive: isPlaybackActive,
+            isRecordingActive: isRecordingActive,
             hoverProgress: hoverProgress,
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,

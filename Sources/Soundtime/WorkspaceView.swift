@@ -77,6 +77,58 @@ final class WorkspaceView: NSView {
         let trackCount: Int
     }
 
+    private struct LiveRecordingWaveformAccumulator {
+        private(set) var bins: [WaveformOverview.Bin] = []
+        private var currentAccumulator = WaveformBinAccumulator()
+        private var framesInCurrentBin = 0
+        private(set) var totalFrameCount = 0
+        private let framesPerBin: Int
+
+        init(sampleRate: Double) {
+            let framesPerSecond = max(sampleRate, 1)
+            framesPerBin = max(Int((framesPerSecond / 180).rounded()), 96)
+        }
+
+        mutating func append(samplesByChannel: [[Float]], frameCount: Int) {
+            guard frameCount > 0, !samplesByChannel.isEmpty else {
+                return
+            }
+
+            for frameIndex in 0..<frameCount {
+                var mixedSample: Float = 0
+                var mixedChannelCount: Float = 0
+                for samples in samplesByChannel where frameIndex < samples.count {
+                    mixedSample += samples[frameIndex]
+                    mixedChannelCount += 1
+                }
+
+                guard mixedChannelCount > 0 else {
+                    continue
+                }
+
+                currentAccumulator.addSample(mixedSample / mixedChannelCount)
+                framesInCurrentBin += 1
+                totalFrameCount += 1
+
+                if framesInCurrentBin >= framesPerBin {
+                    bins.append(currentAccumulator.makeBin())
+                    currentAccumulator = WaveformBinAccumulator()
+                    framesInCurrentBin = 0
+                }
+            }
+        }
+
+        func makeOverview(sampleRate: Double) -> WaveformOverview {
+            var overviewBins = bins
+            if framesInCurrentBin > 0 {
+                overviewBins.append(currentAccumulator.makeBin())
+            }
+
+            let duration = sampleRate > 0 ? Double(totalFrameCount) / sampleRate : 0
+            return WaveformOverview(duration: duration, bins: overviewBins)
+        }
+    }
+
     private var projectTracks: [ProjectTrack] = []
     private var activeTrackID: UUID?
     private var selectedTrackID: UUID?
@@ -100,6 +152,12 @@ final class WorkspaceView: NSView {
     private var loudnessMeterTimer: Timer?
     private var keyDownMonitor: Any?
     private var debugToolsVisible = false
+    private let inputRecorder = AudioInputRecorder()
+    private var recordingTrackID: UUID?
+    private var recordingSamplesByChannel: [[Float]] = []
+    private var recordingSampleRate: Double = 0
+    private var recordingAccumulator: LiveRecordingWaveformAccumulator?
+    private var lastRecordingVisualUpdateTimestamp = CACurrentMediaTime()
     private let playbackController: PlaybackEngine = PlaybackEngineFactory.makeDefault()
     private let playbackRefreshRate: TimeInterval = 10
     private let loudnessMeterRefreshRate: TimeInterval = 60
@@ -349,6 +407,11 @@ final class WorkspaceView: NSView {
         }
         addTrackButton.onPressed = { [weak self] in
             self?.addEmptyTrack()
+        }
+        inputRecorder.onChunk = { [weak self] chunk in
+            Task { @MainActor in
+                self?.appendRecordingChunk(chunk)
+            }
         }
         volumeControl.onVolumeChanged = { [weak self] volume in
             self?.playbackController.setPerceptualVolume(volume)
@@ -678,6 +741,7 @@ final class WorkspaceView: NSView {
             controlView.isSoloed = track.isSoloed
             controlView.volume = track.volume
             controlView.isTrackSelected = track.id == selectedTrackID
+            controlView.isRecording = track.id == recordingTrackID
             controlView.onTrackSelected = { [weak self, trackID = track.id] in
                 self?.selectTrack(trackID)
             }
@@ -686,6 +750,9 @@ final class WorkspaceView: NSView {
             }
             controlView.onSoloChanged = { [weak self, trackID = track.id] isSoloed in
                 self?.updateTrack(trackID) { $0.isSoloed = isSoloed }
+            }
+            controlView.onRecordRequested = { [weak self, trackID = track.id] in
+                self?.toggleRecording(on: trackID)
             }
             controlView.onVolumeChanged = { [weak self, trackID = track.id] volume in
                 self?.updateTrack(trackID) { $0.volume = volume }
@@ -734,6 +801,246 @@ final class WorkspaceView: NSView {
         updateEffectCommandState()
         window?.title = projectWindowTitle()
         updateStatus("\(trackName) added")
+    }
+
+    private func toggleRecording(on trackID: UUID) {
+        if recordingTrackID == trackID {
+            stopRecording()
+            return
+        }
+
+        startRecording(on: trackID)
+    }
+
+    private func startRecording(on trackID: UUID) {
+        guard let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }) else {
+            return
+        }
+
+        if recordingTrackID != nil {
+            stopRecording()
+        }
+
+        if playbackController.isPlaying {
+            playbackController.pause()
+            stopPlaybackTimer()
+        }
+
+        do {
+            try inputRecorder.start()
+        } catch {
+            updateStatus("recording failed: \(error.localizedDescription)")
+            return
+        }
+
+        let snapshot = ProjectTrackUndoSnapshot(
+            tracks: projectTracks,
+            activeTrackID: activeTrackID,
+            selectedTrackID: selectedTrackID,
+            selectedTimelineRange: selectedTimelineRange
+        )
+        editUndoStack.append(.projectTracks(snapshot))
+
+        recordingTrackID = trackID
+        recordingSamplesByChannel = []
+        recordingSampleRate = 0
+        recordingAccumulator = nil
+        lastRecordingVisualUpdateTimestamp = 0
+
+        projectTracks[trackIndex].sourceURL = URL(fileURLWithPath: "/dev/null")
+        projectTracks[trackIndex].durationHint = nil
+        projectTracks[trackIndex].waveformOverview = nil
+        projectTracks[trackIndex].decodedAudioBuffer = nil
+        projectTracks[trackIndex].zeroCrossingIndex = nil
+        projectTracks[trackIndex].zeroCrossingProbe = nil
+        projectTracks[trackIndex].audioTimeline = nil
+        projectTracks[trackIndex].editRevision += 1
+        activeTrackID = trackID
+        selectedTrackID = nil
+        selectedTimelineRange = nil
+        timelineSurface.displaySelection(nil)
+        timelineSurface.displaySelectedTrack(nil)
+        refreshProjectTimelineDisplay()
+        updateProjectDisplayTiming()
+        currentPlaybackStatus = "recording"
+        displayPlaybackVisuals(
+            progress: 1,
+            isPlaying: true,
+            syncPlayhead: true,
+            restartsFisheyeActivation: true,
+            restartsPlayheadKick: true
+        )
+        timelineSurface.displayRecordingActive(true)
+        updateStatus("recording \(projectTracks[trackIndex].name)")
+    }
+
+    private func stopRecording() {
+        guard let trackID = recordingTrackID else {
+            return
+        }
+
+        inputRecorder.stop()
+        applyLiveRecordingOverview(force: true)
+
+        recordingTrackID = nil
+        timelineSurface.displayRecordingActive(false)
+        displayPlaybackVisuals(progress: 1, isPlaying: false, syncPlayhead: true)
+        refreshTrackControls()
+
+        guard
+            let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }),
+            recordingSampleRate > 0,
+            let frameCount = recordingSamplesByChannel.map(\.count).min(),
+            frameCount > 0
+        else {
+            recordingSamplesByChannel = []
+            recordingSampleRate = 0
+            recordingAccumulator = nil
+            updateProjectDisplayTiming()
+            updateStatus("recording stopped")
+            return
+        }
+
+        let samplesByChannel = recordingSamplesByChannel.map { samples in
+            Array(samples.prefix(frameCount))
+        }
+        var buffer = DecodedAudioBuffer(
+            url: URL(fileURLWithPath: "/dev/null"),
+            sampleRate: recordingSampleRate,
+            channelCount: samplesByChannel.count,
+            frameCount: frameCount,
+            samplesByChannel: samplesByChannel
+        )
+        let recordingURL = recordingFileURL(trackName: projectTracks[trackIndex].name)
+        do {
+            try WAVFileWriter.write(buffer, to: recordingURL)
+            buffer = DecodedAudioBuffer(
+                url: recordingURL,
+                sampleRate: buffer.sampleRate,
+                channelCount: buffer.channelCount,
+                frameCount: buffer.frameCount,
+                samplesByChannel: buffer.samplesByChannel
+            )
+            projectTracks[trackIndex].sourceURL = recordingURL
+        } catch {
+            projectTracks[trackIndex].sourceURL = buffer.url
+            updateStatus("recorded in memory - WAV save failed: \(error.localizedDescription)")
+        }
+
+        let waveformOverview = recordingAccumulator?.makeOverview(sampleRate: recordingSampleRate) ??
+            WaveformOverviewBuilder.build(from: buffer)
+        let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: buffer)
+
+        projectTracks[trackIndex].durationHint = buffer.duration
+        projectTracks[trackIndex].waveformOverview = waveformOverview
+        projectTracks[trackIndex].decodedAudioBuffer = buffer
+        projectTracks[trackIndex].zeroCrossingIndex = zeroCrossingIndex
+        projectTracks[trackIndex].zeroCrossingProbe = nil
+        projectTracks[trackIndex].audioTimeline = AudioEditTimeline(sourceBuffer: buffer)
+        projectTracks[trackIndex].editRevision += 1
+        activeTrackID = trackID
+
+        recordingSamplesByChannel = []
+        recordingSampleRate = 0
+        recordingAccumulator = nil
+        syncActiveTrackFields()
+        refreshProjectTimelineDisplay()
+        updateProjectDisplayTiming(sampleRateHint: buffer.sampleRate)
+        reloadPlaybackFromProjectTracks(preserveProgress: false)
+        updateEffectCommandState()
+        updateStatus("recorded \(formatDuration(buffer.duration))")
+    }
+
+    private func appendRecordingChunk(_ chunk: AudioRecordingChunk) {
+        guard recordingTrackID != nil, chunk.frameCount > 0, chunk.sampleRate > 0 else {
+            return
+        }
+
+        let frameCount = min(
+            chunk.frameCount,
+            chunk.samplesByChannel.map(\.count).min() ?? chunk.frameCount
+        )
+        guard frameCount > 0 else {
+            return
+        }
+
+        if recordingSamplesByChannel.isEmpty || recordingSampleRate != chunk.sampleRate {
+            recordingSampleRate = chunk.sampleRate
+            let channelCount = max(chunk.channelCount, 1)
+            recordingSamplesByChannel = (0..<channelCount).map { _ in [] }
+            recordingAccumulator = LiveRecordingWaveformAccumulator(sampleRate: chunk.sampleRate)
+        }
+
+        for channelIndex in recordingSamplesByChannel.indices {
+            let sourceSamples = chunk.samplesByChannel[min(channelIndex, chunk.samplesByChannel.count - 1)]
+            recordingSamplesByChannel[channelIndex].append(contentsOf: sourceSamples.prefix(frameCount))
+        }
+
+        recordingAccumulator?.append(
+            samplesByChannel: chunk.samplesByChannel,
+            frameCount: frameCount
+        )
+
+        let now = CACurrentMediaTime()
+        if now - lastRecordingVisualUpdateTimestamp >= 1.0 / 45.0 {
+            applyLiveRecordingOverview(force: false)
+            lastRecordingVisualUpdateTimestamp = now
+        }
+    }
+
+    private func applyLiveRecordingOverview(force: Bool) {
+        guard
+            let recordingTrackID,
+            let trackIndex = projectTracks.firstIndex(where: { $0.id == recordingTrackID }),
+            let recordingAccumulator,
+            recordingSampleRate > 0
+        else {
+            return
+        }
+
+        let overview = recordingAccumulator.makeOverview(sampleRate: recordingSampleRate)
+        guard force || overview.bins.isEmpty == false else {
+            return
+        }
+
+        projectTracks[trackIndex].waveformOverview = overview
+        projectTracks[trackIndex].durationHint = overview.duration
+        refreshProjectTimelineDisplay(rebuildControls: false)
+        updateProjectDisplayTiming(sampleRateHint: recordingSampleRate)
+        currentPlayheadFrame = displayedFrameCount
+        let now = CACurrentMediaTime()
+        visualPlayheadProgress = 1
+        visualPlayheadAnchorTimestamp = now
+        visualPlaybackActive = true
+        timelineSurface.displayPlayheadProgress(
+            1,
+            syncRenderer: true,
+            anchorTimestamp: now,
+            resetsTouchStart: false
+        )
+        timelineSurface.displayRecordingActive(true)
+        updateTimeReadout()
+    }
+
+    private func recordingFileURL(trackName: String) -> URL {
+        let baseDirectory = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        let recordingsDirectory = baseDirectory
+            .appendingPathComponent("Soundtime", isDirectory: true)
+            .appendingPathComponent("Recordings", isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: recordingsDirectory,
+            withIntermediateDirectories: true
+        )
+
+        let safeTrackName = trackName
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+            .joined(separator: "-")
+        let fileName = "\(safeTrackName.isEmpty ? "Recording" : safeTrackName)-\(UUID().uuidString).wav"
+        return recordingsDirectory.appendingPathComponent(fileName)
     }
 
     private func selectTrack(_ trackID: UUID) {
@@ -1089,6 +1396,10 @@ final class WorkspaceView: NSView {
     }
 
     private func removeProjectTrack(_ trackID: UUID) {
+        if recordingTrackID == trackID {
+            stopRecording()
+        }
+
         projectTracks.removeAll { $0.id == trackID }
         if activeTrackID == trackID {
             activeTrackID = projectTracks.last?.id
@@ -2303,6 +2614,11 @@ final class WorkspaceView: NSView {
     }
 
     private func togglePlayback() {
+        if recordingTrackID != nil {
+            stopRecording()
+            return
+        }
+
         guard playbackController.hasSource else {
             return
         }
