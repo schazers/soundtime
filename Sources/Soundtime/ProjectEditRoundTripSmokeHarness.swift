@@ -96,6 +96,12 @@ enum ProjectEditRoundTripSmokeHarness {
         let originalEditedOverview = timeline.waveformOverview(from: sourceOverview)
         let restoredEditedOverview = restoredTimeline.waveformOverview(from: sourceOverview)
         try requireWaveformOverviewsMatch(originalEditedOverview, restoredEditedOverview)
+        try requireRenderedAudioMatchesEdits(
+            timeline,
+            restoredTimeline,
+            sourceFrameCount: sourceFrameCount,
+            sampleRate: sampleRate
+        )
 
         print(
             "Soundtime project edit round-trip smoke passed: " +
@@ -121,6 +127,59 @@ enum ProjectEditRoundTripSmokeHarness {
             ))
         }
         return WaveformOverview(duration: duration, bins: bins)
+    }
+
+    private static func requireRenderedAudioMatchesEdits(
+        _ originalTimeline: AudioFileEditTimeline,
+        _ restoredTimeline: AudioFileEditTimeline,
+        sourceFrameCount: Int,
+        sampleRate: Double
+    ) throws {
+        let sourceBuffer = syntheticAudioBuffer(frameCount: sourceFrameCount, sampleRate: sampleRate)
+        let originalRender = originalTimeline.audioTimeline(sourceBuffer: sourceBuffer).render()
+        let restoredRender = restoredTimeline.audioTimeline(sourceBuffer: sourceBuffer).render()
+        try require(originalRender.frameCount == 10_800, "rendered edit frame count mismatch")
+        try require(restoredRender.frameCount == originalRender.frameCount, "restored render frame count mismatch")
+        try require(restoredRender.channelCount == originalRender.channelCount, "restored render channel count mismatch")
+
+        for channel in 0..<originalRender.channelCount {
+            try require(
+                channel < restoredRender.samplesByChannel.count,
+                "restored render channel \(channel) missing"
+            )
+            for frame in 0..<originalRender.frameCount {
+                let originalSample = originalRender.samplesByChannel[channel][frame]
+                let restoredSample = restoredRender.samplesByChannel[channel][frame]
+                try require(
+                    abs(originalSample - restoredSample) < 0.000_001,
+                    "restored render mismatch at channel \(channel), frame \(frame)"
+                )
+            }
+        }
+    }
+
+    private static func syntheticAudioBuffer(frameCount: Int, sampleRate: Double) -> DecodedAudioBuffer {
+        var left: [Float] = []
+        var right: [Float] = []
+        left.reserveCapacity(frameCount)
+        right.reserveCapacity(frameCount)
+        for frame in 0..<frameCount {
+            left.append(syntheticSample(channel: 0, frame: frame))
+            right.append(syntheticSample(channel: 1, frame: frame))
+        }
+
+        return DecodedAudioBuffer(
+            url: URL(fileURLWithPath: "/tmp/SoundtimeProjectEditRoundTrip.wav"),
+            sampleRate: sampleRate,
+            channelCount: 2,
+            frameCount: frameCount,
+            samplesByChannel: [left, right]
+        )
+    }
+
+    private static func syntheticSample(channel: Int, frame: Int) -> Float {
+        let base = Float(frame) * 0.000_01
+        return channel == 0 ? base : -base * 1.7
     }
 
     private static func requirePersistentStatesMatch(
