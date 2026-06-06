@@ -863,9 +863,9 @@ final class WorkspaceView: NSView {
                 id: track.id,
                 waveformVersion: waveformVersion(for: track),
                 waveformOverview: track.waveformOverview,
-                durationHint: track.waveformOverview?.duration ??
-                    track.audioTimeline?.duration ??
+                durationHint: track.audioTimeline?.duration ??
                     track.fileTimeline?.duration ??
+                    track.waveformOverview?.duration ??
                     track.decodedAudioBuffer?.duration ??
                     track.durationHint,
                 volume: track.volume,
@@ -1946,7 +1946,8 @@ final class WorkspaceView: NSView {
 
         decodedAudioBuffer = activeTrack.decodedAudioBuffer ?? decodedAudioBuffer
         audioTimeline = activeTrack.audioTimeline
-        if let duration = activeTrack.waveformOverview?.duration {
+        let duration = trackDuration(for: activeTrack)
+        if duration > 0 {
             selectedAudioFile = AudioFileMetadata(
                 url: activeTrack.sourceURL,
                 displayName: activeTrack.name,
@@ -1968,7 +1969,7 @@ final class WorkspaceView: NSView {
 
     private func updateProjectDisplayTiming(sampleRateHint: Double? = nil) {
         let projectDuration = projectTracks.reduce(TimeInterval(0)) { result, track in
-            max(result, track.waveformOverview?.duration ?? track.decodedAudioBuffer?.duration ?? track.durationHint ?? 0)
+            max(result, trackDuration(for: track))
         }
         let sampleRate = sampleRateHint ??
             projectTracks.compactMap { $0.decodedAudioBuffer?.sampleRate }.first ??

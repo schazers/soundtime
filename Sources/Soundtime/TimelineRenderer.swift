@@ -1109,7 +1109,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     private func lightweightRenderTrack(from track: TimelineRenderState.Track) -> TimelineRenderState.Track {
         let currentTrack = renderState.tracks.first { $0.id == track.id }
-        let durationHint = track.waveformOverview?.duration ?? track.durationHint ?? currentTrack?.durationHint
+        let durationHint = track.durationHint ?? track.waveformOverview?.duration ?? currentTrack?.durationHint
         let hasWaveform = track.waveformOverview?.isEmpty == false || currentTrack?.hasWaveform == true
         return TimelineRenderState.Track(
             id: track.id,

@@ -294,7 +294,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     private static func timelineDuration(for tracks: [TimelineRenderState.Track]) -> TimeInterval {
         tracks.reduce(TimeInterval(0)) { result, track in
-            max(result, track.waveformOverview?.duration ?? track.durationHint ?? 0)
+            max(result, track.durationHint ?? track.waveformOverview?.duration ?? 0)
         }
     }
 
