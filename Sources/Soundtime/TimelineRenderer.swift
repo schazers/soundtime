@@ -928,7 +928,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let maximumCachedWaveformShaderBinBuffers = 2_048
     private let maximumCachedWaveformShaderBinBufferBytes = 1_024 * 1_024 * 1_024
     private let maximumBackgroundPrewarmedWaveformShaderBins = 16_384
-    private let maximumViewportPrewarmedWaveformShaderBins = 2_097_152
+    private let maximumViewportPrewarmedWaveformShaderBins = WaveformOverviewBuilder.defaultTargetBinCount
     private let maximumViewportPrewarmTrackCount = 24
     private let waveformPrewarmJobBatchSize = 8
     private let maximumInFlightWaveformShaderBufferUploads = 8
