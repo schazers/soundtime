@@ -2285,7 +2285,7 @@ final class WorkspaceView: NSView {
     }
 
     private func updateProjectPlaybackTrackMix() {
-        playbackController.updateProjectTrackMix(projectPlaybackTracks())
+        playbackController.updateProjectTrackMix(projectPlaybackTrackMixes())
         lastProjectTrackMixPublishTimestamp = CACurrentMediaTime()
     }
 
@@ -2355,6 +2355,17 @@ final class WorkspaceView: NSView {
                 id: track.id,
                 source: source,
                 sourceRevision: track.editRevision,
+                volume: track.volume,
+                isMuted: track.isMuted,
+                isSoloed: track.isSoloed
+            )
+        }
+    }
+
+    private func projectPlaybackTrackMixes() -> [ProjectPlaybackTrackMix] {
+        projectTracks.map { track in
+            ProjectPlaybackTrackMix(
+                id: track.id,
                 volume: track.volume,
                 isMuted: track.isMuted,
                 isSoloed: track.isSoloed

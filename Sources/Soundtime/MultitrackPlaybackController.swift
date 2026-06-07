@@ -181,14 +181,21 @@ final class MultitrackPlaybackController: PlaybackEngine {
 
     func updateZeroCrossingIndex(_ zeroCrossingIndex: AudioZeroCrossingIndex?) {}
 
-    func updateProjectTrackMix(_ tracks: [ProjectPlaybackTrack]) {
-        for track in tracks {
-            guard var player = trackPlayers[track.id] else {
+    func updateProjectTrackMix(_ tracks: [ProjectPlaybackTrackMix]) {
+        for trackMix in tracks {
+            guard var player = trackPlayers[trackMix.id] else {
                 continue
             }
 
-            player.track = track
-            trackPlayers[track.id] = player
+            player.track = ProjectPlaybackTrack(
+                id: player.track.id,
+                source: player.track.source,
+                sourceRevision: player.track.sourceRevision,
+                volume: trackMix.volume,
+                isMuted: trackMix.isMuted,
+                isSoloed: trackMix.isSoloed
+            )
+            trackPlayers[trackMix.id] = player
         }
 
         applyTrackVolumes()
