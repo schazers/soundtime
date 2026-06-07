@@ -192,6 +192,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             action: #selector(TimelineView.pasteTimelineAudio(_:)),
             keyEquivalent: "v"
         ))
+        menu.addItem(NSMenuItem(
+            title: "Duplicate Region",
+            action: #selector(TimelineView.duplicateTimelineRegion(_:)),
+            keyEquivalent: "d"
+        ))
         menu.addItem(.separator())
         let deleteTimeItem = NSMenuItem(
             title: "Delete Time",

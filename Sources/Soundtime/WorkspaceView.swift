@@ -591,6 +591,9 @@ final class WorkspaceView: NSView {
         timelineSurface.onPasteAudio = { [weak self] in
             self?.pasteAudio()
         }
+        timelineSurface.onDuplicateRegionRequested = { [weak self] in
+            self?.duplicateRegion()
+        }
         timelineSurface.onSplitAtPlayhead = { [weak self] in
             self?.splitAtPlayhead()
         }
@@ -5741,6 +5744,149 @@ final class WorkspaceView: NSView {
                 self.updateStatus("paste failed: \(error.localizedDescription)")
             }
         }
+    }
+
+    private func duplicateRegion() {
+        guard
+            let target = currentEditableSelectionTarget(),
+            projectTracks.indices.contains(target.trackIndex),
+            target.editSelection.durationProgress > 0
+        else {
+            updateStatus("select audio to duplicate")
+            return
+        }
+
+        let trackIndex = target.trackIndex
+        let trackID = projectTracks[trackIndex].id
+        let selectionToDuplicate = target.editSelection
+        let insertionSelection = TimelineSelection(
+            startProgress: selectionToDuplicate.endProgress,
+            endProgress: selectionToDuplicate.endProgress,
+            trackID: trackID
+        )
+        let currentOverview = projectTracks[trackIndex].waveformOverview
+        let duplicatedOverview = selectedWaveformOverview(
+            from: currentOverview,
+            selection: selectionToDuplicate
+        )
+        let undoSnapshot = ProjectTrackUndoSnapshot(
+            tracks: projectTracks,
+            activeTrackID: activeTrackID,
+            selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
+            selectedTimelineRange: selectedTimelineRange,
+            restoreProgress: playbackController.snapshot().progress
+        )
+
+        if let currentFileTimeline = try? preferredFileTimelineForEditing(trackIndex: trackIndex) {
+            var timeline = currentFileTimeline
+            guard
+                let clip = timeline.clip(for: selectionToDuplicate),
+                let insertedFrameCount = timeline.replace(insertionSelection, with: clip),
+                insertedFrameCount > 0
+            else {
+                updateStatus("duplicate failed")
+                return
+            }
+
+            editUndoStack.append(.projectTracks(undoSnapshot))
+            cancelEditMaterialization(for: trackID)
+            projectTracks[trackIndex].editRevision += 1
+            let editRevision = projectTracks[trackIndex].editRevision
+            projectTracks[trackIndex].audioTimeline = nil
+            projectTracks[trackIndex].fileTimeline = timeline
+            projectTracks[trackIndex].decodedAudioBuffer = nil
+            projectTracks[trackIndex].durationHint = timeline.duration
+            projectTracks[trackIndex].waveformOverview =
+                optimisticWaveformOverview(
+                    currentOverview,
+                    replacing: insertionSelection,
+                    with: duplicatedOverview,
+                    targetDuration: timeline.duration
+                ) ??
+                optimisticWaveformOverview(
+                    for: timeline,
+                    sourceOverview: projectTracks[trackIndex].sourceWaveformOverview,
+                    fallbackOverview: currentOverview
+                )
+            scheduleFileTimelineWaveformRefinement(
+                trackID: trackID,
+                fileTimeline: timeline,
+                sourceOverview: projectTracks[trackIndex].sourceWaveformOverview ?? currentOverview,
+                editRevision: editRevision
+            )
+            finishDuplicateRegion(
+                trackID: trackID,
+                duration: Double(insertedFrameCount) / max(timeline.sourceSampleRate, 1),
+                preservePlaybackProgress: true
+            )
+            return
+        }
+
+        guard let currentTimeline = projectTracks[trackIndex].audioTimeline else {
+            updateStatus("track is not ready to duplicate")
+            return
+        }
+
+        var timeline = currentTimeline
+        guard
+            let clip = timeline.clip(for: selectionToDuplicate),
+            let insertedFrameCount = timeline.replace(insertionSelection, with: clip),
+            insertedFrameCount > 0
+        else {
+            updateStatus("duplicate failed")
+            return
+        }
+
+        editUndoStack.append(.projectTracks(undoSnapshot))
+        cancelEditMaterialization(for: trackID)
+        projectTracks[trackIndex].editRevision += 1
+        let editRevision = projectTracks[trackIndex].editRevision
+        projectTracks[trackIndex].audioTimeline = timeline
+        projectTracks[trackIndex].fileTimeline = nil
+        projectTracks[trackIndex].decodedAudioBuffer = nil
+        projectTracks[trackIndex].durationHint = timeline.duration
+        projectTracks[trackIndex].waveformOverview = optimisticWaveformOverview(
+            currentOverview,
+            replacing: insertionSelection,
+            with: duplicatedOverview,
+            targetDuration: timeline.duration
+        )
+        cancelEditWaveformRefinement(for: trackID)
+        finishDuplicateRegion(
+            trackID: trackID,
+            duration: Double(insertedFrameCount) / max(timeline.sourceAudioBuffer.sampleRate, 1),
+            preservePlaybackProgress: true
+        )
+        materializeEditedTimeline(
+            trackID: trackID,
+            timeline: timeline,
+            editRevision: editRevision,
+            status: "duplicated \(formatDuration(Double(insertedFrameCount) / max(timeline.sourceAudioBuffer.sampleRate, 1)))",
+            preservePlaybackProgress: true,
+            startDelay: editMaterializationDelay,
+            animateWaveformTransition: false
+        )
+    }
+
+    private func finishDuplicateRegion(
+        trackID: UUID,
+        duration: TimeInterval,
+        preservePlaybackProgress: Bool
+    ) {
+        activeTrackID = trackID
+        selectedTimelineRange = nil
+        timelineSurface.displaySelection(nil)
+        timelineSurface.displayGainPreview(selection: nil, gain: 1)
+        syncActiveTrackFields()
+        refreshProjectTimelineDisplay(rebuildControls: false, animateWaveformTransition: false)
+        updateProjectDisplayTiming()
+        reloadPlaybackFromProjectTracks(
+            preserveProgress: preservePlaybackProgress,
+            resumeIfPlaying: playbackController.isPlaying
+        )
+        updateEffectCommandState()
+        updateStatus("duplicated \(formatDuration(duration))")
     }
 
     private func performOptimisticDelete(copyBeforeDeleting: Bool, scope: EditScope) {
