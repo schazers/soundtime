@@ -47,6 +47,14 @@ final class PerformanceDashboardWindowController: NSWindowController, NSWindowDe
         dashboardView.display(frameStats: frameStats)
     }
 
+    func closeIfVisible() {
+        guard let window, window.isVisible else {
+            return
+        }
+
+        window.close()
+    }
+
     func windowWillClose(_ notification: Notification) {
         dashboardView.pause()
     }

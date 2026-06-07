@@ -941,6 +941,7 @@ final class WorkspaceView: NSView {
     }
 
     private func tearDownRuntimeState() {
+        PerformanceDashboardWindowController.shared.closeIfVisible()
         if let keyDownMonitor {
             NSEvent.removeMonitor(keyDownMonitor)
             self.keyDownMonitor = nil
