@@ -200,6 +200,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         deleteTimeItem.keyEquivalentModifierMask = []
         menu.addItem(deleteTimeItem)
+        menu.addItem(NSMenuItem(
+            title: "Remove Time Range Across Scope",
+            action: #selector(TimelineView.removeTimeRangeAcrossScope(_:)),
+            keyEquivalent: ""
+        ))
 
         let clearSelectionItem = NSMenuItem(
             title: "Clear and Leave Gap",

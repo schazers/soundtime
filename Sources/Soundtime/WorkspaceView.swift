@@ -576,6 +576,9 @@ final class WorkspaceView: NSView {
         timelineSurface.onDeleteSelection = { [weak self] in
             self?.deleteSelectedTrackOrSelection()
         }
+        timelineSurface.onRemoveTimeRangeRequested = { [weak self] in
+            self?.removeTimeRangeAcrossScope()
+        }
         timelineSurface.onClearSelection = { [weak self] in
             self?.clearSelection()
         }
@@ -3893,6 +3896,10 @@ final class WorkspaceView: NSView {
     }
 
     private func deleteSelection() {
+        performOptimisticDelete(copyBeforeDeleting: false, scope: editScope)
+    }
+
+    private func removeTimeRangeAcrossScope() {
         performOptimisticDelete(copyBeforeDeleting: false, scope: editScope)
     }
 
