@@ -365,7 +365,8 @@ private final class PerformanceMetricCardView: NSView {
 
             sparklineView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
             sparklineView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
-            sparklineView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -14),
+            sparklineView.topAnchor.constraint(greaterThanOrEqualTo: subtitleLabel.bottomAnchor, constant: 18),
+            sparklineView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2),
             sparklineView.heightAnchor.constraint(equalToConstant: 34),
         ])
     }
