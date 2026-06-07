@@ -458,6 +458,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         requestTimelineRender()
     }
 
+    func displayCandidateRegions(_ candidateRegions: [TimelineRenderState.CandidateRegion]) {
+        updateTimelineRenderer { renderer in
+            renderer.displayCandidateRegions(candidateRegions)
+        }
+        requestTimelineRender()
+    }
+
     func triggerDeletionEffect(selection: TimelineSelection, sourceSelection: TimelineSelection? = nil) {
         updateTimelineRenderer { renderer in
             renderer.triggerDeletionEffect(selection: selection, sourceSelection: sourceSelection)

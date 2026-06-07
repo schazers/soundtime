@@ -839,6 +839,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var lastInteractiveWaveformPrewarmKeys: [WaveformMipCacheKey] = []
     private var waveformShaderPrewarmGeneration = 0
     private var selectedTrackVertexScratch: [TimelineVertex] = []
+    private var candidateRegionVertexScratch: [TimelineVertex] = []
     private var selectionVertexScratch: [TimelineVertex] = []
     private var gridCache: GridCache?
     private var waveformTransitionStartTime: CFTimeInterval?
@@ -1456,6 +1457,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         renderState = renderState.withGainPreview(gainPreview)
     }
 
+    func displayCandidateRegions(_ candidateRegions: [TimelineRenderState.CandidateRegion]) {
+        renderState = renderState.withCandidateRegions(candidateRegions)
+    }
+
     func inverseFisheyeViewportProgress(
         _ visualViewportProgress: Float,
         trackID: UUID?,
@@ -1844,6 +1849,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             drawableSize: viewportSize,
             renderState: renderState
         )
+        let candidateRegionVertices = makeCandidateRegionVertices(
+            drawableSize: viewportSize,
+            renderState: renderState
+        )
         let usesWaveformShader = shouldRenderShaderWaveforms(
             drawableSize: viewportSize,
             renderState: renderState
@@ -1948,6 +1957,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         )
         encoder.setRenderPipelineState(pipelineState)
         draw(vertices: selectedTrackVertices, primitiveType: .triangle, encoder: encoder)
+        draw(vertices: candidateRegionVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: selectionVertices, primitiveType: .triangle, encoder: encoder, fisheye: selectionFisheye)
         if let previousShaderRenderState, usesPreviousWaveformShader {
             encoder.setRenderPipelineState(waveformPipelineState)
@@ -4484,6 +4494,98 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         )
 
         return selectionVertexScratch
+    }
+
+    private func makeCandidateRegionVertices(
+        drawableSize: CGSize,
+        renderState: TimelineRenderState
+    ) -> [TimelineVertex] {
+        candidateRegionVertexScratch.removeAll(keepingCapacity: true)
+        guard renderState.hasWaveforms, !renderState.candidateRegions.isEmpty else {
+            return candidateRegionVertexScratch
+        }
+
+        let viewport = renderState.viewport
+        let viewportStart = Double(viewport.startProgress)
+        let viewportDuration = max(Double(viewport.durationProgress), 0.000_000_001)
+        let pixelWidth = drawableSize.width > 0 ? Float(1.0 / drawableSize.width) : 0
+        let pixelHeight = drawableSize.height > 0 ? Float(1.0 / drawableSize.height) : 0
+        candidateRegionVertexScratch.reserveCapacity(renderState.candidateRegions.count * 30)
+
+        for region in renderState.candidateRegions where region.selection.durationProgress > 0 {
+            let left = Float((region.selection.startProgress - viewportStart) / viewportDuration)
+            let right = Float((region.selection.endProgress - viewportStart) / viewportDuration)
+            guard right > 0, left < 1 else {
+                continue
+            }
+            guard let verticalRange = selectionVerticalRange(
+                for: region.selection,
+                renderState: renderState,
+                drawableSize: drawableSize
+            ) else {
+                continue
+            }
+
+            let clampedLeft = max(left, 0)
+            let clampedRight = min(right, 1)
+            guard clampedRight > clampedLeft else {
+                continue
+            }
+
+            let fillColor = region.isActive ?
+                SIMD4<Float>(0.95, 0.82, 0.36, 0.22) :
+                SIMD4<Float>(0.92, 0.68, 0.24, 0.14)
+            let outlineColor = region.isActive ?
+                SIMD4<Float>(1.0, 0.92, 0.54, 0.72) :
+                SIMD4<Float>(0.98, 0.76, 0.32, 0.42)
+            let top = max(verticalRange.top, 0)
+            let bottom = min(verticalRange.bottom, 1)
+            appendRectangle(
+                to: &candidateRegionVertexScratch,
+                left: clampedLeft,
+                right: clampedRight,
+                top: top,
+                bottom: bottom,
+                color: fillColor
+            )
+
+            let edgeWidth = max(pixelWidth * (region.isActive ? 2.0 : 1.0), 0.001)
+            let edgeHeight = max(pixelHeight * (region.isActive ? 2.0 : 1.0), 0.001)
+            appendRectangle(
+                to: &candidateRegionVertexScratch,
+                left: clampedLeft,
+                right: min(clampedLeft + edgeWidth, clampedRight),
+                top: top,
+                bottom: bottom,
+                color: outlineColor
+            )
+            appendRectangle(
+                to: &candidateRegionVertexScratch,
+                left: max(clampedRight - edgeWidth, clampedLeft),
+                right: clampedRight,
+                top: top,
+                bottom: bottom,
+                color: outlineColor
+            )
+            appendRectangle(
+                to: &candidateRegionVertexScratch,
+                left: clampedLeft,
+                right: clampedRight,
+                top: top,
+                bottom: min(top + edgeHeight, bottom),
+                color: outlineColor
+            )
+            appendRectangle(
+                to: &candidateRegionVertexScratch,
+                left: clampedLeft,
+                right: clampedRight,
+                top: max(bottom - edgeHeight, top),
+                bottom: bottom,
+                color: outlineColor
+            )
+        }
+
+        return candidateRegionVertexScratch
     }
 
     private func makeSelectedTrackVertices(
