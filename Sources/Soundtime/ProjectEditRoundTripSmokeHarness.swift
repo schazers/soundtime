@@ -62,12 +62,14 @@ enum ProjectEditRoundTripSmokeHarness {
                     editTimeline: originalState
                 ),
             ],
-            windowLayout: SoundtimeProject.WindowLayout(x: 20, y: 40, width: 1280, height: 720)
+            windowLayout: SoundtimeProject.WindowLayout(x: 20, y: 40, width: 1280, height: 720),
+            masterVolume: 0.61
         )
 
         let encodedProject = try JSONEncoder().encode(project)
         let decodedProject = try JSONDecoder().decode(SoundtimeProject.self, from: encodedProject)
         try require(decodedProject.tracks.count == 1, "project track count mismatch")
+        try requireLegacyProjectWithoutMasterVolumeDecodes()
 
         let decodedTrack = try requireValue(decodedProject.tracks.first, "decoded project has no track")
         try require(decodedTrack.id == trackID, "track ID did not persist")
@@ -76,6 +78,7 @@ enum ProjectEditRoundTripSmokeHarness {
         try require(abs(decodedTrack.volume - 0.73) < 0.000_001, "track volume did not persist")
         try require(decodedTrack.isMuted, "track mute state did not persist")
         try require(!decodedTrack.isSoloed, "track solo state did not persist")
+        try require(abs((decodedProject.masterVolume ?? -1) - 0.61) < 0.000_001, "master volume did not persist")
 
         let decodedState = try requireValue(decodedTrack.editTimeline, "project dropped edit timeline")
         try requirePersistentStatesMatch(originalState, decodedState)
@@ -217,6 +220,22 @@ enum ProjectEditRoundTripSmokeHarness {
                 "edited overview bin \(index) mismatch"
             )
         }
+    }
+
+    private static func requireLegacyProjectWithoutMasterVolumeDecodes() throws {
+        let legacyJSON = """
+        {
+          "tracks" : [],
+          "windowLayout" : {
+            "height" : 720,
+            "width" : 1280,
+            "x" : 20,
+            "y" : 40
+          }
+        }
+        """.data(using: .utf8)!
+        let legacyProject = try JSONDecoder().decode(SoundtimeProject.self, from: legacyJSON)
+        try require(legacyProject.masterVolume == nil, "legacy project unexpectedly decoded master volume")
     }
 
     private static func requireValue<Value>(_ value: Value?, _ message: String) throws -> Value {

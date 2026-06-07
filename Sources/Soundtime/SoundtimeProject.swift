@@ -20,6 +20,7 @@ struct SoundtimeProject: Codable, Sendable {
 
     var tracks: [Track]
     var windowLayout: WindowLayout?
+    var masterVolume: Float?
 }
 
 enum SoundtimeProjectStore {
