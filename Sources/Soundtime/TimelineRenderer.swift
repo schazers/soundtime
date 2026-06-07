@@ -1084,6 +1084,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     func displayTracks(_ tracks: [TimelineRenderState.Track], animateWaveformTransition: Bool = true) {
         let previousTracks = renderState.tracks
         let renderTracks = tracks.map { lightweightRenderTrack(from: $0) }
+        let nextRenderState = renderState.withTracks(renderTracks)
         let hasNextWaveforms = renderTracks.contains { $0.hasWaveform }
         var nextTrackWaveformMipLevels: [UUID: [WaveformMipLevel]] = [:]
         var nextTrackWaveformMipKeys: [UUID: WaveformMipCacheKey] = [:]
@@ -1125,13 +1126,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         prewarmInitialWaveformShaderBuffers(
             tracks: renderTracks,
             trackWaveformMipLevels: nextTrackWaveformMipLevels,
-            renderState: renderState.withTracks(renderTracks),
+            renderState: nextRenderState,
             drawableSize: lastRenderViewportSize
         )
         prewarmInteractiveWaveformShaderBuffers(
             tracks: renderTracks,
             trackWaveformMipLevels: nextTrackWaveformMipLevels,
-            renderState: renderState.withTracks(renderTracks),
+            renderState: nextRenderState,
             drawableSize: lastRenderViewportSize
         )
         gridCache = nil
@@ -1147,14 +1148,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         lastTransientParticleBins.removeAll()
         previousRenderedPlayheadX = nil
         previousRenderedPlayheadTime = nil
-        resetTrackFisheyeAudibility(for: renderTracks, at: CACurrentMediaTime())
-        renderState = renderState.withTracks(renderTracks)
+        resetTrackFisheyeAudibility(for: nextRenderState, at: CACurrentMediaTime())
+        renderState = nextRenderState
     }
 
     func displayTrackMixSettings(_ tracks: [TimelineRenderState.Track]) {
         let renderTracks = tracks.map { lightweightRenderTrack(from: $0) }
-        updateTrackFisheyeAudibility(for: renderTracks, at: CACurrentMediaTime())
-        renderState = renderState.withTracks(renderTracks)
+        let nextRenderState = renderState.withTracks(renderTracks)
+        updateTrackFisheyeAudibility(for: nextRenderState, at: CACurrentMediaTime())
+        renderState = nextRenderState
     }
 
     private func lightweightRenderTrack(from track: TimelineRenderState.Track) -> TimelineRenderState.Track {
@@ -1719,7 +1721,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             renderState: renderState,
             displayTimestamp: displayTimestamp
         )
-        updateTrackFisheyeAudibility(for: renderState.tracks, at: displayTimestamp)
+        updateTrackFisheyeAudibility(for: renderState, at: displayTimestamp)
         let waveformFisheye = waveformFisheyeParameters(
             renderState: renderState,
             playheadProgress: renderedPlayheadProgress,
@@ -1996,7 +1998,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return false
         }
 
-        return renderState.tracks.contains { $0.hasWaveform }
+        return renderState.hasWaveforms
     }
 
     private func drawShaderWaveforms(
@@ -2025,7 +2027,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         let tracks = renderState.tracks
-        let anySolo = tracks.contains { $0.isSoloed }
+        let anySolo = renderState.hasSoloedTrack
         let style = waveformVisualStyle(renderState: renderState, projectDuration: projectDuration)
         let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
         waveformShaderBatchScratch.removeAll(keepingCapacity: true)
@@ -3651,7 +3653,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return
         }
 
-        let anySolo = renderState.tracks.contains { $0.isSoloed }
+        let anySolo = renderState.hasSoloedTrack
         let viewport = renderState.viewport
 
         for (trackIndex, track) in renderState.tracks.enumerated() {
@@ -4438,7 +4440,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return []
         }
 
-        let anySolo = tracks.contains { $0.isSoloed }
+        let anySolo = renderState.hasSoloedTrack
         let style = waveformVisualStyle(renderState: renderState, projectDuration: projectDuration)
         let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
         var vertices: [TimelineVertex] = []
@@ -4597,7 +4599,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
 
     private func resetTrackFisheyeAudibility(
-        for tracks: [TimelineRenderState.Track],
+        for renderState: TimelineRenderState,
         at timestamp: CFTimeInterval
     ) {
         guard waveformFisheyeEnabled else {
@@ -4606,7 +4608,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return
         }
 
-        let anySolo = tracks.contains { $0.isSoloed }
+        let tracks = renderState.tracks
+        let anySolo = renderState.hasSoloedTrack
         trackFisheyeAudibilitySignature = trackAudibilitySignature(
             for: tracks,
             anySolo: anySolo
@@ -4626,7 +4629,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
 
     private func updateTrackFisheyeAudibility(
-        for tracks: [TimelineRenderState.Track],
+        for renderState: TimelineRenderState,
         at timestamp: CFTimeInterval
     ) {
         guard waveformFisheyeEnabled else {
@@ -4637,7 +4640,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return
         }
 
-        let anySolo = tracks.contains { $0.isSoloed }
+        let tracks = renderState.tracks
+        let anySolo = renderState.hasSoloedTrack
         let nextSignature = trackAudibilitySignature(for: tracks, anySolo: anySolo)
         guard nextSignature != trackFisheyeAudibilitySignature else {
             return
