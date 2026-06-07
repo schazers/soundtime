@@ -2292,8 +2292,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         )
         let visibleBins = max(Float(max(binCount, 1)) * trackViewportProgress, 1)
         let pointsPerBin = Float(max(drawableSize.width, 1)) / visibleBins
-        let adaptiveSmoothing = min(max((pointsPerBin - 0.08) / 1.65, 0), 0.88)
-        return min(max(adaptiveSmoothing, 0.18), 0.96)
+        let adaptiveSmoothing = min(max((pointsPerBin - 0.02) / 1.15, 0.45), 1.0)
+        return min(max(adaptiveSmoothing, 0.45), 1.0)
     }
 
     private func waveformShaderDrawable(
