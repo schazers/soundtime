@@ -370,7 +370,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         core.seek(toFrame: snappedTargetFrame)
     }
 
-    func updateProjectTrackMix(_ tracks: [ProjectPlaybackTrack]) {
+    func updateProjectTrackMix(_ tracks: [ProjectPlaybackTrackMix]) {
         guard !preparedProjectTracks.isEmpty else {
             return
         }

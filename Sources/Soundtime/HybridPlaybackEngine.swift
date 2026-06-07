@@ -181,7 +181,7 @@ final class HybridPlaybackEngine: PlaybackEngine {
         try loadProjectTracks(tracks)
     }
 
-    func updateProjectTrackMix(_ tracks: [ProjectPlaybackTrack]) {
+    func updateProjectTrackMix(_ tracks: [ProjectPlaybackTrackMix]) {
         switch activeEngine {
         case .realtime:
             realtimeEngine?.updateProjectTrackMix(tracks)

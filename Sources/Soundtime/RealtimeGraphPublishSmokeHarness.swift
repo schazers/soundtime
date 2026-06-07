@@ -99,10 +99,8 @@ enum RealtimeGraphPublishSmokeHarness {
             try playbackEngine.updateProjectTracks(updatedTracks)
             publishDurations.append(milliseconds(since: publishStart))
 
-            let mixTracks = projectTracks(
+            let mixTracks = projectTrackMixes(
                 ids: trackIDs,
-                timelines: timelines,
-                sourceRevisions: sourceRevisions,
                 iteration: iteration + 1
             )
             let mixStart = DispatchTime.now().uptimeNanoseconds
@@ -293,6 +291,24 @@ enum RealtimeGraphPublishSmokeHarness {
                 id: ids[index],
                 source: .timeline(audioTimeline: timelines[index], zeroCrossingIndex: nil),
                 sourceRevision: sourceRevisions[index],
+                volume: volume,
+                isMuted: (index + iteration).isMultiple(of: 29),
+                isSoloed: false
+            ))
+        }
+        return tracks
+    }
+
+    private static func projectTrackMixes(
+        ids: [UUID],
+        iteration: Int
+    ) -> [ProjectPlaybackTrackMix] {
+        var tracks: [ProjectPlaybackTrackMix] = []
+        tracks.reserveCapacity(ids.count)
+        for index in ids.indices {
+            let volume = Float(0.54 + 0.42 * (Double((index + iteration) % 19) / 18.0))
+            tracks.append(ProjectPlaybackTrackMix(
+                id: ids[index],
                 volume: volume,
                 isMuted: (index + iteration).isMultiple(of: 29),
                 isSoloed: false

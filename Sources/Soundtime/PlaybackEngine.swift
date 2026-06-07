@@ -82,6 +82,13 @@ struct ProjectPlaybackTrack: Sendable {
     let isSoloed: Bool
 }
 
+struct ProjectPlaybackTrackMix: Sendable {
+    let id: UUID
+    let volume: Float
+    let isMuted: Bool
+    let isSoloed: Bool
+}
+
 @MainActor
 protocol PlaybackEngine: AnyObject {
     var isPlaying: Bool { get }
@@ -102,7 +109,7 @@ protocol PlaybackEngine: AnyObject {
     ) throws
     func clear()
     func updateZeroCrossingIndex(_ zeroCrossingIndex: AudioZeroCrossingIndex?)
-    func updateProjectTrackMix(_ tracks: [ProjectPlaybackTrack])
+    func updateProjectTrackMix(_ tracks: [ProjectPlaybackTrackMix])
     @discardableResult
     func togglePlayback() throws -> Bool
     func play() throws
@@ -134,7 +141,7 @@ extension PlaybackEngine {
         }
     }
 
-    func updateProjectTrackMix(_ tracks: [ProjectPlaybackTrack]) {}
+    func updateProjectTrackMix(_ tracks: [ProjectPlaybackTrackMix]) {}
 
     func updateProjectTracks(_ tracks: [ProjectPlaybackTrack]) throws {
         try loadProjectTracks(tracks)
