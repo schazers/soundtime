@@ -908,8 +908,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let playheadContactMinimumSpawnInterval: CFTimeInterval = 1.0 / 90.0
     private let transientParticleMaximumCount = 260
     private let maximumTransientParticleVerticesPerFrame = 10_000
-    private let deletionEffectDuration: CFTimeInterval = 0.18
-    private let deletionShardCount = 40
+    private let deletionEffectDuration: CFTimeInterval = 0.14
+    private let deletionShardCount = 28
     private let deletionEffectMaximumCount = 8
     private let deletionEffectMaximumCapturedBins = 512
     private let deletionRippleMaximumCapturedBins = 1_024
@@ -4205,9 +4205,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         let selectionWidth = max(rightX - leftX, 1)
         let pullDistance = max(selectionWidth, 22)
-        let slideTime = min(max(progress / 0.22, 0), 1)
+        let slideTime = min(max(progress / 0.18, 0), 1)
         let easedSlideTime = smoothStep(slideTime)
         let slideProgress = 1 - pow(1 - easedSlideTime, 2.45)
+        let maximumAnimatedTrailingWidth = min(
+            max(selectionWidth * 1.2 + 96, 140),
+            max(width * 0.18, 160)
+        )
+        trailingEndX = min(trailingEndX, rightX + maximumAnimatedTrailingWidth)
         let overlayRightX = max(
             rightX + 20 + min(pullDistance * 0.32, 90),
             trailingEndX + 6
@@ -7888,7 +7893,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             float rightX = right * width;
             float topY = top * height;
             float pullDistance = max(rightX - joinX, 22.0);
-            for (uint index = 0; index < 5; ++index) {
+            for (uint index = 0; index < 2; ++index) {
                 float localSeed = seed + float(index) * 153.31;
                 float y = topY + (0.20 + 0.60 * hash11(localSeed + 19.0)) * laneHeightPixels;
                 float jitter = (hash11(localSeed + 29.0) - 0.5) * laneHeightPixels * 0.08;
@@ -7905,7 +7910,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                     0.70,
                     0.98,
                     0.96,
-                    coverage * streakAlpha * (0.55 + hash11(localSeed + 73.0) * 0.45)
+                    coverage * streakAlpha * (0.42 + hash11(localSeed + 73.0) * 0.32)
                 ));
             }
         }
@@ -7976,10 +7981,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float ageSeconds = progress * duration;
         float2 center = float2(sourceX, sourceY) +
             direction * speed * ageSeconds * (0.35 + blast * 1.25);
-        float radius = 0.30 + 0.88 * hash11(seed + 89.0);
+        float radius = 0.18 + 0.52 * hash11(seed + 89.0);
         float dissolve = 1.0 - smoothstep(0.0, 1.0, progress);
         float alpha = progress < 0.78 ?
-            dissolve * dissolve * (0.12 + 0.09 * hash11(seed + 167.0)) :
+            dissolve * dissolve * (0.10 + 0.07 * hash11(seed + 167.0)) :
             0.0;
         float3 color = float3(
             0.70 + 0.30 * hash11(seed + 131.0),

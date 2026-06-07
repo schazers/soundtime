@@ -259,7 +259,7 @@ final class WorkspaceView: NSView {
     private var audioDevicePreferencesObserver: NSObjectProtocol?
     private var debugToolsVisible = false
     private let editMaterializationDelay: TimeInterval = 0.75
-    private let deleteMaterializationDelay: TimeInterval = 1.05
+    private let deleteMaterializationDelay: TimeInterval = 2.0
     private let editWaveformRefinementDelay: TimeInterval = 0.20
     private var editMaterializationTasks: [UUID: Task<Void, Never>] = [:]
     private var editMaterializationRequestIDs: [UUID: UUID] = [:]
