@@ -1420,6 +1420,20 @@ void soundtime_audio_core_set_transport_ramp_duration(
     );
 }
 
+void soundtime_audio_core_set_track_gain_ramp_duration(
+    SoundtimeAudioCoreEngine* engine,
+    double durationSeconds
+) {
+    if (engine == nullptr) {
+        return;
+    }
+
+    engine->configTrackGainRampDurationSeconds.store(
+        std::max(durationSeconds, 0.0),
+        std::memory_order_release
+    );
+}
+
 SoundtimeAudioCoreSnapshot soundtime_audio_core_snapshot(const SoundtimeAudioCoreEngine* engine) {
     if (engine == nullptr) {
         return SoundtimeAudioCoreSnapshot{};

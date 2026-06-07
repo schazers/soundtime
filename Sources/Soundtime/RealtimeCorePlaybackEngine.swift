@@ -48,6 +48,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         self.core = core
         self.outputDevice = outputDevice
         self.core.setTransportRampDuration(0.018)
+        self.core.setTrackGainRampDuration(0.006)
     }
 
     func setPerceptualVolume(_ volume: Float) {

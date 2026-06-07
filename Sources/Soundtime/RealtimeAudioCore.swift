@@ -384,6 +384,14 @@ final class RealtimeAudioCore {
         soundtime_audio_core_set_transport_ramp_duration(engine, max(duration, 0))
     }
 
+    func setTrackGainRampDuration(_ duration: TimeInterval) {
+        guard let engine else {
+            return
+        }
+
+        soundtime_audio_core_set_track_gain_ramp_duration(engine, max(duration, 0))
+    }
+
     func reset() {
         guard let engine else {
             return
