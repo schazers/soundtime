@@ -1083,7 +1083,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     func displayTracks(_ tracks: [TimelineRenderState.Track], animateWaveformTransition: Bool = true) {
         let previousTracks = renderState.tracks
-        let renderTracks = tracks.map { lightweightRenderTrack(from: $0) }
+        let currentTracksByID = Dictionary(uniqueKeysWithValues: previousTracks.map { ($0.id, $0) })
+        let renderTracks = tracks.map { lightweightRenderTrack(from: $0, currentTrack: currentTracksByID[$0.id]) }
         let nextRenderState = renderState.withTracks(renderTracks)
         let hasNextWaveforms = renderTracks.contains { $0.hasWaveform }
         var nextTrackWaveformMipLevels: [UUID: [WaveformMipLevel]] = [:]
@@ -1153,14 +1154,17 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
 
     func displayTrackMixSettings(_ tracks: [TimelineRenderState.Track]) {
-        let renderTracks = tracks.map { lightweightRenderTrack(from: $0) }
+        let currentTracksByID = Dictionary(uniqueKeysWithValues: renderState.tracks.map { ($0.id, $0) })
+        let renderTracks = tracks.map { lightweightRenderTrack(from: $0, currentTrack: currentTracksByID[$0.id]) }
         let nextRenderState = renderState.withTracks(renderTracks)
         updateTrackFisheyeAudibility(for: nextRenderState, at: CACurrentMediaTime())
         renderState = nextRenderState
     }
 
-    private func lightweightRenderTrack(from track: TimelineRenderState.Track) -> TimelineRenderState.Track {
-        let currentTrack = renderState.tracks.first { $0.id == track.id }
+    private func lightweightRenderTrack(
+        from track: TimelineRenderState.Track,
+        currentTrack: TimelineRenderState.Track? = nil
+    ) -> TimelineRenderState.Track {
         let durationHint = track.durationHint ?? track.waveformOverview?.duration ?? currentTrack?.durationHint
         let hasWaveform = track.waveformOverview?.isEmpty == false || currentTrack?.hasWaveform == true
         return TimelineRenderState.Track(
@@ -2504,7 +2508,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         renderState: TimelineRenderState,
         drawableSize: CGSize
     ) {
-        let visibleIDs = visiblePrewarmTrackIDs(
+        let visibleTracks = visiblePrewarmTracks(
             tracks: tracks,
             renderState: renderState,
             drawableSize: drawableSize
@@ -2513,10 +2517,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             renderState: renderState,
             drawableSize: drawableSize
         )
-        let visibleJobs = tracks.compactMap { track -> (TimelineRenderState.Track, WaveformMipLevel)? in
-            guard visibleIDs.contains(track.id) else {
-                return nil
-            }
+        let visibleJobs = visibleTracks.compactMap { track -> (TimelineRenderState.Track, WaveformMipLevel)? in
             guard let mipLevels = trackWaveformMipLevels[track.id] else {
                 return nil
             }
@@ -2578,7 +2579,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         renderState: TimelineRenderState,
         drawableSize: CGSize
     ) -> [WaveformMipCacheKey] {
-        let visibleIDs = visiblePrewarmTrackIDs(
+        let visibleTracks = visiblePrewarmTracks(
             tracks: tracks,
             renderState: renderState,
             drawableSize: drawableSize
@@ -2587,10 +2588,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             renderState: renderState,
             drawableSize: drawableSize
         )
-        return tracks.compactMap { track -> WaveformMipCacheKey? in
-            guard visibleIDs.contains(track.id) else {
-                return nil
-            }
+        return visibleTracks.compactMap { track -> WaveformMipCacheKey? in
             guard let mipLevels = trackWaveformMipLevels[track.id] else {
                 return nil
             }
@@ -2604,25 +2602,30 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
     }
 
-    private func visiblePrewarmTrackIDs(
+    private func visiblePrewarmTracks(
         tracks: [TimelineRenderState.Track],
         renderState: TimelineRenderState,
         drawableSize: CGSize
-    ) -> Set<UUID> {
+    ) -> [TimelineRenderState.Track] {
         guard !tracks.isEmpty else {
             return []
         }
 
         let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
         let visibleRange = trackLayout.visibleRange(overscan: 1)
-        let visibleTracks = visibleRange.compactMap { trackIndex -> TimelineRenderState.Track? in
+        var visibleTracks: [TimelineRenderState.Track] = []
+        visibleTracks.reserveCapacity(min(maximumViewportPrewarmTrackCount, visibleRange.count))
+        for trackIndex in visibleRange {
+            guard visibleTracks.count < maximumViewportPrewarmTrackCount else {
+                break
+            }
             guard tracks.indices.contains(trackIndex) else {
-                return nil
+                continue
             }
 
-            return tracks[trackIndex]
+            visibleTracks.append(tracks[trackIndex])
         }
-        return Set(visibleTracks.prefix(maximumViewportPrewarmTrackCount).map(\.id))
+        return visibleTracks
     }
 
     private func enqueueWaveformShaderPrewarmJobs(
