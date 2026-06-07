@@ -149,6 +149,14 @@ final class WorkspaceView: NSView {
         let editedFileTimeline: AudioFileEditTimeline?
     }
 
+    private struct SplitTrackEdit {
+        let trackIndex: Int
+        let trackID: UUID
+        let editedDuration: TimeInterval
+        let editedAudioTimeline: AudioEditTimeline?
+        let editedFileTimeline: AudioFileEditTimeline?
+    }
+
     private struct SilenceCleanupResult: Sendable {
         let frameRanges: [Range<Int>]
         let detectedRegionCount: Int
@@ -3927,14 +3935,17 @@ final class WorkspaceView: NSView {
 
         let snapshot = playbackController.snapshot()
         let projectProgress = min(max(snapshot.progress, 0), 1)
-        let insertionSelection = editInsertionSelection(
-            forPlaybackProgress: projectProgress,
-            trackIndex: trackIndex
-        )
-        guard
-            insertionSelection.startProgress > 0,
-            insertionSelection.startProgress < 1
-        else {
+        let scopedTrackIndices = scopedTrackIndices(anchorTrackIndex: trackIndex, scope: editScope)
+        let trackEdits: [SplitTrackEdit]
+        do {
+            trackEdits = try scopedTrackIndices.compactMap {
+                try preparedSplitTrackEdit(trackIndex: $0, projectProgress: projectProgress)
+            }
+        } catch {
+            updateStatus("split failed: \(error.localizedDescription)")
+            return
+        }
+        guard !trackEdits.isEmpty else {
             updateStatus("move the playhead inside the track to split")
             return
         }
@@ -3948,46 +3959,27 @@ final class WorkspaceView: NSView {
             restoreProgress: projectProgress
         )
 
-        let editedAudioTimeline: AudioEditTimeline?
-        let editedFileTimeline: AudioFileEditTimeline?
-        let editedDuration: TimeInterval
+        editUndoStack.append(.projectTracks(undoSnapshot))
+        for edit in trackEdits {
+            guard projectTracks.indices.contains(edit.trackIndex) else {
+                continue
+            }
 
-        if let currentFileTimeline = try? preferredFileTimelineForEditing(trackIndex: trackIndex) {
-            var timeline = currentFileTimeline
-            guard timeline.split(atProgress: insertionSelection.startProgress) else {
-                updateStatus("already split at playhead")
-                return
-            }
-            editedAudioTimeline = nil
-            editedFileTimeline = timeline
-            editedDuration = timeline.duration
-        } else if let currentTimeline = projectTracks[trackIndex].audioTimeline {
-            var timeline = currentTimeline
-            guard timeline.split(atProgress: insertionSelection.startProgress) else {
-                updateStatus("already split at playhead")
-                return
-            }
-            editedAudioTimeline = timeline
-            editedFileTimeline = nil
-            editedDuration = timeline.duration
-        } else {
-            updateStatus("track is not ready to split")
-            return
+            projectTracks[edit.trackIndex].editRevision += 1
+            projectTracks[edit.trackIndex].audioTimeline = edit.editedAudioTimeline
+            projectTracks[edit.trackIndex].fileTimeline = edit.editedFileTimeline
+            projectTracks[edit.trackIndex].decodedAudioBuffer = edit.editedAudioTimeline?.sourceAudioBuffer
+            projectTracks[edit.trackIndex].durationHint = edit.editedDuration
         }
 
-        editUndoStack.append(.projectTracks(undoSnapshot))
-        projectTracks[trackIndex].editRevision += 1
-        projectTracks[trackIndex].audioTimeline = editedAudioTimeline
-        projectTracks[trackIndex].fileTimeline = editedFileTimeline
-        projectTracks[trackIndex].decodedAudioBuffer = editedAudioTimeline?.sourceAudioBuffer
-        projectTracks[trackIndex].durationHint = editedDuration
         refreshProjectTimelineDisplay(rebuildControls: false, animateWaveformTransition: false)
         reloadPlaybackFromProjectTracks(
             preserveProgress: true,
             resumeIfPlaying: playbackController.isPlaying
         )
         updateEffectCommandState()
-        updateStatus("split at \(formatClockTime(Double(projectProgress) * displayedDuration))")
+        let scopeSuffix = trackEdits.count > 1 ? " across \(trackEdits.count) tracks" : ""
+        updateStatus("split at \(formatClockTime(Double(projectProgress) * displayedDuration))\(scopeSuffix)")
     }
 
     private func silenceCleanupTarget() -> EditableSelectionTarget? {
@@ -5146,42 +5138,40 @@ final class WorkspaceView: NSView {
         for target: EditableSelectionTarget,
         scope: EditScope
     ) -> [EditableSelectionTarget] {
+        scopedTrackIndices(anchorTrackIndex: target.trackIndex, scope: scope).compactMap { trackIndex in
+            if trackIndex == target.trackIndex {
+                return target
+            }
+            return rippleDeleteTarget(
+                matching: target.displaySelection,
+                trackIndex: trackIndex
+            )
+        }
+    }
+
+    private func scopedTrackIndices(
+        anchorTrackIndex: Int,
+        scope: EditScope
+    ) -> [Int] {
+        guard projectTracks.indices.contains(anchorTrackIndex) else {
+            return []
+        }
+
         switch scope {
         case .track:
-            return [target]
+            return [anchorTrackIndex]
         case .selected:
             let selectedIDs = selectedTrackIDs.isEmpty ?
-                Set([projectTracks[target.trackIndex].id]) :
+                Set([projectTracks[anchorTrackIndex].id]) :
                 selectedTrackIDs
-            return projectTracks.indices.compactMap { trackIndex in
-                guard selectedIDs.contains(projectTracks[trackIndex].id) else {
-                    return nil
-                }
-                return rippleDeleteTarget(
-                    matching: target.displaySelection,
-                    trackIndex: trackIndex
-                )
-            }
+            return projectTracks.indices.filter { selectedIDs.contains(projectTracks[$0].id) }
         case .group:
-            guard let editGroupID = projectTracks[target.trackIndex].editGroupID else {
-                return [target]
+            guard let editGroupID = projectTracks[anchorTrackIndex].editGroupID else {
+                return [anchorTrackIndex]
             }
-            return projectTracks.indices.compactMap { trackIndex in
-                guard projectTracks[trackIndex].editGroupID == editGroupID else {
-                    return nil
-                }
-                return rippleDeleteTarget(
-                    matching: target.displaySelection,
-                    trackIndex: trackIndex
-                )
-            }
+            return projectTracks.indices.filter { projectTracks[$0].editGroupID == editGroupID }
         case .all:
-            return projectTracks.indices.compactMap { trackIndex in
-                rippleDeleteTarget(
-                    matching: target.displaySelection,
-                    trackIndex: trackIndex
-                )
-            }
+            return Array(projectTracks.indices)
         }
     }
 
@@ -5302,6 +5292,54 @@ final class WorkspaceView: NSView {
                 trackID: trackID,
                 editSelection: selectionToClear,
                 clearedDuration: clearedDuration,
+                editedDuration: timeline.duration,
+                editedAudioTimeline: timeline,
+                editedFileTimeline: nil
+            )
+        }
+
+        return nil
+    }
+
+    private func preparedSplitTrackEdit(
+        trackIndex: Int,
+        projectProgress: Float
+    ) throws -> SplitTrackEdit? {
+        guard projectTracks.indices.contains(trackIndex) else {
+            return nil
+        }
+
+        let insertionSelection = editInsertionSelection(
+            forPlaybackProgress: projectProgress,
+            trackIndex: trackIndex
+        )
+        guard insertionSelection.startProgress > 0, insertionSelection.startProgress < 1 else {
+            return nil
+        }
+
+        let trackID = projectTracks[trackIndex].id
+        if let currentFileTimeline = try preferredFileTimelineForEditing(trackIndex: trackIndex) {
+            var timeline = currentFileTimeline
+            guard timeline.split(atProgress: insertionSelection.startProgress) else {
+                return nil
+            }
+            return SplitTrackEdit(
+                trackIndex: trackIndex,
+                trackID: trackID,
+                editedDuration: timeline.duration,
+                editedAudioTimeline: nil,
+                editedFileTimeline: timeline
+            )
+        }
+
+        if let currentTimeline = projectTracks[trackIndex].audioTimeline {
+            var timeline = currentTimeline
+            guard timeline.split(atProgress: insertionSelection.startProgress) else {
+                return nil
+            }
+            return SplitTrackEdit(
+                trackIndex: trackIndex,
+                trackID: trackID,
                 editedDuration: timeline.duration,
                 editedAudioTimeline: timeline,
                 editedFileTimeline: nil
@@ -6943,6 +6981,17 @@ final class WorkspaceView: NSView {
             return false
         }
 
+        let projectProgress = playbackController.snapshot().progress
+        return scopedTrackIndices(anchorTrackIndex: trackIndex, scope: editScope).contains { scopedTrackIndex in
+            canSplitTrack(at: scopedTrackIndex, projectProgress: projectProgress)
+        }
+    }
+
+    private func canSplitTrack(at trackIndex: Int, projectProgress: Float) -> Bool {
+        guard projectTracks.indices.contains(trackIndex) else {
+            return false
+        }
+
         let track = projectTracks[trackIndex]
         let hasEditableTimeline =
             track.audioTimeline != nil ||
@@ -6953,7 +7002,7 @@ final class WorkspaceView: NSView {
         }
 
         let insertionSelection = editInsertionSelection(
-            forPlaybackProgress: playbackController.snapshot().progress,
+            forPlaybackProgress: projectProgress,
             trackIndex: trackIndex
         )
         return insertionSelection.startProgress > 0 && insertionSelection.startProgress < 1
