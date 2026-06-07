@@ -71,6 +71,7 @@ enum SoundtimeProjectStore {
 
     static func clearRecentProjectURLs() {
         UserDefaults.standard.removeObject(forKey: recentProjectURLPathsKey)
+        UserDefaults.standard.removeObject(forKey: lastProjectURLKey)
     }
 
     private static func recentProjectURLPaths() -> [String] {
