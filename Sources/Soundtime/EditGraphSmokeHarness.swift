@@ -395,6 +395,44 @@ enum EditPreviewSmokeHarness {
                 "delete prefix stability smoke changed untouched prefix bin \(index)"
             )
         }
+
+        var clearTimeline = AudioFileEditTimeline(fileInfo: fileInfo)
+        let clearedFrames = clearTimeline.clear(selection)
+        try require(clearedFrames == deletedFrames, "clear smoke touched a different frame count")
+
+        let clearedOverview = clearTimeline.waveformOverview(from: sourceOverview)
+        try require(
+            clearedOverview.bins.count == sourceOverview.bins.count,
+            "clear smoke changed the preview length"
+        )
+        try require(
+            abs(clearedOverview.duration - sourceOverview.duration) <= 0.000_001,
+            "clear smoke changed the timeline duration"
+        )
+
+        let clearStartIndex = min(
+            max(Int((selection.startProgress * Double(sourceOverview.bins.count)).rounded(.down)), 0),
+            sourceOverview.bins.count
+        )
+        let clearEndIndex = min(
+            max(Int((selection.endProgress * Double(sourceOverview.bins.count)).rounded(.up)), clearStartIndex),
+            sourceOverview.bins.count
+        )
+        for index in 0..<stablePrefixEndIndex {
+            try require(
+                binsMatch(sourceOverview.bins[index], clearedOverview.bins[index]),
+                "clear smoke changed untouched prefix bin \(index)"
+            )
+        }
+        for index in clearStartIndex..<clearEndIndex {
+            let bin = clearedOverview.bins[index]
+            try require(
+                abs(bin.minimumSample) <= 0.000_001 &&
+                    abs(bin.maximumSample) <= 0.000_001 &&
+                    bin.rmsSample <= 0.000_001,
+                "clear smoke left audible preview energy in bin \(index)"
+            )
+        }
     }
 
     private static func makeSourceOverview(duration: TimeInterval, binCount: Int) -> WaveformOverview {

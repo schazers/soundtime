@@ -441,6 +441,9 @@ final class WorkspaceView: NSView {
         timelineSurface.onDeleteSelection = { [weak self] in
             self?.deleteSelectedTrackOrSelection()
         }
+        timelineSurface.onClearSelection = { [weak self] in
+            self?.clearSelection()
+        }
         timelineSurface.onCutSelection = { [weak self] in
             self?.cutSelection()
         }
@@ -935,13 +938,16 @@ final class WorkspaceView: NSView {
             return nil
         }
 
-        if
-            (event.keyCode == 51 || event.keyCode == 117),
-            selectedTrackID != nil || (selectedTimelineRange?.durationProgress ?? 0) > 0,
-            !event.modifierFlags.contains(.command)
-        {
-            deleteSelectedTrackOrSelection()
-            return nil
+        if event.keyCode == 51 || event.keyCode == 117 {
+            if event.modifierFlags.contains(.command) {
+                clearSelection()
+                return nil
+            }
+
+            if selectedTrackID != nil || (selectedTimelineRange?.durationProgress ?? 0) > 0 {
+                deleteSelectedTrackOrSelection()
+                return nil
+            }
         }
 
         let transportModifierMask: NSEvent.ModifierFlags = [.command, .control, .option]
@@ -3476,6 +3482,12 @@ final class WorkspaceView: NSView {
             }
             deleteSelectedTrackOrSelection()
             return AgentCommandResult(status: .accepted, message: "Agent: delete requested")
+        case .clearSelection:
+            guard currentEditableSelectionTarget() != nil else {
+                return AgentCommandResult(status: .failed, message: "Agent: select audio to clear")
+            }
+            clearSelection()
+            return AgentCommandResult(status: .accepted, message: "Agent: clear requested")
         case .cutSelection:
             guard currentEditableSelectionTarget() != nil else {
                 return AgentCommandResult(status: .failed, message: "Agent: select audio to cut")
@@ -3535,6 +3547,143 @@ final class WorkspaceView: NSView {
 
     private func deleteSelection() {
         performOptimisticDelete(copyBeforeDeleting: false)
+    }
+
+    private func clearSelection() {
+        guard
+            let target = currentEditableSelectionTarget(),
+            projectTracks.indices.contains(target.trackIndex)
+        else {
+            updateStatus("select audio to clear")
+            return
+        }
+
+        let trackIndex = target.trackIndex
+        let displaySelectionToClear = target.displaySelection
+        let selectionToClear = target.editSelection
+        let trackID = projectTracks[trackIndex].id
+        let undoSnapshot = ProjectTrackUndoSnapshot(
+            tracks: projectTracks,
+            activeTrackID: activeTrackID,
+            selectedTrackID: selectedTrackID,
+            selectedTimelineRange: selectedTimelineRange,
+            restoreProgress: displaySelectionToClear.startProgressFloat
+        )
+
+        SoundtimeDiagnostics.shared.record(
+            category: .edit,
+            severity: .info,
+            name: "clear-selection",
+            message: "User requested a non-ripple clear edit.",
+            fields: [
+                "trackIndex": "\(trackIndex)",
+                "startProgress": String(format: "%.9f", selectionToClear.startProgress),
+                "endProgress": String(format: "%.9f", selectionToClear.endProgress),
+            ]
+        )
+
+        let selectedDuration: TimeInterval
+        let editedDuration: TimeInterval
+        let editedAudioTimeline: AudioEditTimeline?
+        let editedFileTimeline: AudioFileEditTimeline?
+
+        if let currentFileTimeline = try? preferredFileTimelineForEditing(trackIndex: trackIndex) {
+            var timeline = currentFileTimeline
+            selectedDuration = selectionToClear.duration(in: currentFileTimeline.duration)
+            let affectedFrameCount = timeline.clear(selectionToClear)
+            guard affectedFrameCount > 0 else {
+                return
+            }
+            editedDuration = timeline.duration
+            editedAudioTimeline = nil
+            editedFileTimeline = timeline
+        } else if let currentTimeline = projectTracks[trackIndex].audioTimeline {
+            var timeline = currentTimeline
+            selectedDuration = selectionToClear.duration(in: currentTimeline.duration)
+            let affectedFrameCount = timeline.clear(selectionToClear)
+            guard affectedFrameCount > 0 else {
+                return
+            }
+            editedDuration = timeline.duration
+            editedAudioTimeline = timeline
+            editedFileTimeline = nil
+        } else {
+            let currentFileTimeline: AudioFileEditTimeline
+            do {
+                currentFileTimeline = try editableFileTimeline(forTrackAt: trackIndex)
+            } catch {
+                updateStatus("clear failed: \(error.localizedDescription)")
+                return
+            }
+
+            var timeline = currentFileTimeline
+            selectedDuration = selectionToClear.duration(in: currentFileTimeline.duration)
+            let affectedFrameCount = timeline.clear(selectionToClear)
+            guard affectedFrameCount > 0 else {
+                return
+            }
+            editedDuration = timeline.duration
+            editedAudioTimeline = nil
+            editedFileTimeline = timeline
+        }
+
+        editUndoStack.append(.projectTracks(undoSnapshot))
+        projectTracks[trackIndex].editRevision += 1
+        let editRevision = projectTracks[trackIndex].editRevision
+        projectTracks[trackIndex].audioTimeline = editedAudioTimeline
+        projectTracks[trackIndex].fileTimeline = editedFileTimeline
+        projectTracks[trackIndex].decodedAudioBuffer = nil
+        projectTracks[trackIndex].durationHint = editedDuration
+        let currentOverview = projectTracks[trackIndex].waveformOverview
+        if let editedFileTimeline {
+            projectTracks[trackIndex].waveformOverview =
+                optimisticWaveformOverview(
+                    currentOverview,
+                    applyingGain: 0,
+                    to: selectionToClear
+                ) ??
+                optimisticWaveformOverview(
+                    for: editedFileTimeline,
+                    sourceOverview: projectTracks[trackIndex].sourceWaveformOverview,
+                    fallbackOverview: currentOverview
+                )
+            scheduleFileTimelineWaveformRefinement(
+                trackID: trackID,
+                fileTimeline: editedFileTimeline,
+                sourceOverview: projectTracks[trackIndex].sourceWaveformOverview ?? currentOverview,
+                editRevision: editRevision
+            )
+        } else {
+            projectTracks[trackIndex].waveformOverview = optimisticWaveformOverview(
+                currentOverview,
+                applyingGain: 0,
+                to: selectionToClear
+            )
+            cancelEditWaveformRefinement(for: trackID)
+        }
+
+        selectedTimelineRange = nil
+        timelineSurface.displaySelection(nil)
+        timelineSurface.displayGainPreview(selection: nil, gain: 1)
+        syncActiveTrackFields()
+        refreshProjectTimelineDisplay(rebuildControls: false)
+        updateProjectDisplayTiming()
+        reloadPlaybackFromProjectTracks(preserveProgress: true)
+        updateEffectCommandState()
+        let status = "cleared \(formatDuration(selectedDuration))"
+        updateStatus(status)
+
+        if let editedAudioTimeline {
+            materializeEditedTimeline(
+                trackID: trackID,
+                timeline: editedAudioTimeline,
+                editRevision: editRevision,
+                status: status,
+                preservePlaybackProgress: true,
+                startDelay: editMaterializationDelay,
+                animateWaveformTransition: false
+            )
+        }
     }
 
     private func deleteSelectedTrackOrSelection() {
@@ -5949,11 +6098,21 @@ final class WorkspaceView: NSView {
             WAVAudioDecoder.canDecode(track.sourceURL)
     }
 
+    private var canDeleteSelection: Bool {
+        selectedTrackID != nil || currentEditableSelectionTarget() != nil
+    }
+
+    private var canClearSelection: Bool {
+        currentEditableSelectionTarget() != nil
+    }
+
     private func updateEffectCommandState() {
         timelineSurface.canApplyGainEffect = canApplyGainEffect
         timelineSurface.canApplyFadeEffect = canApplyGainEffect
         timelineSurface.canReapplyLastEffect = lastEffect != nil && canApplyGainEffect
         timelineSurface.canSplitAtPlayhead = canSplitAtPlayhead
+        timelineSurface.canDeleteSelection = canDeleteSelection
+        timelineSurface.canClearSelection = canClearSelection
         timelineSurface.canDeleteSilence = canDeleteSilence
     }
 

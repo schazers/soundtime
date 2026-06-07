@@ -30,6 +30,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onAudioFileDropped: ((URL) -> Void)?
     var onTogglePlayback: (() -> Void)?
     var onDeleteSelection: (() -> Void)?
+    var onClearSelection: (() -> Void)?
     var onCutSelection: (() -> Void)?
     var onCopySelection: (() -> Void)?
     var onPasteAudio: (() -> Void)?
@@ -59,6 +60,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var canApplyFadeEffect = false
     var canReapplyLastEffect = false
     var canSplitAtPlayhead = false
+    var canDeleteSelection = false
+    var canClearSelection = false
     var canDeleteSilence = false
     var isDebugToolsVisible = false
 
@@ -777,6 +780,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        if (event.keyCode == 51 || event.keyCode == 117), event.modifierFlags.contains(.command) {
+            onClearSelection?()
+            return
+        }
+
         if event.keyCode == 51 || event.keyCode == 117 {
             onDeleteSelection?()
             return
@@ -860,6 +868,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onPasteAudio?()
     }
 
+    @objc func deleteTimelineSelection(_ sender: Any?) {
+        onDeleteSelection?()
+    }
+
+    @objc func clearTimelineSelection(_ sender: Any?) {
+        onClearSelection?()
+    }
+
     @objc func splitAtPlayhead(_ sender: Any?) {
         onSplitAtPlayhead?()
     }
@@ -900,6 +916,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return canDeleteSilence
         case #selector(reapplyLastEffect(_:)):
             return canReapplyLastEffect
+        case #selector(deleteTimelineSelection(_:)):
+            return canDeleteSelection
+        case #selector(clearTimelineSelection(_:)):
+            return canClearSelection
         case #selector(splitAtPlayhead(_:)):
             return canSplitAtPlayhead
         case #selector(toggleDebugTools(_:)):

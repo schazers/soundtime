@@ -394,6 +394,14 @@ struct AudioFileEditTimeline: Sendable {
         deleteFrames(in: frameRange)
     }
 
+    mutating func clear(_ selection: TimelineSelection) -> Int {
+        clearFrames(in: frameRange(for: selection))
+    }
+
+    mutating func clear(frameRange: Range<Int>) -> Int {
+        clearFrames(in: frameRange)
+    }
+
     mutating func applyGain(_ gain: Float, to selection: TimelineSelection) -> Int {
         applyGain(gain, toFramesIn: frameRange(for: selection))
     }
@@ -517,6 +525,10 @@ struct AudioFileEditTimeline: Sendable {
         segments = Self.coalescedSegments(nextSegments)
         timelineFrameCount = originalFrameCount - deletedFrameCount
         return deletedFrameCount
+    }
+
+    private mutating func clearFrames(in frameRange: Range<Int>) -> Int {
+        applyGain(0, toFramesIn: frameRange)
     }
 
     private mutating func applyGain(_ gain: Float, toFramesIn frameRange: Range<Int>) -> Int {
