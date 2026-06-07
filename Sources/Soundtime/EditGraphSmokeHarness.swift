@@ -27,9 +27,14 @@ enum EditGraphSmokeHarness {
         )
 
         var timeline = AudioFileEditTimeline(fileInfo: fileInfo)
+        let pasteClip = try requireValue(
+            timeline.clip(for: TimelineSelection(startProgress: 0.018, endProgress: 0.0192)),
+            "edit graph smoke could not prepare paste clip"
+        )
         let operationCount = arguments.contains("--edit-graph-smoke-full") ? 1_500 : 640
         let startTime = DispatchTime.now().uptimeNanoseconds
         var touchedFrameCount = 0
+        var deletedFrameCount = 0
         var operationDurations: [Double] = []
         operationDurations.reserveCapacity(operationCount)
 
@@ -42,17 +47,23 @@ enum EditGraphSmokeHarness {
             )
 
             let operationStartTime = DispatchTime.now().uptimeNanoseconds
-            switch index % 5 {
+            switch index % 7 {
             case 0:
-                touchedFrameCount += timeline.delete(selection)
+                let removedFrameCount = timeline.delete(selection)
+                touchedFrameCount += removedFrameCount
+                deletedFrameCount += removedFrameCount
             case 1:
                 touchedFrameCount += timeline.applyGain(0.72, to: selection)
             case 2:
                 touchedFrameCount += timeline.applyGain(1.18, to: selection)
             case 3:
                 touchedFrameCount += timeline.applyFade(.fadeIn, to: selection)
-            default:
+            case 4:
                 touchedFrameCount += timeline.applyFade(.fadeOut, to: selection)
+            case 5:
+                touchedFrameCount += timeline.replace(selection, with: pasteClip) ?? 0
+            default:
+                touchedFrameCount += timeline.applyGain(1.36, to: selection)
             }
             let operationMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - operationStartTime) / 1_000_000
             operationDurations.append(operationMilliseconds)
@@ -63,8 +74,8 @@ enum EditGraphSmokeHarness {
         let maximumOperationMilliseconds = operationDurations.max() ?? 0
         let state = try requireValue(timeline.persistentState, "edit graph did not persist")
         try require(touchedFrameCount > 0, "edit graph operations touched no frames")
-        try require(timeline.frameCount < sourceFrameCount, "delete operations did not shorten the timeline")
-        try require(state.segments.count < operationCount * 3, "edit graph segment count exploded: \(state.segments.count)")
+        try require(deletedFrameCount > 0, "delete operations did not remove frames")
+        try require(state.segments.count < operationCount * 4, "edit graph segment count exploded: \(state.segments.count)")
         try require(
             p95OperationMilliseconds < 2.0,
             String(format: "edit graph operation p95 was too slow: %.2fms", p95OperationMilliseconds)
@@ -193,6 +204,10 @@ enum EditPreviewSmokeHarness {
         )
 
         var timeline = AudioFileEditTimeline(fileInfo: fileInfo)
+        let pasteClip = try requireValue(
+            timeline.clip(for: TimelineSelection(startProgress: 0.025, endProgress: 0.0265)),
+            "edit preview smoke could not prepare paste clip"
+        )
         var latestOverview = sourceOverview
         var maximumPreviewMilliseconds = 0.0
         var previewDurations: [Double] = []
@@ -207,13 +222,17 @@ enum EditPreviewSmokeHarness {
                 endProgress: min(startProgress + durationProgress, 0.995)
             )
 
-            switch index % 4 {
+            switch index % 6 {
             case 0:
                 _ = timeline.delete(selection)
             case 1:
                 _ = timeline.applyGain(0.64, to: selection)
             case 2:
-                _ = timeline.applyGain(1.22, to: selection)
+                let peak = peakMagnitude(in: latestOverview, selection: selection)
+                let normalizeGain = min(max(1 / max(peak, 0.000_001), 0), 8)
+                _ = timeline.applyGain(normalizeGain, to: selection)
+            case 3:
+                _ = timeline.replace(selection, with: pasteClip)
             default:
                 let fadeDirection: AudioEditTimeline.FadeDirection = index.isMultiple(of: 2) ? .fadeIn : .fadeOut
                 _ = timeline.applyFade(fadeDirection, to: selection)
@@ -231,7 +250,7 @@ enum EditPreviewSmokeHarness {
         let state = try requireValue(timeline.persistentState, "edit graph did not persist")
         try require(!latestOverview.bins.isEmpty, "optimistic preview became empty")
         try require(latestOverview.duration > 0, "optimistic preview duration became invalid")
-        try require(state.segments.count < operationCount * 3, "edit preview segment count exploded: \(state.segments.count)")
+        try require(state.segments.count < operationCount * 4, "edit preview segment count exploded: \(state.segments.count)")
         try require(
             p95PreviewMilliseconds < 8,
             String(format: "optimistic preview p95 was too slow: %.2fms", p95PreviewMilliseconds)
@@ -349,6 +368,31 @@ enum EditPreviewSmokeHarness {
             lhs.lowEnergy == rhs.lowEnergy &&
             lhs.midEnergy == rhs.midEnergy &&
             lhs.highEnergy == rhs.highEnergy
+    }
+
+    private static func peakMagnitude(in overview: WaveformOverview, selection: TimelineSelection) -> Float {
+        let binCount = overview.bins.count
+        guard binCount > 0 else {
+            return 0
+        }
+
+        let startIndex = min(
+            max(Int((selection.startProgress * Double(binCount)).rounded(.down)), 0),
+            binCount
+        )
+        let endIndex = min(
+            max(Int((selection.endProgress * Double(binCount)).rounded(.up)), startIndex),
+            binCount
+        )
+        guard startIndex < endIndex else {
+            return 0
+        }
+
+        var peak: Float = 0
+        for index in startIndex..<endIndex {
+            peak = max(peak, overview.bins[index].peakMagnitude)
+        }
+        return peak
     }
 
     private static func require(_ condition: Bool, _ message: String) throws {
