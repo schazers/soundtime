@@ -1438,6 +1438,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         renderState = renderState.withSelectedTrackID(trackID)
     }
 
+    func displaySelectedTracks(_ trackIDs: Set<UUID>, primaryTrackID: UUID?) {
+        renderState = renderState.withSelectedTrackIDs(trackIDs, primaryTrackID: primaryTrackID)
+    }
+
     func displayTrimPreview(_ trimPreview: TimelineTrimRange?) {
         renderState = renderState.withTrimPreview(trimPreview)
     }
@@ -4487,38 +4491,39 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         renderState: TimelineRenderState
     ) -> [TimelineVertex] {
         selectedTrackVertexScratch.removeAll(keepingCapacity: true)
-        guard
-            let selectedTrackID = renderState.selectedTrackID,
-            let trackIndex = renderState.tracks.firstIndex(where: { $0.id == selectedTrackID }),
-            !renderState.tracks.isEmpty
-        else {
-            return selectedTrackVertexScratch
-        }
-        if
-            let selection = renderState.selection,
-            selection.trackID == selectedTrackID,
-            selection.startProgress <= 0.001,
-            selection.endProgress >= 0.999
-        {
+        guard !renderState.selectedTrackIDs.isEmpty, !renderState.tracks.isEmpty else {
             return selectedTrackVertexScratch
         }
 
-        guard let laneFrame = laneFrame(
-            forTrackIndex: trackIndex,
-            renderState: renderState,
-            drawableSize: drawableSize
-        ) else {
-            return selectedTrackVertexScratch
+        selectedTrackVertexScratch.reserveCapacity(renderState.selectedTrackIDs.count * 6)
+        for (trackIndex, track) in renderState.tracks.enumerated()
+            where renderState.selectedTrackIDs.contains(track.id)
+        {
+            if
+                let selection = renderState.selection,
+                selection.trackID == track.id,
+                selection.startProgress <= 0.001,
+                selection.endProgress >= 0.999
+            {
+                continue
+            }
+
+            guard let laneFrame = laneFrame(
+                forTrackIndex: trackIndex,
+                renderState: renderState,
+                drawableSize: drawableSize
+            ) else {
+                continue
+            }
+            appendRectangle(
+                to: &selectedTrackVertexScratch,
+                left: 0,
+                right: 1,
+                top: max(laneFrame.top, 0),
+                bottom: min(laneFrame.bottom, 1),
+                color: SIMD4<Float>(0.78, 0.78, 0.78, 0.075)
+            )
         }
-        selectedTrackVertexScratch.reserveCapacity(6)
-        appendRectangle(
-            to: &selectedTrackVertexScratch,
-            left: 0,
-            right: 1,
-            top: max(laneFrame.top, 0),
-            bottom: min(laneFrame.bottom, 1),
-            color: SIMD4<Float>(0.78, 0.78, 0.78, 0.075)
-        )
         return selectedTrackVertexScratch
     }
 

@@ -67,6 +67,7 @@ struct TimelineRenderState: Sendable {
     let isHoverGuideArmed: Bool
     let selection: TimelineSelection?
     let selectedTrackID: UUID?
+    let selectedTrackIDs: Set<UUID>
     let trimPreview: TimelineTrimRange?
     let gainPreview: GainPreview?
 
@@ -82,6 +83,7 @@ struct TimelineRenderState: Sendable {
         isHoverGuideArmed: Bool,
         selection: TimelineSelection?,
         selectedTrackID: UUID?,
+        selectedTrackIDs: Set<UUID>? = nil,
         trimPreview: TimelineTrimRange?,
         gainPreview: GainPreview?,
         duration: TimeInterval? = nil,
@@ -102,6 +104,7 @@ struct TimelineRenderState: Sendable {
         self.isHoverGuideArmed = isHoverGuideArmed
         self.selection = selection
         self.selectedTrackID = selectedTrackID
+        self.selectedTrackIDs = selectedTrackIDs ?? selectedTrackID.map { [$0] } ?? []
         self.trimPreview = trimPreview
         self.gainPreview = gainPreview
     }
@@ -145,6 +148,7 @@ struct TimelineRenderState: Sendable {
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
             selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
             trimPreview: trimPreview,
             gainPreview: nil
         )
@@ -163,6 +167,7 @@ struct TimelineRenderState: Sendable {
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
             selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
             trimPreview: trimPreview,
             gainPreview: gainPreview
         )
@@ -181,6 +186,7 @@ struct TimelineRenderState: Sendable {
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
             selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
             duration: duration,
@@ -202,6 +208,7 @@ struct TimelineRenderState: Sendable {
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
             selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
             duration: duration,
@@ -226,6 +233,7 @@ struct TimelineRenderState: Sendable {
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
             selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
             duration: duration,
@@ -247,6 +255,7 @@ struct TimelineRenderState: Sendable {
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
             selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
             duration: duration,
@@ -268,6 +277,7 @@ struct TimelineRenderState: Sendable {
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
             selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
             duration: duration,
@@ -290,6 +300,7 @@ struct TimelineRenderState: Sendable {
             isHoverGuideArmed: clampedProgress != nil && isArmed,
             selection: selection,
             selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
             duration: duration,
@@ -311,6 +322,7 @@ struct TimelineRenderState: Sendable {
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
             selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
             duration: duration,
@@ -332,6 +344,29 @@ struct TimelineRenderState: Sendable {
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
             selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackID.map { [$0] } ?? [],
+            trimPreview: trimPreview,
+            gainPreview: gainPreview,
+            duration: duration,
+            hasWaveforms: hasWaveforms,
+            hasSoloedTrack: hasSoloedTrack
+        )
+    }
+
+    func withSelectedTrackIDs(_ selectedTrackIDs: Set<UUID>, primaryTrackID: UUID?) -> TimelineRenderState {
+        TimelineRenderState(
+            tracks: tracks,
+            viewport: viewport,
+            trackLayout: trackLayout,
+            playheadProgress: playheadProgress,
+            playheadAnchorTimestamp: playheadAnchorTimestamp,
+            isPlaybackActive: isPlaybackActive,
+            isRecordingActive: isRecordingActive,
+            hoverProgress: hoverProgress,
+            isHoverGuideArmed: isHoverGuideArmed,
+            selection: selection,
+            selectedTrackID: primaryTrackID,
+            selectedTrackIDs: selectedTrackIDs,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
             duration: duration,
@@ -353,6 +388,7 @@ struct TimelineRenderState: Sendable {
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
             selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
             duration: duration,
@@ -374,6 +410,7 @@ struct TimelineRenderState: Sendable {
             isHoverGuideArmed: isHoverGuideArmed,
             selection: selection,
             selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
             duration: duration,

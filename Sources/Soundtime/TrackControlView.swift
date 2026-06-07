@@ -6,7 +6,7 @@ final class TrackControlView: NSView {
     var onRecordRequested: (() -> Void)?
     var onVolumeChanged: ((Float) -> Void)?
     var onVolumeEditingEnded: (() -> Void)?
-    var onTrackSelected: (() -> Void)?
+    var onTrackSelected: ((NSEvent.ModifierFlags) -> Void)?
 
     private let panelView = NSView()
     private let contentStack = NSStackView()
@@ -82,7 +82,7 @@ final class TrackControlView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
-        onTrackSelected?()
+        onTrackSelected?(event.modifierFlags)
     }
 
     func configure(

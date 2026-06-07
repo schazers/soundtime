@@ -48,7 +48,8 @@ final class WorkspaceView: NSView {
     private enum EditScope: Int, CaseIterable {
         case track = 0
         case selected = 1
-        case all = 2
+        case group = 2
+        case all = 3
 
         var title: String {
             switch self {
@@ -56,6 +57,8 @@ final class WorkspaceView: NSView {
                 return "Track"
             case .selected:
                 return "Selected"
+            case .group:
+                return "Group"
             case .all:
                 return "All"
             }
@@ -64,6 +67,7 @@ final class WorkspaceView: NSView {
 
     private struct ProjectTrack {
         var id: UUID
+        var editGroupID: UUID? = nil
         var name: String
         var sourceURL: URL
         var durationHint: TimeInterval?
@@ -86,6 +90,7 @@ final class WorkspaceView: NSView {
         var tracks: [ProjectTrack]
         var activeTrackID: UUID?
         var selectedTrackID: UUID?
+        var selectedTrackIDs: Set<UUID> = []
         var selectedTimelineRange: TimelineSelection?
         var restoreProgress: Float?
     }
@@ -217,6 +222,9 @@ final class WorkspaceView: NSView {
     private var projectTracks: [ProjectTrack] = []
     private var activeTrackID: UUID?
     private var selectedTrackID: UUID?
+    private var selectedTrackIDs: Set<UUID> = []
+    private var trackSelectionAnchorID: UUID?
+    private var defaultEditGroupID = UUID()
     private var currentProjectURL: URL?
     private var hasRestoredLastProject = false
     private var isLoadingProject = false
@@ -241,7 +249,7 @@ final class WorkspaceView: NSView {
     private var keyDownMonitor: Any?
     private var audioDevicePreferencesObserver: NSObjectProtocol?
     private var debugToolsVisible = false
-    private var editScope: EditScope = .all
+    private var editScope: EditScope = .group
     private let editMaterializationDelay: TimeInterval = 0.75
     private let deleteMaterializationDelay: TimeInterval = 2.0
     private let deleteVisualRefreshDelay: TimeInterval = 0.13
@@ -398,7 +406,7 @@ final class WorkspaceView: NSView {
         }
         control.segmentStyle = .rounded
         control.trackingMode = .selectOne
-        control.selectedSegment = EditScope.all.rawValue
+        control.selectedSegment = EditScope.group.rawValue
         control.translatesAutoresizingMaskIntoConstraints = false
         return control
     }()
@@ -1081,7 +1089,7 @@ final class WorkspaceView: NSView {
             timelineRenderTracks(),
             animateWaveformTransition: animateWaveformTransition
         )
-        timelineSurface.displaySelectedTrack(selectedTrackID)
+        publishSelectedTracksToTimeline()
         if rebuildControls {
             refreshTrackControls()
         }
@@ -1204,11 +1212,11 @@ final class WorkspaceView: NSView {
                 isMuted: track.isMuted,
                 isSoloed: track.isSoloed,
                 volume: track.volume,
-                isTrackSelected: track.id == selectedTrackID,
+                isTrackSelected: selectedTrackIDs.contains(track.id),
                 isRecording: track.id == recordingTrackID
             )
-            controlView.onTrackSelected = { [weak self, trackID = track.id] in
-                self?.selectTrack(trackID)
+            controlView.onTrackSelected = { [weak self, trackID = track.id] modifierFlags in
+                self?.selectTrack(trackID, modifierFlags: modifierFlags)
             }
             controlView.onMuteChanged = { [weak self, trackID = track.id] isMuted in
                 self?.updateTrack(trackID) { $0.isMuted = isMuted }
@@ -1285,6 +1293,7 @@ final class WorkspaceView: NSView {
             tracks: projectTracks,
             activeTrackID: activeTrackID,
             selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
             selectedTimelineRange: selectedTimelineRange,
             restoreProgress: nil
         )
@@ -1294,6 +1303,7 @@ final class WorkspaceView: NSView {
         let trackName = "Track \(projectTracks.count + 1)"
         let track = ProjectTrack(
             id: trackID,
+            editGroupID: defaultEditGroupID,
             name: trackName,
             sourceURL: URL(fileURLWithPath: "/dev/null"),
             durationHint: nil,
@@ -1378,6 +1388,7 @@ final class WorkspaceView: NSView {
             tracks: projectTracks,
             activeTrackID: activeTrackID,
             selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
             selectedTimelineRange: selectedTimelineRange,
             restoreProgress: nil
         )
@@ -1402,9 +1413,11 @@ final class WorkspaceView: NSView {
         projectTracks[trackIndex].editRevision += 1
         activeTrackID = trackID
         selectedTrackID = nil
+        selectedTrackIDs.removeAll()
+        trackSelectionAnchorID = nil
         selectedTimelineRange = nil
         timelineSurface.displaySelection(nil)
-        timelineSurface.displaySelectedTrack(nil)
+        publishSelectedTracksToTimeline()
         refreshProjectTimelineDisplay()
         updateProjectDisplayTiming()
         currentPlaybackStatus = "recording"
@@ -1742,18 +1755,52 @@ final class WorkspaceView: NSView {
         }
     }
 
-    private func selectTrack(_ trackID: UUID) {
-        guard projectTracks.contains(where: { $0.id == trackID }) else {
+    private func selectTrack(_ trackID: UUID, modifierFlags: NSEvent.ModifierFlags = []) {
+        guard let clickedIndex = projectTracks.firstIndex(where: { $0.id == trackID }) else {
             return
         }
 
-        selectedTrackID = trackID
-        activeTrackID = trackID
-        let fullTrackSelection = fullTrackDisplaySelection(for: trackID)
+        let usesRangeSelection = modifierFlags.contains(.shift)
+        let togglesSelection = modifierFlags.contains(.command)
+
+        if usesRangeSelection,
+           let anchorID = trackSelectionAnchorID,
+           let anchorIndex = projectTracks.firstIndex(where: { $0.id == anchorID })
+        {
+            let bounds = min(anchorIndex, clickedIndex)...max(anchorIndex, clickedIndex)
+            selectedTrackIDs = Set(bounds.map { projectTracks[$0].id })
+            selectedTrackID = trackID
+        } else if togglesSelection {
+            if selectedTrackIDs.contains(trackID) {
+                selectedTrackIDs.remove(trackID)
+                if selectedTrackID == trackID {
+                    selectedTrackID = selectedTrackIDs
+                        .compactMap { id in projectTracks.firstIndex(where: { $0.id == id }).map { (index: $0, id: id) } }
+                        .sorted { $0.index < $1.index }
+                        .first?
+                        .id
+                }
+            } else {
+                selectedTrackIDs.insert(trackID)
+                selectedTrackID = trackID
+                trackSelectionAnchorID = trackID
+            }
+        } else {
+            selectedTrackIDs = [trackID]
+            selectedTrackID = trackID
+            trackSelectionAnchorID = trackID
+        }
+
+        selectedTrackIDs = Set(projectTracks.map(\.id)).intersection(selectedTrackIDs)
+        if let selectedTrackID, !selectedTrackIDs.contains(selectedTrackID) {
+            self.selectedTrackID = selectedTrackIDs.first
+        }
+        activeTrackID = selectedTrackID ?? trackID
+        let fullTrackSelection = selectedTrackID.map(fullTrackDisplaySelection)
         selectedTimelineRange = fullTrackSelection
         timelineSurface.displaySelection(fullTrackSelection)
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
-        timelineSurface.displaySelectedTrack(trackID)
+        publishSelectedTracksToTimeline()
         refreshTrackControls()
         syncActiveTrackFields()
         window?.makeFirstResponder(timelineSurface)
@@ -1762,19 +1809,31 @@ final class WorkspaceView: NSView {
     }
 
     private func clearSelectedTrack() {
-        guard let trackID = selectedTrackID else {
+        guard !selectedTrackIDs.isEmpty || selectedTrackID != nil else {
             return
         }
 
+        let trackID = selectedTrackID
         selectedTrackID = nil
-        if isFullTrackSelection(selectedTimelineRange, trackID: trackID) {
+        selectedTrackIDs.removeAll()
+        trackSelectionAnchorID = nil
+        if let trackID, isFullTrackSelection(selectedTimelineRange, trackID: trackID) {
             selectedTimelineRange = nil
             timelineSurface.displaySelection(nil)
             timelineSurface.displayGainPreview(selection: nil, gain: 1)
             updateEffectCommandState()
         }
-        timelineSurface.displaySelectedTrack(nil)
+        publishSelectedTracksToTimeline()
         refreshTrackControls()
+    }
+
+    private func publishSelectedTracksToTimeline() {
+        let liveTrackIDs = Set(projectTracks.map(\.id))
+        selectedTrackIDs = selectedTrackIDs.intersection(liveTrackIDs)
+        if let selectedTrackID, !selectedTrackIDs.contains(selectedTrackID) {
+            self.selectedTrackID = selectedTrackIDs.first
+        }
+        timelineSurface.displaySelectedTracks(selectedTrackIDs, primaryTrackID: selectedTrackID)
     }
 
     private func updateTrack(
@@ -1817,8 +1876,10 @@ final class WorkspaceView: NSView {
         loadedAudioSummary = nil
         selectedTimelineRange = nil
         selectedTrackID = nil
+        selectedTrackIDs.removeAll()
+        trackSelectionAnchorID = nil
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
-        timelineSurface.displaySelectedTrack(nil)
+        publishSelectedTracksToTimeline()
         updateEffectCommandState()
         currentPlayheadFrame = 0
         displayedFrameCount = 0
@@ -1947,6 +2008,7 @@ final class WorkspaceView: NSView {
         let durationHint = persistedFileTimeline?.duration ?? fileInfo?.duration
         let track = ProjectTrack(
             id: trackID,
+            editGroupID: settings?.editGroupID ?? defaultEditGroupID,
             name: trackName,
             sourceURL: url,
             durationHint: durationHint,
@@ -2130,8 +2192,12 @@ final class WorkspaceView: NSView {
         }
         if selectedTrackID == trackID {
             selectedTrackID = nil
-            timelineSurface.displaySelectedTrack(nil)
         }
+        selectedTrackIDs.remove(trackID)
+        if trackSelectionAnchorID == trackID {
+            trackSelectionAnchorID = nil
+        }
+        publishSelectedTracksToTimeline()
         syncActiveTrackFields()
         refreshProjectTimelineDisplay()
         updateProjectDisplayTiming()
@@ -3660,6 +3726,7 @@ final class WorkspaceView: NSView {
             tracks: projectTracks,
             activeTrackID: activeTrackID,
             selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
             selectedTimelineRange: selectedTimelineRange,
             restoreProgress: displaySelectionToClear.startProgressFloat
         )
@@ -3781,7 +3848,7 @@ final class WorkspaceView: NSView {
     }
 
     private func deleteSelectedTrackOrSelection() {
-        if selectedTrackID != nil {
+        if selectedTrackID != nil || !selectedTrackIDs.isEmpty {
             deleteSelectedTrack()
         } else {
             deleteSelection()
@@ -3815,6 +3882,7 @@ final class WorkspaceView: NSView {
             tracks: projectTracks,
             activeTrackID: activeTrackID,
             selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
             selectedTimelineRange: selectedTimelineRange,
             restoreProgress: projectProgress
         )
@@ -4015,6 +4083,7 @@ final class WorkspaceView: NSView {
             tracks: projectTracks,
             activeTrackID: activeTrackID,
             selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
             selectedTimelineRange: selectedTimelineRange,
             restoreProgress: snapshot.progress
         )
@@ -4112,40 +4181,59 @@ final class WorkspaceView: NSView {
 
     private func deleteSelectedTrack() {
         guard
-            let selectedTrackID,
-            let trackIndex = projectTracks.firstIndex(where: { $0.id == selectedTrackID })
+            let primaryTrackID = selectedTrackID ?? selectedTrackIDs.first,
+            projectTracks.contains(where: { $0.id == primaryTrackID })
         else {
+            return
+        }
+        let trackIDsToDelete = selectedTrackIDs.isEmpty ? [primaryTrackID] : selectedTrackIDs
+        let indexedTrackIDsToDelete = projectTracks.enumerated()
+            .filter { trackIDsToDelete.contains($0.element.id) }
+            .map { (index: $0.offset, id: $0.element.id, name: $0.element.name) }
+        guard !indexedTrackIDsToDelete.isEmpty else {
             return
         }
 
         let snapshot = ProjectTrackUndoSnapshot(
             tracks: projectTracks,
             activeTrackID: activeTrackID,
-            selectedTrackID: selectedTrackID,
+            selectedTrackID: primaryTrackID,
+            selectedTrackIDs: selectedTrackIDs,
             selectedTimelineRange: selectedTimelineRange,
             restoreProgress: nil
         )
         editUndoStack.append(.projectTracks(snapshot))
 
-        let deletedTrackName = projectTracks[trackIndex].name
-        cancelEditMaterialization(for: selectedTrackID)
-        projectTracks.remove(at: trackIndex)
+        let deletedTrackNames = indexedTrackIDsToDelete.map(\.name)
+        for trackID in indexedTrackIDsToDelete.map(\.id) {
+            cancelEditMaterialization(for: trackID)
+        }
+        for trackIndex in indexedTrackIDsToDelete.map(\.index).sorted(by: >) {
+            projectTracks.remove(at: trackIndex)
+        }
         if projectTracks.isEmpty {
             activeTrackID = nil
         } else {
-            activeTrackID = projectTracks[min(trackIndex, projectTracks.count - 1)].id
+            let fallbackIndex = min(indexedTrackIDsToDelete.map(\.index).min() ?? 0, projectTracks.count - 1)
+            activeTrackID = projectTracks[fallbackIndex].id
         }
         self.selectedTrackID = nil
+        selectedTrackIDs.removeAll()
+        trackSelectionAnchorID = nil
         selectedTimelineRange = nil
         timelineSurface.displaySelection(nil)
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
-        timelineSurface.displaySelectedTrack(nil)
+        publishSelectedTracksToTimeline()
         syncActiveTrackFields()
         refreshProjectTimelineDisplay()
         updateProjectDisplayTiming()
         reloadPlaybackFromProjectTracks(preserveProgress: true)
         updateEffectCommandState()
-        updateStatus("deleted track \(deletedTrackName)")
+        if deletedTrackNames.count == 1, let deletedTrackName = deletedTrackNames.first {
+            updateStatus("deleted track \(deletedTrackName)")
+        } else {
+            updateStatus("deleted \(deletedTrackNames.count) tracks")
+        }
     }
 
     private func cutSelection() {
@@ -4376,6 +4464,7 @@ final class WorkspaceView: NSView {
                 tracks: projectTracks,
                 activeTrackID: activeTrackID,
                 selectedTrackID: selectedTrackID,
+                selectedTrackIDs: selectedTrackIDs,
                 selectedTimelineRange: selectedTimelineRange,
                 restoreProgress: nil
             )
@@ -4431,6 +4520,7 @@ final class WorkspaceView: NSView {
                 tracks: projectTracks,
                 activeTrackID: activeTrackID,
                 selectedTrackID: selectedTrackID,
+                selectedTrackIDs: selectedTrackIDs,
                 selectedTimelineRange: selectedTimelineRange,
                 restoreProgress: nil
             )
@@ -4554,6 +4644,7 @@ final class WorkspaceView: NSView {
             tracks: projectTracks,
             activeTrackID: activeTrackID,
             selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
             selectedTimelineRange: selectedTimelineRange,
             restoreProgress: displaySelectionToDelete.startProgressFloat
         )
@@ -4641,9 +4732,21 @@ final class WorkspaceView: NSView {
             resumeIfPlaying: playbackController.isPlaying
         )
         updateEffectCommandState()
-        let scopeSuffix = scope == .all && trackEdits.count > 1 ?
-            " across \(trackEdits.count) tracks" :
-            ""
+        let scopeSuffix: String
+        if trackEdits.count > 1 {
+            switch scope {
+            case .track:
+                scopeSuffix = ""
+            case .selected:
+                scopeSuffix = " across \(trackEdits.count) selected tracks"
+            case .group:
+                scopeSuffix = " across \(trackEdits.count) grouped tracks"
+            case .all:
+                scopeSuffix = " across \(trackEdits.count) tracks"
+            }
+        } else {
+            scopeSuffix = ""
+        }
         let status = "\(copyBeforeDeleting ? "cut" : "deleted") \(formatDuration(statusDuration))\(scopeSuffix)"
         updateStatus(status)
 
@@ -4668,42 +4771,63 @@ final class WorkspaceView: NSView {
         case .track:
             return [target]
         case .selected:
-            if
-                let selectedTrackID,
-                let selectedTrackIndex = projectTracks.firstIndex(where: { $0.id == selectedTrackID }),
-                let editSelection = editSelection(from: target.displaySelection, trackIndex: selectedTrackIndex)
-            {
-                return [
-                    EditableSelectionTarget(
-                        trackIndex: selectedTrackIndex,
-                        displaySelection: TimelineSelection(
-                            startProgress: target.displaySelection.startProgress,
-                            endProgress: target.displaySelection.endProgress,
-                            trackID: selectedTrackID
-                        ),
-                        editSelection: editSelection
-                    )
-                ]
-            }
-            return [target]
-        case .all:
+            let selectedIDs = selectedTrackIDs.isEmpty ?
+                Set([projectTracks[target.trackIndex].id]) :
+                selectedTrackIDs
             return projectTracks.indices.compactMap { trackIndex in
-                let trackID = projectTracks[trackIndex].id
-                let displaySelection = TimelineSelection(
-                    startProgress: target.displaySelection.startProgress,
-                    endProgress: target.displaySelection.endProgress,
-                    trackID: trackID
-                )
-                guard let editSelection = editSelection(from: displaySelection, trackIndex: trackIndex) else {
+                guard selectedIDs.contains(projectTracks[trackIndex].id) else {
                     return nil
                 }
-                return EditableSelectionTarget(
-                    trackIndex: trackIndex,
-                    displaySelection: displaySelection,
-                    editSelection: editSelection
+                return rippleDeleteTarget(
+                    matching: target.displaySelection,
+                    trackIndex: trackIndex
+                )
+            }
+        case .group:
+            guard let editGroupID = projectTracks[target.trackIndex].editGroupID else {
+                return [target]
+            }
+            return projectTracks.indices.compactMap { trackIndex in
+                guard projectTracks[trackIndex].editGroupID == editGroupID else {
+                    return nil
+                }
+                return rippleDeleteTarget(
+                    matching: target.displaySelection,
+                    trackIndex: trackIndex
+                )
+            }
+        case .all:
+            return projectTracks.indices.compactMap { trackIndex in
+                rippleDeleteTarget(
+                    matching: target.displaySelection,
+                    trackIndex: trackIndex
                 )
             }
         }
+    }
+
+    private func rippleDeleteTarget(
+        matching displaySelection: TimelineSelection,
+        trackIndex: Int
+    ) -> EditableSelectionTarget? {
+        guard projectTracks.indices.contains(trackIndex) else {
+            return nil
+        }
+
+        let trackID = projectTracks[trackIndex].id
+        let trackDisplaySelection = TimelineSelection(
+            startProgress: displaySelection.startProgress,
+            endProgress: displaySelection.endProgress,
+            trackID: trackID
+        )
+        guard let editSelection = editSelection(from: trackDisplaySelection, trackIndex: trackIndex) else {
+            return nil
+        }
+        return EditableSelectionTarget(
+            trackIndex: trackIndex,
+            displaySelection: trackDisplaySelection,
+            editSelection: editSelection
+        )
     }
 
     private func preparedRippleDeleteTrackEdit(
@@ -4934,6 +5058,7 @@ final class WorkspaceView: NSView {
             tracks: projectTracks,
             activeTrackID: activeTrackID,
             selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
             selectedTimelineRange: selectedTimelineRange,
             restoreProgress: nil
         )
@@ -5062,6 +5187,7 @@ final class WorkspaceView: NSView {
             tracks: projectTracks,
             activeTrackID: activeTrackID,
             selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
             selectedTimelineRange: selectedTimelineRange,
             restoreProgress: nil
         )
@@ -5203,13 +5329,19 @@ final class WorkspaceView: NSView {
         selectedTrackID = snapshot.selectedTrackID.flatMap { selectedID in
             projectTracks.contains(where: { $0.id == selectedID }) ? selectedID : nil
         }
+        let liveTrackIDs = Set(projectTracks.map(\.id))
+        selectedTrackIDs = snapshot.selectedTrackIDs.intersection(liveTrackIDs)
+        if let selectedTrackID {
+            selectedTrackIDs.insert(selectedTrackID)
+        }
+        trackSelectionAnchorID = selectedTrackID
         selectedTimelineRange = snapshot.selectedTimelineRange
         syncActiveTrackFields()
         updateProjectDisplayTiming()
         timelineSurface.clearDeletionEffects()
         timelineSurface.displaySelection(selectedTimelineRange)
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
-        timelineSurface.displaySelectedTrack(selectedTrackID)
+        publishSelectedTracksToTimeline()
         refreshProjectTimelineDisplay(animateWaveformTransition: false)
         reloadPlaybackFromProjectTracks(
             preserveProgress: snapshot.restoreProgress == nil,
@@ -5501,6 +5633,9 @@ final class WorkspaceView: NSView {
         projectTracks.removeAll()
         activeTrackID = nil
         selectedTrackID = nil
+        selectedTrackIDs.removeAll()
+        trackSelectionAnchorID = nil
+        defaultEditGroupID = UUID()
         decodedAudioBuffer = nil
         audioTimeline = nil
         editUndoStack.removeAll()
@@ -5513,7 +5648,7 @@ final class WorkspaceView: NSView {
         currentPlaybackStatus = "idle"
         stopPlaybackTimer()
         timelineSurface.displaySelection(nil)
-        timelineSurface.displaySelectedTrack(nil)
+        publishSelectedTracksToTimeline()
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
         refreshProjectTimelineDisplay()
         displayPlaybackVisuals(progress: 0, isPlaying: false)
@@ -5595,6 +5730,7 @@ final class WorkspaceView: NSView {
 
                 return SoundtimeProject.Track(
                     id: track.id,
+                    editGroupID: track.editGroupID,
                     name: track.name,
                     filePath: track.sourceURL.path,
                     volume: track.volume,
@@ -6176,9 +6312,11 @@ final class WorkspaceView: NSView {
     }
 
     private func updateSelection(_ selection: TimelineSelection?) {
-        if selectedTrackID != nil {
+        if selectedTrackID != nil || !selectedTrackIDs.isEmpty {
             selectedTrackID = nil
-            timelineSurface.displaySelectedTrack(nil)
+            selectedTrackIDs.removeAll()
+            trackSelectionAnchorID = nil
+            publishSelectedTracksToTimeline()
             refreshTrackControls()
         }
         if let trackID = selection?.trackID {
@@ -6276,7 +6414,7 @@ final class WorkspaceView: NSView {
     }
 
     private var canDeleteSelection: Bool {
-        selectedTrackID != nil || currentEditableSelectionTarget() != nil
+        !selectedTrackIDs.isEmpty || selectedTrackID != nil || currentEditableSelectionTarget() != nil
     }
 
     private var canClearSelection: Bool {
@@ -6336,6 +6474,10 @@ final class WorkspaceView: NSView {
             editScopeHintLabel.stringValue = affectedTrackCount == 1 ?
                 "Delete affects selected track" :
                 "Delete affects \(affectedTrackCount) selected tracks"
+        case .group:
+            editScopeHintLabel.stringValue = affectedTrackCount == 1 ?
+                "Delete affects this group" :
+                "Delete affects \(affectedTrackCount) grouped tracks"
         case .all:
             editScopeHintLabel.stringValue = affectedTrackCount == 1 ?
                 "Delete affects 1 track" :

@@ -15,6 +15,7 @@ struct SoundtimeProject: Codable, Sendable {
 
     struct Track: Codable, Sendable {
         var id: UUID
+        var editGroupID: UUID? = nil
         var name: String
         var filePath: String
         var volume: Float
