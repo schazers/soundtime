@@ -21,11 +21,13 @@ enum AudioSilenceAnalyzer {
         var thresholdDecibels: Float
         var minimumSilenceDuration: TimeInterval
         var paddingDuration: TimeInterval
+        var roomToneHandleDuration: TimeInterval = 0.09
 
         static let podcastCleanup = Configuration(
             thresholdDecibels: -44,
             minimumSilenceDuration: 0.45,
-            paddingDuration: 0.09
+            paddingDuration: 0.09,
+            roomToneHandleDuration: 0.12
         )
     }
 
@@ -92,10 +94,12 @@ enum AudioSilenceAnalyzer {
         }
 
         let paddingFrameCount = max(Int((configuration.paddingDuration * sampleRate).rounded()), 0)
+        let roomToneFrameCount = max(Int((configuration.roomToneHandleDuration * sampleRate).rounded()), 0)
+        let preservedFrameCount = max(paddingFrameCount, roomToneFrameCount)
         let minimumDeleteFrameCount = max(Int((0.04 * sampleRate).rounded()), 1)
         return regions.compactMap { region in
-            let deleteStartFrame = region.startFrame + paddingFrameCount
-            let deleteEndFrame = region.endFrame - paddingFrameCount
+            let deleteStartFrame = region.startFrame + preservedFrameCount
+            let deleteEndFrame = region.endFrame - preservedFrameCount
             guard deleteEndFrame - deleteStartFrame >= minimumDeleteFrameCount else {
                 return nil
             }
