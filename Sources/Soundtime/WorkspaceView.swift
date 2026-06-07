@@ -991,9 +991,9 @@ final class WorkspaceView: NSView {
                 id: track.id,
                 waveformVersion: waveformVersion(for: track),
                 waveformOverview: track.waveformOverview,
-                durationHint: track.audioTimeline?.duration ??
+                durationHint: track.waveformOverview?.duration ??
+                    track.audioTimeline?.duration ??
                     track.fileTimeline?.duration ??
-                    track.waveformOverview?.duration ??
                     track.decodedAudioBuffer?.duration ??
                     track.durationHint,
                 volume: track.volume,
@@ -2452,9 +2452,9 @@ final class WorkspaceView: NSView {
     }
 
     private func trackDuration(for track: ProjectTrack) -> TimeInterval {
-        track.audioTimeline?.duration ??
+        track.waveformOverview?.duration ??
+            track.audioTimeline?.duration ??
             track.fileTimeline?.duration ??
-            track.waveformOverview?.duration ??
             track.decodedAudioBuffer?.duration ??
             track.durationHint ??
             0
@@ -3672,17 +3672,22 @@ final class WorkspaceView: NSView {
             replacing: pasteSelection,
             with: audioClipboard.waveformOverview
         )
-        projectTracks[trackIndex].decodedAudioBuffer = nil
-        projectTracks[trackIndex].zeroCrossingIndex = nil
-        projectTracks[trackIndex].audioTimeline = nil
-        projectTracks[trackIndex].fileTimeline = nil
+        if let currentTimeline {
+            projectTracks[trackIndex].audioTimeline = currentTimeline
+            projectTracks[trackIndex].fileTimeline = nil
+            projectTracks[trackIndex].decodedAudioBuffer = nil
+        } else if let currentFileTimeline {
+            projectTracks[trackIndex].audioTimeline = nil
+            projectTracks[trackIndex].fileTimeline = currentFileTimeline
+            projectTracks[trackIndex].decodedAudioBuffer = nil
+        }
         selectedTimelineRange = nil
         timelineSurface.displaySelection(nil)
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
         refreshProjectTimelineDisplay(rebuildControls: false)
         updateProjectDisplayTiming()
         updateEffectCommandState()
-        updateStatus("pasting")
+        updateStatus("pasting - playback updates shortly")
 
         Task {
             [weak self, currentTimeline, currentFileTimeline, pasteSelection, audioClipboard, sourceURL, trackID, editRevision] in
