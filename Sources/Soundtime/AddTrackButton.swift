@@ -106,14 +106,14 @@ final class AddTrackButton: NSControl {
         path.stroke()
 
         let center = CGPoint(x: bounds.midX, y: bounds.midY)
-        let armLength = min(bounds.width, bounds.height) * 0.16
+        let armLength = min(bounds.width, bounds.height) * 0.12
         let plusPath = NSBezierPath()
         plusPath.move(to: CGPoint(x: center.x - armLength, y: center.y))
         plusPath.line(to: CGPoint(x: center.x + armLength, y: center.y))
         plusPath.move(to: CGPoint(x: center.x, y: center.y - armLength))
         plusPath.line(to: CGPoint(x: center.x, y: center.y + armLength))
         plusPath.lineCapStyle = .round
-        plusPath.lineWidth = 1.8
+        plusPath.lineWidth = 1.55
         symbol.setStroke()
         plusPath.stroke()
     }
