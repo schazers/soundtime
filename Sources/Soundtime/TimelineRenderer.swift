@@ -847,6 +847,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var frameStatsDeletionEffectCount = 0
     private var frameStatsPlayheadContactEventCount = 0
     private var lastRenderViewportSize = CGSize(width: 1600, height: 900)
+    private var lastRenderBackingScale: Float = 1
     var onFrameStatsChanged: ((TimelineFrameStats) -> Void)?
     var onRenderDataPrepared: (() -> Void)?
 
@@ -1134,7 +1135,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             tracks: renderTracks,
             trackWaveformMipLevels: nextTrackWaveformMipLevels,
             renderState: nextRenderState,
-            drawableSize: lastRenderViewportSize
+            drawableSize: lastRenderViewportSize,
+            backingScale: lastRenderBackingScale
         )
         gridCache = nil
         if hasNextWaveforms {
@@ -1352,7 +1354,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         previousRenderedPlayheadX = nil
         previousRenderedPlayheadTime = nil
         renderState = renderState.withViewport(viewport)
-        prewarmCurrentInteractiveWaveformShaderBuffers(drawableSize: lastRenderViewportSize)
+        prewarmCurrentInteractiveWaveformShaderBuffers(
+            drawableSize: lastRenderViewportSize,
+            backingScale: lastRenderBackingScale
+        )
     }
 
     func displayTrackLayout(_ trackLayout: TimelineTrackLayout) {
@@ -1362,7 +1367,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         gridCache = nil
         renderState = renderState.withTrackLayout(trackLayout)
-        prewarmCurrentInteractiveWaveformShaderBuffers(drawableSize: lastRenderViewportSize)
+        prewarmCurrentInteractiveWaveformShaderBuffers(
+            drawableSize: lastRenderViewportSize,
+            backingScale: lastRenderBackingScale
+        )
     }
 
     func displayHoverProgress(_ progress: Float?, isArmed: Bool = false) {
@@ -1664,6 +1672,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     func render(to target: TimelineRenderTarget) {
         lastRenderViewportSize = target.viewportSize
+        lastRenderBackingScale = target.backingScale
         guard
             let commandBuffer = commandQueue.makeCommandBuffer(),
             let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: target.renderPassDescriptor)
@@ -1692,6 +1701,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         displayTimestamp: CFTimeInterval,
         waitUntilCompleted: Bool = false
     ) -> MTLCommandBuffer? {
+        lastRenderViewportSize = viewportSize
+        lastRenderBackingScale = backingScale
         guard
             let commandBuffer = commandQueue.makeCommandBuffer(),
             let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor)
@@ -1786,6 +1797,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let currentShaderWaveformsReady = usesWaveformShader &&
             (!hasWaveformTransition || preferredShaderWaveformsAreReady(
                 drawableSize: viewportSize,
+                backingScale: backingScale,
                 renderState: renderState,
                 trackWaveformMipLevels: mipLevelSnapshot.currentByTrack
             ))
@@ -2055,6 +2067,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                     track: track,
                     mipLevels: mipLevels,
                     drawableSize: drawableSize,
+                    backingScale: backingScale,
                     renderState: renderState,
                     fallbackPolicy: fallbackPolicy
                 )
@@ -2199,6 +2212,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             Float(max(binOffset, 0)),
             waveformSampleSmoothingAmount(
                 drawableSize: drawableSize,
+                backingScale: backingScale,
                 binCount: binCount,
                 trackDurationProgress: trackDurationProgress,
                 renderState: renderState
@@ -2234,6 +2248,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     private func preferredShaderWaveformsAreReady(
         drawableSize: CGSize,
+        backingScale: Float,
         renderState: TimelineRenderState,
         trackWaveformMipLevels: [UUID: [WaveformMipLevel]]
     ) -> Bool {
@@ -2277,6 +2292,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 track: track,
                 mipLevels: mipLevels,
                 drawableSize: drawableSize,
+                backingScale: backingScale,
                 renderState: renderState,
                 fallbackPolicy: .preferredOnly
             ) != nil else {
@@ -2289,6 +2305,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     private func waveformSampleSmoothingAmount(
         drawableSize: CGSize,
+        backingScale: Float,
         binCount: Int,
         trackDurationProgress: Float,
         renderState: TimelineRenderState
@@ -2298,7 +2315,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             1
         )
         let visibleBins = max(Float(max(binCount, 1)) * trackViewportProgress, 1)
-        let pointsPerBin = Float(max(drawableSize.width, 1)) / visibleBins
+        let pixelWidth = Float(max(drawableSize.width, 1)) * max(backingScale, 1)
+        let pointsPerBin = pixelWidth / visibleBins
         let adaptiveSmoothing = min(max((pointsPerBin - 0.02) / 1.15, 0.45), 1.0)
         return min(max(adaptiveSmoothing, 0.45), 1.0)
     }
@@ -2307,6 +2325,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         track: TimelineRenderState.Track,
         mipLevels: [WaveformMipLevel],
         drawableSize: CGSize,
+        backingScale: Float,
         renderState: TimelineRenderState,
         fallbackPolicy: WaveformShaderFallbackPolicy = .allowFallbacks
     ) -> WaveformShaderDrawable? {
@@ -2314,6 +2333,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             !mipLevels.isEmpty,
             let preferredIndex = waveformMipLevelIndex(
                 for: drawableSize,
+                backingScale: backingScale,
                 renderState: renderState,
                 mipLevels: mipLevels
             )
@@ -2489,7 +2509,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     }
 
-    private func prewarmCurrentInteractiveWaveformShaderBuffers(drawableSize: CGSize) {
+    private func prewarmCurrentInteractiveWaveformShaderBuffers(
+        drawableSize: CGSize,
+        backingScale: Float
+    ) {
         guard drawableSize.width > 0, drawableSize.height > 0, !renderState.tracks.isEmpty else {
             return
         }
@@ -2501,7 +2524,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             tracks: renderState.tracks,
             trackWaveformMipLevels: mipLevels,
             renderState: renderState,
-            drawableSize: drawableSize
+            drawableSize: drawableSize,
+            backingScale: backingScale
         )
     }
 
@@ -2509,7 +2533,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         tracks: [TimelineRenderState.Track],
         trackWaveformMipLevels: [UUID: [WaveformMipLevel]],
         renderState: TimelineRenderState,
-        drawableSize: CGSize
+        drawableSize: CGSize,
+        backingScale: Float
     ) {
         let visibleTracks = visiblePrewarmTracks(
             tracks: tracks,
@@ -2518,7 +2543,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         )
         let viewportBinLimit = viewportAwarePrewarmBinLimit(
             renderState: renderState,
-            drawableSize: drawableSize
+            drawableSize: drawableSize,
+            backingScale: backingScale
         )
         let visibleJobs = visibleTracks.compactMap { track -> (TimelineRenderState.Track, WaveformMipLevel)? in
             guard let mipLevels = trackWaveformMipLevels[track.id] else {
@@ -2571,7 +2597,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             tracks: state.tracks,
             trackWaveformMipLevels: mipLevels,
             renderState: state,
-            drawableSize: drawableSize
+            drawableSize: drawableSize,
+            backingScale: lastRenderBackingScale
         )
         return waveformShaderBufferStore.containsAllAllocated(keys)
     }
@@ -2580,7 +2607,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         tracks: [TimelineRenderState.Track],
         trackWaveformMipLevels: [UUID: [WaveformMipLevel]],
         renderState: TimelineRenderState,
-        drawableSize: CGSize
+        drawableSize: CGSize,
+        backingScale: Float
     ) -> [WaveformMipCacheKey] {
         let visibleTracks = visiblePrewarmTracks(
             tracks: tracks,
@@ -2589,7 +2617,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         )
         let viewportBinLimit = viewportAwarePrewarmBinLimit(
             renderState: renderState,
-            drawableSize: drawableSize
+            drawableSize: drawableSize,
+            backingScale: backingScale
         )
         return visibleTracks.compactMap { track -> WaveformMipCacheKey? in
             guard let mipLevels = trackWaveformMipLevels[track.id] else {
@@ -2723,10 +2752,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     private func viewportAwarePrewarmBinLimit(
         renderState: TimelineRenderState,
-        drawableSize: CGSize
+        drawableSize: CGSize,
+        backingScale: Float
     ) -> Int {
         let viewportDurationProgress = max(renderState.viewport.durationProgress, 0.000_001)
-        let drawableWidth = max(Float(drawableSize.width), 1)
+        let drawableWidth = max(Float(drawableSize.width) * max(backingScale, 1), 1)
         let binsForVisibleViewport = Int(
             ceil(Double(drawableWidth * waveformMipTargetBinsPerPoint / viewportDurationProgress))
         )
@@ -6552,11 +6582,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     private func waveformMipLevel(
         for drawableSize: CGSize,
+        backingScale: Float = 1,
         renderState: TimelineRenderState,
         mipLevels: [WaveformMipLevel]
     ) -> WaveformMipLevel? {
         guard let index = waveformMipLevelIndex(
             for: drawableSize,
+            backingScale: backingScale,
             renderState: renderState,
             mipLevels: mipLevels
         ) else {
@@ -6568,6 +6600,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     private func waveformMipLevelIndex(
         for drawableSize: CGSize,
+        backingScale: Float = 1,
         renderState: TimelineRenderState,
         mipLevels: [WaveformMipLevel]
     ) -> Int? {
@@ -6586,7 +6619,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             }
         }
 
-        let width = max(Float(drawableSize.width), 1)
+        let width = max(Float(drawableSize.width) * max(backingScale, 1), 1)
         let targetVisibleBins = max(width * waveformMipTargetBinsPerPoint, 8_192)
 
         for (index, mipLevel) in mipLevels.enumerated() {
