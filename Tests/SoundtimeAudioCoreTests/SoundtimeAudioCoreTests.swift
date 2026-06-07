@@ -23,6 +23,9 @@ final class SoundtimeAudioCoreTests: XCTestCase {
         XCTAssertEqual(snapshot.renderedFrameCount, 16)
         XCTAssertEqual(snapshot.underrunCount, 0)
         XCTAssertEqual(snapshot.droppedCommandCount, 0)
+        XCTAssertEqual(snapshot.callbackCount, 1)
+        XCTAssertGreaterThanOrEqual(snapshot.maxRenderNanoseconds, snapshot.lastRenderNanoseconds)
+        XCTAssertEqual(snapshot.renderDeadlineMissCount, 0)
 
         soundtime_audio_core_seek(engine, 90)
         renderSilence(engine: engine, channelCount: 2, frameCount: 20, hostTimestamp: 12.75)
@@ -31,6 +34,7 @@ final class SoundtimeAudioCoreTests: XCTestCase {
         XCTAssertEqual(snapshot.frameIndex, 100)
         XCTAssertTimestamp(snapshot.hostTimestamp, 12.75 + Double(10) / 48_000)
         XCTAssertEqual(snapshot.renderedFrameCount, 36)
+        XCTAssertEqual(snapshot.callbackCount, 2)
         XCTAssertFalse(snapshot.isPlaying)
     }
 

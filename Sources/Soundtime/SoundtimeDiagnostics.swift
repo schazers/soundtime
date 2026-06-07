@@ -48,6 +48,7 @@ final class SoundtimeDiagnostics: @unchecked Sendable {
     private var latestAudioSnapshot: RealtimeAudioCoreSnapshot?
     private var lastUnderrunCount = 0
     private var lastDroppedCommandCount = 0
+    private var lastRenderDeadlineMissCount = 0
     private var lastTraceWriteByName: [String: TimeInterval] = [:]
     private var mainThreadStallCount = 0
     private var lastMainThreadStallMilliseconds: Double = 0
@@ -115,12 +116,15 @@ final class SoundtimeDiagnostics: @unchecked Sendable {
     func recordAudioCoreSnapshot(_ snapshot: RealtimeAudioCoreSnapshot) {
         let underrunDelta: Int
         let droppedCommandDelta: Int
+        let renderDeadlineMissDelta: Int
         lock.lock()
         latestAudioSnapshot = snapshot
         underrunDelta = max(snapshot.underrunCount - lastUnderrunCount, 0)
         droppedCommandDelta = max(snapshot.droppedCommandCount - lastDroppedCommandCount, 0)
+        renderDeadlineMissDelta = max(snapshot.renderDeadlineMissCount - lastRenderDeadlineMissCount, 0)
         lastUnderrunCount = max(lastUnderrunCount, snapshot.underrunCount)
         lastDroppedCommandCount = max(lastDroppedCommandCount, snapshot.droppedCommandCount)
+        lastRenderDeadlineMissCount = max(lastRenderDeadlineMissCount, snapshot.renderDeadlineMissCount)
         lock.unlock()
 
         if underrunDelta > 0 {
@@ -134,6 +138,9 @@ final class SoundtimeDiagnostics: @unchecked Sendable {
                     "total": "\(snapshot.underrunCount)",
                     "frameIndex": "\(snapshot.frameIndex)",
                     "renderedFrames": "\(snapshot.renderedFrameCount)",
+                    "callbacks": "\(snapshot.callbackCount)",
+                    "lastRenderMs": String(format: "%.3f", Double(snapshot.lastRenderNanoseconds) / 1_000_000),
+                    "maxRenderMs": String(format: "%.3f", Double(snapshot.maxRenderNanoseconds) / 1_000_000),
                     "sampleRate": String(format: "%.1f", snapshot.sampleRate),
                     "isPlaying": "\(snapshot.isPlaying)",
                 ]
@@ -150,6 +157,24 @@ final class SoundtimeDiagnostics: @unchecked Sendable {
                     "delta": "\(droppedCommandDelta)",
                     "total": "\(snapshot.droppedCommandCount)",
                     "renderedFrames": "\(snapshot.renderedFrameCount)",
+                ]
+            )
+        }
+
+        if renderDeadlineMissDelta > 0 {
+            record(
+                category: .audio,
+                severity: .severe,
+                name: "audio-callback-deadline-miss",
+                message: "Realtime audio callback exceeded its render block deadline.",
+                fields: [
+                    "delta": "\(renderDeadlineMissDelta)",
+                    "total": "\(snapshot.renderDeadlineMissCount)",
+                    "callbacks": "\(snapshot.callbackCount)",
+                    "lastRenderMs": String(format: "%.3f", Double(snapshot.lastRenderNanoseconds) / 1_000_000),
+                    "maxRenderMs": String(format: "%.3f", Double(snapshot.maxRenderNanoseconds) / 1_000_000),
+                    "frameCount": "\(snapshot.frameCount)",
+                    "frameIndex": "\(snapshot.frameIndex)",
                 ]
             )
         }

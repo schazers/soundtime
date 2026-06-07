@@ -48,6 +48,10 @@ struct RealtimeAudioCoreSnapshot {
     let renderedFrameCount: Int
     let underrunCount: Int
     let droppedCommandCount: Int
+    let callbackCount: Int
+    let lastRenderNanoseconds: Int
+    let maxRenderNanoseconds: Int
+    let renderDeadlineMissCount: Int
 
     var playbackSnapshot: PlaybackSnapshot {
         PlaybackSnapshot(
@@ -402,7 +406,11 @@ final class RealtimeAudioCore {
                 isPlaying: false,
                 renderedFrameCount: 0,
                 underrunCount: 0,
-                droppedCommandCount: 0
+                droppedCommandCount: 0,
+                callbackCount: 0,
+                lastRenderNanoseconds: 0,
+                maxRenderNanoseconds: 0,
+                renderDeadlineMissCount: 0
             )
         }
 
@@ -415,7 +423,11 @@ final class RealtimeAudioCore {
             isPlaying: snapshot.isPlaying,
             renderedFrameCount: Int(min(snapshot.renderedFrameCount, UInt64(Int.max))),
             underrunCount: Int(min(snapshot.underrunCount, UInt64(Int.max))),
-            droppedCommandCount: Int(min(snapshot.droppedCommandCount, UInt64(Int.max)))
+            droppedCommandCount: Int(min(snapshot.droppedCommandCount, UInt64(Int.max))),
+            callbackCount: Int(min(snapshot.callbackCount, UInt64(Int.max))),
+            lastRenderNanoseconds: Int(min(snapshot.lastRenderNanoseconds, UInt64(Int.max))),
+            maxRenderNanoseconds: Int(min(snapshot.maxRenderNanoseconds, UInt64(Int.max))),
+            renderDeadlineMissCount: Int(min(snapshot.renderDeadlineMissCount, UInt64(Int.max)))
         )
     }
 

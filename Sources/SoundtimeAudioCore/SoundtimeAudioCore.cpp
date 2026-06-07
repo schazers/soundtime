@@ -10,6 +10,8 @@
 #include <utility>
 #include <vector>
 
+#include <mach/mach_time.h>
+
 namespace {
 
 constexpr size_t maximumRealtimeTrackCount = 4096;
@@ -156,6 +158,11 @@ private:
 struct SoundtimeAudioCoreEngine {
     SoundtimeAudioCoreEngine() {
         trackGainRamps.resize(maximumRealtimeTrackCount);
+        mach_timebase_info(&renderTimingTimebase);
+        if (renderTimingTimebase.denom == 0) {
+            renderTimingTimebase.numer = 1;
+            renderTimingTimebase.denom = 1;
+        }
     }
 
     std::atomic<uint64_t> frameIndex{0};
@@ -164,6 +171,10 @@ struct SoundtimeAudioCoreEngine {
     std::atomic<bool> isPlaying{false};
     std::atomic<uint64_t> underrunCount{0};
     std::atomic<uint64_t> droppedCommandCount{0};
+    std::atomic<uint64_t> callbackCount{0};
+    std::atomic<uint64_t> lastRenderNanoseconds{0};
+    std::atomic<uint64_t> maxRenderNanoseconds{0};
+    std::atomic<uint64_t> renderDeadlineMissCount{0};
     std::atomic<uint64_t> configFrameCount{0};
     std::atomic<uint32_t> configChannelCount{0};
     std::atomic<double> configSampleRate{0};
@@ -185,6 +196,7 @@ struct SoundtimeAudioCoreEngine {
     bool stopWhenTransportRampCompletes = false;
     uint64_t transportPauseFrameIndex = 0;
     bool hasTransportPauseFrameIndex = false;
+    mach_timebase_info_data_t renderTimingTimebase{1, 1};
     const RenderGraph* trackGainRampGraph = nullptr;
     size_t trackGainRampCount = 0;
     std::vector<TrackGainRamp> trackGainRamps;
@@ -650,6 +662,10 @@ void reset_engine_runtime(SoundtimeAudioCoreEngine& engine) {
     engine.isPlaying.store(false, std::memory_order_release);
     engine.underrunCount.store(0, std::memory_order_release);
     engine.droppedCommandCount.store(0, std::memory_order_release);
+    engine.callbackCount.store(0, std::memory_order_release);
+    engine.lastRenderNanoseconds.store(0, std::memory_order_release);
+    engine.maxRenderNanoseconds.store(0, std::memory_order_release);
+    engine.renderDeadlineMissCount.store(0, std::memory_order_release);
     engine.transportGain = 1;
     engine.transportGainTarget = 1;
     engine.transportGainStep = 0;
@@ -662,6 +678,41 @@ void reset_engine_runtime(SoundtimeAudioCoreEngine& engine) {
     engine.commandQueue.clear();
     engine.clockSamples.clear();
     engine.meterSamples.clear();
+}
+
+uint64_t ticks_to_nanoseconds(const SoundtimeAudioCoreEngine& engine, uint64_t ticks) {
+    return (ticks * engine.renderTimingTimebase.numer) / engine.renderTimingTimebase.denom;
+}
+
+void publish_render_timing(
+    SoundtimeAudioCoreEngine& engine,
+    uint64_t startTicks,
+    uint32_t frameCount,
+    double sampleRate
+) {
+    const auto elapsedNanoseconds = ticks_to_nanoseconds(engine, mach_absolute_time() - startTicks);
+    engine.callbackCount.fetch_add(1, std::memory_order_acq_rel);
+    engine.lastRenderNanoseconds.store(elapsedNanoseconds, std::memory_order_release);
+
+    auto previousMax = engine.maxRenderNanoseconds.load(std::memory_order_acquire);
+    while (
+        elapsedNanoseconds > previousMax &&
+        !engine.maxRenderNanoseconds.compare_exchange_weak(
+            previousMax,
+            elapsedNanoseconds,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire
+        )
+    ) {}
+
+    if (sampleRate > 0 && std::isfinite(sampleRate) && frameCount > 0) {
+        const auto deadlineNanoseconds = static_cast<uint64_t>(
+            (static_cast<double>(frameCount) / sampleRate) * 1'000'000'000.0
+        );
+        if (deadlineNanoseconds > 0 && elapsedNanoseconds > deadlineNanoseconds) {
+            engine.renderDeadlineMissCount.fetch_add(1, std::memory_order_acq_rel);
+        }
+    }
 }
 
 void gc_retired_graphs_locked(SoundtimeAudioCoreEngine& engine) {
@@ -1383,6 +1434,10 @@ SoundtimeAudioCoreSnapshot soundtime_audio_core_snapshot(const SoundtimeAudioCor
         .renderedFrameCount = engine->renderedFrameCount.load(std::memory_order_acquire),
         .underrunCount = engine->underrunCount.load(std::memory_order_acquire),
         .droppedCommandCount = engine->droppedCommandCount.load(std::memory_order_acquire),
+        .callbackCount = engine->callbackCount.load(std::memory_order_acquire),
+        .lastRenderNanoseconds = engine->lastRenderNanoseconds.load(std::memory_order_acquire),
+        .maxRenderNanoseconds = engine->maxRenderNanoseconds.load(std::memory_order_acquire),
+        .renderDeadlineMissCount = engine->renderDeadlineMissCount.load(std::memory_order_acquire),
     };
 }
 
@@ -1486,9 +1541,12 @@ void soundtime_audio_core_render_at_host_time(
     uint32_t frameCount,
     double hostTimestamp
 ) {
+    const auto renderStartTicks = engine != nullptr ? mach_absolute_time() : uint64_t{0};
     if (outputs == nullptr) {
         if (engine != nullptr) {
             engine->underrunCount.fetch_add(1, std::memory_order_acq_rel);
+            const auto sampleRate = engine->configSampleRate.load(std::memory_order_acquire);
+            publish_render_timing(*engine, renderStartTicks, frameCount, sampleRate);
         }
         return;
     }
@@ -1529,6 +1587,7 @@ void soundtime_audio_core_render_at_host_time(
         );
         publish_clock_sample(*engine);
         release_render_graph(*engine);
+        publish_render_timing(*engine, renderStartTicks, frameCount, config.sampleRate);
         return;
     }
 
@@ -1642,6 +1701,7 @@ void soundtime_audio_core_render_at_host_time(
     );
     publish_clock_sample(*engine);
     release_render_graph(*engine);
+    publish_render_timing(*engine, renderStartTicks, frameCount, config.sampleRate);
 }
 
 SoundtimeAudioCoreRecordingRing* soundtime_audio_core_recording_ring_create(
