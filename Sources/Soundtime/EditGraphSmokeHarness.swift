@@ -30,6 +30,8 @@ enum EditGraphSmokeHarness {
         let operationCount = arguments.contains("--edit-graph-smoke-full") ? 1_500 : 640
         let startTime = DispatchTime.now().uptimeNanoseconds
         var touchedFrameCount = 0
+        var operationDurations: [Double] = []
+        operationDurations.reserveCapacity(operationCount)
 
         for index in 0..<operationCount {
             let startProgress = Double((index * 7_919) % 850_000) / 1_000_000.0
@@ -39,6 +41,7 @@ enum EditGraphSmokeHarness {
                 endProgress: min(startProgress + durationProgress, 0.995)
             )
 
+            let operationStartTime = DispatchTime.now().uptimeNanoseconds
             switch index % 5 {
             case 0:
                 touchedFrameCount += timeline.delete(selection)
@@ -51,13 +54,25 @@ enum EditGraphSmokeHarness {
             default:
                 touchedFrameCount += timeline.applyFade(.fadeOut, to: selection)
             }
+            let operationMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - operationStartTime) / 1_000_000
+            operationDurations.append(operationMilliseconds)
         }
 
         let elapsedMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - startTime) / 1_000_000
+        let p95OperationMilliseconds = percentile(operationDurations, percentile: 0.95)
+        let maximumOperationMilliseconds = operationDurations.max() ?? 0
         let state = try requireValue(timeline.persistentState, "edit graph did not persist")
         try require(touchedFrameCount > 0, "edit graph operations touched no frames")
         try require(timeline.frameCount < sourceFrameCount, "delete operations did not shorten the timeline")
         try require(state.segments.count < operationCount * 3, "edit graph segment count exploded: \(state.segments.count)")
+        try require(
+            p95OperationMilliseconds < 2.0,
+            String(format: "edit graph operation p95 was too slow: %.2fms", p95OperationMilliseconds)
+        )
+        try require(
+            maximumOperationMilliseconds < 12,
+            String(format: "edit graph operation outlier was too slow: %.2fms", maximumOperationMilliseconds)
+        )
         try require(
             elapsedMilliseconds < 1_500,
             String(format: "edit graph operations were too slow: %.2fms", elapsedMilliseconds)
@@ -66,12 +81,28 @@ enum EditGraphSmokeHarness {
 
         print(
             String(
-                format: "Soundtime edit graph smoke passed: %d ops, %d segments, %.2fms",
+                format: "Soundtime edit graph smoke passed: %d ops, %d segments, %.3fms p95 op, %.3fms max op, %.2fms total",
                 operationCount,
                 state.segments.count,
+                p95OperationMilliseconds,
+                maximumOperationMilliseconds,
                 elapsedMilliseconds
             )
         )
+    }
+
+    private static func percentile(_ values: [Double], percentile: Double) -> Double {
+        guard !values.isEmpty else {
+            return 0
+        }
+
+        let sortedValues = values.sorted()
+        let clampedPercentile = min(max(percentile, 0), 1)
+        let index = min(
+            max(Int((Double(sortedValues.count - 1) * clampedPercentile).rounded()), 0),
+            sortedValues.count - 1
+        )
+        return sortedValues[index]
     }
 
     private static func runFileClipPasteSmoke(fileInfo: WAVFileInfo) throws {
