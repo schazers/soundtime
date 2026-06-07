@@ -24,6 +24,7 @@ enum TimelinePerfBaselineHarness {
         let targetsVisibleTrack: Bool
         let deletionBurstInterval: Int?
         var waveformRefreshInterval: Int? = nil
+        var transientBurstInterval: Int? = nil
     }
 
     private struct TrackCacheKey: Hashable {
@@ -441,6 +442,25 @@ enum TimelinePerfBaselineHarness {
             )
             scenarios.append(
                 Scenario(
+                    name: "combined visual effects",
+                    trackCount: 100,
+                    waveformBinCount: nil,
+                    frames: max(frames / 2, 36),
+                    warmupFrames: max(warmupFrames * 4, 144),
+                    viewportDuration: 0.035,
+                    isPlaybackActive: true,
+                    pansDuringRun: false,
+                    zoomsDuringRun: false,
+                    scrollsTracksDuringRun: true,
+                    showsSelection: true,
+                    showsGainPreview: true,
+                    targetsVisibleTrack: true,
+                    deletionBurstInterval: isQuick ? 24 : 36,
+                    transientBurstInterval: isQuick ? 12 : 18
+                )
+            )
+            scenarios.append(
+                Scenario(
                     name: "high-res zoom fidelity",
                     trackCount: 1,
                     waveformBinCount: WaveformOverviewBuilder.defaultTargetBinCount,
@@ -588,6 +608,13 @@ enum TimelinePerfBaselineHarness {
                     tracks: activeTracks,
                     trackLayout: trackLayout,
                     viewportHeight: Float(viewportSize.height)
+                )
+                displayTransientBursts(
+                    scenario: scenario,
+                    renderer: renderer,
+                    frame: frame,
+                    playheadProgress: playheadProgress,
+                    displayTimestamp: displayTimestamp
                 )
 
                 let renderPassDescriptor = makeRenderPassDescriptor(texture: texture)
@@ -852,6 +879,28 @@ enum TimelinePerfBaselineHarness {
         }
     }
 
+    private static func displayTransientBursts(
+        scenario: Scenario,
+        renderer: TimelineRenderer,
+        frame: Int,
+        playheadProgress: Float,
+        displayTimestamp: CFTimeInterval
+    ) {
+        guard
+            let transientBurstInterval = scenario.transientBurstInterval,
+            transientBurstInterval > 0,
+            frame >= scenario.warmupFrames,
+            frame.isMultiple(of: transientBurstInterval)
+        else {
+            return
+        }
+
+        renderer.triggerTransientParticlesForPerformanceTest(
+            originProgress: playheadProgress,
+            displayTimestamp: displayTimestamp
+        )
+    }
+
     private static func targetedTrackID(
         scenario: Scenario,
         tracks: [TimelineRenderState.Track],
@@ -939,19 +988,20 @@ enum TimelinePerfBaselineHarness {
             let slowEnvelope = 0.35 + 0.28 * sin(t * 2 * .pi * 5.0)
             let phraseEnvelope = 0.55 + 0.35 * sin(t * 2 * .pi * 1.7 + 0.6)
             let beat = abs(sin(t * 2 * .pi * 73.0))
-            let transient = (index % 193) < 4 ? Float(0.34) : 0
-            let peak = min(max(0.08 + slowEnvelope * phraseEnvelope * (0.22 + beat * 0.42) + transient, 0), 0.98)
+            let isTransient = index.isMultiple(of: 193)
+            let basePeak = 0.08 + slowEnvelope * phraseEnvelope * (0.18 + beat * 0.28)
+            let peak = isTransient ? Float(0.98) : min(max(basePeak, 0), 0.58)
             let asymmetry = sin(t * 2 * .pi * 29.0) * 0.12
             let minimum = -peak * min(max(0.86 - asymmetry, 0.25), 1)
             let maximum = peak * min(max(0.86 + asymmetry, 0.25), 1)
-            let highEnergy = min(max(0.22 + beat * 0.52 + transient * 0.6, 0), 1)
-            let midEnergy = min(max(0.34 + abs(sin(t * 2 * .pi * 13.0)) * 0.2, 0), 1)
+            let highEnergy = isTransient ? Float(1) : min(max(0.14 + beat * 0.18, 0), 1)
+            let midEnergy = isTransient ? Float(0.92) : min(max(0.24 + abs(sin(t * 2 * .pi * 13.0)) * 0.12, 0), 1)
             let lowEnergy = min(max(0.44 + slowEnvelope * 0.2, 0), 1)
 
             bins.append(WaveformOverview.Bin(
                 minimumSample: minimum,
                 maximumSample: maximum,
-                rmsSample: peak * 0.48,
+                rmsSample: isTransient ? 0.82 : peak * 0.34,
                 lowEnergy: lowEnergy,
                 midEnergy: midEnergy,
                 highEnergy: highEnergy
@@ -1113,6 +1163,9 @@ enum TimelinePerfBaselineHarness {
         }
         if result.scenario.deletionBurstInterval != nil, result.maximumDeletionEffectCount == 0 {
             failures.append("\(label) did not exercise deletion effects")
+        }
+        if result.scenario.name == "combined visual effects", result.maximumTransientParticleCount == 0 {
+            failures.append("\(label) did not exercise transient particles")
         }
 
         return failures

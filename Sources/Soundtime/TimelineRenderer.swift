@@ -1542,6 +1542,34 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         deletionEffectLock.unlock()
     }
 
+    func triggerTransientParticlesForPerformanceTest(
+        originProgress: Float,
+        displayTimestamp: CFTimeInterval
+    ) {
+        let clampedProgress = min(max(originProgress, 0), 1)
+        let seed = UInt64(clampedProgress.bitPattern) &* 0x9E37_79B9_7F4A_7C15
+        spawnTransientParticleBurst(
+            originProgress: clampedProgress,
+            originY: 0.42,
+            isTopEdge: true,
+            strength: 0.88,
+            seed: seed,
+            birthTimestamp: displayTimestamp
+        )
+        spawnTransientParticleBurst(
+            originProgress: clampedProgress,
+            originY: 0.58,
+            isTopEdge: false,
+            strength: 0.88,
+            seed: seed &+ 0xBF58_476D_1CE4_E5B9,
+            birthTimestamp: displayTimestamp
+        )
+        if transientParticles.count > transientParticleMaximumCount {
+            transientParticles.removeFirst(transientParticles.count - transientParticleMaximumCount)
+        }
+        frameStatsTransientParticleCount = transientParticles.count
+    }
+
     private func capturedDeletionBins(for selection: TimelineSelection) -> [WaveformOverview.Bin] {
         guard let overview = deletionCaptureOverview(for: selection) else {
             return []
