@@ -215,6 +215,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: "b"
         ))
         menu.addItem(NSMenuItem(
+            title: "Insert Silence/Time",
+            action: #selector(TimelineView.insertSilenceAtPlayhead(_:)),
+            keyEquivalent: "i"
+        ))
+        menu.addItem(NSMenuItem(
             title: "Zoom to Selection",
             action: #selector(TimelineView.zoomToSelection(_:)),
             keyEquivalent: "j"

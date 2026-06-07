@@ -248,6 +248,59 @@ struct AudioEditTimeline: Sendable {
         clearFrames(in: frameRange)
     }
 
+    mutating func insertSilence(frameCount requestedFrameCount: Int, atProgress progress: Double) -> Int {
+        guard
+            requestedFrameCount > 0,
+            progress.isFinite,
+            sourceBuffer.frameCount > 0
+        else {
+            return 0
+        }
+
+        let insertionFrame = min(
+            max(Int((progress * Double(timelineFrameCount)).rounded()), 0),
+            timelineFrameCount
+        )
+        if insertionFrame > 0, insertionFrame < timelineFrameCount {
+            _ = split(atFrame: insertionFrame)
+        }
+
+        var insertedFrameCount = 0
+        let silenceSegments = makeSilenceSegments(
+            frameCount: requestedFrameCount,
+            insertedFrameCount: &insertedFrameCount
+        )
+        guard !silenceSegments.isEmpty, insertedFrameCount > 0 else {
+            return 0
+        }
+
+        var nextSegments: [Segment] = []
+        nextSegments.reserveCapacity(segments.count + silenceSegments.count + 1)
+        var timelineFrame = 0
+        var didInsert = false
+        var marksNextSegmentAsClipStart = false
+
+        for segment in segments {
+            if !didInsert, insertionFrame <= timelineFrame {
+                nextSegments.append(contentsOf: silenceSegments)
+                didInsert = true
+                marksNextSegmentAsClipStart = true
+            }
+
+            nextSegments.append(marksNextSegmentAsClipStart ? segment.withClipBoundary(true) : segment)
+            marksNextSegmentAsClipStart = false
+            timelineFrame += segment.frameCount
+        }
+
+        if !didInsert {
+            nextSegments.append(contentsOf: silenceSegments)
+        }
+
+        segments = Self.coalescedSegments(nextSegments)
+        timelineFrameCount += insertedFrameCount
+        return insertedFrameCount
+    }
+
     mutating func applyGain(_ gain: Float, to selection: TimelineSelection) -> Int {
         applyGain(gain, toFramesIn: frameRange(for: selection))
     }
@@ -648,6 +701,34 @@ struct AudioEditTimeline: Sendable {
 
     private mutating func clearFrames(in frameRange: Range<Int>) -> Int {
         applyGain(0, toFramesIn: frameRange)
+    }
+
+    private func makeSilenceSegments(
+        frameCount requestedFrameCount: Int,
+        insertedFrameCount: inout Int
+    ) -> [Segment] {
+        guard requestedFrameCount > 0, sourceBuffer.frameCount > 0 else {
+            return []
+        }
+
+        var remainingFrameCount = requestedFrameCount
+        var result: [Segment] = []
+        result.reserveCapacity(max(Int(ceil(Double(requestedFrameCount) / Double(sourceBuffer.frameCount))), 1))
+        var isFirstSegment = true
+        while remainingFrameCount > 0 {
+            let chunkFrameCount = min(remainingFrameCount, sourceBuffer.frameCount)
+            result.append(Segment(
+                sourceStartFrame: 0,
+                frameCount: chunkFrameCount,
+                gainStart: 0,
+                gainEnd: 0,
+                startsNewClip: isFirstSegment
+            ))
+            insertedFrameCount += chunkFrameCount
+            remainingFrameCount -= chunkFrameCount
+            isFirstSegment = false
+        }
+        return result
     }
 
     private mutating func applyGain(_ gain: Float, toFramesIn frameRange: Range<Int>) -> Int {
