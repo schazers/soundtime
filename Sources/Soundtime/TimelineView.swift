@@ -49,6 +49,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onNormalizeRequested: (() -> Void)?
     var onDeleteSilenceRequested: (() -> Void)?
     var onAcceptDeadAirCandidateRequested: (() -> Void)?
+    var onAcceptHighConfidenceDeadAirCandidatesRequested: (() -> Void)?
     var onRejectDeadAirCandidateRequested: (() -> Void)?
     var onAuditionDeadAirCandidateRequested: (() -> Void)?
     var onReapplyLastEffect: (() -> Void)?
@@ -1026,6 +1027,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onAcceptDeadAirCandidateRequested?()
     }
 
+    @objc func acceptHighConfidenceDeadAirCandidates(_ sender: Any?) {
+        onAcceptHighConfidenceDeadAirCandidatesRequested?()
+    }
+
     @objc func rejectDeadAirCandidate(_ sender: Any?) {
         onRejectDeadAirCandidateRequested?()
     }
@@ -1049,6 +1054,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         case #selector(deleteSilence(_:)):
             return canDeleteSilence
         case #selector(acceptDeadAirCandidate(_:)),
+             #selector(acceptHighConfidenceDeadAirCandidates(_:)),
              #selector(rejectDeadAirCandidate(_:)),
              #selector(auditionDeadAirCandidate(_:)):
             return canUseDeadAirCandidate

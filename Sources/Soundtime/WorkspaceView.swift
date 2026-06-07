@@ -171,6 +171,9 @@ final class WorkspaceView: NSView {
         let displaySelection: TimelineSelection
         let editSelection: TimelineSelection
         let frameRange: Range<Int>
+        let confidence: Float
+        let reason: String
+        let estimatedRemovedDuration: TimeInterval
 
         var displayStartProgress: Float {
             displaySelection.startProgressFloat
@@ -287,6 +290,7 @@ final class WorkspaceView: NSView {
     private var deadAirCandidates: [DeadAirReviewCandidate] = []
     private var activeDeadAirCandidateID: UUID?
     private var deadAirAuditionStopTask: Task<Void, Never>?
+    private let highConfidenceSilenceThreshold: Float = 0.86
     private var lastEffect: LastEffect?
     private var currentPlayheadFrame = 0
     private var displayedFrameCount = 0
@@ -622,6 +626,9 @@ final class WorkspaceView: NSView {
         }
         timelineSurface.onAcceptDeadAirCandidateRequested = { [weak self] in
             self?.acceptActiveDeadAirCandidate()
+        }
+        timelineSurface.onAcceptHighConfidenceDeadAirCandidatesRequested = { [weak self] in
+            self?.acceptHighConfidenceDeadAirCandidates()
         }
         timelineSurface.onRejectDeadAirCandidateRequested = { [weak self] in
             self?.rejectActiveDeadAirCandidate()
@@ -4228,13 +4235,26 @@ final class WorkspaceView: NSView {
                 return nil
             }
 
+            let estimatedRemovedDuration = renderedBuffer.sampleRate > 0 ?
+                Double(localRange.count) / renderedBuffer.sampleRate :
+                0
+            let confidence = silenceReviewConfidence(
+                estimatedRemovedDuration: estimatedRemovedDuration
+            )
+            let reason = silenceReviewReason(
+                estimatedRemovedDuration: estimatedRemovedDuration
+            )
+
             return DeadAirReviewCandidate(
                 id: UUID(),
                 trackID: trackID,
                 trackEditRevision: trackEditRevision,
                 displaySelection: candidateDisplaySelection,
                 editSelection: candidateEditSelection,
-                frameRange: lowerBound..<upperBound
+                frameRange: lowerBound..<upperBound,
+                confidence: confidence,
+                reason: reason,
+                estimatedRemovedDuration: estimatedRemovedDuration
             )
         }
 
@@ -4242,6 +4262,29 @@ final class WorkspaceView: NSView {
             candidates: candidates,
             detectedRegionCount: detectedRegions.count
         )
+    }
+
+    private nonisolated static func silenceReviewConfidence(
+        estimatedRemovedDuration: TimeInterval
+    ) -> Float {
+        guard estimatedRemovedDuration.isFinite, estimatedRemovedDuration > 0 else {
+            return 0
+        }
+
+        let durationScore = min(max((estimatedRemovedDuration - 0.18) / 1.2, 0), 1)
+        return Float(min(0.98, 0.72 + durationScore * 0.26))
+    }
+
+    private nonisolated static func silenceReviewReason(
+        estimatedRemovedDuration: TimeInterval
+    ) -> String {
+        if estimatedRemovedDuration >= 1.0 {
+            return "long continuous silence"
+        }
+        if estimatedRemovedDuration >= 0.45 {
+            return "clear pause"
+        }
+        return "short pause"
     }
 
     private func publishDeadAirReviewResult(
@@ -4325,6 +4368,54 @@ final class WorkspaceView: NSView {
             target: target,
             copyBeforeDeleting: false,
             scope: .track
+        )
+    }
+
+    private func acceptHighConfidenceDeadAirCandidates() {
+        let eligibleCandidates = deadAirCandidates.filter {
+            $0.confidence >= highConfidenceSilenceThreshold
+        }
+        guard !eligibleCandidates.isEmpty else {
+            updateStatus("no high-confidence silence candidates")
+            return
+        }
+
+        guard let firstCandidate = eligibleCandidates.first else {
+            updateStatus("no high-confidence silence candidates")
+            return
+        }
+        guard eligibleCandidates.allSatisfy({ $0.trackID == firstCandidate.trackID }) else {
+            updateStatus("high-confidence candidates span tracks; review individually")
+            return
+        }
+        guard
+            let trackIndex = projectTracks.firstIndex(where: { $0.id == firstCandidate.trackID }),
+            projectTracks[trackIndex].editRevision == firstCandidate.trackEditRevision
+        else {
+            clearDeadAirReview(publish: true)
+            updateStatus("silence candidates expired; review again")
+            return
+        }
+
+        let frameRanges = eligibleCandidates.map(\.frameRange)
+        let deletedFrameCount = frameRanges.reduce(0) { total, frameRange in
+            total + frameRange.count
+        }
+        let deletedDuration = eligibleCandidates.reduce(0) { total, candidate in
+            total + candidate.estimatedRemovedDuration
+        }
+        let cleanupResult = SilenceCleanupResult(
+            frameRanges: frameRanges,
+            detectedRegionCount: eligibleCandidates.count,
+            deletedFrameCount: deletedFrameCount,
+            deletedDuration: deletedDuration
+        )
+
+        clearDeadAirReview(publish: true)
+        applySilenceCleanupResult(
+            cleanupResult,
+            trackID: firstCandidate.trackID,
+            expectedEditRevision: firstCandidate.trackEditRevision
         )
     }
 
