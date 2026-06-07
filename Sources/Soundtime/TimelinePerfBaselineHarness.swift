@@ -472,6 +472,7 @@ enum TimelinePerfBaselineHarness {
         var frame = 0
         var hasSettledRendererResidency = false
         var settledResidencyFrameCount = 0
+        var postSettleDiscardFrameCount = 0
         while cpuMilliseconds.count < scenario.frames {
             autoreleasepool {
                 let displayTimestamp = baseTimestamp + Double(frame) / 144.0
@@ -528,10 +529,16 @@ enum TimelinePerfBaselineHarness {
                     let exceededSettleBudget = frame >= minimumSettleFrame + maximumSettleFrames
                     if settledResidencyFrameCount >= requiredSettledResidencyFrames || exceededSettleBudget {
                         hasSettledRendererResidency = true
+                        postSettleDiscardFrameCount = 3
                     }
                 }
 
                 if hasSettledRendererResidency {
+                    if postSettleDiscardFrameCount > 0 {
+                        postSettleDiscardFrameCount -= 1
+                        return
+                    }
+
                     cpuMilliseconds.append(elapsedMilliseconds)
                     if let gpuMillisecondsForFrame = commandBufferGPUMilliseconds(from: commandBuffer) {
                         gpuMilliseconds.append(gpuMillisecondsForFrame)
