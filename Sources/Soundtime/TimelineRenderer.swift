@@ -827,6 +827,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var trackWaveformMipLevels: [UUID: [WaveformMipLevel]] = [:]
     private var previousTrackWaveformMipLevels: [UUID: [WaveformMipLevel]] = [:]
     private let waveformMipLevelStateLock = NSLock()
+    private var waveformSourceTracksByID: [UUID: TimelineRenderState.Track] = [:]
     private var currentTrackWaveformMipKeys: [UUID: WaveformMipCacheKey] = [:]
     private var currentPrimaryWaveformTrackID: UUID?
     private var previousTransitionTracks: [TimelineRenderState.Track] = []
@@ -1127,6 +1128,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     func displayTracks(_ tracks: [TimelineRenderState.Track], animateWaveformTransition: Bool = true) {
         let previousTracks = renderState.tracks
+        updateWaveformSourceTracks(from: tracks)
         let currentTracksByID = Dictionary(uniqueKeysWithValues: previousTracks.map { ($0.id, $0) })
         let renderTracks = tracks.map { lightweightRenderTrack(from: $0, currentTrack: currentTracksByID[$0.id]) }
         let nextRenderState = renderState.withTracks(renderTracks)
@@ -1134,9 +1136,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         var nextTrackWaveformMipLevels: [UUID: [WaveformMipLevel]] = [:]
         var nextTrackWaveformMipKeys: [UUID: WaveformMipCacheKey] = [:]
         for track in tracks {
-            let mipLevels = cachedWaveformMipLevels(for: track)
+            let sourceTrack = waveformSourceTrack(for: track)
+            let mipLevels = cachedWaveformMipLevels(for: sourceTrack)
             nextTrackWaveformMipLevels[track.id] = mipLevels
-            if let key = waveformMipCacheKey(for: track) {
+            if let key = waveformMipCacheKey(for: sourceTrack) {
                 nextTrackWaveformMipKeys[track.id] = key
             }
         }
@@ -1206,8 +1209,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
 
     func displayTrackMixSettings(_ tracks: [TimelineRenderState.Track]) {
+        updateWaveformSourceTracks(from: tracks)
         let currentTracksByID = Dictionary(uniqueKeysWithValues: renderState.tracks.map { ($0.id, $0) })
         let renderTracks = tracks.map { lightweightRenderTrack(from: $0, currentTrack: currentTracksByID[$0.id]) }
+        ensureWaveformMipLevelsExist(for: renderTracks)
         let nextRenderState = renderState.withTracks(renderTracks)
         updateTrackFisheyeAudibility(for: nextRenderState, at: CACurrentMediaTime())
         renderState = nextRenderState
@@ -1217,10 +1222,19 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         from track: TimelineRenderState.Track,
         currentTrack: TimelineRenderState.Track? = nil
     ) -> TimelineRenderState.Track {
-        let durationHint = track.durationHint ?? track.waveformOverview?.duration ?? currentTrack?.durationHint
-        let hasWaveform = track.waveformOverview?.isEmpty == false || currentTrack?.hasWaveform == true
-        let waveformVersion = track.waveformOverview == nil ?
-            (currentTrack?.waveformVersion ?? track.waveformVersion) :
+        let sourceTrack = waveformSourceTracksByID[track.id]
+        let sourceOverview = track.waveformOverview ?? sourceTrack?.waveformOverview
+        let durationHint = track.durationHint ??
+            sourceOverview?.duration ??
+            currentTrack?.durationHint ??
+            sourceTrack?.durationHint
+        let hasWaveform =
+            track.hasWaveform ||
+            sourceOverview?.isEmpty == false ||
+            currentTrack?.hasWaveform == true ||
+            sourceTrack?.hasWaveform == true
+        let waveformVersion = sourceOverview == nil ?
+            (sourceTrack?.waveformVersion ?? currentTrack?.waveformVersion ?? track.waveformVersion) :
             track.waveformVersion
         return TimelineRenderState.Track(
             id: track.id,
@@ -1233,6 +1247,77 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             hasWaveform: hasWaveform,
             clipRanges: track.clipRanges.isEmpty ? (currentTrack?.clipRanges ?? []) : track.clipRanges
         )
+    }
+
+    private func updateWaveformSourceTracks(from tracks: [TimelineRenderState.Track]) {
+        let activeTrackIDs = Set(tracks.map(\.id))
+        waveformSourceTracksByID = waveformSourceTracksByID.filter { activeTrackIDs.contains($0.key) }
+        for track in tracks where track.waveformOverview?.isEmpty == false {
+            waveformSourceTracksByID[track.id] = track
+        }
+    }
+
+    private func waveformSourceTrack(for track: TimelineRenderState.Track) -> TimelineRenderState.Track {
+        guard track.waveformOverview?.isEmpty != false, let sourceTrack = waveformSourceTracksByID[track.id] else {
+            return track
+        }
+
+        return TimelineRenderState.Track(
+            id: track.id,
+            waveformVersion: sourceTrack.waveformVersion,
+            waveformOverview: sourceTrack.waveformOverview,
+            durationHint: track.durationHint ?? sourceTrack.durationHint,
+            volume: track.volume,
+            isMuted: track.isMuted,
+            isSoloed: track.isSoloed,
+            hasWaveform: sourceTrack.hasWaveform,
+            clipRanges: track.clipRanges.isEmpty ? sourceTrack.clipRanges : track.clipRanges
+        )
+    }
+
+    private func ensureWaveformMipLevelsExist(for tracks: [TimelineRenderState.Track]) {
+        var didChangeMipState = false
+        var ensuredPrimaryLevels: [WaveformMipLevel]?
+        waveformMipLevelStateLock.lock()
+        var nextTrackWaveformMipLevels = trackWaveformMipLevels
+        var nextTrackWaveformMipKeys = currentTrackWaveformMipKeys
+        waveformMipLevelStateLock.unlock()
+
+        for track in tracks where track.hasWaveform {
+            guard nextTrackWaveformMipLevels[track.id]?.isEmpty != false else {
+                continue
+            }
+
+            let sourceTrack = waveformSourceTrack(for: track)
+            let mipLevels = cachedWaveformMipLevels(for: sourceTrack)
+            guard !mipLevels.isEmpty else {
+                continue
+            }
+
+            nextTrackWaveformMipLevels[track.id] = mipLevels
+            if let key = waveformMipCacheKey(for: sourceTrack) {
+                nextTrackWaveformMipKeys[track.id] = key
+            }
+            if ensuredPrimaryLevels == nil {
+                ensuredPrimaryLevels = mipLevels
+            }
+            didChangeMipState = true
+        }
+
+        guard didChangeMipState else {
+            return
+        }
+
+        waveformMipLevelStateLock.lock()
+        trackWaveformMipLevels = nextTrackWaveformMipLevels
+        currentTrackWaveformMipKeys = nextTrackWaveformMipKeys
+        if waveformMipLevels.isEmpty, let ensuredPrimaryLevels {
+            waveformMipLevels = ensuredPrimaryLevels
+        }
+        if currentPrimaryWaveformTrackID == nil {
+            currentPrimaryWaveformTrackID = tracks.first(where: { $0.hasWaveform })?.id
+        }
+        waveformMipLevelStateLock.unlock()
     }
 
     func updateWaveformTouchTuning(
@@ -6820,11 +6905,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
 
     private func cachedWaveformMipLevels(for track: TimelineRenderState.Track) -> [WaveformMipLevel] {
-        guard let waveformOverview = track.waveformOverview, !waveformOverview.isEmpty else {
+        let sourceTrack = waveformSourceTrack(for: track)
+        guard let waveformOverview = sourceTrack.waveformOverview, !waveformOverview.isEmpty else {
             return []
         }
 
-        let key = waveformMipCacheKey(for: track)
+        let key = waveformMipCacheKey(for: sourceTrack)
         guard let key else {
             return []
         }
@@ -6845,13 +6931,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
 
     private func waveformMipCacheKey(for track: TimelineRenderState.Track) -> WaveformMipCacheKey? {
-        guard let waveformOverview = track.waveformOverview, !waveformOverview.isEmpty else {
+        let sourceTrack = waveformSourceTrack(for: track)
+        guard let waveformOverview = sourceTrack.waveformOverview, !waveformOverview.isEmpty else {
             return nil
         }
 
         return WaveformMipCacheKey(
-            trackID: track.id,
-            waveformVersion: track.waveformVersion,
+            trackID: sourceTrack.id,
+            waveformVersion: sourceTrack.waveformVersion,
             binCount: waveformOverview.bins.count,
             duration: waveformOverview.duration
         )

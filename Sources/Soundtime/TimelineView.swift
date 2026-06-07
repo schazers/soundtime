@@ -310,6 +310,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         updateTimelineRenderer { renderer in
             renderer.displayTracks(tracks, animateWaveformTransition: animateWaveformTransition)
         }
+        requestTimelineRender()
         displayTrimPreview(nil)
 
         if wasSelectionEnabled != isSelectionEnabled {
