@@ -3,6 +3,7 @@ import Foundation
 struct TimelineTrackLayout: Sendable, Equatable {
     static let `default` = TimelineTrackLayout()
     static let defaultPreferredTrackHeight: Float = 148
+    fileprivate static let maximumAutoFitTrackCount = 4
 
     var scrollOffset: Float
     var preferredTrackHeight: Float
@@ -64,9 +65,14 @@ struct ResolvedTimelineTrackLayout: Sendable, Equatable {
         let fillTrackHeight = safeTrackCount > 0 ?
             safeViewportHeight / Float(safeTrackCount) :
             safeViewportHeight
-        let resolvedTrackHeight = safeTrackCount > 0 ?
-            max(safePreferredTrackHeight, fillTrackHeight) :
-            safeViewportHeight
+        let resolvedTrackHeight: Float
+        if safeTrackCount == 0 {
+            resolvedTrackHeight = safeViewportHeight
+        } else if safeTrackCount <= TimelineTrackLayout.maximumAutoFitTrackCount {
+            resolvedTrackHeight = fillTrackHeight
+        } else {
+            resolvedTrackHeight = max(safePreferredTrackHeight, fillTrackHeight)
+        }
         let resolvedContentHeight = resolvedTrackHeight * Float(max(safeTrackCount, 1))
         let maximumScrollOffset = max(resolvedContentHeight - safeViewportHeight, 0)
 

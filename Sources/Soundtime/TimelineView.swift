@@ -360,10 +360,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     func displayTrackMixSettings(_ tracks: [TimelineRenderState.Track]) {
         currentTrackIDs = tracks.map(\.id)
-        currentRenderTracks = mergeTrackMetadata(tracks)
+        let mergedTracks = mergeTrackMetadata(tracks)
+        currentRenderTracks = mergedTracks
         timelineDuration = Self.timelineDuration(for: tracks)
         let wasSelectionEnabled = isSelectionEnabled
-        isSelectionEnabled = tracks.contains { $0.hasWaveform }
+        isSelectionEnabled = mergedTracks.contains { $0.hasWaveform }
         updateTrackLayoutForCurrentBounds(requestRender: false)
 
         updateTimelineRenderer { renderer in

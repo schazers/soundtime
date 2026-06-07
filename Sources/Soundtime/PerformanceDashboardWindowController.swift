@@ -482,6 +482,11 @@ private final class PerformanceEventLogView: NSView {
 }
 
 private final class PerformanceSparklineView: NSView {
+    private struct Sample {
+        let timestamp: TimeInterval
+        let value: CGFloat
+    }
+
     var maximumValue: CGFloat = 144 {
         didSet {
             needsDisplay = true
@@ -489,8 +494,10 @@ private final class PerformanceSparklineView: NSView {
     }
 
     private let accentColor: NSColor
-    private var samples: [CGFloat] = []
+    private var samples: [Sample] = []
     private let maximumSampleCount = 96
+    private let historyDuration: TimeInterval = 15
+    private var displayTimer: Timer?
 
     init(accentColor: NSColor) {
         self.accentColor = accentColor
@@ -502,11 +509,22 @@ private final class PerformanceSparklineView: NSView {
         nil
     }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            stopDisplayTimer()
+        } else {
+            startDisplayTimerIfNeeded()
+        }
+    }
+
     func append(_ sample: CGFloat) {
-        samples.append(max(sample, 0))
+        samples.append(Sample(timestamp: CACurrentMediaTime(), value: max(sample, 0)))
         if samples.count > maximumSampleCount {
             samples.removeFirst(samples.count - maximumSampleCount)
         }
+        pruneSamples(now: CACurrentMediaTime())
+        startDisplayTimerIfNeeded()
         needsDisplay = true
     }
 
@@ -529,17 +547,30 @@ private final class PerformanceSparklineView: NSView {
             return
         }
 
+        let now = CACurrentMediaTime()
+        pruneSamples(now: now)
         let maxValue = max(maximumValue, 1)
         let path = NSBezierPath()
-        for (index, sample) in samples.enumerated() {
-            let x = rect.minX + CGFloat(index) / CGFloat(max(samples.count - 1, 1)) * rect.width
-            let normalized = min(max(sample / maxValue, 0), 1)
+        var didDrawPoint = false
+        for sample in samples {
+            let age = now - sample.timestamp
+            let x = rect.maxX - CGFloat(age / historyDuration) * rect.width
+            guard x >= rect.minX - 2, x <= rect.maxX + 2 else {
+                continue
+            }
+
+            let normalized = min(max(sample.value / maxValue, 0), 1)
             let y = rect.minY + normalized * rect.height
-            if index == 0 {
+            if !didDrawPoint {
                 path.move(to: NSPoint(x: x, y: y))
+                didDrawPoint = true
             } else {
                 path.line(to: NSPoint(x: x, y: y))
             }
+        }
+
+        guard didDrawPoint else {
+            return
         }
 
         accentColor.withAlphaComponent(0.32).setStroke()
@@ -548,6 +579,33 @@ private final class PerformanceSparklineView: NSView {
         accentColor.setStroke()
         path.lineWidth = 1.6
         path.stroke()
+    }
+
+    private func startDisplayTimerIfNeeded() {
+        guard displayTimer == nil, window != nil else {
+            return
+        }
+
+        let timer = Timer(timeInterval: 1 / 60, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.needsDisplay = true
+            }
+        }
+        timer.tolerance = 1 / 240
+        displayTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stopDisplayTimer() {
+        displayTimer?.invalidate()
+        displayTimer = nil
+    }
+
+    private func pruneSamples(now: TimeInterval) {
+        let oldestTimestamp = now - historyDuration
+        while samples.count > maximumSampleCount || (samples.first?.timestamp ?? now) < oldestTimestamp {
+            samples.removeFirst()
+        }
     }
 }
 
