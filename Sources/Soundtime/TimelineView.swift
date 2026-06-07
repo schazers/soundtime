@@ -412,9 +412,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     func displaySelection(_ selection: TimelineSelection?) {
-        updateTimelineRenderer { renderer in
-            renderer.displaySelection(selection)
-        }
+        timelineRenderer?.publishInteractionSelection(selection)
         requestTimelineRender()
     }
 
@@ -433,9 +431,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     func displayHoverProgress(_ progress: Float?, isArmed: Bool = false) {
-        updateTimelineRenderer { renderer in
-            renderer.displayHoverProgress(progress, isArmed: isArmed)
-        }
+        timelineRenderer?.publishInteractionHover(progress: progress, isArmed: isArmed)
         requestTimelineRender()
     }
 
