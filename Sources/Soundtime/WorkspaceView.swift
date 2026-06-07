@@ -276,6 +276,8 @@ final class WorkspaceView: NSView {
     private var lastRecordingVisualUpdateTimestamp = CACurrentMediaTime()
     private var trackControlViewsByID: [UUID: TrackControlView] = [:]
     private var trackControlReusePool: [TrackControlView] = []
+    private var trackIndicesByID: [UUID: Int] = [:]
+    private var trackIndexCacheTrackCount = 0
     private var currentTrackLaneLayout = ResolvedTimelineTrackLayout(
         totalTrackCount: 0,
         viewportHeight: 1,
@@ -1077,6 +1079,7 @@ final class WorkspaceView: NSView {
     }
 
     private func refreshTrackControls() {
+        rebuildTrackIndexCache()
         let visibleRange = currentTrackLaneLayout.visibleRange(overscan: 1)
         let visibleLowerBound = min(max(visibleRange.lowerBound, 0), projectTracks.count)
         let visibleUpperBound = min(max(visibleRange.upperBound, visibleLowerBound), projectTracks.count)
@@ -1140,6 +1143,15 @@ final class WorkspaceView: NSView {
         layoutTrackControlViews()
     }
 
+    private func rebuildTrackIndexCache() {
+        trackIndicesByID.removeAll(keepingCapacity: true)
+        trackIndicesByID.reserveCapacity(projectTracks.count)
+        for (index, track) in projectTracks.enumerated() {
+            trackIndicesByID[track.id] = index
+        }
+        trackIndexCacheTrackCount = projectTracks.count
+    }
+
     private func updateTrackLaneLayout(_ layout: ResolvedTimelineTrackLayout) {
         guard currentTrackLaneLayout != layout else {
             layoutTrackControlViews()
@@ -1153,11 +1165,10 @@ final class WorkspaceView: NSView {
     private func layoutTrackControlViews() {
         let viewportHeight = max(trackControlsStack.bounds.height, 1)
         let viewportWidth = max(trackControlsStack.bounds.width, 1)
-        let trackIndicesByID = Dictionary(
-            uniqueKeysWithValues: projectTracks.enumerated().map { index, track in
-                (track.id, index)
-            }
-        )
+        if trackIndexCacheTrackCount != projectTracks.count {
+            rebuildTrackIndexCache()
+        }
+
         for (trackID, controlView) in trackControlViewsByID {
             guard
                 let trackIndex = trackIndicesByID[trackID],
