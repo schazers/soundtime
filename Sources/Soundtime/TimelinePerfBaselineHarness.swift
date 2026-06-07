@@ -23,6 +23,7 @@ enum TimelinePerfBaselineHarness {
         let showsGainPreview: Bool
         let targetsVisibleTrack: Bool
         let deletionBurstInterval: Int?
+        var waveformRefreshInterval: Int? = nil
     }
 
     private struct TrackCacheKey: Hashable {
@@ -421,6 +422,25 @@ enum TimelinePerfBaselineHarness {
             )
             scenarios.append(
                 Scenario(
+                    name: "background waveform refresh",
+                    trackCount: 100,
+                    waveformBinCount: isQuick ? 32_768 : 65_536,
+                    frames: max(frames / 2, 36),
+                    warmupFrames: max(warmupFrames, 36),
+                    viewportDuration: 0.12,
+                    isPlaybackActive: true,
+                    pansDuringRun: true,
+                    zoomsDuringRun: false,
+                    scrollsTracksDuringRun: true,
+                    showsSelection: true,
+                    showsGainPreview: true,
+                    targetsVisibleTrack: true,
+                    deletionBurstInterval: nil,
+                    waveformRefreshInterval: isQuick ? 18 : 30
+                )
+            )
+            scenarios.append(
+                Scenario(
                     name: "high-res zoom fidelity",
                     trackCount: 1,
                     waveformBinCount: WaveformOverviewBuilder.defaultTargetBinCount,
@@ -512,10 +532,12 @@ enum TimelinePerfBaselineHarness {
         var gpuMilliseconds: [Double] = []
         var rendererStatsSamples: [TimelineFrameStats] = []
         var visibleLaneCounts: [Int] = []
+        var activeTracks = tracks
         cpuMilliseconds.reserveCapacity(scenario.frames)
         gpuMilliseconds.reserveCapacity(scenario.frames)
         rendererStatsSamples.reserveCapacity(scenario.frames)
         visibleLaneCounts.reserveCapacity(scenario.frames)
+        renderer.displayTracks(activeTracks)
 
         let totalFrames = scenario.warmupFrames + scenario.frames
         let maximumSettleFrames = 240
@@ -540,6 +562,16 @@ enum TimelinePerfBaselineHarness {
                     viewportHeight: Float(viewportSize.height)
                 )
 
+                let didRefreshWaveformSnapshot = refreshWaveformSnapshotIfNeeded(
+                    tracks: &activeTracks,
+                    scenario: scenario,
+                    trackLayout: trackLayout,
+                    viewportHeight: Float(viewportSize.height),
+                    frame: frame
+                )
+                if didRefreshWaveformSnapshot {
+                    renderer.displayTracks(activeTracks)
+                }
                 renderer.displayViewport(viewport)
                 renderer.displayTrackLayout(trackLayout)
                 renderer.displayPlayheadProgress(
@@ -553,7 +585,7 @@ enum TimelinePerfBaselineHarness {
                     renderer: renderer,
                     frame: frame,
                     totalFrames: totalFrames,
-                    tracks: tracks,
+                    tracks: activeTracks,
                     trackLayout: trackLayout,
                     viewportHeight: Float(viewportSize.height)
                 )
@@ -621,6 +653,44 @@ enum TimelinePerfBaselineHarness {
                 viewportHeight: Float(viewportSize.height)
             )
         )
+    }
+
+    private static func refreshWaveformSnapshotIfNeeded(
+        tracks: inout [TimelineRenderState.Track],
+        scenario: Scenario,
+        trackLayout: TimelineTrackLayout,
+        viewportHeight: Float,
+        frame: Int
+    ) -> Bool {
+        guard
+            let refreshInterval = scenario.waveformRefreshInterval,
+            refreshInterval > 0,
+            frame >= scenario.warmupFrames,
+            frame.isMultiple(of: refreshInterval),
+            let trackIndex = targetedTrackIndex(
+                scenario: scenario,
+                tracks: tracks,
+                trackLayout: trackLayout,
+                viewportHeight: viewportHeight,
+                frame: frame
+            ),
+            tracks.indices.contains(trackIndex)
+        else {
+            return false
+        }
+
+        let track = tracks[trackIndex]
+        tracks[trackIndex] = TimelineRenderState.Track(
+            id: track.id,
+            waveformVersion: track.waveformVersion + 1,
+            waveformOverview: track.waveformOverview,
+            durationHint: track.durationHint,
+            volume: track.volume,
+            isMuted: track.isMuted,
+            isSoloed: track.isSoloed,
+            hasWaveform: track.hasWaveform
+        )
+        return true
     }
 
     private static func makeRenderPassDescriptor(texture: MTLTexture) -> MTLRenderPassDescriptor {
@@ -789,6 +859,29 @@ enum TimelinePerfBaselineHarness {
         viewportHeight: Float,
         frame: Int
     ) -> UUID? {
+        guard
+            let trackIndex = targetedTrackIndex(
+                scenario: scenario,
+                tracks: tracks,
+                trackLayout: trackLayout,
+                viewportHeight: viewportHeight,
+                frame: frame
+            ),
+            tracks.indices.contains(trackIndex)
+        else {
+            return nil
+        }
+
+        return tracks[trackIndex].id
+    }
+
+    private static func targetedTrackIndex(
+        scenario: Scenario,
+        tracks: [TimelineRenderState.Track],
+        trackLayout: TimelineTrackLayout,
+        viewportHeight: Float,
+        frame: Int
+    ) -> Int? {
         guard scenario.targetsVisibleTrack, !tracks.isEmpty else {
             return nil
         }
@@ -807,7 +900,7 @@ enum TimelinePerfBaselineHarness {
         guard tracks.indices.contains(trackIndex) else {
             return nil
         }
-        return tracks[trackIndex].id
+        return trackIndex
     }
 
     private static func pulse(frame: Int, period: Int) -> Float {
@@ -893,6 +986,7 @@ enum TimelinePerfBaselineHarness {
             "selection": result.scenario.showsSelection,
             "gain_preview": result.scenario.showsGainPreview,
             "delete_bursts": result.scenario.deletionBurstInterval != nil,
+            "waveform_refresh": result.scenario.waveformRefreshInterval != nil,
             "track_scroll": result.scenario.scrollsTracksDuringRun,
             "target_visible_track": result.scenario.targetsVisibleTrack,
             "visible_lanes_avg": rounded(result.averageVisibleLaneCount),
@@ -975,7 +1069,15 @@ enum TimelinePerfBaselineHarness {
                 "visible-lane budget \(waveformDrawBudget)"
             )
         }
-        if result.maximumShaderBufferUploadCount > 0 || result.maximumShaderBufferUploadInFlightCount > 0 {
+        if result.scenario.waveformRefreshInterval != nil {
+            if result.maximumShaderBufferUploadCount > 2 || result.maximumShaderBufferUploadInFlightCount > 2 {
+                failures.append(
+                    "\(label) exceeded background upload budget " +
+                    "(uploads=\(result.maximumShaderBufferUploadCount), " +
+                    "inFlight=\(result.maximumShaderBufferUploadInFlightCount))"
+                )
+            }
+        } else if result.maximumShaderBufferUploadCount > 0 || result.maximumShaderBufferUploadInFlightCount > 0 {
             failures.append(
                 "\(label) uploaded shader buffers during measured frames " +
                 "(uploads=\(result.maximumShaderBufferUploadCount), " +
