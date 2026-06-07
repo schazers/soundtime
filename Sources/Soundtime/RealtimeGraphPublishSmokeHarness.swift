@@ -23,6 +23,11 @@ enum RealtimeGraphPublishSmokeHarness {
         let renderBlockFrameCount = 256
         let sampleRate = 48_000.0
         let sourceFrameCount = Int(sampleRate) * 30
+        let duplicateTrackPhaseMaxError = try runDuplicateTrackPhaseSmoke(
+            sampleRate: sampleRate,
+            sourceFrameCount: sourceFrameCount,
+            renderBlockFrameCount: renderBlockFrameCount
+        )
         let outputDevice = RealtimeGraphPublishSmokeOutputDevice()
 
         guard let playbackEngine = RealtimeCorePlaybackEngine(outputDevice: outputDevice) else {
@@ -152,6 +157,120 @@ enum RealtimeGraphPublishSmokeHarness {
                 elapsedMilliseconds
             )
         )
+        print(
+            String(
+                format: "Soundtime duplicate track phase smoke passed: max %.8f",
+                duplicateTrackPhaseMaxError
+            )
+        )
+    }
+
+    private static func runDuplicateTrackPhaseSmoke(
+        sampleRate: Double,
+        sourceFrameCount: Int,
+        renderBlockFrameCount: Int
+    ) throws -> Float {
+        let sourceBuffer = syntheticAudioBuffer(frameCount: sourceFrameCount, sampleRate: sampleRate)
+        let baseTimeline = AudioEditTimeline(sourceBuffer: sourceBuffer)
+        let singleDevice = RealtimeGraphPublishSmokeOutputDevice()
+        let duplicateDevice = RealtimeGraphPublishSmokeOutputDevice()
+
+        guard
+            let singleEngine = RealtimeCorePlaybackEngine(outputDevice: singleDevice),
+            let duplicateEngine = RealtimeCorePlaybackEngine(outputDevice: duplicateDevice)
+        else {
+            throw SmokeError.failed("could not create duplicate track phase smoke engines")
+        }
+
+        try singleEngine.loadProjectTracks(duplicatePhaseTracks(
+            timeline: baseTimeline,
+            trackCount: 1
+        ))
+        try duplicateEngine.loadProjectTracks(duplicatePhaseTracks(
+            timeline: baseTimeline,
+            trackCount: 2
+        ))
+        try singleEngine.play()
+        try duplicateEngine.play()
+
+        guard
+            let singleCorePointer = singleDevice.corePointer,
+            let duplicateCorePointer = duplicateDevice.corePointer
+        else {
+            throw SmokeError.failed("duplicate track phase smoke output devices were not configured")
+        }
+
+        let blockCount = 256
+        let singleRender = renderCaptured(
+            corePointer: singleCorePointer,
+            blockCount: blockCount,
+            frameCount: renderBlockFrameCount,
+            sampleRate: sampleRate
+        )
+        let duplicateRender = renderCaptured(
+            corePointer: duplicateCorePointer,
+            blockCount: blockCount,
+            frameCount: renderBlockFrameCount,
+            sampleRate: sampleRate
+        )
+        singleEngine.pause()
+        duplicateEngine.pause()
+
+        let singleSnapshot = soundtime_audio_core_snapshot(singleCorePointer)
+        let duplicateSnapshot = soundtime_audio_core_snapshot(duplicateCorePointer)
+        try require(
+            singleSnapshot.droppedCommandCount == 0 && duplicateSnapshot.droppedCommandCount == 0,
+            "duplicate track phase smoke dropped commands"
+        )
+        try require(
+            singleRender.left.count == duplicateRender.left.count &&
+                singleRender.right.count == duplicateRender.right.count,
+            "duplicate track phase smoke rendered mismatched buffer sizes"
+        )
+
+        var maxError: Float = 0
+        var maxReference: Float = 0
+        for index in singleRender.left.indices {
+            let leftReference = singleRender.left[index] * 2
+            let rightReference = singleRender.right[index] * 2
+            let leftError = abs(duplicateRender.left[index] - leftReference)
+            let rightError = abs(duplicateRender.right[index] - rightReference)
+            maxError = max(maxError, leftError, rightError)
+            maxReference = max(
+                maxReference,
+                abs(leftReference),
+                abs(rightReference),
+                abs(duplicateRender.left[index]),
+                abs(duplicateRender.right[index])
+            )
+        }
+
+        let tolerance = max(0.000_05, maxReference * 0.000_04)
+        try require(
+            maxError <= tolerance,
+            String(
+                format: "duplicate tracks are not sample-synchronous: max error %.8f, tolerance %.8f",
+                maxError,
+                tolerance
+            )
+        )
+        return maxError
+    }
+
+    private static func duplicatePhaseTracks(
+        timeline: AudioEditTimeline,
+        trackCount: Int
+    ) -> [ProjectPlaybackTrack] {
+        (0..<trackCount).map { index in
+            ProjectPlaybackTrack(
+                id: UUID(uuidString: String(format: "00000000-0000-4000-9000-%012d", index)) ?? UUID(),
+                source: .timeline(audioTimeline: timeline, zeroCrossingIndex: nil),
+                sourceRevision: 0,
+                volume: 1,
+                isMuted: false,
+                isSoloed: false
+            )
+        }
     }
 
     private static func projectTracks(
@@ -228,6 +347,55 @@ enum RealtimeGraphPublishSmokeHarness {
                 }
             }
         }
+    }
+
+    private nonisolated static func renderCaptured(
+        corePointer: OpaquePointer,
+        blockCount: Int,
+        frameCount: Int,
+        sampleRate: Double
+    ) -> (left: [Float], right: [Float]) {
+        var leftOutput = [Float](repeating: 0, count: frameCount)
+        var rightOutput = [Float](repeating: 0, count: frameCount)
+        var capturedLeft: [Float] = []
+        var capturedRight: [Float] = []
+        capturedLeft.reserveCapacity(blockCount * frameCount)
+        capturedRight.reserveCapacity(blockCount * frameCount)
+
+        for blockIndex in 0..<blockCount {
+            leftOutput.withUnsafeMutableBufferPointer { leftBuffer in
+                rightOutput.withUnsafeMutableBufferPointer { rightBuffer in
+                    var outputs: [UnsafeMutablePointer<Float>?] = [
+                        leftBuffer.baseAddress,
+                        rightBuffer.baseAddress,
+                    ]
+                    outputs.withUnsafeMutableBufferPointer { outputBuffer in
+                        soundtime_audio_core_render_at_host_time(
+                            corePointer,
+                            outputBuffer.baseAddress,
+                            2,
+                            UInt32(frameCount),
+                            Double(blockIndex * frameCount) / sampleRate
+                        )
+                    }
+
+                    if let baseAddress = leftBuffer.baseAddress {
+                        capturedLeft.append(contentsOf: UnsafeBufferPointer(
+                            start: baseAddress,
+                            count: frameCount
+                        ))
+                    }
+                    if let baseAddress = rightBuffer.baseAddress {
+                        capturedRight.append(contentsOf: UnsafeBufferPointer(
+                            start: baseAddress,
+                            count: frameCount
+                        ))
+                    }
+                }
+            }
+        }
+
+        return (capturedLeft, capturedRight)
     }
 
     private static func syntheticAudioBuffer(frameCount: Int, sampleRate: Double) -> DecodedAudioBuffer {
