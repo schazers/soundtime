@@ -49,6 +49,19 @@ enum ProjectEditRoundTripSmokeHarness {
         )
         try require(fadedOutFrames == 1_080, "fade-out frame count mismatch")
 
+        let copiedClip = try requireValue(
+            timeline.clip(for: TimelineSelection(startProgress: 0.08, endProgress: 0.12, trackID: trackID)),
+            "could not copy file-backed clip"
+        )
+        let pastedFrames = try requireValue(
+            timeline.replace(
+                TimelineSelection(startProgress: 0.65, endProgress: 0.65, trackID: trackID),
+                with: copiedClip
+            ),
+            "could not paste file-backed clip"
+        )
+        try require(pastedFrames == copiedClip.frameCount, "pasted clip frame count mismatch")
+
         let originalState = try requireValue(timeline.persistentState, "edited timeline did not persist")
         let project = SoundtimeProject(
             tracks: [
@@ -97,7 +110,10 @@ enum ProjectEditRoundTripSmokeHarness {
             "could not restore edit timeline"
         )
         try require(restoredTimeline.isCompatible(with: fileInfo), "restored edit timeline is incompatible")
-        try require(restoredTimeline.frameCount == sourceFrameCount - deletedFrames, "restored frame count mismatch")
+        try require(
+            restoredTimeline.frameCount == sourceFrameCount - deletedFrames + pastedFrames,
+            "restored frame count mismatch"
+        )
         try require(abs(restoredTimeline.duration - timeline.duration) < 0.000_001, "restored duration mismatch")
         try requirePersistentStatesMatch(
             originalState,
@@ -112,7 +128,8 @@ enum ProjectEditRoundTripSmokeHarness {
             timeline,
             restoredTimeline,
             sourceFrameCount: sourceFrameCount,
-            sampleRate: sampleRate
+            sampleRate: sampleRate,
+            expectedFrameCount: sourceFrameCount - deletedFrames + pastedFrames
         )
 
         print(
@@ -145,12 +162,13 @@ enum ProjectEditRoundTripSmokeHarness {
         _ originalTimeline: AudioFileEditTimeline,
         _ restoredTimeline: AudioFileEditTimeline,
         sourceFrameCount: Int,
-        sampleRate: Double
+        sampleRate: Double,
+        expectedFrameCount: Int
     ) throws {
         let sourceBuffer = syntheticAudioBuffer(frameCount: sourceFrameCount, sampleRate: sampleRate)
         let originalRender = originalTimeline.audioTimeline(sourceBuffer: sourceBuffer).render()
         let restoredRender = restoredTimeline.audioTimeline(sourceBuffer: sourceBuffer).render()
-        try require(originalRender.frameCount == 10_800, "rendered edit frame count mismatch")
+        try require(originalRender.frameCount == expectedFrameCount, "rendered edit frame count mismatch")
         try require(restoredRender.frameCount == originalRender.frameCount, "restored render frame count mismatch")
         try require(restoredRender.channelCount == originalRender.channelCount, "restored render channel count mismatch")
 
