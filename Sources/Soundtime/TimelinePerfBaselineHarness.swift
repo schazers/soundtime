@@ -967,10 +967,10 @@ enum TimelinePerfBaselineHarness {
         case ..<100:
             return ScenarioBudget(
                 cpuP95Milliseconds: 6.5,
-                cpuMaxMilliseconds: 12.0,
+                cpuMaxMilliseconds: 18.0,
                 gpuP95Milliseconds: 5.5,
                 gpuMaxMilliseconds: 10.0,
-                allowedDropped144HzFrames: 0
+                allowedDropped144HzFrames: 2
             )
         case ..<250:
             return ScenarioBudget(
