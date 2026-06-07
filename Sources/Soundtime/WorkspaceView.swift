@@ -255,7 +255,11 @@ final class WorkspaceView: NSView {
     private var selectedAudioFile: AudioFileMetadata?
     private var decodedAudioBuffer: DecodedAudioBuffer?
     private var audioTimeline: AudioEditTimeline?
-    private var editUndoStack: [UndoAction] = []
+    private var editUndoStack: [UndoAction] = [] {
+        didSet {
+            scheduleAutosaveIfNeeded()
+        }
+    }
     private var loadedAudioSummary: String?
     private var selectedTimelineRange: TimelineSelection?
     private var deadAirCandidates: [DeadAirReviewCandidate] = []
@@ -506,6 +510,10 @@ final class WorkspaceView: NSView {
     private var trackControlsBelowDebugConstraint: NSLayoutConstraint?
     private var trackControlsBelowHeaderConstraint: NSLayoutConstraint?
     private var lastResponsiveLayoutWidth: CGFloat = -1
+    private let autosaveID = UUID()
+    private let autosaveDelay: TimeInterval = 1.5
+    private var autosaveWorkItem: DispatchWorkItem?
+    private var isAutosaveSuppressed = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1108,11 +1116,14 @@ final class WorkspaceView: NSView {
         }
         hasRestoredLastProject = true
 
-        guard let lastProjectURL = SoundtimeProjectStore.lastProjectURL() else {
+        if let lastProjectURL = SoundtimeProjectStore.lastProjectURL() {
+            loadProject(from: lastProjectURL)
             return
         }
 
-        loadProject(from: lastProjectURL)
+        if let recoveryURL = SoundtimeProjectStore.recoverableAutosaveURLs().first {
+            loadRecoveredAutosave(from: recoveryURL)
+        }
     }
 
     private func refreshProjectTimelineDisplay(
@@ -1889,6 +1900,7 @@ final class WorkspaceView: NSView {
             scheduleProjectTrackMixUpdate()
         }
         updateStatus(currentPlaybackStatus)
+        scheduleAutosaveIfNeeded()
     }
 
     private func reloadProjectPlaybackImmediately() {
@@ -2062,6 +2074,7 @@ final class WorkspaceView: NSView {
         )
 
         projectTracks.append(track)
+        scheduleAutosaveIfNeeded()
         activeTrackID = trackID
         selectedTimelineRange = nil
         updateEffectCommandState()
@@ -5933,8 +5946,11 @@ final class WorkspaceView: NSView {
             try prepareProjectForSerialization()
             let projectURL = normalizedProjectURL(url)
             try SoundtimeProjectStore.save(currentProject(), to: projectURL)
-            currentProjectURL = projectURL
-            markProjectSourceFilesAsSaved()
+            withoutAutosave {
+                currentProjectURL = projectURL
+                markProjectSourceFilesAsSaved()
+            }
+            SoundtimeProjectStore.removeAutosave(projectURL: projectURL, autosaveID: autosaveID)
             SoundtimeProjectStore.rememberLastProjectURL(projectURL)
             window?.title = projectWindowTitle()
             updateLoadedProjectSummary()
@@ -5952,10 +5968,78 @@ final class WorkspaceView: NSView {
         do {
             try prepareProjectForSerialization()
             try SoundtimeProjectStore.save(currentProject(), to: currentProjectURL)
-            markProjectSourceFilesAsSaved()
+            withoutAutosave {
+                markProjectSourceFilesAsSaved()
+            }
         } catch {
             updateStatus("project window save failed: \(error.localizedDescription)")
         }
+    }
+
+    private func scheduleAutosaveIfNeeded() {
+        guard
+            !isAutosaveSuppressed,
+            !isLoadingProject,
+            !projectTracks.isEmpty
+        else {
+            return
+        }
+
+        autosaveWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.writeProjectAutosave()
+        }
+        autosaveWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + autosaveDelay, execute: workItem)
+    }
+
+    private func writeProjectAutosave() {
+        guard
+            !isAutosaveSuppressed,
+            !isLoadingProject,
+            !projectTracks.isEmpty
+        else {
+            return
+        }
+
+        do {
+            let url = try SoundtimeProjectStore.saveAutosave(
+                currentProject(),
+                projectURL: currentProjectURL,
+                autosaveID: autosaveID
+            )
+            SoundtimeDiagnostics.shared.record(
+                category: .system,
+                severity: .info,
+                name: "project-autosave",
+                message: "Project autosave was written.",
+                fields: [
+                    "file": url.lastPathComponent,
+                    "trackCount": "\(projectTracks.count)",
+                ]
+            )
+        } catch {
+            SoundtimeDiagnostics.shared.record(
+                category: .system,
+                severity: .warning,
+                name: "project-autosave-failed",
+                message: "Project autosave failed.",
+                fields: [
+                    "error": error.localizedDescription,
+                ]
+            )
+        }
+    }
+
+    private func withoutAutosave(_ body: () throws -> Void) rethrows {
+        let previousValue = isAutosaveSuppressed
+        isAutosaveSuppressed = true
+        autosaveWorkItem?.cancel()
+        autosaveWorkItem = nil
+        defer {
+            isAutosaveSuppressed = previousValue
+        }
+        try body()
     }
 
     private func loadProject(from url: URL) {
@@ -5964,9 +6048,11 @@ final class WorkspaceView: NSView {
         }
 
         do {
-            let project = try SoundtimeProjectStore.load(from: url)
-            clearProjectForLoad()
-            currentProjectURL = url
+            let project = try SoundtimeProjectStore.loadRecoveringAutosave(from: url)
+            withoutAutosave {
+                clearProjectForLoad()
+                currentProjectURL = url
+            }
             SoundtimeProjectStore.rememberLastProjectURL(url)
             applyWindowLayout(project.windowLayout)
             applyProjectMasterVolume(project.masterVolume)
@@ -5987,6 +6073,35 @@ final class WorkspaceView: NSView {
         } catch {
             isLoadingProject = false
             updateStatus("project open failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func loadRecoveredAutosave(from url: URL) {
+        do {
+            let project = try SoundtimeProjectStore.load(from: url)
+            withoutAutosave {
+                clearProjectForLoad()
+                currentProjectURL = nil
+            }
+            applyWindowLayout(project.windowLayout)
+            applyProjectMasterVolume(project.masterVolume)
+            applyProjectTimelineViewport(project.timelineViewport)
+            resetWaveformFisheyeTuningToDefaults()
+            isLoadingProject = true
+            for track in project.tracks {
+                addDroppedWAVTrack(
+                    at: URL(fileURLWithPath: track.filePath),
+                    settings: track
+                )
+            }
+            isLoadingProject = false
+            reloadPlaybackFromProjectTracks(preserveProgress: false)
+            window?.title = projectWindowTitle()
+            updateLoadedProjectSummary()
+            updateStatus(playbackController.hasSource ? "recovered autosave - resolving waveforms" : "recovered autosave")
+        } catch {
+            isLoadingProject = false
+            updateStatus("autosave recovery failed: \(error.localizedDescription)")
         }
     }
 

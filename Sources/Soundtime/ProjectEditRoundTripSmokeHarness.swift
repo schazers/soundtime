@@ -85,8 +85,14 @@ enum ProjectEditRoundTripSmokeHarness {
 
         let encodedProject = try JSONEncoder().encode(project)
         let decodedProject = try JSONDecoder().decode(SoundtimeProject.self, from: encodedProject)
+        try require(
+            decodedProject.schemaVersion == SoundtimeProject.currentSchemaVersion,
+            "project schema version did not persist"
+        )
         try require(decodedProject.tracks.count == 1, "project track count mismatch")
         try requireLegacyProjectWithoutMasterVolumeDecodes()
+        try requireProjectStoreMigratesLegacyProject()
+        try requireMultiTrackEditGraphStressRoundTrip(fileInfo: fileInfo)
 
         let decodedTrack = try requireValue(decodedProject.tracks.first, "decoded project has no track")
         try require(decodedTrack.id == trackID, "track ID did not persist")
@@ -263,8 +269,102 @@ enum ProjectEditRoundTripSmokeHarness {
         }
         """.data(using: .utf8)!
         let legacyProject = try JSONDecoder().decode(SoundtimeProject.self, from: legacyJSON)
+        try require(legacyProject.schemaVersion == 1, "legacy project schema version mismatch")
         try require(legacyProject.masterVolume == nil, "legacy project unexpectedly decoded master volume")
         try require(legacyProject.timelineViewport == nil, "legacy project unexpectedly decoded timeline viewport")
+    }
+
+    private static func requireProjectStoreMigratesLegacyProject() throws {
+        let legacyURL = URL(fileURLWithPath: "/tmp/SoundtimeLegacyProjectMigrationSmoke.soundtime")
+        let legacyJSON = """
+        {
+          "tracks" : [
+            {
+              "id" : "11111111-2222-3333-4444-555555555555",
+              "name" : "Legacy",
+              "filePath" : "/tmp/legacy.wav",
+              "volume" : 1,
+              "isMuted" : false,
+              "isSoloed" : false
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+        try legacyJSON.write(to: legacyURL, options: [.atomic])
+        defer {
+            try? FileManager.default.removeItem(at: legacyURL)
+        }
+
+        let migratedProject = try SoundtimeProjectStore.load(from: legacyURL)
+        try require(
+            migratedProject.schemaVersion == SoundtimeProject.currentSchemaVersion,
+            "project store did not migrate legacy schema"
+        )
+        try require(migratedProject.tracks.count == 1, "migrated legacy project lost tracks")
+    }
+
+    private static func requireMultiTrackEditGraphStressRoundTrip(fileInfo: WAVFileInfo) throws {
+        let projectURL = URL(fileURLWithPath: "/tmp/SoundtimeProjectStressRoundTrip.soundtime")
+        let editGroupID = UUID(uuidString: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") ?? UUID()
+        let tracks: [SoundtimeProject.Track] = try (0..<12).map { trackIndex in
+            var timeline = AudioFileEditTimeline(fileInfo: fileInfo)
+            for editIndex in 0..<18 {
+                let start = Double((trackIndex * 7_111 + editIndex * 31_337) % 750_000) / 1_000_000
+                let end = min(start + 0.004 + Double(editIndex % 5) * 0.000_7, 0.96)
+                let selection = TimelineSelection(startProgress: start, endProgress: end)
+                switch editIndex % 4 {
+                case 0:
+                    _ = timeline.applyGain(0.82, to: selection)
+                case 1:
+                    _ = timeline.applyFade(.fadeIn, to: selection)
+                case 2:
+                    _ = timeline.applyFade(.fadeOut, to: selection)
+                default:
+                    _ = timeline.delete(selection)
+                }
+            }
+
+            return SoundtimeProject.Track(
+                id: UUID(),
+                editGroupID: editGroupID,
+                name: "Stress \(trackIndex + 1)",
+                filePath: fileInfo.url.path,
+                volume: Float(0.5 + Double(trackIndex) * 0.025),
+                isMuted: trackIndex.isMultiple(of: 5),
+                isSoloed: trackIndex == 3,
+                editTimeline: try requireValue(timeline.persistentState, "stress track did not persist")
+            )
+        }
+        let project = SoundtimeProject(
+            tracks: tracks,
+            windowLayout: SoundtimeProject.WindowLayout(x: 44, y: 55, width: 1440, height: 900),
+            masterVolume: 0.88,
+            timelineViewport: SoundtimeProject.TimelineViewport(startProgress: 0.11, durationProgress: 0.37)
+        )
+
+        let data = try JSONEncoder().encode(project)
+        try data.write(to: projectURL, options: [.atomic])
+        defer {
+            try? FileManager.default.removeItem(at: projectURL)
+        }
+
+        let restoredProject = try SoundtimeProjectStore.load(from: projectURL)
+        try require(restoredProject.schemaVersion == SoundtimeProject.currentSchemaVersion, "stress schema mismatch")
+        try require(restoredProject.tracks.count == tracks.count, "stress track count mismatch")
+        try require(abs((restoredProject.masterVolume ?? 0) - 0.88) < 0.000_001, "stress master volume mismatch")
+        for (index, pair) in zip(tracks, restoredProject.tracks).enumerated() {
+            let original = pair.0
+            let restored = pair.1
+            try require(original.editGroupID == restored.editGroupID, "stress track \(index) group mismatch")
+            try require(original.name == restored.name, "stress track \(index) name mismatch")
+            try require(abs(original.volume - restored.volume) < 0.000_001, "stress track \(index) volume mismatch")
+            try require(original.isMuted == restored.isMuted, "stress track \(index) mute mismatch")
+            try require(original.isSoloed == restored.isSoloed, "stress track \(index) solo mismatch")
+            try requirePersistentStatesMatch(
+                try requireValue(original.editTimeline, "stress original timeline missing"),
+                try requireValue(restored.editTimeline, "stress restored timeline missing")
+            )
+        }
     }
 
     private static func requireValue<Value>(_ value: Value?, _ message: String) throws -> Value {
