@@ -8,6 +8,21 @@ struct AudioFileEditTimeline: Sendable {
         var frameCount: Int
         var gainStart: Float
         var gainEnd: Float
+        var startsNewClip: Bool?
+
+        init(
+            sourceStartFrame: Int,
+            frameCount: Int,
+            gainStart: Float,
+            gainEnd: Float,
+            startsNewClip: Bool? = nil
+        ) {
+            self.sourceStartFrame = sourceStartFrame
+            self.frameCount = frameCount
+            self.gainStart = gainStart
+            self.gainEnd = gainEnd
+            self.startsNewClip = startsNewClip
+        }
     }
 
     struct PersistentState: Codable, Sendable {
@@ -40,6 +55,21 @@ struct AudioFileEditTimeline: Sendable {
         let frameCount: Int
         let gainStart: Float
         let gainEnd: Float
+        let startsNewClip: Bool
+
+        init(
+            sourceStartFrame: Int,
+            frameCount: Int,
+            gainStart: Float,
+            gainEnd: Float,
+            startsNewClip: Bool = false
+        ) {
+            self.sourceStartFrame = sourceStartFrame
+            self.frameCount = frameCount
+            self.gainStart = gainStart
+            self.gainEnd = gainEnd
+            self.startsNewClip = startsNewClip
+        }
 
         var sourceEndFrame: Int {
             sourceStartFrame + frameCount
@@ -65,7 +95,8 @@ struct AudioFileEditTimeline: Sendable {
                 sourceStartFrame: sourceStartFrame,
                 frameCount: frameCount,
                 gainStart: gainStart * gain,
-                gainEnd: gainEnd * gain
+                gainEnd: gainEnd * gain,
+                startsNewClip: startsNewClip
             )
         }
 
@@ -74,7 +105,18 @@ struct AudioFileEditTimeline: Sendable {
                 sourceStartFrame: sourceStartFrame,
                 frameCount: frameCount,
                 gainStart: gainStart * startMultiplier,
-                gainEnd: gainEnd * endMultiplier
+                gainEnd: gainEnd * endMultiplier,
+                startsNewClip: startsNewClip
+            )
+        }
+
+        func withClipBoundary(_ startsNewClip: Bool) -> Segment {
+            Segment(
+                sourceStartFrame: sourceStartFrame,
+                frameCount: frameCount,
+                gainStart: gainStart,
+                gainEnd: gainEnd,
+                startsNewClip: startsNewClip
             )
         }
     }
@@ -120,7 +162,8 @@ struct AudioFileEditTimeline: Sendable {
                     sourceStartFrame: persistentSegment.sourceStartFrame,
                     frameCount: persistentSegment.frameCount,
                     gainStart: persistentSegment.gainStart,
-                    gainEnd: persistentSegment.gainEnd
+                    gainEnd: persistentSegment.gainEnd,
+                    startsNewClip: persistentSegment.startsNewClip == true
                 )
             },
             sourceFrameCount: persistentState.sourceFrameCount
@@ -153,7 +196,8 @@ struct AudioFileEditTimeline: Sendable {
                     sourceStartFrame: playbackSegment.sourceStartFrame,
                     frameCount: playbackSegment.frameCount,
                     gainStart: playbackSegment.gainStart,
-                    gainEnd: playbackSegment.gainEnd
+                    gainEnd: playbackSegment.gainEnd,
+                    startsNewClip: playbackSegment.startsNewClip
                 )
             },
             sourceFrameCount: sourceFrameCount
@@ -200,7 +244,8 @@ struct AudioFileEditTimeline: Sendable {
                     sourceStartFrame: segment.sourceStartFrame,
                     frameCount: segment.frameCount,
                     gainStart: segment.gainStart,
-                    gainEnd: segment.gainEnd
+                    gainEnd: segment.gainEnd,
+                    startsNewClip: segment.startsNewClip ? true : nil
                 )
             }
         )
@@ -219,7 +264,8 @@ struct AudioFileEditTimeline: Sendable {
                 frameCount: segment.frameCount,
                 sourceFrameScale: 0,
                 gainStart: segment.gainStart,
-                gainEnd: segment.gainEnd
+                gainEnd: segment.gainEnd,
+                startsNewClip: segment.startsNewClip
             )
         }
     }
@@ -255,7 +301,8 @@ struct AudioFileEditTimeline: Sendable {
                     sourceStartFrame: segment.sourceStartFrame,
                     frameCount: segment.frameCount,
                     gainStart: segment.gainStart,
-                    gainEnd: segment.gainEnd
+                    gainEnd: segment.gainEnd,
+                    startsNewClip: segment.startsNewClip ? true : nil
                 )
             }
         )
@@ -272,7 +319,8 @@ struct AudioFileEditTimeline: Sendable {
                     sourceStartFrame: persistentSegment.sourceStartFrame,
                     frameCount: persistentSegment.frameCount,
                     gainStart: persistentSegment.gainStart,
-                    gainEnd: persistentSegment.gainEnd
+                    gainEnd: persistentSegment.gainEnd,
+                    startsNewClip: persistentSegment.startsNewClip == true
                 )
             },
             sourceFrameCount: sourceFrameCount
@@ -348,6 +396,15 @@ struct AudioFileEditTimeline: Sendable {
 
     mutating func applyFade(_ direction: AudioEditTimeline.FadeDirection, to selection: TimelineSelection) -> Int {
         applyFade(direction, toFramesIn: frameRange(for: selection))
+    }
+
+    mutating func split(atProgress progress: Double) -> Bool {
+        guard progress.isFinite, timelineFrameCount > 1 else {
+            return false
+        }
+
+        let splitFrame = Int((progress * Double(timelineFrameCount)).rounded())
+        return split(atFrame: splitFrame)
     }
 
     private func frameRange(for selection: TimelineSelection) -> Range<Int> {
@@ -436,7 +493,8 @@ struct AudioFileEditTimeline: Sendable {
                     sourceStartFrame: segment.sourceStartFrame,
                     frameCount: beforeCount,
                     gainStart: segment.gainStart,
-                    gainEnd: segment.gainEnd
+                    gainEnd: segment.gainEnd,
+                    startsNewClip: segment.startsNewClip
                 ))
             }
 
@@ -446,7 +504,8 @@ struct AudioFileEditTimeline: Sendable {
                     sourceStartFrame: segment.sourceStartFrame + overlapEndFrame - segmentStartFrame,
                     frameCount: afterCount,
                     gainStart: segment.gainStart,
-                    gainEnd: segment.gainEnd
+                    gainEnd: segment.gainEnd,
+                    startsNewClip: overlapEndFrame == segmentStartFrame ? segment.startsNewClip : false
                 ))
             }
         }
@@ -590,7 +649,8 @@ struct AudioFileEditTimeline: Sendable {
                 sourceStartFrame: segment.sourceStartFrame + offset,
                 frameCount: 0,
                 gainStart: segment.gain(at: offset),
-                gainEnd: segment.gain(at: offset)
+                gainEnd: segment.gain(at: offset),
+                startsNewClip: offset == 0 && segment.startsNewClip
             )
         }
 
@@ -598,8 +658,55 @@ struct AudioFileEditTimeline: Sendable {
             sourceStartFrame: segment.sourceStartFrame + offset,
             frameCount: count,
             gainStart: segment.gain(at: offset),
-            gainEnd: segment.gain(at: offset + count - 1)
+            gainEnd: segment.gain(at: offset + count - 1),
+            startsNewClip: offset == 0 && segment.startsNewClip
         )
+    }
+
+    private mutating func split(atFrame requestedFrame: Int) -> Bool {
+        guard requestedFrame > 0, requestedFrame < timelineFrameCount else {
+            return false
+        }
+
+        var nextSegments: [Segment] = []
+        nextSegments.reserveCapacity(segments.count + 1)
+        var timelineFrame = 0
+        var didSplit = false
+
+        for segment in segments {
+            let segmentStartFrame = timelineFrame
+            let segmentEndFrame = timelineFrame + segment.frameCount
+            timelineFrame = segmentEndFrame
+
+            if requestedFrame == segmentStartFrame, !nextSegments.isEmpty {
+                if segment.startsNewClip {
+                    nextSegments.append(segment)
+                } else {
+                    nextSegments.append(segment.withClipBoundary(true))
+                    didSplit = true
+                }
+                continue
+            }
+
+            guard requestedFrame > segmentStartFrame, requestedFrame < segmentEndFrame else {
+                nextSegments.append(segment)
+                continue
+            }
+
+            let beforeCount = requestedFrame - segmentStartFrame
+            let afterCount = segmentEndFrame - requestedFrame
+            nextSegments.append(slice(segment, offset: 0, count: beforeCount))
+            nextSegments.append(slice(segment, offset: beforeCount, count: afterCount).withClipBoundary(true))
+            didSplit = true
+        }
+
+        guard didSplit else {
+            return false
+        }
+
+        segments = Self.coalescedSegments(nextSegments)
+        timelineFrameCount = Self.totalFrameCount(segments)
+        return true
     }
 
     private static func smoothstep(_ progress: Float) -> Float {
@@ -631,13 +738,15 @@ struct AudioFileEditTimeline: Sendable {
         var result: [Segment] = []
         result.reserveCapacity(segments.count)
 
-        for segment in segments where segment.frameCount > 0 {
+        for rawSegment in segments where rawSegment.frameCount > 0 {
+            let segment = result.isEmpty ? rawSegment.withClipBoundary(false) : rawSegment
             guard let previous = result.last else {
                 result.append(segment)
                 continue
             }
 
             if
+                !segment.startsNewClip,
                 previous.sourceEndFrame == segment.sourceStartFrame,
                 previous.hasConstantGain,
                 segment.hasConstantGain,
@@ -647,7 +756,8 @@ struct AudioFileEditTimeline: Sendable {
                     sourceStartFrame: previous.sourceStartFrame,
                     frameCount: previous.frameCount + segment.frameCount,
                     gainStart: previous.gainStart,
-                    gainEnd: previous.gainEnd
+                    gainEnd: previous.gainEnd,
+                    startsNewClip: previous.startsNewClip
                 )
             } else {
                 result.append(segment)
@@ -689,7 +799,8 @@ struct AudioFileEditTimeline: Sendable {
                 sourceStartFrame: segment.sourceStartFrame,
                 frameCount: frameCount,
                 gainStart: segment.gainStart,
-                gainEnd: segment.gainEnd
+                gainEnd: segment.gainEnd,
+                startsNewClip: segment.startsNewClip
             )
         })
     }

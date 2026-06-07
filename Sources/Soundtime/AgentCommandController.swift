@@ -31,6 +31,7 @@ enum AgentResolvedCommand: Sendable, Equatable {
     case cutSelection
     case copySelection
     case pasteAudio
+    case splitAtPlayhead
     case showGain
     case normalizeSelection
     case fadeInSelection
@@ -94,6 +95,13 @@ final class AgentCommandRegistry {
                 identifier: "timeline.copyPaste",
                 title: "Copy, Cut, Paste",
                 summary: "Use the current selection and edit insertion point for clipboard edits."
+            )
+        )
+        register(
+            AgentCommandCapability(
+                identifier: "timeline.splitAtPlayhead",
+                title: "Split at Playhead",
+                summary: "Split the active track at the current playhead using a persistent clip boundary."
             )
         )
         register(
@@ -232,6 +240,9 @@ final class AgentCommandController {
         }
         if normalized == "paste" || normalized.contains("paste audio") {
             return .pasteAudio
+        }
+        if normalized.contains("split") || normalized.contains("blade") {
+            return .splitAtPlayhead
         }
         if normalized.contains("normalize") {
             return .normalizeSelection
