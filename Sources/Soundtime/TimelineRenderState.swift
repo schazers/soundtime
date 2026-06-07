@@ -1,6 +1,22 @@
 import Foundation
 
 struct TimelineRenderState: Sendable {
+    struct ClipRange: Equatable, Sendable {
+        let startProgress: Double
+        let endProgress: Double
+
+        init(startProgress: Double, endProgress: Double) {
+            let clampedStart = min(max(startProgress, 0), 1)
+            let clampedEnd = min(max(endProgress, 0), 1)
+            self.startProgress = min(clampedStart, clampedEnd)
+            self.endProgress = max(clampedStart, clampedEnd)
+        }
+
+        var durationProgress: Double {
+            endProgress - startProgress
+        }
+    }
+
     struct Track: Sendable {
         let id: UUID
         let waveformVersion: Int
@@ -10,6 +26,7 @@ struct TimelineRenderState: Sendable {
         let volume: Float
         let isMuted: Bool
         let isSoloed: Bool
+        let clipRanges: [ClipRange]
 
         init(
             id: UUID,
@@ -19,7 +36,8 @@ struct TimelineRenderState: Sendable {
             volume: Float,
             isMuted: Bool,
             isSoloed: Bool,
-            hasWaveform: Bool? = nil
+            hasWaveform: Bool? = nil,
+            clipRanges: [ClipRange] = []
         ) {
             self.id = id
             self.waveformVersion = waveformVersion
@@ -29,6 +47,7 @@ struct TimelineRenderState: Sendable {
             self.isMuted = isMuted
             self.isSoloed = isSoloed
             self.hasWaveform = hasWaveform ?? (waveformOverview?.isEmpty == false)
+            self.clipRanges = clipRanges.filter { $0.durationProgress > 0 }
         }
     }
 
