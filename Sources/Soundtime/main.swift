@@ -53,6 +53,18 @@ if CommandLine.arguments.contains("--edit-preview-smoke") {
     }
 }
 
+if CommandLine.arguments.contains("--realtime-graph-publish-smoke") {
+    do {
+        try MainActor.assumeIsolated {
+            try RealtimeGraphPublishSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        }
+        exit(0)
+    } catch {
+        fputs("Soundtime realtime graph publish smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
 let app = NSApplication.shared
 let delegate = AppDelegate()
 

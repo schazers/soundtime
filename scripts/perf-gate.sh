@@ -23,5 +23,8 @@ swift run Soundtime --edit-graph-smoke
 echo "== Soundtime edit preview smoke =="
 swift run Soundtime --edit-preview-smoke
 
+echo "== Soundtime realtime graph publish smoke =="
+swift run Soundtime --realtime-graph-publish-smoke
+
 echo "== Soundtime timeline perf baseline =="
 swift run Soundtime --timeline-perf-baseline "${mode_args[@]}"
