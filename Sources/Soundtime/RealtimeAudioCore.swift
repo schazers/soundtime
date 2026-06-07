@@ -169,6 +169,8 @@ struct PreparedRealtimeAudioTrack: Sendable {
 
 final class RealtimeAudioCore {
     private var engine: OpaquePointer?
+    private var segmentConfigScratch: [SoundtimeAudioCoreSegmentConfig] = []
+    private var segmentedTrackConfigScratch: [SoundtimeAudioCoreSegmentedTrackConfig] = []
 
     var enginePointer: OpaquePointer? {
         engine
@@ -276,36 +278,43 @@ final class RealtimeAudioCore {
         _ tracks: [PreparedRealtimeAudioTrack],
         _ body: (UnsafeBufferPointer<SoundtimeAudioCoreSegmentedTrackConfig>) -> T
     ) -> T {
-        let segmentConfigs = tracks.flatMap { track in
-            track.segments.map { segment in
-                SoundtimeAudioCoreSegmentConfig(
+        let totalSegmentCount = tracks.reduce(0) { result, track in
+            result + track.segments.count
+        }
+        segmentConfigScratch.removeAll(keepingCapacity: true)
+        segmentConfigScratch.reserveCapacity(totalSegmentCount)
+        for track in tracks {
+            for segment in track.segments {
+                segmentConfigScratch.append(SoundtimeAudioCoreSegmentConfig(
                     outputStartFrame: UInt64(max(segment.outputStartFrame, 0)),
                     sourceStartFrame: UInt64(max(segment.sourceStartFrame, 0)),
                     frameCount: UInt64(max(segment.frameCount, 0)),
                     sourceFrameScale: segment.sourceFrameScale,
                     gainStart: max(segment.gainStart, 0),
                     gainEnd: max(segment.gainEnd, 0)
-                )
+                ))
             }
         }
 
-        return segmentConfigs.withUnsafeBufferPointer { segmentBuffer in
+        return segmentConfigScratch.withUnsafeBufferPointer { segmentBuffer in
             var segmentOffset = 0
-            let trackConfigs = tracks.map { track in
+            segmentedTrackConfigScratch.removeAll(keepingCapacity: true)
+            segmentedTrackConfigScratch.reserveCapacity(tracks.count)
+            for track in tracks {
                 let segmentCount = track.segments.count
                 let segmentPointer = segmentCount > 0 ?
                     segmentBuffer.baseAddress?.advanced(by: segmentOffset) :
                     nil
                 segmentOffset += segmentCount
-                return SoundtimeAudioCoreSegmentedTrackConfig(
+                segmentedTrackConfigScratch.append(SoundtimeAudioCoreSegmentedTrackConfig(
                     source: track.source.sourcePointer,
                     segments: segmentPointer,
                     segmentCount: UInt32(max(segmentCount, 0)),
                     gain: max(track.gain, 0)
-                )
+                ))
             }
 
-            return trackConfigs.withUnsafeBufferPointer(body)
+            return segmentedTrackConfigScratch.withUnsafeBufferPointer(body)
         }
     }
 
