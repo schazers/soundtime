@@ -8275,6 +8275,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float minimumSample = clamp(bin.minimumSample * gain, -1.0, 1.0);
         float maximumSample = clamp(bin.maximumSample * gain, -1.0, 1.0);
         float rmsSample = clamp(bin.rmsSample * gain, 0.0, 1.0);
+        float signalMagnitude = max(max(abs(minimumSample), abs(maximumSample)), rmsSample);
+        float touchSignalEnergy = smoothstep(0.006, 0.055, signalMagnitude);
         float touchEnergy = clamp(in.touch.w, 0.0, 1.0);
         float geometryInfluence = 0.0;
         float lightInfluence = 0.0;
@@ -8295,6 +8297,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 in.touch2.w
             ) * touchEnergy;
         }
+        geometryInfluence *= touchSignalEnergy;
+        lightInfluence *= touchSignalEnergy;
         float expansion = 1.0 + 0.30 * geometryInfluence;
 
         float peakTop = centerY - maximumSample * amplitudeHeight * expansion;
