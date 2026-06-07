@@ -609,6 +609,9 @@ final class WorkspaceView: NSView {
         timelineSurface.onSelectTimeAcrossLinkedTracksRequested = { [weak self] in
             self?.selectTimeAcrossLinkedTracks()
         }
+        timelineSurface.onSelectAllClipsOnTrackRequested = { [weak self] in
+            self?.selectAllClipsOnTrack()
+        }
         timelineSurface.onUndo = { [weak self] in
             self?.undoLastEdit()
         }
@@ -4529,6 +4532,29 @@ final class WorkspaceView: NSView {
         updateEditScopeHint()
         updateEffectCommandState()
         updateStatus("selected time across \(linkedTrackIDs.count) linked \(linkedTrackIDs.count == 1 ? "track" : "tracks")")
+    }
+
+    private func selectAllClipsOnTrack() {
+        guard
+            let trackIndex = activeProjectTrackIndex(),
+            projectTracks.indices.contains(trackIndex)
+        else {
+            updateStatus("select a track")
+            return
+        }
+
+        let trackID = projectTracks[trackIndex].id
+        let selection = fullTrackDisplaySelection(for: trackID)
+        selectedTimelineRange = selection
+        activeTrackID = trackID
+        selectedTrackID = nil
+        selectedTrackIDs.removeAll()
+        publishSelectedTracksToTimeline()
+        refreshTrackControls()
+        timelineSurface.displaySelection(selection)
+        timelineSurface.focusSelection(selection)
+        updateEffectCommandState()
+        updateStatus("selected all clips on track")
     }
 
     private func silenceCleanupTarget() -> EditableSelectionTarget? {
