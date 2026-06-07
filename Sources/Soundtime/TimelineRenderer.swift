@@ -538,6 +538,40 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
     }
 
+    private final class TimelineInteractionStateStore {
+        private let lock = NSLock()
+        private var selection: TimelineSelection?
+        private var hoverProgress: Float?
+        private var isHoverArmed = false
+
+        func publishSelection(_ selection: TimelineSelection?) {
+            lock.lock()
+            defer {
+                lock.unlock()
+            }
+            self.selection = selection
+        }
+
+        func publishHover(progress: Float?, isArmed: Bool) {
+            lock.lock()
+            defer {
+                lock.unlock()
+            }
+            hoverProgress = progress
+            isHoverArmed = isArmed
+        }
+
+        func applying(to state: TimelineRenderState) -> TimelineRenderState {
+            lock.lock()
+            defer {
+                lock.unlock()
+            }
+            return state
+                .withSelection(selection)
+                .withHover(progress: hoverProgress, isArmed: isHoverArmed)
+        }
+    }
+
     private final class DynamicVertexBufferRing {
         private let buffers: [MTLBuffer]
         private let capacity: Int
@@ -782,6 +816,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     )
     private let waveformGeometryStore = WaveformGeometryStore()
     private let renderStateStore = TimelineRenderStateStore(initialState: .empty)
+    private let interactionStateStore = TimelineInteractionStateStore()
     private var renderState = TimelineRenderState.empty {
         didSet {
             renderStateStore.publish(renderState)
@@ -1382,11 +1417,21 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
 
     func displayHoverProgress(_ progress: Float?, isArmed: Bool = false) {
+        interactionStateStore.publishHover(progress: progress, isArmed: isArmed)
         renderState = renderState.withHover(progress: progress, isArmed: isArmed)
     }
 
     func displaySelection(_ selection: TimelineSelection?) {
+        interactionStateStore.publishSelection(selection)
         renderState = renderState.withSelection(selection)
+    }
+
+    func publishInteractionSelection(_ selection: TimelineSelection?) {
+        interactionStateStore.publishSelection(selection)
+    }
+
+    func publishInteractionHover(progress: Float?, isArmed: Bool = false) {
+        interactionStateStore.publishHover(progress: progress, isArmed: isArmed)
     }
 
     func displaySelectedTrack(_ trackID: UUID?) {
@@ -1769,7 +1814,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         displayTimestamp: CFTimeInterval
     ) {
         resetFrameDiagnosticsForNextFrame()
-        let renderState = renderStateStore.snapshot()
+        let renderState = interactionStateStore.applying(to: renderStateStore.snapshot())
         let mipLevelSnapshot = waveformMipLevelSnapshot()
         let renderedPlayheadProgress = currentPlayheadProgress(
             renderState: renderState,
