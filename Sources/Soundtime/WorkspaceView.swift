@@ -542,6 +542,8 @@ final class WorkspaceView: NSView {
     private let autosaveDelay: TimeInterval = 1.5
     private var autosaveWorkItem: DispatchWorkItem?
     private var isAutosaveSuppressed = false
+    private var wavFileInfoCache: [URL: WAVFileInfo] = [:]
+    private var invalidWAVFileInfoCache: Set<URL> = []
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1829,10 +1831,7 @@ final class WorkspaceView: NSView {
             withIntermediateDirectories: true
         )
 
-        let safeTrackName = trackName
-            .components(separatedBy: CharacterSet.alphanumerics.inverted)
-            .filter { !$0.isEmpty }
-            .joined(separator: "-")
+        let safeTrackName = sanitizedSourceStem(trackName)
         let fileName = "\(safeTrackName.isEmpty ? "Recording" : safeTrackName)-\(UUID().uuidString).wav"
         return recordingsDirectory.appendingPathComponent(fileName)
     }
@@ -1857,6 +1856,96 @@ final class WorkspaceView: NSView {
         let candidate = normalizedOwnedURL(url)
         return candidate.path.hasPrefix(recordingsDirectory.path + "/")
             && candidate.pathExtension.lowercased() == "wav"
+    }
+
+    private func decodableWAVFileInfo(for url: URL) -> WAVFileInfo? {
+        let normalizedURL = url.standardizedFileURL
+        guard WAVAudioDecoder.canDecode(normalizedURL) else {
+            return nil
+        }
+
+        if let cachedFileInfo = wavFileInfoCache[normalizedURL] {
+            return cachedFileInfo
+        }
+        if invalidWAVFileInfoCache.contains(normalizedURL) {
+            return nil
+        }
+
+        do {
+            let fileInfo = try WAVAudioDecoder.inspect(url: normalizedURL)
+            wavFileInfoCache[normalizedURL] = fileInfo
+            return fileInfo
+        } catch {
+            invalidWAVFileInfoCache.insert(normalizedURL)
+            return nil
+        }
+    }
+
+    private func projectTrackSourceURL(
+        for track: SoundtimeProject.Track,
+        projectURL: URL
+    ) -> URL {
+        let url = URL(fileURLWithPath: track.filePath).standardizedFileURL
+        guard
+            track.editTimeline == nil,
+            isOwnedRecordingURL(url),
+            let ownedFileInfo = decodableWAVFileInfo(for: url),
+            ownedFileInfo.duration > 0,
+            ownedFileInfo.duration < 30
+        else {
+            return url
+        }
+
+        return recoveredOriginalSourceURL(
+            forOwnedURL: url,
+            ownedFileInfo: ownedFileInfo,
+            projectURL: projectURL
+        ) ?? url
+    }
+
+    private func recoveredOriginalSourceURL(
+        forOwnedURL ownedURL: URL,
+        ownedFileInfo: WAVFileInfo,
+        projectURL: URL
+    ) -> URL? {
+        let ownedStem = sanitizedSourceStem(ownedURL.deletingPathExtension().lastPathComponent)
+        guard !ownedStem.isEmpty else {
+            return nil
+        }
+
+        let minimumRecoveredDuration = max(ownedFileInfo.duration * 4, 30)
+        return projectSourceRecoveryCandidateURLs(projectURL: projectURL)
+            .filter { $0.standardizedFileURL != ownedURL.standardizedFileURL }
+            .first { candidateURL in
+                let candidateStem = sanitizedSourceStem(candidateURL.deletingPathExtension().lastPathComponent)
+                guard
+                    !candidateStem.isEmpty,
+                    ownedStem == candidateStem || ownedStem.hasPrefix(candidateStem + "-"),
+                    let candidateFileInfo = decodableWAVFileInfo(for: candidateURL)
+                else {
+                    return false
+                }
+
+                return candidateFileInfo.duration >= minimumRecoveredDuration
+            }
+    }
+
+    private func projectSourceRecoveryCandidateURLs(projectURL: URL) -> [URL] {
+        let projectDirectory = projectURL.deletingLastPathComponent()
+        let urls = (try? FileManager.default.contentsOfDirectory(
+            at: projectDirectory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )) ?? []
+
+        return urls.filter(WAVAudioDecoder.canDecode)
+    }
+
+    private func sanitizedSourceStem(_ value: String) -> String {
+        value
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+            .joined(separator: "-")
     }
 
     private func ownedSourceURLs(in tracks: [ProjectTrack]) -> Set<URL> {
@@ -2664,13 +2753,17 @@ final class WorkspaceView: NSView {
     private func projectPlaybackTracks() -> [ProjectPlaybackTrack] {
         return projectTracks.compactMap { track -> ProjectPlaybackTrack? in
             let source: ProjectPlaybackTrack.Source
-            if let fileTimeline = track.fileTimeline, WAVAudioDecoder.canDecode(track.sourceURL) {
+            if
+                let fileTimeline = track.fileTimeline,
+                let fileInfo = decodableWAVFileInfo(for: track.sourceURL),
+                fileTimeline.isCompatible(with: fileInfo)
+            {
                 source = .fileTimeline(
                     url: track.sourceURL,
                     timeline: fileTimeline,
                     zeroCrossingProbe: track.zeroCrossingProbe
                 )
-            } else if track.editRevision == 0, WAVAudioDecoder.canDecode(track.sourceURL) {
+            } else if track.editRevision == 0, decodableWAVFileInfo(for: track.sourceURL) != nil {
                 source = .file(
                     url: track.sourceURL,
                     zeroCrossingProbe: track.zeroCrossingProbe
@@ -2721,9 +2814,13 @@ final class WorkspaceView: NSView {
 
     private func projectMixTrackSnapshot(for track: ProjectTrack) -> ProjectMixTrackSnapshot? {
         let source: ProjectMixTrackSource
-        if let fileTimeline = track.fileTimeline, WAVAudioDecoder.canDecode(track.sourceURL) {
+        if
+            let fileTimeline = track.fileTimeline,
+            let fileInfo = decodableWAVFileInfo(for: track.sourceURL),
+            fileTimeline.isCompatible(with: fileInfo)
+        {
             source = .fileTimeline(track.sourceURL, fileTimeline)
-        } else if track.editRevision == 0, WAVAudioDecoder.canDecode(track.sourceURL) {
+        } else if track.editRevision == 0, decodableWAVFileInfo(for: track.sourceURL) != nil {
             source = .file(track.sourceURL)
         } else if let audioTimeline = track.audioTimeline {
             source = .timeline(audioTimeline)
@@ -5693,8 +5790,7 @@ final class WorkspaceView: NSView {
         sourceURL: URL
     ) -> AudioFileEditTimeline? {
         guard
-            WAVAudioDecoder.canDecode(sourceURL),
-            let fileInfo = try? WAVAudioDecoder.inspect(url: sourceURL),
+            let fileInfo = decodableWAVFileInfo(for: sourceURL),
             audioTimeline.sourceAudioBuffer.frameCount == fileInfo.frameCount,
             abs(audioTimeline.sourceAudioBuffer.sampleRate - fileInfo.sampleRate) < 0.001,
             let fileTimeline = AudioFileEditTimeline(
@@ -5729,7 +5825,7 @@ final class WorkspaceView: NSView {
             return fileTimeline
         }
 
-        guard WAVAudioDecoder.canDecode(projectTracks[trackIndex].sourceURL) else {
+        guard decodableWAVFileInfo(for: projectTracks[trackIndex].sourceURL) != nil else {
             return nil
         }
 
@@ -7622,7 +7718,7 @@ final class WorkspaceView: NSView {
             isLoadingProject = true
             for track in project.tracks {
                 addDroppedWAVTrack(
-                    at: URL(fileURLWithPath: track.filePath),
+                    at: projectTrackSourceURL(for: track, projectURL: url),
                     settings: track
                 )
             }
@@ -7652,7 +7748,7 @@ final class WorkspaceView: NSView {
             isLoadingProject = true
             for track in project.tracks {
                 addDroppedWAVTrack(
-                    at: URL(fileURLWithPath: track.filePath),
+                    at: projectTrackSourceURL(for: track, projectURL: url),
                     settings: track
                 )
             }
@@ -7765,7 +7861,7 @@ final class WorkspaceView: NSView {
     private func currentProject() -> SoundtimeProject {
         SoundtimeProject(
             tracks: projectTracks.compactMap { track in
-                guard WAVAudioDecoder.canDecode(track.sourceURL) else {
+                guard decodableWAVFileInfo(for: track.sourceURL) != nil else {
                     return nil
                 }
 
@@ -7831,7 +7927,7 @@ final class WorkspaceView: NSView {
     }
 
     private func persistedEditTimeline(for track: ProjectTrack) -> AudioFileEditTimeline.PersistentState? {
-        guard WAVAudioDecoder.canDecode(track.sourceURL) else {
+        guard decodableWAVFileInfo(for: track.sourceURL) != nil else {
             return nil
         }
 
@@ -8707,7 +8803,7 @@ final class WorkspaceView: NSView {
         let hasEditableTimeline =
             track.audioTimeline != nil ||
             track.fileTimeline != nil ||
-            WAVAudioDecoder.canDecode(track.sourceURL)
+            decodableWAVFileInfo(for: track.sourceURL) != nil
         return hasEditableTimeline && target.editSelection.durationProgress > 0
     }
 
@@ -8723,7 +8819,7 @@ final class WorkspaceView: NSView {
         let hasEditableTimeline =
             track.audioTimeline != nil ||
             track.fileTimeline != nil ||
-            WAVAudioDecoder.canDecode(track.sourceURL)
+            decodableWAVFileInfo(for: track.sourceURL) != nil
         return hasEditableTimeline && target.editSelection.durationProgress > 0
     }
 
@@ -8750,7 +8846,7 @@ final class WorkspaceView: NSView {
         let hasEditableTimeline =
             track.audioTimeline != nil ||
             track.fileTimeline != nil ||
-            WAVAudioDecoder.canDecode(track.sourceURL)
+            decodableWAVFileInfo(for: track.sourceURL) != nil
         guard hasEditableTimeline else {
             return false
         }
@@ -8773,7 +8869,7 @@ final class WorkspaceView: NSView {
         let track = projectTracks[target.trackIndex]
         return track.audioTimeline != nil ||
             track.fileTimeline != nil ||
-            WAVAudioDecoder.canDecode(track.sourceURL)
+            decodableWAVFileInfo(for: track.sourceURL) != nil
     }
 
     private var canDeleteSelection: Bool {
@@ -8807,7 +8903,7 @@ final class WorkspaceView: NSView {
         let track = projectTracks[target.trackIndex]
         return track.audioTimeline != nil ||
             track.fileTimeline != nil ||
-            WAVAudioDecoder.canDecode(track.sourceURL)
+            decodableWAVFileInfo(for: track.sourceURL) != nil
     }
 
     private func updateEditScopeHint() {
