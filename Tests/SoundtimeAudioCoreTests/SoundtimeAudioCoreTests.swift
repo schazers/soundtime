@@ -831,6 +831,68 @@ final class SoundtimeAudioCoreTests: XCTestCase {
         XCTAssertEqual(output[0][3], 1, accuracy: 0.000_001)
     }
 
+    func testPreparedTrackGainRampDurationIsConfigurable() throws {
+        let engine = try XCTUnwrap(soundtime_audio_core_create())
+        defer {
+            soundtime_audio_core_destroy(engine)
+        }
+
+        var left = [Float](repeating: 1, count: 16)
+        var right = [Float](repeating: 1, count: 16)
+        let preparedSource = left.withUnsafeMutableBufferPointer { leftSamples in
+            right.withUnsafeMutableBufferPointer { rightSamples in
+                var channels = [
+                    UnsafePointer(leftSamples.baseAddress),
+                    UnsafePointer(rightSamples.baseAddress),
+                ]
+                return channels.withUnsafeMutableBufferPointer { channelPointers in
+                    soundtime_audio_core_source_create_planar(
+                        channelPointers.baseAddress,
+                        UInt64(leftSamples.count),
+                        2,
+                        1_000
+                    )
+                }
+            }
+        }
+        let source = try XCTUnwrap(preparedSource)
+        defer {
+            soundtime_audio_core_source_destroy(source)
+        }
+
+        var tracks = [SoundtimeAudioCoreTrackConfig(source: source, gain: 1)]
+        XCTAssertTrue(tracks.withUnsafeMutableBufferPointer { trackBuffer in
+            soundtime_audio_core_set_prepared_tracks(
+                engine,
+                trackBuffer.baseAddress,
+                UInt32(trackBuffer.count)
+            )
+        })
+
+        soundtime_audio_core_set_transport_ramp_duration(engine, 0)
+        soundtime_audio_core_set_track_gain_ramp_duration(engine, 0.006)
+        soundtime_audio_core_play(engine)
+        _ = render(engine: engine, channelCount: 2, frameCount: 1, hostTimestamp: 0)
+
+        tracks[0].gain = 0
+        XCTAssertTrue(tracks.withUnsafeMutableBufferPointer { trackBuffer in
+            soundtime_audio_core_update_prepared_tracks(
+                engine,
+                trackBuffer.baseAddress,
+                UInt32(trackBuffer.count)
+            )
+        })
+
+        let output = render(engine: engine, channelCount: 2, frameCount: 7, hostTimestamp: 0.1)
+        XCTAssertEqual(output[0][0], Float(5.0 / 6.0), accuracy: 0.000_001)
+        XCTAssertEqual(output[0][1], Float(4.0 / 6.0), accuracy: 0.000_001)
+        XCTAssertEqual(output[0][2], Float(3.0 / 6.0), accuracy: 0.000_001)
+        XCTAssertEqual(output[0][3], Float(2.0 / 6.0), accuracy: 0.000_001)
+        XCTAssertEqual(output[0][4], Float(1.0 / 6.0), accuracy: 0.000_001)
+        XCTAssertEqual(output[0][5], 0, accuracy: 0.000_001)
+        XCTAssertEqual(output[0][6], 0, accuracy: 0.000_001)
+    }
+
     func testManyPreparedTrackGainRampsStaySynchronous() throws {
         let engine = try XCTUnwrap(soundtime_audio_core_create())
         defer {

@@ -143,6 +143,10 @@ void soundtime_audio_core_set_transport_ramp_duration(
     SoundtimeAudioCoreEngine* engine,
     double durationSeconds
 );
+void soundtime_audio_core_set_track_gain_ramp_duration(
+    SoundtimeAudioCoreEngine* engine,
+    double durationSeconds
+);
 SoundtimeAudioCoreSnapshot soundtime_audio_core_snapshot(const SoundtimeAudioCoreEngine* engine);
 bool soundtime_audio_core_pop_clock_sample(
     SoundtimeAudioCoreEngine* engine,
