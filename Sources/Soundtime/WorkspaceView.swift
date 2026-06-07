@@ -4589,6 +4589,7 @@ final class WorkspaceView: NSView {
             SoundtimeProjectStore.rememberLastProjectURL(url)
             applyWindowLayout(project.windowLayout)
             applyProjectMasterVolume(project.masterVolume)
+            applyProjectTimelineViewport(project.timelineViewport)
             resetWaveformFisheyeTuningToDefaults()
             isLoadingProject = true
             for track in project.tracks {
@@ -4717,7 +4718,8 @@ final class WorkspaceView: NSView {
                 )
             },
             windowLayout: currentWindowLayout(),
-            masterVolume: volumeControl.perceptualVolume
+            masterVolume: volumeControl.perceptualVolume,
+            timelineViewport: currentTimelineViewport()
         )
     }
 
@@ -4729,6 +4731,39 @@ final class WorkspaceView: NSView {
         let clampedVolume = min(max(volume, 0), 1)
         volumeControl.perceptualVolume = clampedVolume
         playbackController.setPerceptualVolume(clampedVolume)
+    }
+
+    private func currentTimelineViewport() -> SoundtimeProject.TimelineViewport? {
+        let viewport = timelineSurface.currentViewport
+        guard
+            viewport.startProgress.isFinite,
+            viewport.durationProgress.isFinite,
+            viewport.durationProgress > 0
+        else {
+            return nil
+        }
+
+        return SoundtimeProject.TimelineViewport(
+            startProgress: viewport.startProgress,
+            durationProgress: viewport.durationProgress
+        )
+    }
+
+    private func applyProjectTimelineViewport(_ viewport: SoundtimeProject.TimelineViewport?) {
+        guard
+            let viewport,
+            viewport.startProgress.isFinite,
+            viewport.durationProgress.isFinite,
+            viewport.durationProgress > 0
+        else {
+            timelineSurface.restoreViewport(nil)
+            return
+        }
+
+        timelineSurface.restoreViewport(TimelineViewport(
+            startProgress: viewport.startProgress,
+            durationProgress: viewport.durationProgress
+        ))
     }
 
     private func persistedEditTimeline(for track: ProjectTrack) -> AudioFileEditTimeline.PersistentState? {
