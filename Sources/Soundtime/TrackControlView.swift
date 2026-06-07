@@ -162,14 +162,14 @@ final class TrackControlView: NSView {
         NSLayoutConstraint.activate([
             panelView.leadingAnchor.constraint(equalTo: leadingAnchor),
             panelView.trailingAnchor.constraint(equalTo: trailingAnchor),
-            panelView.centerYAnchor.constraint(equalTo: centerYAnchor),
-            panelView.topAnchor.constraint(greaterThanOrEqualTo: topAnchor, constant: 5),
-            panelView.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -5),
+            panelView.topAnchor.constraint(equalTo: topAnchor),
+            panelView.bottomAnchor.constraint(equalTo: bottomAnchor),
 
-            contentStack.topAnchor.constraint(equalTo: panelView.topAnchor, constant: 8),
+            contentStack.centerYAnchor.constraint(equalTo: panelView.centerYAnchor),
+            contentStack.topAnchor.constraint(greaterThanOrEqualTo: panelView.topAnchor, constant: 8),
             contentStack.leadingAnchor.constraint(equalTo: panelView.leadingAnchor, constant: 12),
             contentStack.trailingAnchor.constraint(lessThanOrEqualTo: panelView.trailingAnchor, constant: -12),
-            contentStack.bottomAnchor.constraint(equalTo: panelView.bottomAnchor, constant: -8),
+            contentStack.bottomAnchor.constraint(lessThanOrEqualTo: panelView.bottomAnchor, constant: -8),
 
             titleLabel.widthAnchor.constraint(equalTo: panelView.widthAnchor, constant: -24),
 
