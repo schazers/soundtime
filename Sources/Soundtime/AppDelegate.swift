@@ -245,6 +245,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: ""
         ))
         menu.addItem(NSMenuItem(
+            title: "Slip Clip Contents Left",
+            action: #selector(TimelineView.slipClipContentsLeft(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Slip Clip Contents Right",
+            action: #selector(TimelineView.slipClipContentsRight(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
             title: "Snap Selection to Playhead/Edges/Silence",
             action: #selector(TimelineView.snapSelectionToPlayheadEdgesOrSilence(_:)),
             keyEquivalent: ""

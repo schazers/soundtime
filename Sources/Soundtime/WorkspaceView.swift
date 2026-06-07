@@ -606,6 +606,9 @@ final class WorkspaceView: NSView {
         timelineSurface.onNudgeSelectionRequested = { [weak self] direction in
             self?.nudgeSelection(direction: direction)
         }
+        timelineSurface.onSlipClipContentsRequested = { [weak self] direction in
+            self?.slipClipContents(direction: direction)
+        }
         timelineSurface.onSnapSelectionRequested = { [weak self] in
             self?.snapSelectionToPlayheadEdgesOrSilence()
         }
@@ -3055,6 +3058,47 @@ final class WorkspaceView: NSView {
         )
     }
 
+    private func editableClipSlipTarget() -> EditableSelectionTarget? {
+        guard
+            let baseTarget = currentEditableSelectionTarget() ?? editableClipAtPlayheadTarget(),
+            projectTracks.indices.contains(baseTarget.trackIndex)
+        else {
+            return nil
+        }
+
+        let track = projectTracks[baseTarget.trackIndex]
+        let midpointProgress = (
+            baseTarget.editSelection.startProgress +
+                baseTarget.editSelection.endProgress
+        ) * 0.5
+        guard
+            let clipRange = timelineClipRanges(for: track).first(where: {
+                midpointProgress >= $0.startProgress && midpointProgress <= $0.endProgress
+            })
+        else {
+            return baseTarget
+        }
+
+        let projectDuration = projectSelectionDuration
+        let trackDuration = trackDuration(for: track)
+        let trackDurationProgress = projectDuration > 0 ? trackDuration / projectDuration : 1
+        let displaySelection = TimelineSelection(
+            startProgress: clipRange.startProgress * trackDurationProgress,
+            endProgress: clipRange.endProgress * trackDurationProgress,
+            trackID: track.id
+        )
+        let editSelection = TimelineSelection(
+            startProgress: clipRange.startProgress,
+            endProgress: clipRange.endProgress,
+            trackID: track.id
+        )
+        return EditableSelectionTarget(
+            trackIndex: baseTarget.trackIndex,
+            displaySelection: displaySelection,
+            editSelection: editSelection
+        )
+    }
+
     private func materializeEditedTimeline(
         trackID: UUID,
         timeline: AudioEditTimeline,
@@ -4378,6 +4422,126 @@ final class WorkspaceView: NSView {
                 timeline: editedAudioTimeline,
                 editRevision: editRevision,
                 status: "healed adjacent clips",
+                preservePlaybackProgress: true,
+                startDelay: editMaterializationDelay,
+                animateWaveformTransition: false
+            )
+        }
+    }
+
+    private func slipClipContents(direction: Int) {
+        guard
+            direction != 0,
+            let target = editableClipSlipTarget(),
+            projectTracks.indices.contains(target.trackIndex)
+        else {
+            updateStatus("select a clip to slip")
+            return
+        }
+
+        let trackIndex = target.trackIndex
+        let trackID = projectTracks[trackIndex].id
+        let currentOverview = projectTracks[trackIndex].waveformOverview
+        let undoSnapshot = ProjectTrackUndoSnapshot(
+            tracks: projectTracks,
+            activeTrackID: activeTrackID,
+            selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
+            selectedTimelineRange: selectedTimelineRange,
+            restoreProgress: playbackController.snapshot().progress
+        )
+
+        let editedAudioTimeline: AudioEditTimeline?
+        let editedFileTimeline: AudioFileEditTimeline?
+        let appliedFrameDelta: Int
+        let appliedSampleRate: Double
+        if let currentFileTimeline = try? preferredFileTimelineForEditing(trackIndex: trackIndex) {
+            let requestedFrameDelta = Int((currentFileTimeline.sourceSampleRate * 0.05).rounded()) * direction
+            var timeline = currentFileTimeline
+            appliedFrameDelta = timeline.slipClip(
+                AudioFileEditTimeline.ClipRange(
+                    startProgress: target.editSelection.startProgress,
+                    endProgress: target.editSelection.endProgress
+                ),
+                byFrameCount: requestedFrameDelta
+            )
+            guard appliedFrameDelta != 0 else {
+                updateStatus("clip is at source edge")
+                return
+            }
+            appliedSampleRate = currentFileTimeline.sourceSampleRate
+            editedAudioTimeline = nil
+            editedFileTimeline = timeline
+        } else if let currentTimeline = projectTracks[trackIndex].audioTimeline {
+            let requestedFrameDelta = Int((currentTimeline.sourceAudioBuffer.sampleRate * 0.05).rounded()) * direction
+            var timeline = currentTimeline
+            appliedFrameDelta = timeline.slipClip(
+                AudioEditTimeline.ClipRange(
+                    startProgress: target.editSelection.startProgress,
+                    endProgress: target.editSelection.endProgress
+                ),
+                byFrameCount: requestedFrameDelta
+            )
+            guard appliedFrameDelta != 0 else {
+                updateStatus("clip is at source edge")
+                return
+            }
+            appliedSampleRate = currentTimeline.sourceAudioBuffer.sampleRate
+            editedAudioTimeline = timeline
+            editedFileTimeline = nil
+        } else {
+            updateStatus("track is not ready to slip")
+            return
+        }
+
+        editUndoStack.append(.projectTracks(undoSnapshot))
+        cancelEditMaterialization(for: trackID)
+        projectTracks[trackIndex].editRevision += 1
+        let editRevision = projectTracks[trackIndex].editRevision
+        projectTracks[trackIndex].audioTimeline = editedAudioTimeline
+        projectTracks[trackIndex].fileTimeline = editedFileTimeline
+        projectTracks[trackIndex].decodedAudioBuffer = editedAudioTimeline?.sourceAudioBuffer
+        projectTracks[trackIndex].durationHint = editedFileTimeline?.duration ?? editedAudioTimeline?.duration
+
+        if let editedFileTimeline {
+            projectTracks[trackIndex].waveformOverview =
+                optimisticWaveformOverview(
+                    for: editedFileTimeline,
+                    sourceOverview: projectTracks[trackIndex].sourceWaveformOverview,
+                    fallbackOverview: currentOverview
+                )
+            scheduleFileTimelineWaveformRefinement(
+                trackID: trackID,
+                fileTimeline: editedFileTimeline,
+                sourceOverview: projectTracks[trackIndex].sourceWaveformOverview ?? currentOverview,
+                editRevision: editRevision
+            )
+        } else if let currentOverview {
+            projectTracks[trackIndex].waveformOverview = WaveformOverview(
+                duration: editedAudioTimeline?.duration ?? currentOverview.duration,
+                bins: currentOverview.bins
+            )
+            cancelEditWaveformRefinement(for: trackID)
+        }
+
+        activeTrackID = trackID
+        syncActiveTrackFields()
+        refreshProjectTimelineDisplay(rebuildControls: false, animateWaveformTransition: false)
+        updateProjectDisplayTiming()
+        reloadPlaybackFromProjectTracks(
+            preserveProgress: true,
+            resumeIfPlaying: playbackController.isPlaying
+        )
+        updateEffectCommandState()
+        let slippedDuration = abs(Double(appliedFrameDelta)) / max(appliedSampleRate, 1)
+        updateStatus("slipped clip \(direction < 0 ? "left" : "right") \(formatDuration(slippedDuration))")
+
+        if let editedAudioTimeline {
+            materializeEditedTimeline(
+                trackID: trackID,
+                timeline: editedAudioTimeline,
+                editRevision: editRevision,
+                status: "slipped clip \(formatDuration(slippedDuration))",
                 preservePlaybackProgress: true,
                 startDelay: editMaterializationDelay,
                 animateWaveformTransition: false
