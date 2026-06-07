@@ -110,7 +110,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var pagingPlayheadProgress: Float = 0
     private var pagingPlayheadAnchorTimestamp = CACurrentMediaTime()
     private var latestSubmittedPresentationTimestamp = CACurrentMediaTime()
-    private let selectionDragThreshold: CGFloat = 0.25
+    private let selectionDragThreshold: CGFloat = 0.01
     private let trimHandleHitWidth: CGFloat = 18
     private let rightPanVelocitySmoothing: Float = 0.42
     private let rightPanMomentumDecayRate: Double = 5.2
@@ -1677,6 +1677,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         let yFromTop = Float(bounds.height - point.y)
         guard let trackIndex = resolvedTrackLayoutForCurrentBounds().trackIndex(atYFromTop: yFromTop) else {
+            return nil
+        }
+        guard currentTrackIDs.indices.contains(trackIndex) else {
             return nil
         }
         return currentTrackIDs[trackIndex]
