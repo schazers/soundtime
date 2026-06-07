@@ -48,6 +48,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onFadeOutRequested: (() -> Void)?
     var onNormalizeRequested: (() -> Void)?
     var onDeleteSilenceRequested: (() -> Void)?
+    var onAcceptDeadAirCandidateRequested: (() -> Void)?
+    var onRejectDeadAirCandidateRequested: (() -> Void)?
+    var onAuditionDeadAirCandidateRequested: (() -> Void)?
     var onReapplyLastEffect: (() -> Void)?
     var onSeekRequested: ((Float) -> Void)?
     var onPlayFromProgress: ((Float) -> Void)?
@@ -63,6 +66,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var canDeleteSelection = false
     var canClearSelection = false
     var canDeleteSilence = false
+    var canUseDeadAirCandidate = false
     var isDebugToolsVisible = false
 
     private enum TimelineDragMode {
@@ -943,6 +947,18 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onDeleteSilenceRequested?()
     }
 
+    @objc func acceptDeadAirCandidate(_ sender: Any?) {
+        onAcceptDeadAirCandidateRequested?()
+    }
+
+    @objc func rejectDeadAirCandidate(_ sender: Any?) {
+        onRejectDeadAirCandidateRequested?()
+    }
+
+    @objc func auditionDeadAirCandidate(_ sender: Any?) {
+        onAuditionDeadAirCandidateRequested?()
+    }
+
     @objc func reapplyLastEffect(_ sender: Any?) {
         onReapplyLastEffect?()
     }
@@ -957,6 +973,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return canApplyGainEffect
         case #selector(deleteSilence(_:)):
             return canDeleteSilence
+        case #selector(acceptDeadAirCandidate(_:)),
+             #selector(rejectDeadAirCandidate(_:)),
+             #selector(auditionDeadAirCandidate(_:)):
+            return canUseDeadAirCandidate
         case #selector(reapplyLastEffect(_:)):
             return canReapplyLastEffect
         case #selector(deleteTimelineSelection(_:)):
