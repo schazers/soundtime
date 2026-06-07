@@ -881,12 +881,17 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var frameStatsTransientParticleCount = 0
     private var frameStatsDeletionEffectCount = 0
     private var frameStatsPlayheadContactEventCount = 0
+    private var lastFrameStats: TimelineFrameStats?
     private var lastRenderViewportSize = CGSize(width: 1600, height: 900)
     private var lastRenderBackingScale: Float = 1
     var onFrameStatsChanged: ((TimelineFrameStats) -> Void)?
     var onRenderDataPrepared: (() -> Void)?
 
     func currentFrameStatsSnapshot() -> TimelineFrameStats {
+        if let lastFrameStats {
+            return lastFrameStats
+        }
+
         let waveformBufferDiagnostics = waveformShaderBufferStore.diagnostics()
         return TimelineFrameStats(
             framesPerSecond: 0,
@@ -3280,6 +3285,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         frameIntervalSum = 0
         frameIntervalSquareSum = 0
         worstFrameInterval = 0
+        lastFrameStats = frameStats
         onFrameStatsChanged?(frameStats)
     }
 

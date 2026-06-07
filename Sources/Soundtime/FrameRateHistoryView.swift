@@ -180,6 +180,9 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
         renderSamples.withUnsafeBytes { bytes in
             if let baseAddress = bytes.baseAddress, !bytes.isEmpty {
                 encoder.setFragmentBytes(baseAddress, length: bytes.count, index: 0)
+            } else {
+                var emptySample = HistorySample(timestamp: now, framesPerSecond: 0)
+                encoder.setFragmentBytes(&emptySample, length: MemoryLayout<HistorySample>.stride, index: 0)
             }
         }
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<HistoryUniforms>.stride, index: 1)
@@ -202,8 +205,6 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
                     framesPerSecond: latestSample.framesPerSecond
                 ))
             }
-        } else {
-            renderSamples.append(HistorySample(timestamp: now, framesPerSecond: 0))
         }
 
         if renderSamples.count > maximumSampleCount {
@@ -336,7 +337,8 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
         float fill = 0.0;
         float latestDot = 0.0;
         float latestDanger = 0.0;
-        float leftFade = smoothstep(left, left + 0.060, uv.x);
+        float edgeFade = smoothstep(left, left + 0.070, uv.x) *
+            (1.0 - smoothstep(right - 0.070, right, uv.x));
 
         if (sampleCount >= 2u) {
             for (uint i = 1u; i < sampleCount; ++i) {
@@ -355,8 +357,8 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
                 float distance = segment_distance(scaledUV, p0, p1);
                 float lineWidth = 1.45 / height;
                 float glowWidth = 7.5 / height;
-                float segmentLine = (1.0 - smoothstep(lineWidth, lineWidth + 1.4 / height, distance)) * leftFade;
-                float segmentGlow = (1.0 - smoothstep(lineWidth, glowWidth, distance)) * leftFade;
+                float segmentLine = (1.0 - smoothstep(lineWidth, lineWidth + 1.4 / height, distance)) * edgeFade;
+                float segmentGlow = (1.0 - smoothstep(lineWidth, glowWidth, distance)) * edgeFade;
                 float danger = max(fps_danger(previousSample), fps_danger(currentSample));
                 line = max(line, segmentLine);
                 glow = max(glow, segmentGlow);
@@ -369,13 +371,13 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
                 float inSegmentX = smoothstep(segmentLeft, segmentLeft + 0.004, uv.x) *
                     (1.0 - smoothstep(segmentRight - 0.004, segmentRight, uv.x));
                 fill = max(fill, inSegmentX * smoothstep(bottom, yOnSegment, uv.y) *
-                    (1.0 - smoothstep(yOnSegment, yOnSegment + 0.01, uv.y)) * 0.10 * leftFade);
+                    (1.0 - smoothstep(yOnSegment, yOnSegment + 0.01, uv.y)) * 0.10 * edgeFade);
             }
 
             HistorySample latestSample = samples[sampleCount - 1u];
             float latestX = mix(left, right, sample_x(latestSample, now, duration));
             float latestY = sample_y(latestSample, maxFPS, bottom, top);
-            latestDot = 1.0 - smoothstep(2.0 / height, 6.0 / height, distance(scaledUV, float2(latestX * aspect, latestY)));
+            latestDot = (1.0 - smoothstep(2.0 / height, 6.0 / height, distance(scaledUV, float2(latestX * aspect, latestY)))) * edgeFade;
             latestDanger = fps_danger(latestSample);
         }
 
