@@ -1167,9 +1167,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     ) -> TimelineRenderState.Track {
         let durationHint = track.durationHint ?? track.waveformOverview?.duration ?? currentTrack?.durationHint
         let hasWaveform = track.waveformOverview?.isEmpty == false || currentTrack?.hasWaveform == true
+        let waveformVersion = track.waveformOverview == nil ?
+            (currentTrack?.waveformVersion ?? track.waveformVersion) :
+            track.waveformVersion
         return TimelineRenderState.Track(
             id: track.id,
-            waveformVersion: track.waveformVersion,
+            waveformVersion: waveformVersion,
             waveformOverview: nil,
             durationHint: durationHint,
             volume: track.volume,
