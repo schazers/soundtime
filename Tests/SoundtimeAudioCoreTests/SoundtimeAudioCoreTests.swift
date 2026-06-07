@@ -471,6 +471,82 @@ final class SoundtimeAudioCoreTests: XCTestCase {
         XCTAssertEqual(output[1], [-1, -2, -2.5, -6])
     }
 
+    func testSegmentedTrackAppliesSpliceFadeAtDiscontinuousJoin() throws {
+        let engine = try XCTUnwrap(soundtime_audio_core_create())
+        defer {
+            soundtime_audio_core_destroy(engine)
+        }
+
+        var samples = [Float](repeating: 1, count: 64)
+        let preparedSource = samples.withUnsafeMutableBufferPointer { sampleBuffer in
+            var channels = [UnsafePointer(sampleBuffer.baseAddress)]
+            return channels.withUnsafeMutableBufferPointer { channelPointers in
+                soundtime_audio_core_source_create_planar(
+                    channelPointers.baseAddress,
+                    UInt64(sampleBuffer.count),
+                    1,
+                    1_000
+                )
+            }
+        }
+        let source = try XCTUnwrap(preparedSource)
+        defer {
+            soundtime_audio_core_source_destroy(source)
+        }
+
+        var segments = [
+            SoundtimeAudioCoreSegmentConfig(
+                outputStartFrame: 0,
+                sourceStartFrame: 0,
+                frameCount: 20,
+                sourceFrameScale: 1,
+                gainStart: 1,
+                gainEnd: 1
+            ),
+            SoundtimeAudioCoreSegmentConfig(
+                outputStartFrame: 20,
+                sourceStartFrame: 40,
+                frameCount: 20,
+                sourceFrameScale: 1,
+                gainStart: 1,
+                gainEnd: 1
+            ),
+        ]
+        let didLoad = segments.withUnsafeMutableBufferPointer { segmentBuffer in
+            var tracks = [
+                SoundtimeAudioCoreSegmentedTrackConfig(
+                    source: source,
+                    segments: segmentBuffer.baseAddress,
+                    segmentCount: UInt32(segmentBuffer.count),
+                    gain: 1
+                ),
+            ]
+            return tracks.withUnsafeMutableBufferPointer { trackBuffer in
+                soundtime_audio_core_set_prepared_segmented_tracks(
+                    engine,
+                    trackBuffer.baseAddress,
+                    UInt32(trackBuffer.count)
+                )
+            }
+        }
+        XCTAssertTrue(didLoad)
+
+        soundtime_audio_core_set_transport_ramp_duration(engine, 0)
+        soundtime_audio_core_play(engine)
+
+        let output = render(engine: engine, channelCount: 2, frameCount: 40, hostTimestamp: 16)
+        XCTAssertEqual(output[0][14], 1, accuracy: 0.000_001)
+        XCTAssertEqual(output[0][16], 0.84375, accuracy: 0.000_001)
+        XCTAssertEqual(output[0][17], 0.5, accuracy: 0.000_001)
+        XCTAssertEqual(output[0][18], 0.15625, accuracy: 0.000_001)
+        XCTAssertEqual(output[0][19], 0, accuracy: 0.000_001)
+        XCTAssertEqual(output[0][20], 0, accuracy: 0.000_001)
+        XCTAssertEqual(output[0][21], 0.15625, accuracy: 0.000_001)
+        XCTAssertEqual(output[0][22], 0.5, accuracy: 0.000_001)
+        XCTAssertEqual(output[0][23], 0.84375, accuracy: 0.000_001)
+        XCTAssertEqual(output[0][24], 1, accuracy: 0.000_001)
+    }
+
     func testIdenticalSegmentedTracksSumWithoutPhaseOffset() throws {
         let engine = try XCTUnwrap(soundtime_audio_core_create())
         defer {
