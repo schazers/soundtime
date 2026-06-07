@@ -250,6 +250,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: ""
         ))
         menu.addItem(NSMenuItem(
+            title: "Select All Clips on Track",
+            action: #selector(TimelineView.selectAllClipsOnTrack(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
             title: "Zoom to Selection",
             action: #selector(TimelineView.zoomToSelection(_:)),
             keyEquivalent: "j"
