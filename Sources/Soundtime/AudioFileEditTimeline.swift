@@ -82,6 +82,7 @@ struct AudioFileEditTimeline: Sendable {
     let sourceFrameCount: Int
     let sourceSampleRate: Double
     private var segments: [Segment]
+    private var timelineFrameCount: Int
 
     init(fileInfo: WAVFileInfo) {
         sourceFrameCount = fileInfo.frameCount
@@ -95,8 +96,10 @@ struct AudioFileEditTimeline: Sendable {
                     gainEnd: 1
                 ),
             ]
+            timelineFrameCount = fileInfo.frameCount
         } else {
             segments = []
+            timelineFrameCount = 0
         }
     }
 
@@ -122,6 +125,7 @@ struct AudioFileEditTimeline: Sendable {
             },
             sourceFrameCount: persistentState.sourceFrameCount
         )
+        timelineFrameCount = Self.totalFrameCount(segments)
 
         guard persistentState.sourceFrameCount == 0 || !segments.isEmpty else {
             return nil
@@ -154,6 +158,7 @@ struct AudioFileEditTimeline: Sendable {
             },
             sourceFrameCount: sourceFrameCount
         )
+        timelineFrameCount = Self.totalFrameCount(segments)
 
         guard sourceFrameCount == 0 || !segments.isEmpty else {
             return nil
@@ -161,9 +166,7 @@ struct AudioFileEditTimeline: Sendable {
     }
 
     var frameCount: Int {
-        segments.reduce(0) { total, segment in
-            total + segment.frameCount
-        }
+        timelineFrameCount
     }
 
     var duration: TimeInterval {
@@ -282,9 +285,9 @@ struct AudioFileEditTimeline: Sendable {
         let beforeSegments = segments(in: 0..<replacementRange.lowerBound)
         let afterSegments = segments(in: replacementRange.upperBound..<frameCount)
         segments = Self.coalescedSegments(beforeSegments + replacementSegments + afterSegments)
-        return replacementSegments.reduce(0) { total, segment in
-            total + segment.frameCount
-        }
+        let replacementFrameCount = Self.totalFrameCount(replacementSegments)
+        timelineFrameCount = timelineFrameCount - replacementRange.count + replacementFrameCount
+        return replacementFrameCount
     }
 
     func waveformOverview(from sourceOverview: WaveformOverview) -> WaveformOverview {
@@ -372,6 +375,7 @@ struct AudioFileEditTimeline: Sendable {
 
         let clampedRange = max(frameRange.lowerBound, 0)..<min(frameRange.upperBound, frameCount)
         var outputSegments: [Segment] = []
+        outputSegments.reserveCapacity(segments.count)
         var timelineFrame = 0
 
         for segment in segments {
@@ -399,15 +403,18 @@ struct AudioFileEditTimeline: Sendable {
     private mutating func deleteFrames(in frameRange: Range<Int>) -> Int {
         guard
             frameRange.lowerBound < frameRange.upperBound,
-            frameRange.lowerBound < frameCount,
+            frameRange.lowerBound < timelineFrameCount,
             frameRange.upperBound > 0
         else {
             return 0
         }
 
-        let clampedRange = max(frameRange.lowerBound, 0)..<min(frameRange.upperBound, frameCount)
+        let originalFrameCount = timelineFrameCount
+        let clampedRange = max(frameRange.lowerBound, 0)..<min(frameRange.upperBound, originalFrameCount)
         var nextSegments: [Segment] = []
+        nextSegments.reserveCapacity(segments.count + 2)
         var timelineFrame = 0
+        var deletedFrameCount = 0
 
         for segment in segments {
             let segmentStartFrame = timelineFrame
@@ -422,6 +429,7 @@ struct AudioFileEditTimeline: Sendable {
                 continue
             }
 
+            deletedFrameCount += overlapEndFrame - overlapStartFrame
             let beforeCount = overlapStartFrame - segmentStartFrame
             if beforeCount > 0 {
                 nextSegments.append(Segment(
@@ -443,17 +451,15 @@ struct AudioFileEditTimeline: Sendable {
             }
         }
 
-        let deletedFrameCount = frameCount - nextSegments.reduce(0) { total, segment in
-            total + segment.frameCount
-        }
         segments = Self.coalescedSegments(nextSegments)
+        timelineFrameCount = originalFrameCount - deletedFrameCount
         return deletedFrameCount
     }
 
     private mutating func applyGain(_ gain: Float, toFramesIn frameRange: Range<Int>) -> Int {
         guard
             frameRange.lowerBound < frameRange.upperBound,
-            frameRange.lowerBound < frameCount,
+            frameRange.lowerBound < timelineFrameCount,
             frameRange.upperBound > 0,
             gain >= 0,
             gain.isFinite
@@ -461,8 +467,9 @@ struct AudioFileEditTimeline: Sendable {
             return 0
         }
 
-        let clampedRange = max(frameRange.lowerBound, 0)..<min(frameRange.upperBound, frameCount)
+        let clampedRange = max(frameRange.lowerBound, 0)..<min(frameRange.upperBound, timelineFrameCount)
         var nextSegments: [Segment] = []
+        nextSegments.reserveCapacity(segments.count + 2)
         var timelineFrame = 0
         var affectedFrameCount = 0
 
@@ -512,15 +519,16 @@ struct AudioFileEditTimeline: Sendable {
     ) -> Int {
         guard
             frameRange.lowerBound < frameRange.upperBound,
-            frameRange.lowerBound < frameCount,
+            frameRange.lowerBound < timelineFrameCount,
             frameRange.upperBound > 0
         else {
             return 0
         }
 
-        let clampedRange = max(frameRange.lowerBound, 0)..<min(frameRange.upperBound, frameCount)
+        let clampedRange = max(frameRange.lowerBound, 0)..<min(frameRange.upperBound, timelineFrameCount)
         let selectedFrameCount = clampedRange.count
         var nextSegments: [Segment] = []
+        nextSegments.reserveCapacity(segments.count + 2)
         var timelineFrame = 0
         var affectedFrameCount = 0
 
@@ -647,6 +655,12 @@ struct AudioFileEditTimeline: Sendable {
         }
 
         return result
+    }
+
+    private static func totalFrameCount(_ segments: [Segment]) -> Int {
+        segments.reduce(0) { total, segment in
+            total + segment.frameCount
+        }
     }
 
     private static func validatedSegments(

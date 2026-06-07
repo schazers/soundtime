@@ -120,10 +120,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             return
         }
 
-        let existingTracksByID = Dictionary(uniqueKeysWithValues: preparedProjectTracks.map { ($0.id, $0) })
-        let preparedTracks = try tracks.map { track in
-            try preparedProjectTrack(from: track, existingPreparedTrack: existingTracksByID[track.id])
-        }
+        let preparedTracks = try prepareProjectTracks(tracks)
 
         let sampleRate = preparedTracks[0].source.sampleRate
         guard sampleRate > 0, preparedTracks.allSatisfy({ $0.source.sampleRate > 0 }) else {
@@ -163,10 +160,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         }
 
         let previousSnapshot = snapshot()
-        let existingTracksByID = Dictionary(uniqueKeysWithValues: preparedProjectTracks.map { ($0.id, $0) })
-        let preparedTracks = try tracks.map { track in
-            try preparedProjectTrack(from: track, existingPreparedTrack: existingTracksByID[track.id])
-        }
+        let preparedTracks = try prepareProjectTracks(tracks)
 
         let sampleRate = preparedTracks[0].source.sampleRate
         guard sampleRate > 0, preparedTracks.allSatisfy({ $0.source.sampleRate > 0 }) else {
@@ -626,6 +620,35 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             isMuted: track.isMuted,
             isSoloed: track.isSoloed
         )
+    }
+
+    private func prepareProjectTracks(_ tracks: [ProjectPlaybackTrack]) throws -> [PreparedProjectTrack] {
+        let existingTracksByID = Dictionary(uniqueKeysWithValues: preparedProjectTracks.map { ($0.id, $0) })
+        var reusableTracksBySourceIdentity: [String: PreparedProjectTrack] = [:]
+        reusableTracksBySourceIdentity.reserveCapacity(preparedProjectTracks.count + tracks.count)
+        for preparedTrack in preparedProjectTracks {
+            if let sourceIdentity = preparedTrack.sourceIdentity {
+                reusableTracksBySourceIdentity[sourceIdentity] = preparedTrack
+            }
+        }
+
+        var preparedTracks: [PreparedProjectTrack] = []
+        preparedTracks.reserveCapacity(tracks.count)
+        for track in tracks {
+            let stableSourceIdentity = sourceIdentity(for: track.source)
+            let reusablePreparedTrack = existingTracksByID[track.id] ??
+                stableSourceIdentity.flatMap { reusableTracksBySourceIdentity[$0] }
+            let preparedTrack = try preparedProjectTrack(
+                from: track,
+                existingPreparedTrack: reusablePreparedTrack
+            )
+            preparedTracks.append(preparedTrack)
+            if let sourceIdentity = preparedTrack.sourceIdentity {
+                reusableTracksBySourceIdentity[sourceIdentity] = preparedTrack
+            }
+        }
+
+        return preparedTracks
     }
 
     private func sourceIdentity(for source: ProjectPlaybackTrack.Source) -> String? {
