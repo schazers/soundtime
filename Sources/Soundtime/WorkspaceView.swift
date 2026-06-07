@@ -606,6 +606,9 @@ final class WorkspaceView: NSView {
         timelineSurface.onSnapSelectionRequested = { [weak self] in
             self?.snapSelectionToPlayheadEdgesOrSilence()
         }
+        timelineSurface.onSelectTimeAcrossLinkedTracksRequested = { [weak self] in
+            self?.selectTimeAcrossLinkedTracks()
+        }
         timelineSurface.onUndo = { [weak self] in
             self?.undoLastEdit()
         }
@@ -4493,6 +4496,39 @@ final class WorkspaceView: NSView {
         candidates.min { lhs, rhs in
             abs(lhs - progress) < abs(rhs - progress)
         } ?? progress
+    }
+
+    private func selectTimeAcrossLinkedTracks() {
+        guard
+            let selection = selectedTimelineRange,
+            selection.durationProgress > 0,
+            let trackIndex = trackIndex(for: selection),
+            projectTracks.indices.contains(trackIndex)
+        else {
+            updateStatus("select time on a linked track")
+            return
+        }
+
+        guard let editGroupID = projectTracks[trackIndex].editGroupID else {
+            updateStatus("track has no linked edit group")
+            return
+        }
+
+        let linkedTrackIDs = Set(projectTracks.filter { $0.editGroupID == editGroupID }.map(\.id))
+        guard !linkedTrackIDs.isEmpty else {
+            updateStatus("no linked tracks found")
+            return
+        }
+
+        selectedTrackID = projectTracks[trackIndex].id
+        selectedTrackIDs = linkedTrackIDs
+        activeTrackID = projectTracks[trackIndex].id
+        editScope = .group
+        publishSelectedTracksToTimeline()
+        refreshTrackControls()
+        updateEditScopeHint()
+        updateEffectCommandState()
+        updateStatus("selected time across \(linkedTrackIDs.count) linked \(linkedTrackIDs.count == 1 ? "track" : "tracks")")
     }
 
     private func silenceCleanupTarget() -> EditableSelectionTarget? {
