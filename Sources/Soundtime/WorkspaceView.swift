@@ -5702,7 +5702,7 @@ final class WorkspaceView: NSView {
 
     private func applyNormalizeEffect() {
         guard
-            let target = currentEditableSelectionTarget(),
+            let target = currentEditableSelectionTarget() ?? editableClipAtPlayheadTarget(),
             projectTracks.indices.contains(target.trackIndex)
         else {
             updateStatus("select audio to normalize")
@@ -5738,7 +5738,7 @@ final class WorkspaceView: NSView {
             }
 
             guard
-                let currentTarget = self.currentEditableSelectionTarget(),
+                let currentTarget = self.currentEditableSelectionTarget() ?? self.editableClipAtPlayheadTarget(),
                 self.projectTracks.indices.contains(currentTarget.trackIndex),
                 self.projectTracks[currentTarget.trackIndex].id == trackID,
                 self.projectTracks[currentTarget.trackIndex].editRevision == editRevision,
@@ -5775,7 +5775,7 @@ final class WorkspaceView: NSView {
     }
 
     private func previewSelectedGain(_ gain: Float) {
-        guard let target = currentEditableSelectionTarget(), canApplyGainEffect else {
+        guard let target = currentEditableSelectionTarget() ?? editableClipAtPlayheadTarget(), canApplyGainEffect else {
             timelineSurface.displayGainPreview(selection: nil, gain: 1)
             return
         }
@@ -5800,7 +5800,7 @@ final class WorkspaceView: NSView {
         lastEffect: LastEffect? = nil
     ) {
         guard
-            let target = currentEditableSelectionTarget()
+            let target = currentEditableSelectionTarget() ?? editableClipAtPlayheadTarget()
         else {
             return
         }
@@ -7249,7 +7249,7 @@ final class WorkspaceView: NSView {
 
     private var canApplyGainEffect: Bool {
         guard
-            let target = currentEditableSelectionTarget(),
+            let target = currentEditableSelectionTarget() ?? editableClipAtPlayheadTarget(),
             projectTracks.indices.contains(target.trackIndex)
         else {
             return false
