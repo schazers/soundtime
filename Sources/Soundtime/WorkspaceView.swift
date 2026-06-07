@@ -208,6 +208,7 @@ final class WorkspaceView: NSView {
     private var debugToolsVisible = false
     private let editMaterializationDelay: TimeInterval = 0.75
     private let deleteMaterializationDelay: TimeInterval = 2.0
+    private let deleteVisualRefreshDelay: TimeInterval = 0.13
     private let editWaveformRefinementDelay: TimeInterval = 0.20
     private var editMaterializationTasks: [UUID: Task<Void, Never>] = [:]
     private var editMaterializationRequestIDs: [UUID: UUID] = [:]
@@ -276,8 +277,8 @@ final class WorkspaceView: NSView {
         WAVPreviewLevel(targetBinCount: 3_145_728, samplesPerBin: 2),
         WAVPreviewLevel(targetBinCount: 4_194_304, samplesPerBin: 2),
     ]
-    private let optimisticEditPreviewBinLimit = 32_768
-    private let optimisticEditPreviewSamplesPerBin = 4
+    private let optimisticEditPreviewBinLimit = 262_144
+    private let optimisticEditPreviewSamplesPerBin = 2
 
     private struct WAVPreviewLevel {
         let targetBinCount: Int
@@ -4019,7 +4020,7 @@ final class WorkspaceView: NSView {
         selectedTimelineRange = nil
         timelineSurface.displaySelection(nil)
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
-        refreshProjectTimelineDisplay(rebuildControls: false, animateWaveformTransition: false)
+        scheduleDeleteVisualRefresh(trackID: trackID, editRevision: editRevision)
         updateProjectDisplayTiming()
         let editedTrackDuration = projectTracks.indices.contains(trackIndex) ?
             trackDuration(for: projectTracks[trackIndex]) :
@@ -4050,6 +4051,20 @@ final class WorkspaceView: NSView {
                 startDelay: deleteMaterializationDelay,
                 animateWaveformTransition: false
             )
+        }
+    }
+
+    private func scheduleDeleteVisualRefresh(trackID: UUID, editRevision: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + deleteVisualRefreshDelay) { [weak self] in
+            guard
+                let self,
+                let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }),
+                projectTracks[trackIndex].editRevision == editRevision
+            else {
+                return
+            }
+
+            refreshProjectTimelineDisplay(rebuildControls: false, animateWaveformTransition: false)
         }
     }
 
