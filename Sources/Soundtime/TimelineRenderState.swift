@@ -84,12 +84,14 @@ struct TimelineRenderState: Sendable {
         selectedTrackID: UUID?,
         trimPreview: TimelineTrimRange?,
         gainPreview: GainPreview?,
-        duration: TimeInterval? = nil
+        duration: TimeInterval? = nil,
+        hasWaveforms: Bool? = nil,
+        hasSoloedTrack: Bool? = nil
     ) {
         self.tracks = tracks
         self.duration = duration ?? Self.projectDuration(for: tracks)
-        hasWaveforms = tracks.contains { $0.hasWaveform }
-        hasSoloedTrack = tracks.contains { $0.isSoloed }
+        self.hasWaveforms = hasWaveforms ?? tracks.contains { $0.hasWaveform }
+        self.hasSoloedTrack = hasSoloedTrack ?? tracks.contains { $0.isSoloed }
         self.viewport = viewport
         self.trackLayout = trackLayout
         self.playheadProgress = playheadProgress
@@ -181,7 +183,9 @@ struct TimelineRenderState: Sendable {
             selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
-            duration: duration
+            duration: duration,
+            hasWaveforms: hasWaveforms,
+            hasSoloedTrack: hasSoloedTrack
         )
     }
 
@@ -200,7 +204,9 @@ struct TimelineRenderState: Sendable {
             selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
-            duration: duration
+            duration: duration,
+            hasWaveforms: hasWaveforms,
+            hasSoloedTrack: hasSoloedTrack
         )
     }
 
@@ -222,7 +228,9 @@ struct TimelineRenderState: Sendable {
             selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
-            duration: duration
+            duration: duration,
+            hasWaveforms: hasWaveforms,
+            hasSoloedTrack: hasSoloedTrack
         )
     }
 
@@ -241,7 +249,9 @@ struct TimelineRenderState: Sendable {
             selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
-            duration: duration
+            duration: duration,
+            hasWaveforms: hasWaveforms,
+            hasSoloedTrack: hasSoloedTrack
         )
     }
 
@@ -260,7 +270,9 @@ struct TimelineRenderState: Sendable {
             selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
-            duration: duration
+            duration: duration,
+            hasWaveforms: hasWaveforms,
+            hasSoloedTrack: hasSoloedTrack
         )
     }
 
@@ -280,7 +292,9 @@ struct TimelineRenderState: Sendable {
             selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
-            duration: duration
+            duration: duration,
+            hasWaveforms: hasWaveforms,
+            hasSoloedTrack: hasSoloedTrack
         )
     }
 
@@ -299,7 +313,9 @@ struct TimelineRenderState: Sendable {
             selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
-            duration: duration
+            duration: duration,
+            hasWaveforms: hasWaveforms,
+            hasSoloedTrack: hasSoloedTrack
         )
     }
 
@@ -318,7 +334,9 @@ struct TimelineRenderState: Sendable {
             selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
-            duration: duration
+            duration: duration,
+            hasWaveforms: hasWaveforms,
+            hasSoloedTrack: hasSoloedTrack
         )
     }
 
@@ -337,7 +355,9 @@ struct TimelineRenderState: Sendable {
             selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
-            duration: duration
+            duration: duration,
+            hasWaveforms: hasWaveforms,
+            hasSoloedTrack: hasSoloedTrack
         )
     }
 
@@ -356,7 +376,9 @@ struct TimelineRenderState: Sendable {
             selectedTrackID: selectedTrackID,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
-            duration: duration
+            duration: duration,
+            hasWaveforms: hasWaveforms,
+            hasSoloedTrack: hasSoloedTrack
         )
     }
 }
