@@ -482,6 +482,23 @@ struct AudioFileEditTimeline: Sendable {
         return split(atFrame: splitFrame)
     }
 
+    mutating func trim(to trimRange: TimelineTrimRange) -> Int {
+        let originalFrameCount = frameCount
+        let keepStartFrame = Int((trimRange.startProgress * Float(originalFrameCount)).rounded(.down))
+        let keepEndFrame = Int((trimRange.endProgress * Float(originalFrameCount)).rounded(.up))
+
+        guard
+            keepStartFrame < keepEndFrame,
+            keepStartFrame > 0 || keepEndFrame < originalFrameCount
+        else {
+            return 0
+        }
+
+        let trailingDeletedFrameCount = deleteFrames(in: keepEndFrame..<originalFrameCount)
+        let leadingDeletedFrameCount = deleteFrames(in: 0..<keepStartFrame)
+        return trailingDeletedFrameCount + leadingDeletedFrameCount
+    }
+
     private func frameRange(for selection: TimelineSelection) -> Range<Int> {
         let startFrame = Int((selection.startProgress * Double(frameCount)).rounded(.down))
         let endFrame = Int((selection.endProgress * Double(frameCount)).rounded(.up))
