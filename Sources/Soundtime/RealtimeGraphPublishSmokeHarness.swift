@@ -33,6 +33,10 @@ enum RealtimeGraphPublishSmokeHarness {
             sourceFrameCount: sourceFrameCount,
             isFull: isFull
         )
+        try runLazyFileOutputRefreshSmoke(
+            sampleRate: sampleRate,
+            sourceFrameCount: sourceFrameCount
+        )
         let outputDevice = RealtimeGraphPublishSmokeOutputDevice()
 
         guard let playbackEngine = RealtimeCorePlaybackEngine(outputDevice: outputDevice) else {
@@ -460,6 +464,28 @@ enum RealtimeGraphPublishSmokeHarness {
         )
     }
 
+    private static func runLazyFileOutputRefreshSmoke(
+        sampleRate: Double,
+        sourceFrameCount: Int
+    ) throws {
+        let wavURL = URL(fileURLWithPath: "/tmp/SoundtimeRealtimeOutputRefreshSmoke.wav")
+        try writeSyntheticPCM16WAV(
+            to: wavURL,
+            frameCount: sourceFrameCount,
+            sampleRate: sampleRate
+        )
+        let outputDevice = RealtimeGraphPublishSmokeOutputDevice()
+        guard let playbackEngine = RealtimeCorePlaybackEngine(outputDevice: outputDevice) else {
+            throw SmokeError.failed("could not create output refresh playback engine")
+        }
+
+        try playbackEngine.loadFile(at: wavURL, zeroCrossingProbe: nil)
+        try require(outputDevice.configureCount == 1, "lazy file output did not configure initially")
+        try playbackEngine.refreshOutputDevice()
+        try require(outputDevice.invalidateCount == 1, "lazy file output refresh did not invalidate")
+        try require(outputDevice.configureCount == 2, "lazy file output refresh did not reconfigure")
+    }
+
     private static func fileBackedProjectTracks(
         ids: [UUID],
         url: URL,
@@ -700,12 +726,17 @@ enum RealtimeGraphPublishSmokeHarness {
 
 private final class RealtimeGraphPublishSmokeOutputDevice: RealtimeAudioOutputDevice {
     var corePointer: OpaquePointer?
+    private(set) var configureCount = 0
+    private(set) var invalidateCount = 0
 
     func configure(corePointer: OpaquePointer, sampleRate _: Double) throws {
+        configureCount += 1
         self.corePointer = corePointer
     }
 
-    func invalidateConfiguration() {}
+    func invalidateConfiguration() {
+        invalidateCount += 1
+    }
 
     func start() throws {}
 

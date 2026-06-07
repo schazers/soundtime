@@ -196,7 +196,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
     }
 
     func refreshOutputDevice() throws {
-        guard sourceLoaded, sampleRate > 0 else {
+        guard hasSource, sampleRate > 0 else {
             return
         }
 
