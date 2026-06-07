@@ -90,6 +90,7 @@ enum EditGraphSmokeHarness {
         )
         try runFileClipPasteSmoke(fileInfo: fileInfo)
         try runSplitPersistenceSmoke(fileInfo: fileInfo)
+        try runSilenceAnalyzerSmoke()
 
         print(
             String(
@@ -179,6 +180,40 @@ enum EditGraphSmokeHarness {
             "split smoke lost clip boundaries after restore"
         )
         try require(restoredTimeline.frameCount == timeline.frameCount, "split smoke changed timeline length")
+    }
+
+    private static func runSilenceAnalyzerSmoke() throws {
+        let sampleRate = 1_000.0
+        var samples = [Float](repeating: 0.25, count: 1_800)
+        for frame in 420..<1_020 {
+            samples[frame] = 0.000_1
+        }
+        for frame in 1_300..<1_360 {
+            samples[frame] = 0.000_1
+        }
+        let buffer = DecodedAudioBuffer(
+            url: URL(fileURLWithPath: "/tmp/SoundtimeSilenceAnalyzerSmoke.wav"),
+            sampleRate: sampleRate,
+            channelCount: 1,
+            frameCount: samples.count,
+            samplesByChannel: [samples]
+        )
+        let configuration = AudioSilenceAnalyzer.Configuration(
+            thresholdDecibels: -44,
+            minimumSilenceDuration: 0.30,
+            paddingDuration: 0.10
+        )
+        let regions = AudioSilenceAnalyzer.detectSilence(in: buffer, configuration: configuration)
+        try require(regions.count == 1, "silence analyzer detected unexpected region count: \(regions.count)")
+        try require(regions[0].startFrame == 420, "silence analyzer region start mismatch")
+        try require(regions[0].endFrame == 1_020, "silence analyzer region end mismatch")
+
+        let deletionRanges = AudioSilenceAnalyzer.deletionRanges(
+            for: regions,
+            sampleRate: sampleRate,
+            configuration: configuration
+        )
+        try require(deletionRanges == [520..<920], "silence analyzer padding range mismatch")
     }
 
     private static func require(_ condition: Bool, _ message: String) throws {
