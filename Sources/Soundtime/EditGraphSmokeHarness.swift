@@ -112,6 +112,7 @@ enum EditGraphSmokeHarness {
         try runLinkedRippleDeleteSmoke(fileInfo: fileInfo)
         try runSplitPersistenceSmoke(fileInfo: fileInfo)
         try runSilenceAnalyzerSmoke()
+        try runPodcastExportProcessorSmoke()
 
         print(
             String(
@@ -298,6 +299,50 @@ enum EditGraphSmokeHarness {
             configuration: configuration
         )
         try require(deletionRanges == [520..<920], "silence analyzer padding range mismatch")
+    }
+
+    private static func runPodcastExportProcessorSmoke() throws {
+        let sampleRate = 48_000.0
+        let frameCount = Int(sampleRate * 2)
+        let samples = (0..<frameCount).map { frameIndex -> Float in
+            let phase = Double(frameIndex) / sampleRate * 440 * 2 * .pi
+            return Float(sin(phase) * 0.035)
+        }
+        let buffer = DecodedAudioBuffer(
+            url: URL(fileURLWithPath: "/tmp/SoundtimePodcastExportSmoke.wav"),
+            sampleRate: sampleRate,
+            channelCount: 2,
+            frameCount: frameCount,
+            samplesByChannel: [samples, samples]
+        )
+        let result = try PodcastExportProcessor.masteredForPodcast(
+            buffer,
+            settings: PodcastExportSettings(
+                targetIntegratedLUFS: -16,
+                truePeakCeilingDBTP: -1,
+                maximumGainAdjustmentDecibels: 36
+            )
+        )
+        let peakCeiling = PodcastExportProcessor.amplitude(decibels: -1)
+
+        try require(
+            result.analysis.outputIntegratedLUFS > result.analysis.inputIntegratedLUFS,
+            "podcast export smoke did not raise quiet audio toward target loudness"
+        )
+        try require(
+            abs(result.analysis.outputIntegratedLUFS - (-16)) < 0.8,
+            String(format: "podcast export smoke missed loudness target: %.2f", result.analysis.outputIntegratedLUFS)
+        )
+        try require(
+            PodcastExportProcessor.approximateTruePeakAmplitude(result.buffer) <= peakCeiling + 0.000_5,
+            "podcast export smoke exceeded peak ceiling"
+        )
+        for channelSamples in result.buffer.samplesByChannel {
+            try require(
+                !channelSamples.contains { !$0.isFinite },
+                "podcast export smoke produced non-finite samples"
+            )
+        }
     }
 
     private static func require(_ condition: Bool, _ message: String) throws {

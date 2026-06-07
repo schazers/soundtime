@@ -5830,11 +5830,15 @@ final class WorkspaceView: NSView {
         }
 
         let savePanel = NSSavePanel()
-        savePanel.title = "Export WAV"
+        savePanel.title = "Export Audio"
         savePanel.nameFieldStringValue = suggestedExportFilename()
         savePanel.canCreateDirectories = true
         savePanel.isExtensionHidden = false
-        savePanel.allowedContentTypes = [.wav]
+        savePanel.allowedContentTypes = [
+            .wav,
+            UTType(filenameExtension: "m4a") ?? .audio,
+            UTType(filenameExtension: "mp3") ?? .audio,
+        ]
 
         let completion: (NSApplication.ModalResponse) -> Void = {
             [weak self, projectMixSnapshots, fallbackDecodedAudioBuffer] response in
@@ -6288,16 +6292,27 @@ final class WorkspaceView: NSView {
 
         Task { [weak self, decodedAudioBuffer, destinationURL] in
             do {
-                let exportURL = destinationURL.pathExtension.isEmpty ?
-                    destinationURL.appendingPathExtension("wav") :
-                    destinationURL
+                let (exportURL, analysis) = try await Task.detached(priority: .userInitiated) {
+                    let masteredExport = try PodcastExportProcessor.masteredForPodcast(decodedAudioBuffer)
+                    Task { @MainActor in
+                        exportProgressOverlay.updateProgress(0.2)
+                    }
 
-                try await Task.detached(priority: .userInitiated) {
-                    try WAVFileWriter.write(decodedAudioBuffer, to: exportURL) { progress in
+                    let exportURL = Self.normalizedAudioExportURL(destinationURL)
+                    if CompressedAudioFileWriter.canWrite(to: exportURL) {
+                        try CompressedAudioFileWriter.write(masteredExport.buffer, to: exportURL)
                         Task { @MainActor in
-                            exportProgressOverlay.updateProgress(progress)
+                            exportProgressOverlay.updateProgress(1)
+                        }
+                    } else {
+                        try WAVFileWriter.write(masteredExport.buffer, to: exportURL) { progress in
+                            Task { @MainActor in
+                                exportProgressOverlay.updateProgress(0.2 + progress * 0.8)
+                            }
                         }
                     }
+
+                    return (exportURL, masteredExport.analysis)
                 }.value
 
                 guard let self else {
@@ -6305,7 +6320,14 @@ final class WorkspaceView: NSView {
                 }
 
                 self.exportProgressOverlay.showComplete()
-                self.updateStatus("exported \(exportURL.lastPathComponent)")
+                self.updateStatus(
+                    String(
+                        format: "exported %@ (%.1f LUFS, %.1f dBTP)",
+                        exportURL.lastPathComponent,
+                        analysis.outputIntegratedLUFS,
+                        analysis.outputTruePeakDBTP
+                    )
+                )
             } catch {
                 guard let self else {
                     return
@@ -6315,6 +6337,10 @@ final class WorkspaceView: NSView {
                 self.updateStatus("export failed: \(error.localizedDescription)")
             }
         }
+    }
+
+    private nonisolated static func normalizedAudioExportURL(_ destinationURL: URL) -> URL {
+        destinationURL.pathExtension.isEmpty ? destinationURL.appendingPathExtension("wav") : destinationURL
     }
 
     private func startPlaybackTimer() {
