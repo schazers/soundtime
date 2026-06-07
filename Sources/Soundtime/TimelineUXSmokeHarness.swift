@@ -34,6 +34,7 @@ enum TimelineUXSmokeHarness {
     }
 
     static func runFromCommandLine(arguments: [String]) throws {
+        let startedAtNanoseconds = DispatchTime.now().uptimeNanoseconds
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw SmokeError.metalDeviceUnavailable
         }
@@ -186,6 +187,19 @@ enum TimelineUXSmokeHarness {
         complete("main FPS graph draws visible cyan/red pixels")
         complete("performance monitor FPS/CPU graphs draw visible pixels")
 
+        if let reportURL = StabilityReportWriter.writePassedSuite(
+            name: "timeline-ux-smoke",
+            startedAtNanoseconds: startedAtNanoseconds,
+            checks: completedChecks,
+            metadata: [
+                "viewportWidth": "\(textureWidth)",
+                "viewportHeight": "\(textureHeight)",
+                "syntheticWAV": wavURL.path,
+            ],
+            arguments: arguments
+        ) {
+            print("wrote stability report: \(reportURL.path)")
+        }
         print("Soundtime timeline UX smoke passed: \(completedChecks.count) checks")
     }
 

@@ -3,6 +3,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+if [[ -n "${SOUNDTIME_STABILITY_REPORT_DIR:-}" ]]; then
+  mkdir -p "$SOUNDTIME_STABILITY_REPORT_DIR"
+fi
+
 mode_args=(--quick --ci)
 if [[ "${1:-}" == "--full" ]]; then
   mode_args=(--ci)
