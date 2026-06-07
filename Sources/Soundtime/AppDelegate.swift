@@ -194,7 +194,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ))
         menu.addItem(.separator())
         let deleteTimeItem = NSMenuItem(
-            title: "Delete Time Across Tracks",
+            title: "Delete Time",
             action: #selector(TimelineView.deleteTimelineSelection(_:)),
             keyEquivalent: "\u{7F}"
         )
