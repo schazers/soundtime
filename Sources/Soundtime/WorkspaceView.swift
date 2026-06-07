@@ -407,6 +407,11 @@ final class WorkspaceView: NSView {
         configure()
     }
 
+    override func mouseDown(with event: NSEvent) {
+        clearSelectedTrack()
+        super.mouseDown(with: event)
+    }
+
     private func configure() {
         wantsLayer = true
         layer?.backgroundColor = SoundtimeColors.windowBackground.cgColor
