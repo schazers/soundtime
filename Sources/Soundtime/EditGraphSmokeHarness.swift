@@ -123,6 +123,8 @@ enum EditPreviewSmokeHarness {
         var timeline = AudioFileEditTimeline(fileInfo: fileInfo)
         var latestOverview = sourceOverview
         var maximumPreviewMilliseconds = 0.0
+        var previewDurations: [Double] = []
+        previewDurations.reserveCapacity(operationCount)
         let startTime = DispatchTime.now().uptimeNanoseconds
 
         for index in 0..<operationCount {
@@ -148,17 +150,23 @@ enum EditPreviewSmokeHarness {
             let previewStartTime = DispatchTime.now().uptimeNanoseconds
             latestOverview = timeline.waveformOverview(from: sourceOverview)
             let previewMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - previewStartTime) / 1_000_000
+            previewDurations.append(previewMilliseconds)
             maximumPreviewMilliseconds = max(maximumPreviewMilliseconds, previewMilliseconds)
         }
 
         let elapsedMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - startTime) / 1_000_000
+        let p95PreviewMilliseconds = percentile(previewDurations, percentile: 0.95)
         let state = try requireValue(timeline.persistentState, "edit graph did not persist")
         try require(!latestOverview.bins.isEmpty, "optimistic preview became empty")
         try require(latestOverview.duration > 0, "optimistic preview duration became invalid")
         try require(state.segments.count < operationCount * 3, "edit preview segment count exploded: \(state.segments.count)")
         try require(
-            maximumPreviewMilliseconds < 24,
-            String(format: "single optimistic preview was too slow: %.2fms", maximumPreviewMilliseconds)
+            p95PreviewMilliseconds < 8,
+            String(format: "optimistic preview p95 was too slow: %.2fms", p95PreviewMilliseconds)
+        )
+        try require(
+            maximumPreviewMilliseconds < 48,
+            String(format: "optimistic preview outlier was too slow: %.2fms", maximumPreviewMilliseconds)
         )
         try require(
             elapsedMilliseconds < 2_000,
@@ -167,14 +175,29 @@ enum EditPreviewSmokeHarness {
 
         print(
             String(
-                format: "Soundtime edit preview smoke passed: %d ops, %d bins, %d segments, %.2fms max preview, %.2fms total",
+                format: "Soundtime edit preview smoke passed: %d ops, %d bins, %d segments, %.2fms p95 preview, %.2fms max preview, %.2fms total",
                 operationCount,
                 previewBinCount,
                 state.segments.count,
+                p95PreviewMilliseconds,
                 maximumPreviewMilliseconds,
                 elapsedMilliseconds
             )
         )
+    }
+
+    private static func percentile(_ values: [Double], percentile: Double) -> Double {
+        guard !values.isEmpty else {
+            return 0
+        }
+
+        let sortedValues = values.sorted()
+        let clampedPercentile = min(max(percentile, 0), 1)
+        let index = min(
+            max(Int((Double(sortedValues.count - 1) * clampedPercentile).rounded()), 0),
+            sortedValues.count - 1
+        )
+        return sortedValues[index]
     }
 
     private static func makeSourceOverview(duration: TimeInterval, binCount: Int) -> WaveformOverview {
