@@ -46,6 +46,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onFadeInRequested: (() -> Void)?
     var onFadeOutRequested: (() -> Void)?
     var onNormalizeRequested: (() -> Void)?
+    var onDeleteSilenceRequested: (() -> Void)?
     var onReapplyLastEffect: (() -> Void)?
     var onSeekRequested: ((Float) -> Void)?
     var onPlayFromProgress: ((Float) -> Void)?
@@ -58,6 +59,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var canApplyFadeEffect = false
     var canReapplyLastEffect = false
     var canSplitAtPlayhead = false
+    var canDeleteSilence = false
     var isDebugToolsVisible = false
 
     private enum TimelineDragMode {
@@ -878,6 +880,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onNormalizeRequested?()
     }
 
+    @objc func deleteSilence(_ sender: Any?) {
+        onDeleteSilenceRequested?()
+    }
+
     @objc func reapplyLastEffect(_ sender: Any?) {
         onReapplyLastEffect?()
     }
@@ -890,6 +896,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return canApplyFadeEffect
         case #selector(normalizeTimelineSelection(_:)):
             return canApplyGainEffect
+        case #selector(deleteSilence(_:)):
+            return canDeleteSilence
         case #selector(reapplyLastEffect(_:)):
             return canReapplyLastEffect
         case #selector(splitAtPlayhead(_:)):
