@@ -1,5 +1,6 @@
 import AppKit
 import Darwin
+import Metal
 import QuartzCore
 
 final class PerformanceDashboardWindowController: NSWindowController, NSWindowDelegate {
@@ -481,32 +482,62 @@ private final class PerformanceEventLogView: NSView {
     }
 }
 
-private final class PerformanceSparklineView: NSView {
-    private struct Sample {
-        let timestamp: TimeInterval
-        let value: CGFloat
+private final class PerformanceSparklineView: TimelineMetalLayerView {
+    private struct SparkVertex {
+        var position: SIMD2<Float>
+    }
+
+    private struct SparkSample {
+        var timestamp: Float
+        var value: Float
+    }
+
+    private struct SparkUniforms {
+        var viewport: SIMD4<Float>
+        var timing: SIMD4<Float>
+        var accentColor: SIMD4<Float>
+        var style: SIMD4<Float>
     }
 
     var maximumValue: CGFloat = 144 {
         didSet {
-            needsDisplay = true
+            render()
         }
     }
 
-    private let accentColor: NSColor
-    private var samples: [Sample] = []
-    private let maximumSampleCount = 96
-    private let historyDuration: TimeInterval = 15
+    private let accentColor: SIMD4<Float>
+    private let historyDuration: CFTimeInterval = 15
+    private let historyExitDuration: CFTimeInterval = 1.25
+    private let maximumSampleCount = 192
+    private let timeOrigin = CACurrentMediaTime()
+    private let sampleLock = NSLock()
+    private var samples: [SparkSample] = []
     private var displayTimer: Timer?
+    private var commandQueue: MTLCommandQueue?
+    private var pipelineState: MTLRenderPipelineState?
+    private var vertices: [SparkVertex] = [
+        SparkVertex(position: SIMD2<Float>(0, 0)),
+        SparkVertex(position: SIMD2<Float>(1, 0)),
+        SparkVertex(position: SIMD2<Float>(0, 1)),
+        SparkVertex(position: SIMD2<Float>(1, 0)),
+        SparkVertex(position: SIMD2<Float>(1, 1)),
+        SparkVertex(position: SIMD2<Float>(0, 1)),
+    ]
+
+    override var mouseDownCanMoveWindow: Bool {
+        false
+    }
 
     init(accentColor: NSColor) {
-        self.accentColor = accentColor
-        super.init(frame: .zero)
-        wantsLayer = true
+        self.accentColor = Self.colorVector(from: accentColor)
+        super.init(frame: .zero, device: MTLCreateSystemDefaultDevice())
+        configureSparklineRenderer()
     }
 
     required init?(coder: NSCoder) {
-        nil
+        self.accentColor = SIMD4<Float>(0.10, 0.86, 0.96, 1)
+        super.init(coder: coder)
+        configureSparklineRenderer()
     }
 
     override func viewDidMoveToWindow() {
@@ -515,70 +546,132 @@ private final class PerformanceSparklineView: NSView {
             stopDisplayTimer()
         } else {
             startDisplayTimerIfNeeded()
+            render()
         }
+    }
+
+    override func layout() {
+        super.layout()
+        render()
     }
 
     func append(_ sample: CGFloat) {
-        samples.append(Sample(timestamp: CACurrentMediaTime(), value: max(sample, 0)))
-        if samples.count > maximumSampleCount {
-            samples.removeFirst(samples.count - maximumSampleCount)
-        }
-        pruneSamples(now: CACurrentMediaTime())
+        let now = relativeTimestamp()
+        sampleLock.lock()
+        samples.append(SparkSample(timestamp: now, value: Float(max(sample, 0))))
+        trimSamples(now: now)
+        sampleLock.unlock()
+
         startDisplayTimerIfNeeded()
-        needsDisplay = true
+        render()
     }
 
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        guard bounds.width > 4, bounds.height > 4 else {
+    private func configureSparklineRenderer() {
+        colorPixelFormat = .bgra8Unorm
+        clearColor = MTLClearColor(red: 0.045, green: 0.046, blue: 0.047, alpha: 1)
+        framebufferOnly = true
+
+        guard
+            let device = metalDevice,
+            let commandQueue = device.makeCommandQueue()
+        else {
             return
         }
 
-        let rect = bounds.insetBy(dx: 1, dy: 1)
-        NSColor(calibratedWhite: 0.045, alpha: 1).setFill()
-        NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5).fill()
-
-        NSColor(calibratedWhite: 0.16, alpha: 1).setStroke()
-        let border = NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5)
-        border.lineWidth = 1
-        border.stroke()
-
-        guard samples.count > 1 else {
-            return
-        }
-
-        let now = CACurrentMediaTime()
-        pruneSamples(now: now)
-        let maxValue = max(maximumValue, 1)
-        let path = NSBezierPath()
-        var didDrawPoint = false
-        for sample in samples {
-            let age = now - sample.timestamp
-            let x = rect.maxX - CGFloat(age / historyDuration) * rect.width
-            guard x >= rect.minX - 2, x <= rect.maxX + 2 else {
-                continue
+        do {
+            let library = try device.makeLibrary(source: Self.shaderSource, options: nil)
+            guard
+                let vertexFunction = library.makeFunction(name: "performance_sparkline_vertex"),
+                let fragmentFunction = library.makeFunction(name: "performance_sparkline_fragment")
+            else {
+                return
             }
 
-            let normalized = min(max(sample.value / maxValue, 0), 1)
-            let y = rect.minY + normalized * rect.height
-            if !didDrawPoint {
-                path.move(to: NSPoint(x: x, y: y))
-                didDrawPoint = true
+            let descriptor = MTLRenderPipelineDescriptor()
+            descriptor.vertexFunction = vertexFunction
+            descriptor.fragmentFunction = fragmentFunction
+            descriptor.colorAttachments[0].pixelFormat = colorPixelFormat
+            descriptor.colorAttachments[0].isBlendingEnabled = true
+            descriptor.colorAttachments[0].rgbBlendOperation = .add
+            descriptor.colorAttachments[0].alphaBlendOperation = .add
+            descriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+            descriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+            descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+            descriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+
+            self.commandQueue = commandQueue
+            pipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
+        } catch {
+            Swift.print("Soundtime could not create performance sparkline renderer: \(error)")
+        }
+    }
+
+    private func render() {
+        guard
+            let renderTarget = makeTimelineRenderTarget(),
+            let commandQueue,
+            let pipelineState,
+            let commandBuffer = commandQueue.makeCommandBuffer(),
+            let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderTarget.renderPassDescriptor)
+        else {
+            return
+        }
+
+        let now = relativeTimestamp()
+        let renderSamples = currentRenderSamples(now: now)
+        var uniforms = SparkUniforms(
+            viewport: SIMD4<Float>(
+                Float(renderTarget.viewportSize.width),
+                Float(renderTarget.viewportSize.height),
+                renderTarget.backingScale,
+                Float(max(maximumValue, 1))
+            ),
+            timing: SIMD4<Float>(
+                now,
+                Float(historyDuration),
+                Float(renderSamples.count),
+                0
+            ),
+            accentColor: accentColor,
+            style: SIMD4<Float>(0.070, 1.0, 0.0, 0.0)
+        )
+
+        encoder.setRenderPipelineState(pipelineState)
+        vertices.withUnsafeBytes { bytes in
+            guard let baseAddress = bytes.baseAddress else {
+                return
+            }
+            encoder.setVertexBytes(baseAddress, length: bytes.count, index: 0)
+        }
+        renderSamples.withUnsafeBytes { bytes in
+            if let baseAddress = bytes.baseAddress, !bytes.isEmpty {
+                encoder.setFragmentBytes(baseAddress, length: bytes.count, index: 0)
             } else {
-                path.line(to: NSPoint(x: x, y: y))
+                var emptySample = SparkSample(timestamp: now, value: 0)
+                encoder.setFragmentBytes(&emptySample, length: MemoryLayout<SparkSample>.stride, index: 0)
             }
         }
+        encoder.setFragmentBytes(&uniforms, length: MemoryLayout<SparkUniforms>.stride, index: 1)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertices.count)
+        encoder.endEncoding()
+        commandBuffer.present(renderTarget.drawable)
+        commandBuffer.commit()
+    }
 
-        guard didDrawPoint else {
-            return
+    private func currentRenderSamples(now: Float) -> [SparkSample] {
+        sampleLock.lock()
+        trimSamples(now: now)
+        var renderSamples = samples
+        sampleLock.unlock()
+
+        if let latestSample = renderSamples.last, now > latestSample.timestamp {
+            renderSamples.append(SparkSample(timestamp: now, value: latestSample.value))
         }
 
-        accentColor.withAlphaComponent(0.32).setStroke()
-        path.lineWidth = 5
-        path.stroke()
-        accentColor.setStroke()
-        path.lineWidth = 1.6
-        path.stroke()
+        if renderSamples.count > maximumSampleCount {
+            renderSamples.removeFirst(renderSamples.count - maximumSampleCount)
+        }
+        return renderSamples
     }
 
     private func startDisplayTimerIfNeeded() {
@@ -588,7 +681,7 @@ private final class PerformanceSparklineView: NSView {
 
         let timer = Timer(timeInterval: 1 / 60, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.needsDisplay = true
+                self?.render()
             }
         }
         timer.tolerance = 1 / 240
@@ -601,12 +694,172 @@ private final class PerformanceSparklineView: NSView {
         displayTimer = nil
     }
 
-    private func pruneSamples(now: TimeInterval) {
-        let oldestTimestamp = now - historyDuration
+    private func trimSamples(now: Float) {
+        let oldestTimestamp = now - Float(historyDuration + historyExitDuration)
         while samples.count > maximumSampleCount || (samples.first?.timestamp ?? now) < oldestTimestamp {
             samples.removeFirst()
         }
     }
+
+    private func relativeTimestamp() -> Float {
+        Float(CACurrentMediaTime() - timeOrigin)
+    }
+
+    private static func colorVector(from color: NSColor) -> SIMD4<Float> {
+        let resolvedColor = color.usingColorSpace(.deviceRGB) ?? color
+        return SIMD4<Float>(
+            Float(resolvedColor.redComponent),
+            Float(resolvedColor.greenComponent),
+            Float(resolvedColor.blueComponent),
+            Float(resolvedColor.alphaComponent)
+        )
+    }
+
+    private static let shaderSource = """
+    #include <metal_stdlib>
+    using namespace metal;
+
+    struct SparkVertex {
+        float2 position;
+    };
+
+    struct SparkSample {
+        float timestamp;
+        float value;
+    };
+
+    struct SparkUniforms {
+        float4 viewport;
+        float4 timing;
+        float4 accentColor;
+        float4 style;
+    };
+
+    struct RasterizedVertex {
+        float4 position [[position]];
+        float2 uv;
+    };
+
+    vertex RasterizedVertex performance_sparkline_vertex(
+        uint vertexID [[vertex_id]],
+        constant SparkVertex *vertices [[buffer(0)]]
+    ) {
+        float2 position = vertices[vertexID].position;
+        RasterizedVertex out;
+        out.position = float4(position.x * 2.0 - 1.0, position.y * 2.0 - 1.0, 0.0, 1.0);
+        out.uv = position;
+        return out;
+    }
+
+    static float rect_alpha(float2 p, float left, float right, float bottom, float top) {
+        float2 distance = min(p - float2(left, bottom), float2(right, top) - p);
+        float edgeDistance = min(distance.x, distance.y);
+        float aa = max(max(fwidth(p.x), fwidth(p.y)), 0.001);
+        return smoothstep(0.0, aa, edgeDistance);
+    }
+
+    static float line_alpha(float value, float target, float width) {
+        float distance = abs(value - target);
+        float aa = max(fwidth(value), 0.001);
+        return 1.0 - smoothstep(width, width + aa, distance);
+    }
+
+    static float segment_distance(float2 point, float2 start, float2 end) {
+        float2 segment = end - start;
+        float segmentLengthSquared = max(dot(segment, segment), 0.000001);
+        float amount = clamp(dot(point - start, segment) / segmentLengthSquared, 0.0, 1.0);
+        return length(point - (start + segment * amount));
+    }
+
+    static float sample_x(SparkSample sample, float now, float duration) {
+        return 1.0 - ((now - sample.timestamp) / max(duration, 0.001));
+    }
+
+    static float sample_y(SparkSample sample, float maxValue, float bottom, float top) {
+        float normalizedValue = clamp(sample.value / max(maxValue, 1.0), 0.0, 1.0);
+        return mix(bottom, top, normalizedValue);
+    }
+
+    fragment float4 performance_sparkline_fragment(
+        RasterizedVertex in [[stage_in]],
+        constant SparkSample *samples [[buffer(0)]],
+        constant SparkUniforms &uniforms [[buffer(1)]]
+    ) {
+        float2 uv = in.uv;
+        float width = max(uniforms.viewport.x, 1.0);
+        float height = max(uniforms.viewport.y, 1.0);
+        float maxValue = max(uniforms.viewport.w, 1.0);
+        float now = uniforms.timing.x;
+        float duration = max(uniforms.timing.y, 0.001);
+        uint sampleCount = min(uint(max(uniforms.timing.z, 0.0)), 192u);
+
+        float left = 0.012;
+        float right = 0.988;
+        float bottom = 0.14;
+        float top = 0.88;
+        float body = rect_alpha(uv, left, right, bottom, top);
+        float3 accent = uniforms.accentColor.rgb;
+        float3 color = float3(0.043, 0.045, 0.046);
+        color = mix(color, float3(0.057, 0.063, 0.066), body);
+
+        float grid = 0.0;
+        for (float amount = 0.25; amount < 1.0; amount += 0.25) {
+            float y = mix(bottom, top, amount);
+            grid += line_alpha(uv.y, y, 0.0012) * 0.18 * body;
+        }
+        color = mix(color, accent * 0.34, clamp(grid, 0.0, 1.0));
+
+        float aspect = width / height;
+        float2 scaledUV = float2(uv.x * aspect, uv.y);
+        float edgeFadeWidth = max(uniforms.style.x, 0.001);
+        float edgeFade = smoothstep(left, left + edgeFadeWidth, uv.x) *
+            (1.0 - smoothstep(right - edgeFadeWidth, right, uv.x));
+        float line = 0.0;
+        float glow = 0.0;
+        float underFill = 0.0;
+
+        if (sampleCount >= 2u) {
+            for (uint i = 1u; i < sampleCount; ++i) {
+                SparkSample previousSample = samples[i - 1u];
+                SparkSample currentSample = samples[i];
+                float x0 = mix(left, right, sample_x(previousSample, now, duration));
+                float x1 = mix(left, right, sample_x(currentSample, now, duration));
+                if ((x0 < left && x1 < left) || (x0 > right && x1 > right)) {
+                    continue;
+                }
+
+                float y0 = sample_y(previousSample, maxValue, bottom, top);
+                float y1 = sample_y(currentSample, maxValue, bottom, top);
+                float2 p0 = float2(x0 * aspect, y0);
+                float2 p1 = float2(x1 * aspect, y1);
+                float distance = segment_distance(scaledUV, p0, p1);
+                float lineWidth = 1.35 / height;
+                float glowWidth = 8.5 / height;
+                line = max(line, (1.0 - smoothstep(lineWidth, lineWidth + 1.3 / height, distance)) * edgeFade);
+                glow = max(glow, (1.0 - smoothstep(lineWidth, glowWidth, distance)) * edgeFade);
+
+                float segmentLeft = min(x0, x1);
+                float segmentRight = max(x0, x1);
+                float segmentT = clamp((uv.x - x0) / max(x1 - x0, 0.000001), 0.0, 1.0);
+                float yOnSegment = mix(y0, y1, segmentT);
+                float inSegment = smoothstep(segmentLeft, segmentLeft + 0.004, uv.x) *
+                    (1.0 - smoothstep(segmentRight - 0.004, segmentRight, uv.x));
+                underFill = max(underFill, inSegment * smoothstep(bottom, yOnSegment, uv.y) *
+                    (1.0 - smoothstep(yOnSegment, yOnSegment + 0.018, uv.y)) * edgeFade);
+            }
+        }
+
+        color += accent * glow * 0.26 * body;
+        color = mix(color, accent * 0.28, underFill * 0.16 * body);
+        float3 lineColor = mix(accent, float3(0.94, 0.99, 1.0), line * 0.35);
+        color = mix(color, lineColor, line * body);
+
+        float sheen = smoothstep(top, top - 0.14, uv.y) * body * 0.05;
+        color += accent * sheen;
+
+        return float4(color, 1.0);
+    }
+    """
 }
 
 private final class PerformanceActionButton: NSControl {

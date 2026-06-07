@@ -421,7 +421,7 @@ final class WorkspaceView: NSView {
     }()
 
     private let framesPerSecondLabel: NSTextField = {
-        let label = NSTextField(labelWithString: "0 fps - +/-0.0 max 0.0")
+        let label = NSTextField(labelWithString: "-- fps")
         label.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
         label.alignment = .right
         label.textColor = NSColor.secondaryLabelColor
@@ -1018,6 +1018,7 @@ final class WorkspaceView: NSView {
         let showsLoudness = width >= 760
         let showsFrameHistory = width >= 380
         let showsEditScope = width >= 720
+        let showsFrameStatsText = width >= 500
         let showsDebugText = debugToolsVisible && width >= 760
         let showsDebugSliders = SoundtimeFeatureFlags.waveformFisheye && debugToolsVisible && width >= 980
 
@@ -1027,10 +1028,10 @@ final class WorkspaceView: NSView {
         volumeControl.isHidden = !showsVolume
         loudnessMeter.isHidden = !showsLoudness
         frameRateHistoryView.isHidden = !showsFrameHistory
-        framesPerSecondLabel.isHidden = !showsDebugText
+        framesPerSecondLabel.isHidden = !showsFrameStatsText
         editScopeStack.isHidden = !showsEditScope
         fisheyeControlsStack.isHidden = !showsDebugSliders
-        framesPerSecondWidthConstraint?.constant = showsDebugText ? 390 : 0
+        framesPerSecondWidthConstraint?.constant = showsDebugText ? 390 : 58
         trackControlsBelowDebugConstraint?.isActive = showsDebugSliders
         trackControlsBelowHeaderConstraint?.isActive = !showsDebugSliders
     }
@@ -8666,30 +8667,31 @@ final class WorkspaceView: NSView {
         SoundtimeDiagnostics.shared.recordFrameStats(frameStats)
         PerformanceDashboardWindowController.shared.display(frameStats: frameStats)
         frameRateHistoryView.display(frameStats: frameStats)
-        guard debugToolsVisible else {
-            return
-        }
 
         let shaderBufferMegabytes = Int((Double(frameStats.shaderBufferByteCount) / 1_048_576).rounded())
-        framesPerSecondLabel.stringValue = String(
-            format: "%d fps %@ c%d g%d fx%d/%d p%d d%d k%d b%d/%dMB u%d/%d m%d +/-%.1f max %.1f",
-            frameStats.framesPerSecond,
-            frameStats.waveformRenderer,
-            frameStats.cpuWaveformVertexCount,
-            frameStats.gpuWaveformDrawCount,
-            frameStats.effectVertexCount,
-            frameStats.effectDroppedVertexCount,
-            frameStats.transientParticleCount,
-            frameStats.deletionEffectCount,
-            frameStats.playheadContactEventCount,
-            frameStats.shaderBufferCount,
-            shaderBufferMegabytes,
-            frameStats.shaderBufferUploadCount,
-            frameStats.shaderBufferUploadInFlightCount,
-            frameStats.waveformMipCacheCount,
-            frameStats.frameTimeJitterMilliseconds,
-            frameStats.worstFrameTimeMilliseconds
-        )
+        if debugToolsVisible {
+            framesPerSecondLabel.stringValue = String(
+                format: "%d fps %@ c%d g%d fx%d/%d p%d d%d k%d b%d/%dMB u%d/%d m%d +/-%.1f max %.1f",
+                frameStats.framesPerSecond,
+                frameStats.waveformRenderer,
+                frameStats.cpuWaveformVertexCount,
+                frameStats.gpuWaveformDrawCount,
+                frameStats.effectVertexCount,
+                frameStats.effectDroppedVertexCount,
+                frameStats.transientParticleCount,
+                frameStats.deletionEffectCount,
+                frameStats.playheadContactEventCount,
+                frameStats.shaderBufferCount,
+                shaderBufferMegabytes,
+                frameStats.shaderBufferUploadCount,
+                frameStats.shaderBufferUploadInFlightCount,
+                frameStats.waveformMipCacheCount,
+                frameStats.frameTimeJitterMilliseconds,
+                frameStats.worstFrameTimeMilliseconds
+            )
+        } else {
+            framesPerSecondLabel.stringValue = String(format: "%d fps", frameStats.framesPerSecond)
+        }
     }
 
     private var canApplyGainEffect: Bool {
