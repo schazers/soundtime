@@ -93,6 +93,10 @@ final class AudioUnitOutputDevice: RealtimeAudioOutputDevice {
         }
     }
 
+    func invalidateConfiguration() {
+        resetAudioUnit()
+    }
+
     func start() throws {
         let audioUnit = try configuredAudioUnit()
         if !isInitialized {

@@ -205,6 +205,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             outputDevice.stop()
         }
 
+        outputDevice.invalidateConfiguration()
         try configureOutputDevice(sampleRate: sampleRate)
 
         if shouldResume {

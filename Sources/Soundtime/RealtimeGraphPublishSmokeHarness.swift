@@ -705,6 +705,8 @@ private final class RealtimeGraphPublishSmokeOutputDevice: RealtimeAudioOutputDe
         self.corePointer = corePointer
     }
 
+    func invalidateConfiguration() {}
+
     func start() throws {}
 
     func stop() {}

@@ -76,6 +76,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         newProjectItem.target = self
         menu.addItem(newProjectItem)
+        let preferencesItem = NSMenuItem(
+            title: "Preferences...",
+            action: #selector(showPreferences(_:)),
+            keyEquivalent: ","
+        )
+        preferencesItem.target = self
+        menu.addItem(preferencesItem)
+        menu.addItem(.separator())
         menu.addItem(NSMenuItem(
             title: "Open Project...",
             action: #selector(TimelineView.openProject(_:)),
@@ -102,13 +110,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         debugToolsItem.keyEquivalentModifierMask = [.command, .shift]
         menu.addItem(debugToolsItem)
-        let preferencesItem = NSMenuItem(
-            title: "Preferences...",
-            action: #selector(showPreferences(_:)),
-            keyEquivalent: ","
-        )
-        preferencesItem.target = self
-        menu.addItem(preferencesItem)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(
             title: "Export...",
