@@ -3913,6 +3913,17 @@ final class WorkspaceView: NSView {
         let displaySelectionToDelete = target.displaySelection
         let selectionToDelete = target.editSelection
         let trackID = projectTracks[trackIndex].id
+        SoundtimeDiagnostics.shared.record(
+            category: .edit,
+            severity: .info,
+            name: copyBeforeDeleting ? "cut-selection" : "delete-selection",
+            message: "User requested an optimistic audio edit.",
+            fields: [
+                "trackIndex": "\(trackIndex)",
+                "startProgress": String(format: "%.9f", selectionToDelete.startProgress),
+                "endProgress": String(format: "%.9f", selectionToDelete.endProgress),
+            ]
+        )
         let trackDurationBeforeDelete = trackDuration(for: projectTracks[trackIndex])
         let targetPlaybackTime = min(
             max(selectionToDelete.startProgress * trackDurationBeforeDelete, 0),
@@ -4481,6 +4492,16 @@ final class WorkspaceView: NSView {
 
     private func restoreProjectTracks(from snapshot: ProjectTrackUndoSnapshot) {
         let replacedTracks = projectTracks
+        SoundtimeDiagnostics.shared.record(
+            category: .edit,
+            severity: .info,
+            name: "undo-project-tracks",
+            message: "Restoring project tracks from undo snapshot.",
+            fields: [
+                "trackCount": "\(snapshot.tracks.count)",
+                "restoreProgress": snapshot.restoreProgress.map { String(format: "%.9f", $0) } ?? "preserve",
+            ]
+        )
         cancelAllEditMaterialization()
         projectTracks = snapshot.tracks
         activeTrackID = snapshot.activeTrackID.flatMap { activeID in
@@ -5477,6 +5498,7 @@ final class WorkspaceView: NSView {
     }
 
     private func updateFrameStats(_ frameStats: TimelineFrameStats) {
+        SoundtimeDiagnostics.shared.recordFrameStats(frameStats)
         frameRateHistoryView.display(frameStats: frameStats)
         guard debugToolsVisible else {
             return

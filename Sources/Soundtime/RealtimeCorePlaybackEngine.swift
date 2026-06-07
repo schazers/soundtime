@@ -398,6 +398,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
 
     func snapshot() -> PlaybackSnapshot {
         let detailedSnapshot = core.detailedSnapshot()
+        SoundtimeDiagnostics.shared.recordAudioCoreSnapshot(detailedSnapshot)
         let snapshotTimestamp = CACurrentMediaTime()
         if
             let pendingCommandRenderedFrameCount,
