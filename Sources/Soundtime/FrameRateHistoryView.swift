@@ -295,6 +295,10 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
         return mix(bottom, top, normalizedFPS);
     }
 
+    static float fps_danger(HistorySample sample) {
+        return 1.0 - smoothstep(60.0, 80.0, sample.framesPerSecond);
+    }
+
     fragment float4 frame_rate_history_fragment(
         RasterizedVertex in [[stage_in]],
         constant HistorySample *samples [[buffer(0)]],
@@ -327,8 +331,11 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
         float2 scaledUV = float2(uv.x * aspect, uv.y);
         float line = 0.0;
         float glow = 0.0;
+        float lineDanger = 0.0;
+        float glowDanger = 0.0;
         float fill = 0.0;
         float latestDot = 0.0;
+        float latestDanger = 0.0;
         float leftFade = smoothstep(left, left + 0.060, uv.x);
 
         if (sampleCount >= 2u) {
@@ -348,8 +355,13 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
                 float distance = segment_distance(scaledUV, p0, p1);
                 float lineWidth = 1.45 / height;
                 float glowWidth = 7.5 / height;
-                line = max(line, (1.0 - smoothstep(lineWidth, lineWidth + 1.4 / height, distance)) * leftFade);
-                glow = max(glow, (1.0 - smoothstep(lineWidth, glowWidth, distance)) * leftFade);
+                float segmentLine = (1.0 - smoothstep(lineWidth, lineWidth + 1.4 / height, distance)) * leftFade;
+                float segmentGlow = (1.0 - smoothstep(lineWidth, glowWidth, distance)) * leftFade;
+                float danger = max(fps_danger(previousSample), fps_danger(currentSample));
+                line = max(line, segmentLine);
+                glow = max(glow, segmentGlow);
+                lineDanger = max(lineDanger, segmentLine * danger);
+                glowDanger = max(glowDanger, segmentGlow * danger);
 
                 float segmentLeft = min(x0, x1);
                 float segmentRight = max(x0, x1);
@@ -364,14 +376,22 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
             float latestX = mix(left, right, sample_x(latestSample, now, duration));
             float latestY = sample_y(latestSample, maxFPS, bottom, top);
             latestDot = 1.0 - smoothstep(2.0 / height, 6.0 / height, distance(scaledUV, float2(latestX * aspect, latestY)));
+            latestDanger = fps_danger(latestSample);
         }
 
-        float3 glowColor = float3(0.08, 0.70, 0.86);
-        float3 lineColor = mix(float3(0.28, 0.82, 0.86), float3(0.94, 0.98, 0.99), line * 0.45);
+        float lineDangerAmount = clamp(lineDanger / max(line, 0.0001), 0.0, 1.0);
+        float glowDangerAmount = clamp(glowDanger / max(glow, 0.0001), 0.0, 1.0);
+        float3 calmGlowColor = float3(0.08, 0.70, 0.86);
+        float3 dangerGlowColor = float3(1.0, 0.13, 0.08);
+        float3 glowColor = mix(calmGlowColor, dangerGlowColor, glowDangerAmount);
+        float3 calmLineColor = mix(float3(0.28, 0.82, 0.86), float3(0.94, 0.98, 0.99), line * 0.45);
+        float3 dangerLineColor = mix(float3(0.96, 0.20, 0.12), float3(1.0, 0.62, 0.50), line * 0.30);
+        float3 lineColor = mix(calmLineColor, dangerLineColor, lineDangerAmount);
+        float3 latestDotColor = mix(float3(0.96, 1.0, 1.0), float3(1.0, 0.24, 0.15), latestDanger);
         color += glowColor * glow * 0.28 * background;
         color = mix(color, float3(0.09, 0.34, 0.39), fill * background);
         color = mix(color, lineColor, line * background);
-        color = mix(color, float3(0.96, 1.0, 1.0), latestDot * 0.75 * background);
+        color = mix(color, latestDotColor, latestDot * 0.75 * background);
 
         float topSheen = smoothstep(top, top - 0.10, uv.y) * background * 0.08;
         color += float3(0.18, 0.46, 0.50) * topSheen;
