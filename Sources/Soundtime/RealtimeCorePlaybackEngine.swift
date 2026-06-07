@@ -788,10 +788,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             }
 
             if !track.segments.isEmpty {
-                return track.segments.contains { segment in
-                    projectFrame >= segment.outputStartFrame &&
-                        projectFrame < segment.outputStartFrame + segment.frameCount
-                }
+                return segment(containingProjectFrame: projectFrame, in: track) != nil
             }
 
             let sourceFrame = Int((projectTime * track.source.sampleRate).rounded(.down))
@@ -803,12 +800,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         forProjectFrame projectFrame: Int,
         in track: PreparedProjectTrack
     ) -> Int {
-        if
-            let segment = track.segments.first(where: { segment in
-                projectFrame >= segment.outputStartFrame &&
-                    projectFrame < segment.outputStartFrame + segment.frameCount
-            })
-        {
+        if let segment = segment(containingProjectFrame: projectFrame, in: track) {
             let offset = max(projectFrame - segment.outputStartFrame, 0)
             let sourceFrameScale = effectiveSourceFrameScale(for: track, segment: segment)
             let sourceFrame = segment.sourceStartFrame + Int((Double(offset) * sourceFrameScale).rounded(.down))
@@ -827,24 +819,45 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         nearProjectFrame: Int,
         in track: PreparedProjectTrack
     ) -> Int {
-        if
-            let segment = track.segments.first(where: { segment in
-                let sourceFrameScale = effectiveSourceFrameScale(for: track, segment: segment)
-                return sourceFrame >= segment.sourceStartFrame &&
-                    sourceFrame < segment.sourceStartFrame +
-                    Int((Double(segment.frameCount) * sourceFrameScale).rounded(.up)) &&
-                    nearProjectFrame >= segment.outputStartFrame &&
-                    nearProjectFrame < segment.outputStartFrame + segment.frameCount
-            })
-        {
+        if let segment = segment(containingProjectFrame: nearProjectFrame, in: track) {
+            let sourceFrameScale = effectiveSourceFrameScale(for: track, segment: segment)
+            guard
+                sourceFrame >= segment.sourceStartFrame,
+                sourceFrame < segment.sourceStartFrame +
+                    Int((Double(segment.frameCount) * sourceFrameScale).rounded(.up))
+            else {
+                return nearProjectFrame
+            }
+
             let sourceOffset = max(sourceFrame - segment.sourceStartFrame, 0)
-            let sourceFrameScale = max(effectiveSourceFrameScale(for: track, segment: segment), .leastNonzeroMagnitude)
-            let outputOffset = Int((Double(sourceOffset) / sourceFrameScale).rounded(.down))
+            let boundedSourceFrameScale = max(sourceFrameScale, .leastNonzeroMagnitude)
+            let outputOffset = Int((Double(sourceOffset) / boundedSourceFrameScale).rounded(.down))
             return segment.outputStartFrame + outputOffset
         }
 
         let snappedProjectTime = TimeInterval(sourceFrame) / track.source.sampleRate
         return Int((snappedProjectTime * sampleRate).rounded(.down))
+    }
+
+    private func segment(
+        containingProjectFrame projectFrame: Int,
+        in track: PreparedProjectTrack
+    ) -> PreparedRealtimeAudioSegment? {
+        var lowerBound = 0
+        var upperBound = track.segments.count
+        while lowerBound < upperBound {
+            let middle = lowerBound + (upperBound - lowerBound) / 2
+            let segment = track.segments[middle]
+            if projectFrame < segment.outputStartFrame {
+                upperBound = middle
+            } else if projectFrame >= segment.outputStartFrame + segment.frameCount {
+                lowerBound = middle + 1
+            } else {
+                return segment
+            }
+        }
+
+        return nil
     }
 
     private func effectiveSourceFrameScale(
