@@ -38,6 +38,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onSplitAtPlayhead: (() -> Void)?
     var onInsertSilenceRequested: (() -> Void)?
     var onHealAdjacentClipsRequested: (() -> Void)?
+    var onNudgeSelectionRequested: ((Int) -> Void)?
     var onUndo: (() -> Void)?
     var onExportRequested: (() -> Void)?
     var onOpenProjectRequested: (() -> Void)?
@@ -886,6 +887,16 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        if event.modifierFlags.contains(.option), event.keyCode == 123 {
+            onNudgeSelectionRequested?(-1)
+            return
+        }
+
+        if event.modifierFlags.contains(.option), event.keyCode == 124 {
+            onNudgeSelectionRequested?(1)
+            return
+        }
+
         if event.keyCode == 14, event.modifierFlags.contains(.command) {
             onExportRequested?()
             return
@@ -1045,6 +1056,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onHealAdjacentClipsRequested?()
     }
 
+    @objc func nudgeSelectionLeft(_ sender: Any?) {
+        onNudgeSelectionRequested?(-1)
+    }
+
+    @objc func nudgeSelectionRight(_ sender: Any?) {
+        onNudgeSelectionRequested?(1)
+    }
+
     @objc func zoomToSelection(_ sender: Any?) {
         zoomToSelection()
     }
@@ -1114,6 +1133,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
              #selector(nextDeadAirCandidate(_:)),
              #selector(previousDeadAirCandidate(_:)):
             return canUseDeadAirCandidate
+        case #selector(nudgeSelectionLeft(_:)),
+             #selector(nudgeSelectionRight(_:)):
+            return currentSelection?.durationProgress ?? 0 > 0
         case #selector(reapplyLastEffect(_:)):
             return canReapplyLastEffect
         case #selector(deleteTimelineSelection(_:)):

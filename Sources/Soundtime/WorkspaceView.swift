@@ -600,6 +600,9 @@ final class WorkspaceView: NSView {
         timelineSurface.onHealAdjacentClipsRequested = { [weak self] in
             self?.healAdjacentClips()
         }
+        timelineSurface.onNudgeSelectionRequested = { [weak self] direction in
+            self?.nudgeSelection(direction: direction)
+        }
         timelineSurface.onUndo = { [weak self] in
             self?.undoLastEdit()
         }
@@ -4368,6 +4371,36 @@ final class WorkspaceView: NSView {
                 animateWaveformTransition: false
             )
         }
+    }
+
+    private func nudgeSelection(direction: Int) {
+        guard
+            let selection = selectedTimelineRange,
+            selection.durationProgress > 0
+        else {
+            updateStatus("select time to nudge")
+            return
+        }
+
+        let projectDuration = projectSelectionDuration
+        guard projectDuration > 0 else {
+            updateStatus("load audio before nudging")
+            return
+        }
+
+        let nudgeDuration: TimeInterval = 0.05
+        let deltaProgress = Double(direction) * nudgeDuration / projectDuration
+        let selectionDuration = selection.durationProgress
+        let nextStart = min(max(selection.startProgress + deltaProgress, 0), max(1 - selectionDuration, 0))
+        let nudgedSelection = TimelineSelection(
+            startProgress: nextStart,
+            endProgress: nextStart + selectionDuration,
+            trackID: selection.trackID
+        )
+        selectedTimelineRange = nudgedSelection
+        timelineSurface.displaySelection(nudgedSelection)
+        updateEffectCommandState()
+        updateStatus("nudged selection \(direction < 0 ? "left" : "right") \(formatDuration(nudgeDuration))")
     }
 
     private func silenceCleanupTarget() -> EditableSelectionTarget? {
