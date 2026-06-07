@@ -258,6 +258,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: ""
         ))
         menu.addItem(NSMenuItem(
+            title: "Accept High-Confidence Silence Candidates",
+            action: #selector(TimelineView.acceptHighConfidenceDeadAirCandidates(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
             title: "Reject Silence Candidate",
             action: #selector(TimelineView.rejectDeadAirCandidate(_:)),
             keyEquivalent: ""
