@@ -430,6 +430,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         requestTimelineRender()
     }
 
+    func displaySelectedTracks(_ trackIDs: Set<UUID>, primaryTrackID: UUID?) {
+        updateTimelineRenderer { renderer in
+            renderer.displaySelectedTracks(trackIDs, primaryTrackID: primaryTrackID)
+        }
+        requestTimelineRender()
+    }
+
     func displayTrimPreview(_ trimRange: TimelineTrimRange?) {
         updateTimelineRenderer { renderer in
             renderer.displayTrimPreview(trimRange)
