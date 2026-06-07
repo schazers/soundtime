@@ -45,6 +45,11 @@ final class WorkspaceView: NSView {
         case coalesced
     }
 
+    private enum RippleDeleteScope: Equatable {
+        case activeTrack
+        case linkedProject
+    }
+
     private struct ProjectTrack {
         var id: UUID
         var name: String
@@ -104,6 +109,17 @@ final class WorkspaceView: NSView {
         let trackIndex: Int
         let displaySelection: TimelineSelection
         let editSelection: TimelineSelection
+    }
+
+    private struct RippleDeleteTrackEdit {
+        let trackIndex: Int
+        let trackID: UUID
+        let displaySelection: TimelineSelection
+        let editSelection: TimelineSelection
+        let deletedDuration: TimeInterval
+        let editedDuration: TimeInterval
+        let editedAudioTimeline: AudioEditTimeline?
+        let editedFileTimeline: AudioFileEditTimeline?
     }
 
     private struct SilenceCleanupResult: Sendable {
@@ -3546,7 +3562,7 @@ final class WorkspaceView: NSView {
     }
 
     private func deleteSelection() {
-        performOptimisticDelete(copyBeforeDeleting: false)
+        performOptimisticDelete(copyBeforeDeleting: false, scope: .linkedProject)
     }
 
     private func clearSelection() {
@@ -4055,7 +4071,7 @@ final class WorkspaceView: NSView {
     }
 
     private func cutSelection() {
-        performOptimisticDelete(copyBeforeDeleting: true)
+        performOptimisticDelete(copyBeforeDeleting: true, scope: .activeTrack)
     }
 
     private func copySelection() {
@@ -4410,7 +4426,7 @@ final class WorkspaceView: NSView {
         }
     }
 
-    private func performOptimisticDelete(copyBeforeDeleting: Bool) {
+    private func performOptimisticDelete(copyBeforeDeleting: Bool, scope: RippleDeleteScope) {
         guard
             let target = currentEditableSelectionTarget()
         else {
@@ -4425,25 +4441,36 @@ final class WorkspaceView: NSView {
             return
         }
 
-        let trackIndex = target.trackIndex
         let displaySelectionToDelete = target.displaySelection
-        let selectionToDelete = target.editSelection
-        let trackID = projectTracks[trackIndex].id
+        let projectDurationBeforeDelete = projectSelectionDuration
+        let targetPlaybackTime = min(
+            max(displaySelectionToDelete.startProgress * projectDurationBeforeDelete, 0),
+            projectDurationBeforeDelete
+        )
+        let deleteTargets = rippleDeleteTargets(for: target, scope: scope)
+        let trackEdits: [RippleDeleteTrackEdit]
+        do {
+            trackEdits = try deleteTargets.compactMap { try preparedRippleDeleteTrackEdit(for: $0) }
+        } catch {
+            updateStatus("delete failed: \(error.localizedDescription)")
+            return
+        }
+        guard !trackEdits.isEmpty else {
+            updateStatus("no audio in selected time")
+            return
+        }
+
         SoundtimeDiagnostics.shared.record(
             category: .edit,
             severity: .info,
-            name: copyBeforeDeleting ? "cut-selection" : "delete-selection",
+            name: copyBeforeDeleting ? "cut-selection" : "delete-time",
             message: "User requested an optimistic audio edit.",
             fields: [
-                "trackIndex": "\(trackIndex)",
-                "startProgress": String(format: "%.9f", selectionToDelete.startProgress),
-                "endProgress": String(format: "%.9f", selectionToDelete.endProgress),
+                "scope": scope == .linkedProject ? "linkedProject" : "activeTrack",
+                "trackCount": "\(trackEdits.count)",
+                "startProgress": String(format: "%.9f", displaySelectionToDelete.startProgress),
+                "endProgress": String(format: "%.9f", displaySelectionToDelete.endProgress),
             ]
-        )
-        let trackDurationBeforeDelete = trackDuration(for: projectTracks[trackIndex])
-        let targetPlaybackTime = min(
-            max(selectionToDelete.startProgress * trackDurationBeforeDelete, 0),
-            trackDurationBeforeDelete
         )
         let undoSnapshot = ProjectTrackUndoSnapshot(
             tracks: projectTracks,
@@ -4457,104 +4484,74 @@ final class WorkspaceView: NSView {
             copySelection()
         }
 
-        let deletedDuration: TimeInterval
-        let editedDuration: TimeInterval
-        let editedAudioTimeline: AudioEditTimeline?
-        let editedFileTimeline: AudioFileEditTimeline?
-
-        if let currentFileTimeline = try? preferredFileTimelineForEditing(trackIndex: trackIndex) {
-            var timeline = currentFileTimeline
-            deletedDuration = selectionToDelete.duration(in: currentFileTimeline.duration)
-            let deletedFrameCount = timeline.delete(selectionToDelete)
-            guard deletedFrameCount > 0 else {
-                return
-            }
-            editedDuration = timeline.duration
-            editedAudioTimeline = nil
-            editedFileTimeline = timeline
-        } else if let currentTimeline = projectTracks[trackIndex].audioTimeline {
-            var timeline = currentTimeline
-            deletedDuration = selectionToDelete.duration(in: currentTimeline.duration)
-            let deletedFrameCount = timeline.delete(selectionToDelete)
-            guard deletedFrameCount > 0 else {
-                return
-            }
-            editedDuration = timeline.duration
-            editedAudioTimeline = timeline
-            editedFileTimeline = nil
-        } else {
-            let currentFileTimeline: AudioFileEditTimeline
-            do {
-                currentFileTimeline = try editableFileTimeline(forTrackAt: trackIndex)
-            } catch {
-                updateStatus("delete failed: \(error.localizedDescription)")
-                return
-            }
-
-            var timeline = currentFileTimeline
-            deletedDuration = selectionToDelete.duration(in: currentFileTimeline.duration)
-            let deletedFrameCount = timeline.delete(selectionToDelete)
-            guard deletedFrameCount > 0 else {
-                return
-            }
-            editedDuration = timeline.duration
-            editedAudioTimeline = nil
-            editedFileTimeline = timeline
-        }
-
-        timelineSurface.triggerDeletionEffect(
-            selection: displaySelectionToDelete,
-            sourceSelection: selectionToDelete
-        )
         editUndoStack.append(.projectTracks(undoSnapshot))
-        projectTracks[trackIndex].editRevision += 1
-        let editRevision = projectTracks[trackIndex].editRevision
-        projectTracks[trackIndex].audioTimeline = editedAudioTimeline
-        projectTracks[trackIndex].fileTimeline = editedFileTimeline
-        projectTracks[trackIndex].decodedAudioBuffer = nil
-        projectTracks[trackIndex].durationHint = editedDuration
-        let currentOverview = projectTracks[trackIndex].waveformOverview
-        if let editedFileTimeline {
-            projectTracks[trackIndex].waveformOverview =
-                optimisticWaveformOverview(
-                    currentOverview,
-                    replacing: selectionToDelete,
-                    with: nil,
-                    targetDuration: editedDuration
-                ) ??
-                optimisticWaveformOverview(
-                    for: editedFileTimeline,
-                    sourceOverview: projectTracks[trackIndex].sourceWaveformOverview,
-                    fallbackOverview: currentOverview
+
+        var materializationEdits: [(trackID: UUID, timeline: AudioEditTimeline, editRevision: Int)] = []
+        var statusDuration = TimeInterval(0)
+        for edit in trackEdits {
+            guard projectTracks.indices.contains(edit.trackIndex) else {
+                continue
+            }
+
+            timelineSurface.triggerDeletionEffect(
+                selection: edit.displaySelection,
+                sourceSelection: edit.editSelection
+            )
+            projectTracks[edit.trackIndex].editRevision += 1
+            let editRevision = projectTracks[edit.trackIndex].editRevision
+            projectTracks[edit.trackIndex].audioTimeline = edit.editedAudioTimeline
+            projectTracks[edit.trackIndex].fileTimeline = edit.editedFileTimeline
+            projectTracks[edit.trackIndex].decodedAudioBuffer = nil
+            projectTracks[edit.trackIndex].durationHint = edit.editedDuration
+            let currentOverview = projectTracks[edit.trackIndex].waveformOverview
+            if let editedFileTimeline = edit.editedFileTimeline {
+                projectTracks[edit.trackIndex].waveformOverview =
+                    optimisticWaveformOverview(
+                        currentOverview,
+                        replacing: edit.editSelection,
+                        with: nil,
+                        targetDuration: edit.editedDuration
+                    ) ??
+                    optimisticWaveformOverview(
+                        for: editedFileTimeline,
+                        sourceOverview: projectTracks[edit.trackIndex].sourceWaveformOverview,
+                        fallbackOverview: currentOverview
+                    )
+                scheduleFileTimelineWaveformRefinement(
+                    trackID: edit.trackID,
+                    fileTimeline: editedFileTimeline,
+                    sourceOverview: projectTracks[edit.trackIndex].sourceWaveformOverview ?? currentOverview,
+                    editRevision: editRevision,
+                    delay: deleteMaterializationDelay
                 )
-            scheduleFileTimelineWaveformRefinement(
-                trackID: trackID,
-                fileTimeline: editedFileTimeline,
-                sourceOverview: projectTracks[trackIndex].sourceWaveformOverview ?? currentOverview,
-                editRevision: editRevision,
-                delay: deleteMaterializationDelay
-            )
-        } else {
-            projectTracks[trackIndex].waveformOverview = optimisticWaveformOverview(
-                currentOverview,
-                replacing: selectionToDelete,
-                with: nil,
-                targetDuration: editedDuration
-            )
-            cancelEditWaveformRefinement(for: trackID)
+            } else {
+                projectTracks[edit.trackIndex].waveformOverview = optimisticWaveformOverview(
+                    currentOverview,
+                    replacing: edit.editSelection,
+                    with: nil,
+                    targetDuration: edit.editedDuration
+                )
+                cancelEditWaveformRefinement(for: edit.trackID)
+            }
+
+            statusDuration = max(statusDuration, edit.deletedDuration)
+            scheduleDeleteVisualRefresh(trackID: edit.trackID, editRevision: editRevision)
+            if let editedAudioTimeline = edit.editedAudioTimeline {
+                materializationEdits.append((
+                    trackID: edit.trackID,
+                    timeline: editedAudioTimeline,
+                    editRevision: editRevision
+                ))
+            }
         }
 
         selectedTimelineRange = nil
         timelineSurface.displaySelection(nil)
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
-        scheduleDeleteVisualRefresh(trackID: trackID, editRevision: editRevision)
+        syncActiveTrackFields()
         updateProjectDisplayTiming()
-        let editedTrackDuration = projectTracks.indices.contains(trackIndex) ?
-            trackDuration(for: projectTracks[trackIndex]) :
-            0
         let clampedTargetPlaybackTime = min(
             targetPlaybackTime,
-            max(editedTrackDuration, 0),
             max(displayedDuration, 0)
         )
         let targetPlaybackProgress = displayedDuration > 0 ?
@@ -4566,19 +4563,102 @@ final class WorkspaceView: NSView {
             resumeIfPlaying: playbackController.isPlaying
         )
         updateEffectCommandState()
-        updateStatus("\(copyBeforeDeleting ? "cut" : "deleted") \(formatDuration(deletedDuration))")
+        let scopeSuffix = scope == .linkedProject && trackEdits.count > 1 ?
+            " across \(trackEdits.count) tracks" :
+            ""
+        let status = "\(copyBeforeDeleting ? "cut" : "deleted") \(formatDuration(statusDuration))\(scopeSuffix)"
+        updateStatus(status)
 
-        if let editedAudioTimeline {
+        for edit in materializationEdits {
             materializeEditedTimeline(
-                trackID: trackID,
-                timeline: editedAudioTimeline,
-                editRevision: editRevision,
-                status: "\(copyBeforeDeleting ? "cut" : "deleted") \(formatDuration(deletedDuration))",
+                trackID: edit.trackID,
+                timeline: edit.timeline,
+                editRevision: edit.editRevision,
+                status: status,
                 preservePlaybackProgress: true,
                 startDelay: deleteMaterializationDelay,
                 animateWaveformTransition: false
             )
         }
+    }
+
+    private func rippleDeleteTargets(
+        for target: EditableSelectionTarget,
+        scope: RippleDeleteScope
+    ) -> [EditableSelectionTarget] {
+        switch scope {
+        case .activeTrack:
+            return [target]
+        case .linkedProject:
+            return projectTracks.indices.compactMap { trackIndex in
+                let trackID = projectTracks[trackIndex].id
+                let displaySelection = TimelineSelection(
+                    startProgress: target.displaySelection.startProgress,
+                    endProgress: target.displaySelection.endProgress,
+                    trackID: trackID
+                )
+                guard let editSelection = editSelection(from: displaySelection, trackIndex: trackIndex) else {
+                    return nil
+                }
+                return EditableSelectionTarget(
+                    trackIndex: trackIndex,
+                    displaySelection: displaySelection,
+                    editSelection: editSelection
+                )
+            }
+        }
+    }
+
+    private func preparedRippleDeleteTrackEdit(
+        for target: EditableSelectionTarget
+    ) throws -> RippleDeleteTrackEdit? {
+        guard projectTracks.indices.contains(target.trackIndex) else {
+            return nil
+        }
+
+        let trackIndex = target.trackIndex
+        let trackID = projectTracks[trackIndex].id
+        let selectionToDelete = target.editSelection
+
+        if let currentFileTimeline = try preferredFileTimelineForEditing(trackIndex: trackIndex) {
+            var timeline = currentFileTimeline
+            let deletedDuration = selectionToDelete.duration(in: currentFileTimeline.duration)
+            let deletedFrameCount = timeline.delete(selectionToDelete)
+            guard deletedFrameCount > 0 else {
+                return nil
+            }
+            return RippleDeleteTrackEdit(
+                trackIndex: trackIndex,
+                trackID: trackID,
+                displaySelection: target.displaySelection,
+                editSelection: selectionToDelete,
+                deletedDuration: deletedDuration,
+                editedDuration: timeline.duration,
+                editedAudioTimeline: nil,
+                editedFileTimeline: timeline
+            )
+        }
+
+        if let currentTimeline = projectTracks[trackIndex].audioTimeline {
+            var timeline = currentTimeline
+            let deletedDuration = selectionToDelete.duration(in: currentTimeline.duration)
+            let deletedFrameCount = timeline.delete(selectionToDelete)
+            guard deletedFrameCount > 0 else {
+                return nil
+            }
+            return RippleDeleteTrackEdit(
+                trackIndex: trackIndex,
+                trackID: trackID,
+                displaySelection: target.displaySelection,
+                editSelection: selectionToDelete,
+                deletedDuration: deletedDuration,
+                editedDuration: timeline.duration,
+                editedAudioTimeline: timeline,
+                editedFileTimeline: nil
+            )
+        }
+
+        return nil
     }
 
     private func scheduleDeleteVisualRefresh(trackID: UUID, editRevision: Int) {

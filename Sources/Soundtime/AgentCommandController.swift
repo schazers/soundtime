@@ -67,8 +67,8 @@ final class AgentCommandRegistry {
         register(
             AgentCommandCapability(
                 identifier: "timeline.deleteSelection",
-                title: "Delete Time",
-                summary: "Ripple-delete the currently selected audio region using the app's edit graph."
+                title: "Delete Time Across Tracks",
+                summary: "Ripple-delete the selected timeline time across linked podcast tracks."
             )
         )
         register(

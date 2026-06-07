@@ -89,6 +89,7 @@ enum EditGraphSmokeHarness {
             String(format: "edit graph operations were too slow: %.2fms", elapsedMilliseconds)
         )
         try runFileClipPasteSmoke(fileInfo: fileInfo)
+        try runLinkedRippleDeleteSmoke(fileInfo: fileInfo)
         try runSplitPersistenceSmoke(fileInfo: fileInfo)
         try runSilenceAnalyzerSmoke()
 
@@ -155,6 +156,54 @@ enum EditGraphSmokeHarness {
         try require(
             restoredTimeline.frameCount == timeline.frameCount,
             "file clip smoke persisted the wrong frame count"
+        )
+    }
+
+    private static func runLinkedRippleDeleteSmoke(fileInfo: WAVFileInfo) throws {
+        let shortFrameCount = Int((fileInfo.sampleRate * 30).rounded())
+        let shortFileInfo = WAVFileInfo(
+            url: URL(fileURLWithPath: "/tmp/SoundtimeLinkedRippleDeleteSmokeShort.wav"),
+            formatTag: fileInfo.formatTag,
+            channelCount: fileInfo.channelCount,
+            sampleRate: fileInfo.sampleRate,
+            blockAlign: fileInfo.blockAlign,
+            bitsPerSample: fileInfo.bitsPerSample,
+            dataRange: 44..<(44 + shortFrameCount * Int(fileInfo.blockAlign))
+        )
+        var hostTimeline = AudioFileEditTimeline(fileInfo: fileInfo)
+        var guestTimeline = AudioFileEditTimeline(fileInfo: shortFileInfo)
+        let startTime = 8.0
+        let endTime = 9.25
+        let expectedDeletedFrameCount = Int(((endTime - startTime) * fileInfo.sampleRate).rounded())
+        let hostSelection = TimelineSelection(
+            startProgress: startTime / hostTimeline.duration,
+            endProgress: endTime / hostTimeline.duration
+        )
+        let guestSelection = TimelineSelection(
+            startProgress: startTime / guestTimeline.duration,
+            endProgress: endTime / guestTimeline.duration
+        )
+
+        let hostFrameCountBeforeDelete = hostTimeline.frameCount
+        let guestFrameCountBeforeDelete = guestTimeline.frameCount
+        let hostDeletedFrameCount = hostTimeline.delete(hostSelection)
+        let guestDeletedFrameCount = guestTimeline.delete(guestSelection)
+
+        try require(
+            hostDeletedFrameCount == expectedDeletedFrameCount,
+            "linked ripple smoke host deleted an unexpected frame count"
+        )
+        try require(
+            guestDeletedFrameCount == expectedDeletedFrameCount,
+            "linked ripple smoke guest deleted an unexpected frame count"
+        )
+        try require(
+            hostTimeline.frameCount == hostFrameCountBeforeDelete - expectedDeletedFrameCount,
+            "linked ripple smoke host timeline did not shorten correctly"
+        )
+        try require(
+            guestTimeline.frameCount == guestFrameCountBeforeDelete - expectedDeletedFrameCount,
+            "linked ripple smoke guest timeline did not shorten correctly"
         )
     }
 
