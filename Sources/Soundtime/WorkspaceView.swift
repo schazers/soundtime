@@ -4588,6 +4588,7 @@ final class WorkspaceView: NSView {
             currentProjectURL = url
             SoundtimeProjectStore.rememberLastProjectURL(url)
             applyWindowLayout(project.windowLayout)
+            applyProjectMasterVolume(project.masterVolume)
             resetWaveformFisheyeTuningToDefaults()
             isLoadingProject = true
             for track in project.tracks {
@@ -4715,8 +4716,19 @@ final class WorkspaceView: NSView {
                     editTimeline: persistedEditTimeline(for: track)
                 )
             },
-            windowLayout: currentWindowLayout()
+            windowLayout: currentWindowLayout(),
+            masterVolume: volumeControl.perceptualVolume
         )
+    }
+
+    private func applyProjectMasterVolume(_ volume: Float?) {
+        guard let volume, volume.isFinite else {
+            return
+        }
+
+        let clampedVolume = min(max(volume, 0), 1)
+        volumeControl.perceptualVolume = clampedVolume
+        playbackController.setPerceptualVolume(clampedVolume)
     }
 
     private func persistedEditTimeline(for track: ProjectTrack) -> AudioFileEditTimeline.PersistentState? {
