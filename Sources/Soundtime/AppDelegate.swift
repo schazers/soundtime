@@ -225,6 +225,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: "i"
         ))
         menu.addItem(NSMenuItem(
+            title: "Heal Adjacent Clips",
+            action: #selector(TimelineView.healAdjacentClips(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
             title: "Zoom to Selection",
             action: #selector(TimelineView.zoomToSelection(_:)),
             keyEquivalent: "j"

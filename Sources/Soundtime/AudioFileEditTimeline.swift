@@ -572,6 +572,40 @@ struct AudioFileEditTimeline: Sendable {
         return split(atFrame: splitFrame)
     }
 
+    mutating func healNearestClipBoundary(atProgress progress: Double) -> Bool {
+        guard progress.isFinite, timelineFrameCount > 1 else {
+            return false
+        }
+
+        let targetFrame = min(
+            max(Int((progress * Double(timelineFrameCount)).rounded()), 0),
+            timelineFrameCount
+        )
+        var timelineFrame = 0
+        var nearestIndex: Int?
+        var nearestDistance = Int.max
+        for index in segments.indices {
+            let segment = segments[index]
+            if segment.startsNewClip, timelineFrame > 0 {
+                let distance = abs(timelineFrame - targetFrame)
+                if distance < nearestDistance {
+                    nearestDistance = distance
+                    nearestIndex = index
+                }
+            }
+            timelineFrame += segment.frameCount
+        }
+
+        guard let nearestIndex else {
+            return false
+        }
+
+        segments[nearestIndex] = segments[nearestIndex].withClipBoundary(false)
+        segments = Self.coalescedSegments(segments)
+        timelineFrameCount = Self.totalFrameCount(segments)
+        return true
+    }
+
     mutating func trim(to trimRange: TimelineTrimRange) -> Int {
         let originalFrameCount = frameCount
         let keepStartFrame = Int((trimRange.startProgress * Float(originalFrameCount)).rounded(.down))
