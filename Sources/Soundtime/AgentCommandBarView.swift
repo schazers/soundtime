@@ -353,19 +353,6 @@ private final class AgentPromptTextView: NSTextView {
         super.keyDown(with: event)
     }
 
-    override func drawInsertionPoint(in rect: NSRect, color: NSColor, turnedOn flag: Bool) {
-        var adjustedRect = rect
-        adjustedRect.size.width = max(rect.width, 2.5)
-        adjustedRect.size.height += 6
-        if isFlipped {
-            adjustedRect.origin.y += 2.5
-        } else {
-            adjustedRect.origin.y -= 2.5
-        }
-
-        super.drawInsertionPoint(in: adjustedRect, color: color, turnedOn: flag)
-    }
-
     private func configure() {
         drawsBackground = false
         isEditable = true
@@ -489,7 +476,7 @@ private final class AgentTextFieldBackgroundView: NSView {
         let radius: CGFloat = 25
         let path = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
 
-        NSColor(white: 0.025, alpha: 0.58).setFill()
+        NSColor(white: 0.16, alpha: 0.92).setFill()
         path.fill()
 
         guard isFocused else {
@@ -544,6 +531,11 @@ private final class AgentSendButton: NSControl {
         addTrackingArea(nextTrackingArea)
     }
 
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
     override func mouseEntered(with event: NSEvent) {
         isHovered = true
     }
@@ -577,7 +569,7 @@ private final class AgentSendButton: NSControl {
         super.draw(dirtyRect)
 
         let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
-        let radius = min(rect.height * 0.5, 25)
+        let radius = min(rect.height * 0.36, 15)
         let buttonPath = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
 
         if isEnabled, isHovered || isPressed {
