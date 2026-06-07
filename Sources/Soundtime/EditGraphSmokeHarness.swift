@@ -213,6 +213,7 @@ enum EditPreviewSmokeHarness {
             elapsedMilliseconds < 2_000,
             String(format: "edit previews were too slow: %.2fms", elapsedMilliseconds)
         )
+        try runDeletePrefixStabilitySmoke()
 
         print(
             String(
@@ -241,6 +242,51 @@ enum EditPreviewSmokeHarness {
         return sortedValues[index]
     }
 
+    private static func runDeletePrefixStabilitySmoke() throws {
+        let sampleRate = 48_000.0
+        let sourceFrameCount = Int(sampleRate) * 60 * 12
+        let sourceURL = URL(fileURLWithPath: "/tmp/SoundtimeDeletePrefixStabilitySmoke.wav")
+        let fileInfo = WAVFileInfo(
+            url: sourceURL,
+            formatTag: 1,
+            channelCount: 2,
+            sampleRate: sampleRate,
+            blockAlign: 4,
+            bitsPerSample: 16,
+            dataRange: 44..<(44 + sourceFrameCount * 4)
+        )
+        let sourceOverview = makeSourceOverview(
+            duration: Double(sourceFrameCount) / sampleRate,
+            binCount: 65_536
+        )
+        let selection = TimelineSelection(startProgress: 0.42, endProgress: 0.54)
+        let stablePrefixEndIndex = max(
+            Int((selection.startProgress * Double(sourceOverview.bins.count)).rounded(.down)) - 2,
+            0
+        )
+
+        var timeline = AudioFileEditTimeline(fileInfo: fileInfo)
+        let deletedFrames = timeline.delete(selection)
+        try require(deletedFrames > 0, "delete prefix stability smoke deleted no frames")
+
+        let editedOverview = timeline.waveformOverview(from: sourceOverview)
+        try require(
+            editedOverview.bins.count < sourceOverview.bins.count,
+            "delete prefix stability smoke did not shorten the preview"
+        )
+        try require(
+            editedOverview.bins.count > stablePrefixEndIndex,
+            "delete prefix stability smoke produced too few bins"
+        )
+
+        for index in 0..<stablePrefixEndIndex {
+            try require(
+                binsMatch(sourceOverview.bins[index], editedOverview.bins[index]),
+                "delete prefix stability smoke changed untouched prefix bin \(index)"
+            )
+        }
+    }
+
     private static func makeSourceOverview(duration: TimeInterval, binCount: Int) -> WaveformOverview {
         var bins: [WaveformOverview.Bin] = []
         bins.reserveCapacity(binCount)
@@ -263,6 +309,15 @@ enum EditPreviewSmokeHarness {
         }
 
         return WaveformOverview(duration: duration, bins: bins)
+    }
+
+    private static func binsMatch(_ lhs: WaveformOverview.Bin, _ rhs: WaveformOverview.Bin) -> Bool {
+        lhs.minimumSample == rhs.minimumSample &&
+            lhs.maximumSample == rhs.maximumSample &&
+            lhs.rmsSample == rhs.rmsSample &&
+            lhs.lowEnergy == rhs.lowEnergy &&
+            lhs.midEnergy == rhs.midEnergy &&
+            lhs.highEnergy == rhs.highEnergy
     }
 
     private static func require(_ condition: Bool, _ message: String) throws {
