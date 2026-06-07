@@ -112,6 +112,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var needsTimelineRender = false
     private var isRenderDataPreparedRenderPending = false
     private let renderFlightGate = RenderFlightGate()
+    private var lastInteractionRenderKickTimestamp: CFTimeInterval = 0
     private var isTimelinePlaybackActive = false
     private var timelineDuration: TimeInterval = 0
     private var pagingPlayheadProgress: Float = 0
@@ -134,6 +135,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private let playbackStopTouchTrailRenderPulseDuration: CFTimeInterval = 1.25
     private let waveformTransitionRenderPulseDuration: CFTimeInterval = 0.24
     private let targetFramesPerSecond = 144
+    private let interactionRenderKickMinimumInterval: CFTimeInterval = 1.0 / 240.0
     private let scrollZoomSensitivity: Float = 0.01
     private let supportedAudioExtensions: Set<String> = [
         "aif",
@@ -666,6 +668,33 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         return true
     }
 
+    private func kickInteractionRenderIfPossible() {
+        requestTimelineRender()
+        let now = CACurrentMediaTime()
+        guard now - lastInteractionRenderKickTimestamp >= interactionRenderKickMinimumInterval else {
+            return
+        }
+        guard renderFlightGate.begin() else {
+            return
+        }
+
+        guard
+            let timelineRenderer,
+            let renderTarget = makeTimelineRenderTarget()
+        else {
+            renderFlightGate.finish()
+            return
+        }
+
+        lastInteractionRenderKickTimestamp = now
+        latestSubmittedPresentationTimestamp = renderTarget.displayTimestamp
+        needsTimelineRender = false
+        timelineRenderQueue.async { [weak self, timelineRenderer, renderTarget] in
+            timelineRenderer.render(to: renderTarget)
+            self?.renderFlightGate.finish()
+        }
+    }
+
     private func startTransientRenderPulse(duration: CFTimeInterval? = nil) {
         transientRenderEndTime = CFAbsoluteTimeGetCurrent() + (duration ?? transientRenderPulseDuration)
         startTimelineDisplayLink()
@@ -1115,6 +1144,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         isDraggingSelection = false
         isDraggingTrim = false
         displayHoverProgress(timelineProgress, isArmed: true)
+        kickInteractionRenderIfPossible()
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -1146,8 +1176,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         if isDraggingSelection {
             updateSelection(from: selectionAnchorProgress, to: preciseProgress(for: point), notifyChange: false)
+            kickInteractionRenderIfPossible()
         } else {
             displayHoverProgress(progress(for: point), isArmed: true)
+            kickInteractionRenderIfPossible()
         }
     }
 
@@ -1645,6 +1677,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         displayHoverProgress(progress(for: point))
+        kickInteractionRenderIfPossible()
     }
 
     private func updateSelection(from startProgress: Double, to endProgress: Double, notifyChange: Bool) {
