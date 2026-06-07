@@ -8,6 +8,11 @@ struct SoundtimeProject: Codable, Sendable {
         var height: Double
     }
 
+    struct TimelineViewport: Codable, Sendable {
+        var startProgress: Float
+        var durationProgress: Float
+    }
+
     struct Track: Codable, Sendable {
         var id: UUID
         var name: String
@@ -21,6 +26,7 @@ struct SoundtimeProject: Codable, Sendable {
     var tracks: [Track]
     var windowLayout: WindowLayout?
     var masterVolume: Float?
+    var timelineViewport: TimelineViewport?
 }
 
 enum SoundtimeProjectStore {

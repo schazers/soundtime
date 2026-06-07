@@ -76,6 +76,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         qos: .userInteractive
     )
     private var viewport = TimelineViewport.full
+    private var pendingRestoredViewport: TimelineViewport?
     private var trackLayout = TimelineTrackLayout.default
     private var lastPublishedTrackLayout: ResolvedTimelineTrackLayout?
     private var isSelectionEnabled = false
@@ -243,6 +244,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             )
             setViewport(preservedViewport)
         }
+        if let pendingRestoredViewport, isSelectionEnabled {
+            self.pendingRestoredViewport = nil
+            setViewport(pendingRestoredViewport)
+        }
         updateTrackLayoutForCurrentBounds(requestRender: false)
 
         updateTimelineRenderer { renderer in
@@ -273,6 +278,25 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             displaySelection(nil)
             displayHoverProgress(nil)
             onSelectionChanged?(nil)
+        }
+    }
+
+    var currentViewport: TimelineViewport {
+        viewport
+    }
+
+    func restoreViewport(_ restoredViewport: TimelineViewport?) {
+        guard let restoredViewport else {
+            pendingRestoredViewport = nil
+            setViewport(.full)
+            return
+        }
+
+        if isSelectionEnabled {
+            pendingRestoredViewport = nil
+            setViewport(restoredViewport)
+        } else {
+            pendingRestoredViewport = restoredViewport
         }
     }
 
