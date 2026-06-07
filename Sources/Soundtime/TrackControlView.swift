@@ -9,6 +9,7 @@ final class TrackControlView: NSView {
     var onTrackSelected: ((NSEvent.ModifierFlags) -> Void)?
 
     private let panelView = NSView()
+    private let selectedAccentView = NSView()
     private let contentStack = NSStackView()
     private let titleLabel = NSTextField(labelWithString: "")
     private let volumeSlider = HorizontalTrackVolumeSliderView()
@@ -16,6 +17,13 @@ final class TrackControlView: NSView {
     private let soloButton = TrackToggleButton(title: "S")
     private let recordButton = TrackIconButton(systemSymbolName: "mic.fill")
     private let buttonStack = NSStackView()
+    private var trackingArea: NSTrackingArea?
+
+    private var isHovered = false {
+        didSet {
+            updateAppearance()
+        }
+    }
 
     var isTrackSelected = false {
         didSet {
@@ -64,6 +72,30 @@ final class TrackControlView: NSView {
         false
     }
 
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+
+        let nextTrackingArea = NSTrackingArea(
+            rect: bounds,
+            options: [.activeInKeyWindow, .mouseEnteredAndExited, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        trackingArea = nextTrackingArea
+        addTrackingArea(nextTrackingArea)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+    }
+
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard let hitView = super.hitTest(point) else {
             return nil
@@ -108,6 +140,9 @@ final class TrackControlView: NSView {
         layer?.backgroundColor = NSColor.clear.cgColor
         panelView.wantsLayer = true
         panelView.translatesAutoresizingMaskIntoConstraints = false
+        selectedAccentView.wantsLayer = true
+        selectedAccentView.layer?.backgroundColor = NSColor(red: 0.15, green: 0.82, blue: 0.92, alpha: 1).cgColor
+        selectedAccentView.translatesAutoresizingMaskIntoConstraints = false
         updateAppearance()
 
         titleLabel.font = .systemFont(ofSize: 11, weight: .semibold)
@@ -157,6 +192,7 @@ final class TrackControlView: NSView {
         contentStack.addArrangedSubview(buttonStack)
 
         addSubview(panelView)
+        panelView.addSubview(selectedAccentView)
         panelView.addSubview(contentStack)
 
         NSLayoutConstraint.activate([
@@ -164,6 +200,11 @@ final class TrackControlView: NSView {
             panelView.trailingAnchor.constraint(equalTo: trailingAnchor),
             panelView.topAnchor.constraint(equalTo: topAnchor),
             panelView.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            selectedAccentView.leadingAnchor.constraint(equalTo: panelView.leadingAnchor),
+            selectedAccentView.topAnchor.constraint(equalTo: panelView.topAnchor),
+            selectedAccentView.bottomAnchor.constraint(equalTo: panelView.bottomAnchor),
+            selectedAccentView.widthAnchor.constraint(equalToConstant: 3),
 
             contentStack.centerYAnchor.constraint(equalTo: panelView.centerYAnchor),
             contentStack.topAnchor.constraint(greaterThanOrEqualTo: panelView.topAnchor, constant: 10),
@@ -186,9 +227,19 @@ final class TrackControlView: NSView {
     }
 
     private func updateAppearance() {
-        panelView.layer?.backgroundColor = NSColor(white: isTrackSelected ? 0.16 : 0.075, alpha: 1).cgColor
-        panelView.layer?.borderColor = NSColor(white: isTrackSelected ? 0.46 : 0.17, alpha: 1).cgColor
+        let baseWhite: CGFloat
+        if isTrackSelected {
+            baseWhite = isHovered ? 0.19 : 0.17
+        } else {
+            baseWhite = isHovered ? 0.105 : 0.075
+        }
+        panelView.layer?.backgroundColor = NSColor(white: baseWhite, alpha: 1).cgColor
+        panelView.layer?.borderColor = NSColor(
+            white: isTrackSelected ? 0.52 : (isHovered ? 0.24 : 0.17),
+            alpha: 1
+        ).cgColor
         panelView.layer?.borderWidth = 1
+        selectedAccentView.isHidden = !isTrackSelected
     }
 }
 
