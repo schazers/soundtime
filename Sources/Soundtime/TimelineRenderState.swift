@@ -55,6 +55,8 @@ struct TimelineRenderState: Sendable {
 
     let tracks: [Track]
     let duration: TimeInterval?
+    let hasWaveforms: Bool
+    let hasSoloedTrack: Bool
     let viewport: TimelineViewport
     let trackLayout: TimelineTrackLayout
     let playheadProgress: Float
@@ -86,6 +88,8 @@ struct TimelineRenderState: Sendable {
     ) {
         self.tracks = tracks
         self.duration = duration ?? Self.projectDuration(for: tracks)
+        hasWaveforms = tracks.contains { $0.hasWaveform }
+        hasSoloedTrack = tracks.contains { $0.isSoloed }
         self.viewport = viewport
         self.trackLayout = trackLayout
         self.playheadProgress = playheadProgress
@@ -102,10 +106,6 @@ struct TimelineRenderState: Sendable {
 
     var waveformOverview: WaveformOverview? {
         tracks.first?.waveformOverview
-    }
-
-    var hasWaveforms: Bool {
-        tracks.contains { $0.hasWaveform }
     }
 
     private static func projectDuration(for tracks: [Track]) -> TimeInterval? {
