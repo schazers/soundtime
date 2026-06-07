@@ -4278,14 +4278,14 @@ final class WorkspaceView: NSView {
         if let editedFileTimeline {
             projectTracks[trackIndex].waveformOverview =
                 optimisticWaveformOverview(
-                    for: editedFileTimeline,
-                    sourceOverview: projectTracks[trackIndex].sourceWaveformOverview,
-                    fallbackOverview: currentOverview
-                ) ??
-                optimisticWaveformOverview(
                     currentOverview,
                     applyingGain: gain,
                     to: selectionToApply
+                ) ??
+                optimisticWaveformOverview(
+                    for: editedFileTimeline,
+                    sourceOverview: projectTracks[trackIndex].sourceWaveformOverview,
+                    fallbackOverview: currentOverview
                 )
             scheduleFileTimelineWaveformRefinement(
                 trackID: trackID,
@@ -4409,14 +4409,14 @@ final class WorkspaceView: NSView {
         if let editedFileTimeline {
             projectTracks[trackIndex].waveformOverview =
                 optimisticWaveformOverview(
-                    for: editedFileTimeline,
-                    sourceOverview: projectTracks[trackIndex].sourceWaveformOverview,
-                    fallbackOverview: currentOverview
-                ) ??
-                optimisticWaveformOverview(
                     currentOverview,
                     applyingFade: timelineFadeDirection,
                     to: selectionToApply
+                ) ??
+                optimisticWaveformOverview(
+                    for: editedFileTimeline,
+                    sourceOverview: projectTracks[trackIndex].sourceWaveformOverview,
+                    fallbackOverview: currentOverview
                 )
             scheduleFileTimelineWaveformRefinement(
                 trackID: trackID,
