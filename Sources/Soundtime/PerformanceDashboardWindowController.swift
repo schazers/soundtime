@@ -10,13 +10,13 @@ final class PerformanceDashboardWindowController: NSWindowController, NSWindowDe
 
     private init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 940, height: 650),
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 860),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Soundtime Performance"
-        window.minSize = NSSize(width: 760, height: 520)
+        window.minSize = NSSize(width: 620, height: 720)
         window.isReleasedWhenClosed = false
         window.contentView = dashboardView
         super.init(window: window)
