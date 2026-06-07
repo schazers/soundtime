@@ -103,6 +103,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var selectionAnchorProgress: Double?
     private var selectionAnchorPoint: CGPoint?
     private var selectionAnchorTrackID: UUID?
+    private var currentSelection: TimelineSelection?
     private var activeClipBoundaryHit: ClipBoundaryHit?
     private var activeDragMode: TimelineDragMode?
     private var hoverTrackingArea: NSTrackingArea?
@@ -469,6 +470,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     func displaySelection(_ selection: TimelineSelection?) {
+        currentSelection = selection
         timelineRenderer?.publishInteractionSelection(selection)
         requestTimelineRender()
     }
@@ -973,6 +975,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onSplitAtPlayhead?()
     }
 
+    @objc func zoomToSelection(_ sender: Any?) {
+        zoomToSelection()
+    }
+
     @objc func showGainEffect(_ sender: Any?) {
         onGainRequested?()
     }
@@ -1031,6 +1037,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return canClearSelection
         case #selector(splitAtPlayhead(_:)):
             return canSplitAtPlayhead
+        case #selector(zoomToSelection(_:)):
+            return currentSelection?.durationProgress ?? 0 > 0
         case #selector(toggleDebugTools(_:)):
             menuItem.state = isDebugToolsVisible ? .on : .off
             return true
@@ -1676,6 +1684,24 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
         window?.invalidateCursorRects(for: self)
         requestTimelineRender()
+    }
+
+    private func zoomToSelection() {
+        guard
+            let selection = currentSelection,
+            selection.durationProgress > 0
+        else {
+            return
+        }
+
+        let selectionStart = Float(selection.startProgress)
+        let selectionDuration = max(Float(selection.durationProgress), 0.000_001)
+        let padding = max(selectionDuration * 0.14, 0.002)
+        let nextViewport = TimelineViewport(
+            startProgress: selectionStart - padding,
+            durationProgress: min(selectionDuration + padding * 2, 1)
+        )
+        setViewport(nextViewport)
     }
 
     func scrollTracks(byPixels deltaPixels: Float) {
