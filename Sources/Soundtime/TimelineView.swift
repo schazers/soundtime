@@ -72,6 +72,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onFrameStatsChanged: ((TimelineFrameStats) -> Void)?
     var onTimelineInteractionBegan: (() -> Void)?
     var onTrackLaneLayoutChanged: ((ResolvedTimelineTrackLayout) -> Void)?
+    var onExportWAVRequested: (() -> Void)?
+    var onExportSelectedRegionRequested: (() -> Void)?
+    var onExportMixdownAndStemsRequested: (() -> Void)?
+    var onExportStemsRequested: (() -> Void)?
     var canApplyGainEffect = false
     var canApplyFadeEffect = false
     var canReapplyLastEffect = false
@@ -1007,6 +1011,22 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onExportRequested?()
     }
 
+    @objc func exportWAVAudio(_ sender: Any?) {
+        onExportWAVRequested?()
+    }
+
+    @objc func exportSelectedRegion(_ sender: Any?) {
+        onExportSelectedRegionRequested?()
+    }
+
+    @objc func exportMixdownAndStems(_ sender: Any?) {
+        onExportMixdownAndStemsRequested?()
+    }
+
+    @objc func exportStems(_ sender: Any?) {
+        onExportStemsRequested?()
+    }
+
     @objc func openProject(_ sender: Any?) {
         onOpenProjectRequested?()
     }
@@ -1193,6 +1213,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return canSplitAtPlayhead
         case #selector(reapplyLastEffect(_:)):
             return canReapplyLastEffect
+        case #selector(exportSelectedRegion(_:)):
+            return currentSelection?.durationProgress ?? 0 > 0
         case #selector(deleteTimelineSelection(_:)):
             return canDeleteSelection
         case #selector(removeTimeRangeAcrossScope(_:)):

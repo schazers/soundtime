@@ -116,6 +116,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             action: #selector(TimelineView.exportAudio(_:)),
             keyEquivalent: "e"
         ))
+        menu.addItem(NSMenuItem(
+            title: "Export WAV...",
+            action: #selector(TimelineView.exportWAVAudio(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Export Selected Region...",
+            action: #selector(TimelineView.exportSelectedRegion(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Export Mixdown Plus Stems...",
+            action: #selector(TimelineView.exportMixdownAndStems(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Export Stems...",
+            action: #selector(TimelineView.exportStems(_:)),
+            keyEquivalent: ""
+        ))
         menu.addItem(.separator())
         let quitItem = NSMenuItem(
             title: "Quit Soundtime",
