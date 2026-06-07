@@ -47,7 +47,7 @@ enum AudioImportPipeline {
         samplesPerBin: Int
     ) async throws -> (WAVFileInfo, WaveformOverview) {
         try await Task.detached(priority: .utility) {
-            try ImportWorkBudget.shared.performExclusiveHeavyWork {
+            try ImportWorkBudget.shared.performScheduledHeavyWork(.previewRefinement) {
                 try WAVAudioDecoder.buildSparsePreview(
                     url: url,
                     targetBinCount: targetBinCount,
@@ -63,7 +63,7 @@ enum AudioImportPipeline {
         AudioZeroCrossingIndex
     ) {
         try await Task.detached(priority: .background) {
-            try ImportWorkBudget.shared.performExclusiveHeavyWork {
+            try ImportWorkBudget.shared.performScheduledHeavyWork(.backgroundDecode) {
                 let decodedAudioBuffer = try WAVAudioDecoder.decode(url: url)
                 let waveformOverview = WaveformOverviewBuilder.build(from: decodedAudioBuffer)
                 let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: decodedAudioBuffer)
@@ -82,7 +82,7 @@ enum AudioImportPipeline {
 
             do {
                 let (decodedAudioBuffer, waveformOverview, zeroCrossingIndex) =
-                    try ImportWorkBudget.shared.performExclusiveHeavyWork {
+                    try ImportWorkBudget.shared.performScheduledHeavyWork(.backgroundDecode) {
                         let decodedAudioBuffer = try WAVAudioDecoder.decode(url: url)
                         let waveformOverview = WaveformOverviewBuilder.build(from: decodedAudioBuffer)
                         let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: decodedAudioBuffer)

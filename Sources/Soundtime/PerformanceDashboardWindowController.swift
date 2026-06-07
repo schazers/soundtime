@@ -201,6 +201,7 @@ private final class PerformanceDashboardView: NSView {
 
     private func updateDashboard() {
         let diagnostics = SoundtimeDiagnostics.shared.snapshot(limit: 60)
+        let importBudget = ImportWorkBudget.shared.snapshot()
         let frameStats = latestFrameStats ?? diagnostics.frameStats
         let cpuPercent = cpuSampler.samplePercent()
 
@@ -251,15 +252,19 @@ private final class PerformanceDashboardView: NSView {
         threadCard.update(lines: [
             "Main stalls   \(diagnostics.mainThreadStallCount)",
             String(format: "Last stall    %.1f ms", diagnostics.lastMainThreadStallMilliseconds),
+            "Heavy work    \(importBudget.exclusiveWorkInFlight) active",
+            "Deferred      \(importBudget.deferredWorkCount)",
+            "Last defer    \(importBudget.lastDeferredWorkClass)",
             "Warnings      \(diagnostics.warningEventCount)",
             "Severe        \(diagnostics.severeEventCount)",
-            "Monitor       active",
         ])
 
         traceCard.update(lines: [
             "Ring buffer   2048 events",
             "Shown events  \(diagnostics.events.count)",
             "Auto export   severe events",
+            "BG complete   \(importBudget.completedWorkCount)",
+            String(format: "BG defer sec  %.2f", importBudget.totalDeferredSeconds),
             "Format        JSON",
             "Location      /tmp",
         ])
