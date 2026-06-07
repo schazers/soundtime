@@ -2210,6 +2210,13 @@ final class WorkspaceView: NSView {
             return false
         }
 
+        do {
+            try await ImportWorkBudget.shared.waitForAsyncTurn(
+                idleSettleDuration >= 0.5 ? .backgroundDecode : .previewRefinement
+            )
+        } catch {
+            return false
+        }
         await Task.yield()
         return isCurrent() && !Task.isCancelled
     }

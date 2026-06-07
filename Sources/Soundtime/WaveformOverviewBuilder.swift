@@ -17,7 +17,7 @@ enum WaveformOverviewBuilder {
 
         for binIndex in 0..<binCount {
             if binIndex.isMultiple(of: 512) {
-                try? ImportWorkBudget.shared.waitIfPlaybackActive()
+                try? ImportWorkBudget.shared.waitIfPlaybackActive(.backgroundDecode)
             }
 
             let startFrame = binIndex * buffer.frameCount / binCount
