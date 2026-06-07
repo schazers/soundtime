@@ -7509,6 +7509,17 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         return float4(in.color.rgb, alpha);
     }
 
+    static float catmull_rom_scalar(float p0, float p1, float p2, float p3, float t) {
+        float t2 = t * t;
+        float t3 = t2 * t;
+        return 0.5 * (
+            (2.0 * p1) +
+            (-p0 + p2) * t +
+            (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2 +
+            (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+        );
+    }
+
     static WaveformShaderBin sample_waveform_bin(
         float localProgress,
         constant WaveformShaderBin *bins,
@@ -7528,8 +7539,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         uint leftIndex = uint(floor(scaledIndex));
         uint rightIndex = min(leftIndex + 1u, count - 1u);
         float amount = fract(scaledIndex);
+        uint previousIndex = leftIndex > 0u ? leftIndex - 1u : leftIndex;
+        uint nextIndex = min(rightIndex + 1u, count - 1u);
+        WaveformShaderBin previousBin = bins[binOffset + previousIndex];
         WaveformShaderBin leftBin = bins[binOffset + leftIndex];
         WaveformShaderBin rightBin = bins[binOffset + rightIndex];
+        WaveformShaderBin nextBin = bins[binOffset + nextIndex];
         WaveformShaderBin linearBin;
         linearBin.minimumSample = mix(leftBin.minimumSample, rightBin.minimumSample, amount);
         linearBin.maximumSample = mix(leftBin.maximumSample, rightBin.maximumSample, amount);
@@ -7540,15 +7555,84 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         linearBin.peakMagnitude = mix(leftBin.peakMagnitude, rightBin.peakMagnitude, amount);
         linearBin.reserved = 0.0;
 
+        float cubicAmount = amount * amount * (3.0 - 2.0 * amount);
+        WaveformShaderBin cubicBin;
+        cubicBin.minimumSample = catmull_rom_scalar(
+            previousBin.minimumSample,
+            leftBin.minimumSample,
+            rightBin.minimumSample,
+            nextBin.minimumSample,
+            cubicAmount
+        );
+        cubicBin.maximumSample = catmull_rom_scalar(
+            previousBin.maximumSample,
+            leftBin.maximumSample,
+            rightBin.maximumSample,
+            nextBin.maximumSample,
+            cubicAmount
+        );
+        cubicBin.rmsSample = catmull_rom_scalar(
+            previousBin.rmsSample,
+            leftBin.rmsSample,
+            rightBin.rmsSample,
+            nextBin.rmsSample,
+            cubicAmount
+        );
+        cubicBin.lowEnergy = catmull_rom_scalar(
+            previousBin.lowEnergy,
+            leftBin.lowEnergy,
+            rightBin.lowEnergy,
+            nextBin.lowEnergy,
+            cubicAmount
+        );
+        cubicBin.midEnergy = catmull_rom_scalar(
+            previousBin.midEnergy,
+            leftBin.midEnergy,
+            rightBin.midEnergy,
+            nextBin.midEnergy,
+            cubicAmount
+        );
+        cubicBin.highEnergy = catmull_rom_scalar(
+            previousBin.highEnergy,
+            leftBin.highEnergy,
+            rightBin.highEnergy,
+            nextBin.highEnergy,
+            cubicAmount
+        );
+        cubicBin.peakMagnitude = catmull_rom_scalar(
+            previousBin.peakMagnitude,
+            leftBin.peakMagnitude,
+            rightBin.peakMagnitude,
+            nextBin.peakMagnitude,
+            cubicAmount
+        );
+        cubicBin.reserved = 0.0;
+
         float blendAmount = clamp(smoothAmount, 0.0, 1.0);
+        float cubicBlendAmount = blendAmount * 0.62;
+        WaveformShaderBin smoothBin;
+        smoothBin.minimumSample = clamp(mix(linearBin.minimumSample, cubicBin.minimumSample, cubicBlendAmount), -1.0, 1.0);
+        smoothBin.maximumSample = clamp(mix(linearBin.maximumSample, cubicBin.maximumSample, cubicBlendAmount), -1.0, 1.0);
+        if (smoothBin.minimumSample > smoothBin.maximumSample) {
+            float midpoint = (smoothBin.minimumSample + smoothBin.maximumSample) * 0.5;
+            smoothBin.minimumSample = midpoint;
+            smoothBin.maximumSample = midpoint;
+        }
+        smoothBin.rmsSample = clamp(mix(linearBin.rmsSample, cubicBin.rmsSample, cubicBlendAmount), 0.0, 1.0);
+        smoothBin.lowEnergy = clamp(mix(linearBin.lowEnergy, cubicBin.lowEnergy, cubicBlendAmount), 0.0, 1.0);
+        smoothBin.midEnergy = clamp(mix(linearBin.midEnergy, cubicBin.midEnergy, cubicBlendAmount), 0.0, 1.0);
+        smoothBin.highEnergy = clamp(mix(linearBin.highEnergy, cubicBin.highEnergy, cubicBlendAmount), 0.0, 1.0);
+        smoothBin.peakMagnitude = clamp(mix(linearBin.peakMagnitude, cubicBin.peakMagnitude, cubicBlendAmount), 0.0, 1.0);
+        smoothBin.reserved = 0.0;
+
         WaveformShaderBin result;
-        result.minimumSample = mix(nearestBin.minimumSample, linearBin.minimumSample, blendAmount);
-        result.maximumSample = mix(nearestBin.maximumSample, linearBin.maximumSample, blendAmount);
-        result.rmsSample = mix(nearestBin.rmsSample, linearBin.rmsSample, blendAmount);
-        result.lowEnergy = mix(nearestBin.lowEnergy, linearBin.lowEnergy, blendAmount);
-        result.midEnergy = mix(nearestBin.midEnergy, linearBin.midEnergy, blendAmount);
-        result.highEnergy = mix(nearestBin.highEnergy, linearBin.highEnergy, blendAmount);
-        result.peakMagnitude = mix(nearestBin.peakMagnitude, linearBin.peakMagnitude, blendAmount);
+        result.minimumSample = mix(nearestBin.minimumSample, smoothBin.minimumSample, blendAmount);
+        result.maximumSample = mix(nearestBin.maximumSample, smoothBin.maximumSample, blendAmount);
+        result.rmsSample = mix(nearestBin.rmsSample, smoothBin.rmsSample, blendAmount);
+        result.lowEnergy = mix(nearestBin.lowEnergy, smoothBin.lowEnergy, blendAmount);
+        result.midEnergy = mix(nearestBin.midEnergy, smoothBin.midEnergy, blendAmount);
+        result.highEnergy = mix(nearestBin.highEnergy, smoothBin.highEnergy, blendAmount);
+        result.peakMagnitude = mix(nearestBin.peakMagnitude, smoothBin.peakMagnitude, blendAmount);
         result.reserved = 0.0;
         return result;
     }
