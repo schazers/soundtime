@@ -26,6 +26,7 @@ enum RecordingSmokeHarness {
         let chunkCount = arguments.contains("--long") ? 32 : 4
         let expectedFrameCount = chunkFrameCount * chunkCount
         let writer = try StreamingWAVTakeWriter(url: tempURL)
+        var liveAccumulator = LiveRecordingWaveformAccumulator(sampleRate: sampleRate)
 
         for chunkIndex in 0..<chunkCount {
             let chunk = makeSyntheticChunk(
@@ -35,6 +36,10 @@ enum RecordingSmokeHarness {
                 frameOffset: chunkIndex * chunkFrameCount
             )
             writer.append(chunk)
+            liveAccumulator.append(
+                samplesByChannel: chunk.samplesByChannel,
+                frameCount: chunk.frameCount
+            )
         }
 
         let take = try writer.finish()
@@ -53,6 +58,13 @@ enum RecordingSmokeHarness {
             samplesPerBin: 8
         )
         try require(!overview.bins.isEmpty, "recording preview generated no bins")
+        let liveOverview = liveAccumulator.makeOverview(sampleRate: sampleRate)
+        try require(liveAccumulator.totalFrameCount == expectedFrameCount, "live preview frame count mismatch")
+        try require(!liveOverview.bins.isEmpty, "live preview generated no bins")
+        try require(
+            abs(liveOverview.duration - take.duration) < 0.000_1,
+            "live preview duration did not match recorded take"
+        )
 
         let decoded = try WAVAudioDecoder.decode(url: tempURL)
         try require(decoded.frameCount == expectedFrameCount, "decoded recording frame count mismatch")
