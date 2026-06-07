@@ -840,6 +840,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        if
+            event.charactersIgnoringModifiers?.lowercased() == "j",
+            event.modifierFlags.contains(.command)
+        {
+            zoomToSelection()
+            return
+        }
+
         if event.keyCode == 14, event.modifierFlags.contains(.command) {
             onExportRequested?()
             return
@@ -870,6 +878,18 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             }
 
             onTogglePlayback?()
+            return
+        }
+
+        if event.keyCode == 53 {
+            displayTrimPreview(nil)
+            displaySelection(nil)
+            onSelectionChanged?(nil)
+            onTimelineInteractionBegan?()
+            activeDragMode = nil
+            activeClipBoundaryHit = nil
+            isDraggingSelection = false
+            isDraggingTrim = false
             return
         }
 
