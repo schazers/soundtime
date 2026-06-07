@@ -268,7 +268,11 @@ final class WorkspaceView: NSView {
     private var currentProjectURL: URL?
     private var hasRestoredLastProject = false
     private var isLoadingProject = false
-    private var audioClipboard: AudioClipboard?
+    private var audioClipboard: AudioClipboard? {
+        didSet {
+            updateEffectCommandState()
+        }
+    }
     private var activeImportID = UUID()
     private var selectedAudioFile: AudioFileMetadata?
     private var decodedAudioBuffer: DecodedAudioBuffer?
@@ -7351,6 +7355,18 @@ final class WorkspaceView: NSView {
         currentEditableSelectionTarget() != nil
     }
 
+    private var canCopySelection: Bool {
+        currentEditableSelectionTarget() != nil
+    }
+
+    private var canCutSelection: Bool {
+        currentEditableSelectionTarget() != nil
+    }
+
+    private var canPasteAudio: Bool {
+        audioClipboard != nil && activeProjectTrackIndex() != nil
+    }
+
     private func isEditableRippleDeleteTarget(_ target: EditableSelectionTarget) -> Bool {
         guard
             projectTracks.indices.contains(target.trackIndex),
@@ -7420,6 +7436,9 @@ final class WorkspaceView: NSView {
         timelineSurface.canApplyFadeEffect = canApplyFadeEffect
         timelineSurface.canReapplyLastEffect = canReapplyLastEffect
         timelineSurface.canSplitAtPlayhead = canSplitAtPlayhead
+        timelineSurface.canCutSelection = canCutSelection
+        timelineSurface.canCopySelection = canCopySelection
+        timelineSurface.canPasteAudio = canPasteAudio
         timelineSurface.canDeleteSelection = canDeleteSelection
         timelineSurface.canClearSelection = canClearSelection
         timelineSurface.canDeleteSilence = canDeleteSilence

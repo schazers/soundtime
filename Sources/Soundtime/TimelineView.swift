@@ -64,6 +64,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var canApplyFadeEffect = false
     var canReapplyLastEffect = false
     var canSplitAtPlayhead = false
+    var canCutSelection = false
+    var canCopySelection = false
+    var canPasteAudio = false
     var canDeleteSelection = false
     var canClearSelection = false
     var canDeleteSilence = false
@@ -1055,6 +1058,12 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return canDeleteSelection
         case #selector(clearTimelineSelection(_:)):
             return canClearSelection
+        case #selector(cutTimelineSelection(_:)):
+            return canCutSelection
+        case #selector(copyTimelineSelection(_:)):
+            return canCopySelection
+        case #selector(pasteTimelineAudio(_:)):
+            return canPasteAudio
         case #selector(splitAtPlayhead(_:)):
             return canSplitAtPlayhead
         case #selector(zoomToSelection(_:)):
