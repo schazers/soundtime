@@ -174,7 +174,7 @@ private final class PerformanceDashboardView: NSView {
             fpsCard.topAnchor.constraint(equalTo: subtitleLabel.bottomAnchor, constant: 22),
             fpsCard.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 26),
             fpsCard.widthAnchor.constraint(equalTo: cpuCard.widthAnchor),
-            fpsCard.heightAnchor.constraint(equalToConstant: 150),
+            fpsCard.heightAnchor.constraint(equalToConstant: 174),
 
             cpuCard.topAnchor.constraint(equalTo: fpsCard.topAnchor),
             cpuCard.leadingAnchor.constraint(equalTo: fpsCard.trailingAnchor, constant: 16),
@@ -344,11 +344,11 @@ private final class PerformanceMetricCardView: NSView {
 
         sparklineView.translatesAutoresizingMaskIntoConstraints = false
 
+        addSubview(sparklineView)
         addSubview(titleLabel)
         addSubview(valueLabel)
         addSubview(unitLabel)
         addSubview(subtitleLabel)
-        addSubview(sparklineView)
 
         NSLayoutConstraint.activate([
             titleLabel.topAnchor.constraint(equalTo: topAnchor, constant: 14),
