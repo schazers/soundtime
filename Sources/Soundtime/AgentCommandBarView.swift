@@ -72,8 +72,7 @@ final class AgentCommandBarView: NSView, NSTextViewDelegate {
     override func hitTest(_ point: NSPoint) -> NSView? {
         let textRect = convert(textBackgroundView.bounds, from: textBackgroundView).insetBy(dx: -2, dy: -2)
         if textRect.contains(point) {
-            let scrollPoint = convert(point, to: scrollView)
-            return scrollView.hitTest(scrollPoint) ?? scrollView
+            return textView
         }
 
         return super.hitTest(point)
@@ -174,7 +173,7 @@ final class AgentCommandBarView: NSView, NSTextViewDelegate {
 
             placeholderLabel.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor),
             placeholderLabel.trailingAnchor.constraint(lessThanOrEqualTo: scrollView.trailingAnchor),
-            placeholderLabel.centerYAnchor.constraint(equalTo: textBackgroundView.centerYAnchor, constant: 1),
+            placeholderLabel.centerYAnchor.constraint(equalTo: textBackgroundView.centerYAnchor),
 
             sendButton.trailingAnchor.constraint(equalTo: panelView.trailingAnchor, constant: -10),
             sendButton.topAnchor.constraint(equalTo: textBackgroundView.topAnchor),
@@ -365,12 +364,12 @@ private final class AgentPromptTextView: NSTextView {
 
     override func drawInsertionPoint(in rect: NSRect, color: NSColor, turnedOn flag: Bool) {
         var adjustedRect = rect
-        adjustedRect.size.width = max(rect.width, 2.2)
-        adjustedRect.size.height += 4
+        adjustedRect.size.width = max(rect.width, 2.5)
+        adjustedRect.size.height += 6
         if isFlipped {
-            adjustedRect.origin.y += 1.5
+            adjustedRect.origin.y += 2.5
         } else {
-            adjustedRect.origin.y -= 1.5
+            adjustedRect.origin.y -= 2.5
         }
 
         super.drawInsertionPoint(in: adjustedRect, color: color, turnedOn: flag)
@@ -390,14 +389,14 @@ private final class AgentPromptTextView: NSTextView {
         isVerticallyResizable = true
         minSize = NSSize(width: 0, height: 40)
         maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        textContainerInset = NSSize(width: 0, height: 14)
-        font = .systemFont(ofSize: 15, weight: .regular)
+        textContainerInset = NSSize(width: 0, height: 15)
+        font = .systemFont(ofSize: 15.5, weight: .regular)
         let paragraphStyle = NSMutableParagraphStyle()
-        paragraphStyle.lineSpacing = 4
+        paragraphStyle.lineSpacing = 5
         paragraphStyle.paragraphSpacing = 0
         defaultParagraphStyle = paragraphStyle
         typingAttributes = [
-            .font: NSFont.systemFont(ofSize: 15, weight: .regular),
+            .font: NSFont.systemFont(ofSize: 15.5, weight: .regular),
             .foregroundColor: NSColor(white: 0.94, alpha: 1),
             .paragraphStyle: paragraphStyle,
         ]
