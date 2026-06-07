@@ -284,7 +284,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         let nextTimelineDuration = Self.timelineDuration(for: tracks)
         timelineDuration = nextTimelineDuration
         let wasSelectionEnabled = isSelectionEnabled
-        isSelectionEnabled = tracks.contains { $0.hasWaveform }
+        isSelectionEnabled = Self.hasInteractiveTimelineContent(tracks)
         if !wasSelectionEnabled || !isSelectionEnabled {
             setViewport(.full)
         } else if
@@ -364,7 +364,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         currentRenderTracks = mergedTracks
         timelineDuration = Self.timelineDuration(for: mergedTracks)
         let wasSelectionEnabled = isSelectionEnabled
-        isSelectionEnabled = mergedTracks.contains { $0.hasWaveform }
+        isSelectionEnabled = Self.hasInteractiveTimelineContent(mergedTracks)
         updateTrackLayoutForCurrentBounds(requestRender: false)
 
         updateTimelineRenderer { renderer in
@@ -380,6 +380,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private static func timelineDuration(for tracks: [TimelineRenderState.Track]) -> TimeInterval {
         tracks.reduce(TimeInterval(0)) { result, track in
             max(result, track.durationHint ?? track.waveformOverview?.duration ?? 0)
+        }
+    }
+
+    private static func hasInteractiveTimelineContent(_ tracks: [TimelineRenderState.Track]) -> Bool {
+        tracks.contains { track in
+            track.hasWaveform ||
+                (track.durationHint.map { $0.isFinite && $0 > 0 } ?? false) ||
+                (track.waveformOverview?.duration.isFinite == true && (track.waveformOverview?.duration ?? 0) > 0)
         }
     }
 
