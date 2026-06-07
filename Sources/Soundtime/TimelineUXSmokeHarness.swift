@@ -139,6 +139,33 @@ enum TimelineUXSmokeHarness {
         )
         complete("pan changes viewport rendering and playhead x")
 
+        try verifyUltraZoomStillRenders(
+            renderer: renderer,
+            track: track,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        complete("ultra-zoom timeline render remains nonblank")
+
+        try verifyMultipleTrackLanesRender(
+            renderer: renderer,
+            track: track,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        complete("multi-track lane render keeps every visible lane alive")
+
+        try verifyDeletionEffectLifecycle(
+            renderer: renderer,
+            track: track,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        complete("delete animation effect appears and expires")
+
         try verifyHitTestingMathSurvivesDurationChanges()
         complete("timeline hit-testing maps clicked x before and after edits")
 
@@ -361,6 +388,117 @@ enum TimelineUXSmokeHarness {
         try require(secondX < firstX - 80, "panning did not move playhead left as viewport moved right: \(firstX) -> \(secondX)")
     }
 
+    private static func verifyUltraZoomStillRenders(
+        renderer: TimelineRenderer,
+        track: TimelineRenderState.Track,
+        texture: MTLTexture,
+        viewportSize: CGSize,
+        backingScale: Float
+    ) throws {
+        let viewport = TimelineViewport(startProgress: 0.318, durationProgress: 0.004)
+        let frame = try renderTimeline(
+            renderer: renderer,
+            tracks: [track],
+            viewport: viewport,
+            playheadProgress: 0.3198,
+            isPlaybackActive: false,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        try require(frame.summary.nonBackgroundPixelCount > 9_000, "ultra-zoom timeline render went mostly blank")
+        try require(frame.summary.brightPixelCount > 900, "ultra-zoom waveform was too dim to detect")
+    }
+
+    private static func verifyMultipleTrackLanesRender(
+        renderer: TimelineRenderer,
+        track: TimelineRenderState.Track,
+        texture: MTLTexture,
+        viewportSize: CGSize,
+        backingScale: Float
+    ) throws {
+        let tracks = [
+            track,
+            renderTrack(from: track, id: UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-000000000002") ?? UUID(), volume: 0.72),
+            renderTrack(from: track, id: UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-000000000003") ?? UUID(), volume: 0.48),
+        ]
+        let frame = try renderTimeline(
+            renderer: renderer,
+            tracks: tracks,
+            viewport: .full,
+            playheadProgress: 0.40,
+            isPlaybackActive: false,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+
+        let laneHeight = max(frame.summary.height / tracks.count, 1)
+        for laneIndex in tracks.indices {
+            let startRow = laneIndex * laneHeight
+            let endRow = laneIndex == tracks.count - 1 ? frame.summary.height : min(startRow + laneHeight, frame.summary.height)
+            let count = nonBackgroundPixelCount(inRows: startRow..<endRow, bytes: frame.bytes, width: frame.summary.width)
+            try require(count > 2_500, "multi-track lane \(laneIndex) rendered too few waveform pixels: \(count)")
+        }
+    }
+
+    private static func verifyDeletionEffectLifecycle(
+        renderer: TimelineRenderer,
+        track: TimelineRenderState.Track,
+        texture: MTLTexture,
+        viewportSize: CGSize,
+        backingScale: Float
+    ) throws {
+        renderer.clearDeletionEffects()
+        let selection = TimelineSelection(startProgress: 0.24, endProgress: 0.32, trackID: track.id)
+        let baseTimestamp = CACurrentMediaTime()
+        let baseFrame = try renderTimeline(
+            renderer: renderer,
+            tracks: [track],
+            viewport: .full,
+            playheadProgress: 0.24,
+            isPlaybackActive: false,
+            displayTimestamp: baseTimestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+
+        renderer.triggerDeletionEffect(selection: selection)
+        let activeFrame = try renderTimeline(
+            renderer: renderer,
+            tracks: [track],
+            viewport: .full,
+            playheadProgress: 0.24,
+            isPlaybackActive: false,
+            displayTimestamp: baseTimestamp + 0.02,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        try require(
+            pixelDifferenceCount(baseFrame.bytes, activeFrame.bytes, threshold: 12) > 1_500,
+            "delete animation effect did not visibly alter the render"
+        )
+
+        let expiredFrame = try renderTimeline(
+            renderer: renderer,
+            tracks: [track],
+            viewport: .full,
+            playheadProgress: 0.24,
+            isPlaybackActive: false,
+            displayTimestamp: baseTimestamp + 0.30,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        try require(
+            pixelDifferenceCount(baseFrame.bytes, expiredFrame.bytes, threshold: 12) < 600,
+            "delete animation effect did not visually expire"
+        )
+        renderer.clearDeletionEffects()
+    }
+
     private static func verifyHitTestingMathSurvivesDurationChanges() throws {
         let viewport = TimelineViewport(startProgress: 0.20, durationProgress: 0.50)
         let clickedViewportProgress: Float = 0.60
@@ -518,6 +656,23 @@ enum TimelineUXSmokeHarness {
         )
     }
 
+    private static func renderTrack(
+        from track: TimelineRenderState.Track,
+        id: UUID,
+        volume: Float
+    ) -> TimelineRenderState.Track {
+        TimelineRenderState.Track(
+            id: id,
+            waveformVersion: track.waveformVersion,
+            waveformOverview: track.waveformOverview,
+            durationHint: track.durationHint,
+            volume: volume,
+            isMuted: false,
+            isSoloed: false,
+            clipRanges: track.clipRanges
+        )
+    }
+
     private static func makeTexture(
         device: MTLDevice,
         pixelFormat: MTLPixelFormat,
@@ -562,6 +717,40 @@ enum TimelineUXSmokeHarness {
             let redDelta = abs(Int(lhs[byteIndex + 2]) - Int(rhs[byteIndex + 2]))
             if max(blueDelta, greenDelta, redDelta) > threshold {
                 count += 1
+            }
+        }
+        return count
+    }
+
+    private static func nonBackgroundPixelCount(
+        inRows rows: Range<Int>,
+        bytes: [UInt8],
+        width: Int,
+        backgroundLuminanceThreshold: Int = 34
+    ) -> Int {
+        guard width > 0, !rows.isEmpty else {
+            return 0
+        }
+
+        var count = 0
+        for row in rows {
+            guard row >= 0 else {
+                continue
+            }
+            let rowStart = row * width * 4
+            guard rowStart >= 0, rowStart + width * 4 <= bytes.count else {
+                continue
+            }
+
+            for column in 0..<width {
+                let byteIndex = rowStart + column * 4
+                let blue = Int(bytes[byteIndex])
+                let green = Int(bytes[byteIndex + 1])
+                let red = Int(bytes[byteIndex + 2])
+                let luminance = (red * 54 + green * 183 + blue * 19) / 256
+                if luminance > backgroundLuminanceThreshold {
+                    count += 1
+                }
             }
         }
         return count
