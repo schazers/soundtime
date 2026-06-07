@@ -6694,6 +6694,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         var shouldNotify = false
         waveformMipLevelStateLock.lock()
         if currentTrackWaveformMipKeys[key.trackID] == key {
+            if let currentLevels = trackWaveformMipLevels[key.trackID],
+               !currentLevels.isEmpty,
+               waveformMipLevelBinSignature(currentLevels) != waveformMipLevelBinSignature(levels)
+            {
+                previousTrackWaveformMipLevels = trackWaveformMipLevels
+                previousTransitionTracks = renderState.tracks
+                waveformGeometryStore.promoteCurrentToPrevious()
+                waveformTransitionStartTime = nil
+            }
             trackWaveformMipLevels[key.trackID] = levels
             if currentPrimaryWaveformTrackID == key.trackID {
                 waveformMipLevels = levels
@@ -6707,8 +6716,16 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         waveformMipLevelCacheLock.unlock()
 
         if shouldNotify {
+            prewarmCurrentInteractiveWaveformShaderBuffers(
+                drawableSize: lastRenderViewportSize,
+                backingScale: lastRenderBackingScale
+            )
             onRenderDataPrepared?()
         }
+    }
+
+    private func waveformMipLevelBinSignature(_ levels: [WaveformMipLevel]) -> [Int] {
+        levels.map(\.binCount)
     }
 
     private func publishWaveformMipLevelsToCache(
