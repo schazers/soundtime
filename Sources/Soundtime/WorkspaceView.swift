@@ -1133,9 +1133,14 @@ final class WorkspaceView: NSView {
     private func layoutTrackControlViews() {
         let viewportHeight = max(trackControlsStack.bounds.height, 1)
         let viewportWidth = max(trackControlsStack.bounds.width, 1)
+        let trackIndicesByID = Dictionary(
+            uniqueKeysWithValues: projectTracks.enumerated().map { index, track in
+                (track.id, index)
+            }
+        )
         for (trackID, controlView) in trackControlViewsByID {
             guard
-                let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }),
+                let trackIndex = trackIndicesByID[trackID],
                 let laneFrame = currentTrackLaneLayout.laneFrame(forTrackIndex: trackIndex)
             else {
                 controlView.isHidden = true
