@@ -35,6 +35,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onCutSelection: (() -> Void)?
     var onCopySelection: (() -> Void)?
     var onPasteAudio: (() -> Void)?
+    var onDuplicateRegionRequested: (() -> Void)?
     var onSplitAtPlayhead: (() -> Void)?
     var onInsertSilenceRequested: (() -> Void)?
     var onHealAdjacentClipsRequested: (() -> Void)?
@@ -846,6 +847,15 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         if
+            event.charactersIgnoringModifiers?.lowercased() == "d",
+            event.modifierFlags.contains(.command),
+            !event.modifierFlags.contains(.shift)
+        {
+            onDuplicateRegionRequested?()
+            return
+        }
+
+        if
             event.charactersIgnoringModifiers?.lowercased() == "b",
             event.modifierFlags.contains(.command)
         {
@@ -1035,6 +1045,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onPasteAudio?()
     }
 
+    @objc func duplicateTimelineRegion(_ sender: Any?) {
+        onDuplicateRegionRequested?()
+    }
+
     @objc func deleteTimelineSelection(_ sender: Any?) {
         onDeleteSelection?()
     }
@@ -1168,6 +1182,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         case #selector(cutTimelineSelection(_:)):
             return canCutSelection
         case #selector(copyTimelineSelection(_:)):
+            return canCopySelection
+        case #selector(duplicateTimelineRegion(_:)):
             return canCopySelection
         case #selector(pasteTimelineAudio(_:)):
             return canPasteAudio

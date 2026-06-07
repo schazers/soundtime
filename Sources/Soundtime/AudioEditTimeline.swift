@@ -37,6 +37,29 @@ struct AudioEditTimeline: Sendable {
         }
     }
 
+    struct Clip: Sendable {
+        fileprivate var segments: [Segment]
+
+        var frameCount: Int {
+            Self.totalFrameCount(segments)
+        }
+
+        var duration: TimeInterval {
+            guard sourceSampleRate > 0 else {
+                return 0
+            }
+            return Double(frameCount) / sourceSampleRate
+        }
+
+        fileprivate let sourceSampleRate: Double
+
+        private static func totalFrameCount(_ segments: [Segment]) -> Int {
+            segments.reduce(0) { total, segment in
+                total + segment.frameCount
+            }
+        }
+    }
+
     struct ClipRange: Equatable, Sendable {
         let startProgress: Double
         let endProgress: Double
@@ -47,7 +70,7 @@ struct AudioEditTimeline: Sendable {
         case trailing
     }
 
-    private struct Segment: Sendable {
+    fileprivate struct Segment: Sendable {
         let sourceStartFrame: Int
         let frameCount: Int
         let gainStart: Float
@@ -246,6 +269,35 @@ struct AudioEditTimeline: Sendable {
 
     mutating func clear(frameRange: Range<Int>) -> Int {
         clearFrames(in: frameRange)
+    }
+
+    func clip(for selection: TimelineSelection) -> Clip? {
+        let selectedSegments = segments(in: frameRange(for: selection))
+        guard !selectedSegments.isEmpty else {
+            return nil
+        }
+
+        return Clip(
+            segments: selectedSegments,
+            sourceSampleRate: sourceBuffer.sampleRate
+        )
+    }
+
+    mutating func replace(_ selection: TimelineSelection, with clip: Clip) -> Int? {
+        guard
+            abs(sourceBuffer.sampleRate - clip.sourceSampleRate) < 0.001,
+            !clip.segments.isEmpty
+        else {
+            return nil
+        }
+
+        let replacementRange = clampedFrameRange(for: selection)
+        let beforeSegments = segments(in: 0..<replacementRange.lowerBound)
+        let afterSegments = segments(in: replacementRange.upperBound..<frameCount)
+        segments = Self.coalescedSegments(beforeSegments + clip.segments + afterSegments)
+        let replacementFrameCount = Self.totalFrameCount(clip.segments)
+        timelineFrameCount = timelineFrameCount - replacementRange.count + replacementFrameCount
+        return replacementFrameCount
     }
 
     mutating func insertSilence(frameCount requestedFrameCount: Int, atProgress progress: Double) -> Int {
@@ -635,6 +687,49 @@ struct AudioEditTimeline: Sendable {
         segments.reduce(0) { total, segment in
             total + segment.frameCount
         }
+    }
+
+    private func clampedFrameRange(for selection: TimelineSelection) -> Range<Int> {
+        let frameRange = frameRange(for: selection)
+        return max(frameRange.lowerBound, 0)..<min(max(frameRange.upperBound, frameRange.lowerBound), frameCount)
+    }
+
+    private func segments(in frameRange: Range<Int>) -> [Segment] {
+        guard
+            frameRange.lowerBound < frameRange.upperBound,
+            frameRange.lowerBound < timelineFrameCount,
+            frameRange.upperBound > 0
+        else {
+            return []
+        }
+
+        let clampedRange = max(frameRange.lowerBound, 0)..<min(frameRange.upperBound, timelineFrameCount)
+        var result: [Segment] = []
+        result.reserveCapacity(segments.count)
+        var timelineFrame = 0
+
+        for segment in segments {
+            let segmentStartFrame = timelineFrame
+            let segmentEndFrame = timelineFrame + segment.frameCount
+            timelineFrame = segmentEndFrame
+
+            let overlapStartFrame = max(segmentStartFrame, clampedRange.lowerBound)
+            let overlapEndFrame = min(segmentEndFrame, clampedRange.upperBound)
+            guard overlapStartFrame < overlapEndFrame else {
+                continue
+            }
+
+            let segmentOffset = overlapStartFrame - segmentStartFrame
+            let selectedCount = overlapEndFrame - overlapStartFrame
+            let slicedSegment = slice(
+                segment,
+                offset: segmentOffset,
+                count: selectedCount
+            )
+            result.append(result.isEmpty ? slicedSegment.withClipBoundary(true) : slicedSegment)
+        }
+
+        return Self.coalescedSegments(result)
     }
 
     private mutating func split(atFrame requestedFrame: Int) -> Bool {
