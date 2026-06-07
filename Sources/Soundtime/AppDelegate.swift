@@ -243,22 +243,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: ""
         ))
         menu.addItem(NSMenuItem(
-            title: "Review Dead Air",
+            title: "Review Shorten Silence",
             action: #selector(TimelineView.deleteSilence(_:)),
             keyEquivalent: ""
         ))
         menu.addItem(NSMenuItem(
-            title: "Audition Dead Air Candidate",
+            title: "Audition Silence Candidate",
             action: #selector(TimelineView.auditionDeadAirCandidate(_:)),
             keyEquivalent: ""
         ))
         menu.addItem(NSMenuItem(
-            title: "Accept Dead Air Candidate",
+            title: "Accept Silence Candidate",
             action: #selector(TimelineView.acceptDeadAirCandidate(_:)),
             keyEquivalent: ""
         ))
         menu.addItem(NSMenuItem(
-            title: "Reject Dead Air Candidate",
+            title: "Reject Silence Candidate",
             action: #selector(TimelineView.rejectDeadAirCandidate(_:)),
             keyEquivalent: ""
         ))

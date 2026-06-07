@@ -4122,7 +4122,7 @@ final class WorkspaceView: NSView {
         let configuration = AudioSilenceAnalyzer.Configuration.podcastCleanup
 
         clearDeadAirReview(publish: true)
-        updateStatus("reviewing dead air")
+        updateStatus("reviewing shorten silence")
         Task { [weak self, sourceURL, audioTimeline, fileTimeline, displaySelection, editSelection, trackID, editRevision, configuration] in
             let result = await Task.detached(priority: .userInitiated) {
                 try Self.detectDeadAirReviewCandidates(
@@ -4149,7 +4149,7 @@ final class WorkspaceView: NSView {
                     expectedEditRevision: editRevision
                 )
             case let .failure(error):
-                self.updateStatus("dead air review failed: \(error.localizedDescription)")
+                self.updateStatus("shorten silence review failed: \(error.localizedDescription)")
             }
         }
     }
@@ -4253,13 +4253,13 @@ final class WorkspaceView: NSView {
             let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }),
             projectTracks[trackIndex].editRevision == expectedEditRevision
         else {
-            updateStatus("dead air review skipped: track changed")
+            updateStatus("shorten silence review skipped: track changed")
             return
         }
 
         guard !result.candidates.isEmpty else {
             clearDeadAirReview(publish: true)
-            updateStatus("no removable dead air found")
+            updateStatus("no removable silence found")
             return
         }
 
@@ -4268,7 +4268,7 @@ final class WorkspaceView: NSView {
         publishDeadAirCandidateRegions()
         updateEffectCommandState()
         let candidateWord = result.candidates.count == 1 ? "candidate" : "candidates"
-        updateStatus("found \(result.candidates.count) dead air \(candidateWord)")
+        updateStatus("found \(result.candidates.count) silence \(candidateWord)")
     }
 
     private func activeDeadAirCandidate() -> DeadAirReviewCandidate? {
@@ -4303,7 +4303,7 @@ final class WorkspaceView: NSView {
 
     private func acceptActiveDeadAirCandidate() {
         guard let candidate = activeDeadAirCandidate() else {
-            updateStatus("no dead air candidate to accept")
+            updateStatus("no silence candidate to accept")
             return
         }
         guard
@@ -4311,7 +4311,7 @@ final class WorkspaceView: NSView {
             projectTracks[trackIndex].editRevision == candidate.trackEditRevision
         else {
             clearDeadAirReview(publish: true)
-            updateStatus("dead air candidate expired; review again")
+            updateStatus("silence candidate expired; review again")
             return
         }
 
@@ -4332,7 +4332,7 @@ final class WorkspaceView: NSView {
         guard let candidate = activeDeadAirCandidate(),
               let candidateIndex = deadAirCandidates.firstIndex(where: { $0.id == candidate.id })
         else {
-            updateStatus("no dead air candidate to reject")
+            updateStatus("no silence candidate to reject")
             return
         }
 
@@ -4342,17 +4342,17 @@ final class WorkspaceView: NSView {
             deadAirCandidates.first?.id
         if deadAirCandidates.isEmpty {
             clearDeadAirReview(publish: true)
-            updateStatus("dead air review complete")
+            updateStatus("shorten silence review complete")
         } else {
             publishDeadAirCandidateRegions()
             updateEffectCommandState()
-            updateStatus("rejected dead air candidate")
+            updateStatus("rejected silence candidate")
         }
     }
 
     private func auditionActiveDeadAirCandidate() {
         guard let candidate = activeDeadAirCandidate() else {
-            updateStatus("no dead air candidate to audition")
+            updateStatus("no silence candidate to audition")
             return
         }
         guard playbackController.hasSource else {
@@ -4380,7 +4380,7 @@ final class WorkspaceView: NSView {
             }
             refreshPlaybackProgress(syncPlayheadWhenPlaying: true)
             startPlaybackTimer()
-            updateStatus("auditioning dead air")
+            updateStatus("auditioning silence candidate")
         } catch {
             stopPlaybackTimer()
             updateStatus("audition failed: \(error.localizedDescription)")
@@ -4401,7 +4401,7 @@ final class WorkspaceView: NSView {
                 self.playbackController.pause()
                 self.refreshPlaybackProgress(syncPlayheadWhenPlaying: false)
                 self.stopPlaybackTimer()
-                self.updateStatus("auditioned dead air candidate")
+                self.updateStatus("auditioned silence candidate")
             }
         }
     }
