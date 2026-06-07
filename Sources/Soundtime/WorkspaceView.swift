@@ -5365,22 +5365,107 @@ final class WorkspaceView: NSView {
 
     private func trimTimeline(to trimRange: TimelineTrimRange) {
         guard
-            let currentTimeline = audioTimeline,
-            trimRange.trimsAudio
+            trimRange.trimsAudio,
+            let trackIndex = activeProjectTrackIndex(),
+            projectTracks.indices.contains(trackIndex)
         else {
             return
         }
 
-        var editedTimeline = currentTimeline
-        let originalDuration = currentTimeline.duration
-        let trimmedFrameCount = editedTimeline.trim(to: trimRange)
-        guard trimmedFrameCount > 0 else {
+        let trackID = projectTracks[trackIndex].id
+        let undoSnapshot = ProjectTrackUndoSnapshot(
+            tracks: projectTracks,
+            activeTrackID: activeTrackID,
+            selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
+            selectedTimelineRange: selectedTimelineRange,
+            restoreProgress: playbackController.snapshot().progress
+        )
+        let editedAudioTimeline: AudioEditTimeline?
+        let editedFileTimeline: AudioFileEditTimeline?
+        let trimmedDuration: TimeInterval
+
+        if let currentFileTimeline = try? preferredFileTimelineForEditing(trackIndex: trackIndex) {
+            var timeline = currentFileTimeline
+            let originalDuration = currentFileTimeline.duration
+            let trimmedFrameCount = timeline.trim(to: trimRange)
+            guard trimmedFrameCount > 0 else {
+                return
+            }
+            trimmedDuration = max(originalDuration - timeline.duration, 0)
+            editedAudioTimeline = nil
+            editedFileTimeline = timeline
+        } else if let currentTimeline = projectTracks[trackIndex].audioTimeline {
+            var timeline = currentTimeline
+            let originalDuration = currentTimeline.duration
+            let trimmedFrameCount = timeline.trim(to: trimRange)
+            guard trimmedFrameCount > 0 else {
+                return
+            }
+            trimmedDuration = max(originalDuration - timeline.duration, 0)
+            editedAudioTimeline = timeline
+            editedFileTimeline = nil
+        } else {
+            updateStatus("track is not ready to trim")
             return
         }
 
-        editUndoStack.append(.timeline(trackID: activeTrackID, timeline: currentTimeline))
-        applyTimeline(editedTimeline)
-        updateStatus("trimmed \(formatDuration(originalDuration - editedTimeline.duration))")
+        editUndoStack.append(.projectTracks(undoSnapshot))
+        cancelEditMaterialization(for: trackID)
+        projectTracks[trackIndex].editRevision += 1
+        let editRevision = projectTracks[trackIndex].editRevision
+        projectTracks[trackIndex].audioTimeline = editedAudioTimeline
+        projectTracks[trackIndex].fileTimeline = editedFileTimeline
+        projectTracks[trackIndex].decodedAudioBuffer = editedAudioTimeline?.sourceAudioBuffer
+        projectTracks[trackIndex].durationHint = editedFileTimeline?.duration ?? editedAudioTimeline?.duration
+        let currentOverview = projectTracks[trackIndex].waveformOverview
+        if let editedFileTimeline {
+            projectTracks[trackIndex].waveformOverview =
+                optimisticWaveformOverview(
+                    for: editedFileTimeline,
+                    sourceOverview: projectTracks[trackIndex].sourceWaveformOverview,
+                    fallbackOverview: currentOverview
+                )
+            scheduleFileTimelineWaveformRefinement(
+                trackID: trackID,
+                fileTimeline: editedFileTimeline,
+                sourceOverview: projectTracks[trackIndex].sourceWaveformOverview ?? currentOverview,
+                editRevision: editRevision,
+                delay: editMaterializationDelay
+            )
+        } else if let currentOverview {
+            projectTracks[trackIndex].waveformOverview = WaveformOverview(
+                duration: editedAudioTimeline?.duration ?? currentOverview.duration,
+                bins: currentOverview.bins
+            )
+            cancelEditWaveformRefinement(for: trackID)
+        }
+
+        selectedTimelineRange = nil
+        timelineSurface.displaySelection(nil)
+        timelineSurface.displayGainPreview(selection: nil, gain: 1)
+        syncActiveTrackFields()
+        refreshProjectTimelineDisplay(rebuildControls: false, animateWaveformTransition: false)
+        updateProjectDisplayTiming()
+        reloadPlaybackFromProjectTracks(
+            preserveProgress: true,
+            resumeIfPlaying: playbackController.isPlaying
+        )
+        updateEffectCommandState()
+        let status = "trimmed \(formatDuration(trimmedDuration))"
+        updateStatus(status)
+
+        if let editedAudioTimeline {
+            materializeEditedTimeline(
+                trackID: trackID,
+                timeline: editedAudioTimeline,
+                editRevision: editRevision,
+                status: status,
+                preservePlaybackProgress: true,
+                startDelay: editMaterializationDelay,
+                animateWaveformTransition: false
+            )
+        }
     }
 
     private func showGainEffect() {
