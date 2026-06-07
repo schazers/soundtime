@@ -999,7 +999,7 @@ final class WorkspaceView: NSView {
     }
 
     private func refreshProjectTrackMixDisplay() {
-        timelineSurface.displayTrackMixSettings(timelineRenderTracks())
+        timelineSurface.displayTrackMixSettings(timelineMixRenderTracks())
     }
 
     private func timelineRenderTracks() -> [TimelineRenderState.Track] {
@@ -1016,6 +1016,26 @@ final class WorkspaceView: NSView {
                 volume: track.volume,
                 isMuted: track.isMuted,
                 isSoloed: track.isSoloed
+            )
+        }
+    }
+
+    private func timelineMixRenderTracks() -> [TimelineRenderState.Track] {
+        projectTracks.map { track in
+            let durationHint = track.waveformOverview?.duration ??
+                track.audioTimeline?.duration ??
+                track.fileTimeline?.duration ??
+                track.decodedAudioBuffer?.duration ??
+                track.durationHint
+            return TimelineRenderState.Track(
+                id: track.id,
+                waveformVersion: track.editRevision,
+                waveformOverview: nil,
+                durationHint: durationHint,
+                volume: track.volume,
+                isMuted: track.isMuted,
+                isSoloed: track.isSoloed,
+                hasWaveform: track.waveformOverview?.isEmpty == false
             )
         }
     }

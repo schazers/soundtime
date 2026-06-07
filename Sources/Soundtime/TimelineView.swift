@@ -227,7 +227,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         let nextTimelineDuration = Self.timelineDuration(for: tracks)
         timelineDuration = nextTimelineDuration
         let wasSelectionEnabled = isSelectionEnabled
-        isSelectionEnabled = tracks.contains { $0.waveformOverview?.isEmpty == false }
+        isSelectionEnabled = tracks.contains { $0.hasWaveform }
         if !wasSelectionEnabled || !isSelectionEnabled {
             setViewport(.full)
         } else if
@@ -304,7 +304,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         currentTrackIDs = tracks.map(\.id)
         timelineDuration = Self.timelineDuration(for: tracks)
         let wasSelectionEnabled = isSelectionEnabled
-        isSelectionEnabled = tracks.contains { $0.waveformOverview?.isEmpty == false }
+        isSelectionEnabled = tracks.contains { $0.hasWaveform }
         updateTrackLayoutForCurrentBounds(requestRender: false)
 
         updateTimelineRenderer { renderer in
