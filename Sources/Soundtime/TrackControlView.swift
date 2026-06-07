@@ -110,8 +110,8 @@ final class TrackControlView: NSView {
         panelView.translatesAutoresizingMaskIntoConstraints = false
         updateAppearance()
 
-        titleLabel.font = .systemFont(ofSize: 10, weight: .medium)
-        titleLabel.textColor = NSColor(white: 0.78, alpha: 1)
+        titleLabel.font = .systemFont(ofSize: 11, weight: .semibold)
+        titleLabel.textColor = NSColor(white: 0.84, alpha: 1)
         titleLabel.lineBreakMode = .byTruncatingTail
         titleLabel.maximumNumberOfLines = 1
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -141,7 +141,7 @@ final class TrackControlView: NSView {
 
         buttonStack.orientation = .horizontal
         buttonStack.alignment = .centerY
-        buttonStack.spacing = 6
+        buttonStack.spacing = 7
         buttonStack.translatesAutoresizingMaskIntoConstraints = false
         buttonStack.addArrangedSubview(soloButton)
         buttonStack.addArrangedSubview(muteButton)
@@ -150,7 +150,7 @@ final class TrackControlView: NSView {
         contentStack.orientation = .vertical
         contentStack.alignment = .leading
         contentStack.distribution = .fill
-        contentStack.spacing = 6
+        contentStack.spacing = 7
         contentStack.translatesAutoresizingMaskIntoConstraints = false
         contentStack.addArrangedSubview(titleLabel)
         contentStack.addArrangedSubview(volumeSlider)
@@ -166,15 +166,15 @@ final class TrackControlView: NSView {
             panelView.bottomAnchor.constraint(equalTo: bottomAnchor),
 
             contentStack.centerYAnchor.constraint(equalTo: panelView.centerYAnchor),
-            contentStack.topAnchor.constraint(greaterThanOrEqualTo: panelView.topAnchor, constant: 8),
-            contentStack.leadingAnchor.constraint(equalTo: panelView.leadingAnchor, constant: 12),
-            contentStack.trailingAnchor.constraint(lessThanOrEqualTo: panelView.trailingAnchor, constant: -12),
-            contentStack.bottomAnchor.constraint(lessThanOrEqualTo: panelView.bottomAnchor, constant: -8),
+            contentStack.topAnchor.constraint(greaterThanOrEqualTo: panelView.topAnchor, constant: 10),
+            contentStack.leadingAnchor.constraint(equalTo: panelView.leadingAnchor, constant: 14),
+            contentStack.trailingAnchor.constraint(lessThanOrEqualTo: panelView.trailingAnchor, constant: -14),
+            contentStack.bottomAnchor.constraint(lessThanOrEqualTo: panelView.bottomAnchor, constant: -10),
 
-            titleLabel.widthAnchor.constraint(equalTo: panelView.widthAnchor, constant: -24),
+            titleLabel.widthAnchor.constraint(equalTo: panelView.widthAnchor, constant: -28),
 
-            volumeSlider.widthAnchor.constraint(equalToConstant: 104),
-            volumeSlider.heightAnchor.constraint(equalToConstant: 20),
+            volumeSlider.widthAnchor.constraint(equalToConstant: 112),
+            volumeSlider.heightAnchor.constraint(equalToConstant: 22),
 
             soloButton.widthAnchor.constraint(equalToConstant: 31),
             soloButton.heightAnchor.constraint(equalToConstant: 26),
