@@ -13,6 +13,7 @@ enum SoundtimeDiagnosticCategory: String, Codable, Sendable {
     case edit
     case device
     case interaction
+    case threading
     case system
 }
 
@@ -25,6 +26,16 @@ struct SoundtimeDiagnosticEvent: Codable, Sendable {
     let fields: [String: String]
 }
 
+struct SoundtimeDiagnosticsSnapshot: Sendable {
+    let frameStats: TimelineFrameStats?
+    let audioSnapshot: RealtimeAudioCoreSnapshot?
+    let events: [SoundtimeDiagnosticEvent]
+    let mainThreadStallCount: Int
+    let lastMainThreadStallMilliseconds: Double
+    let severeEventCount: Int
+    let warningEventCount: Int
+}
+
 final class SoundtimeDiagnostics: @unchecked Sendable {
     static let shared = SoundtimeDiagnostics()
 
@@ -33,9 +44,15 @@ final class SoundtimeDiagnostics: @unchecked Sendable {
     private let traceWriteQueue = DispatchQueue(label: "Soundtime.diagnostics.trace", qos: .utility)
     private let severeTraceWriteThrottle: TimeInterval = 3
     private var events: [SoundtimeDiagnosticEvent] = []
+    private var latestFrameStats: TimelineFrameStats?
+    private var latestAudioSnapshot: RealtimeAudioCoreSnapshot?
     private var lastUnderrunCount = 0
     private var lastDroppedCommandCount = 0
     private var lastTraceWriteByName: [String: TimeInterval] = [:]
+    private var mainThreadStallCount = 0
+    private var lastMainThreadStallMilliseconds: Double = 0
+    private var severeEventCount = 0
+    private var warningEventCount = 0
 
     private init() {}
 
@@ -61,6 +78,10 @@ final class SoundtimeDiagnostics: @unchecked Sendable {
     }
 
     func recordFrameStats(_ stats: TimelineFrameStats) {
+        lock.lock()
+        latestFrameStats = stats
+        lock.unlock()
+
         let severity: SoundtimeDiagnosticSeverity
         if stats.framesPerSecond <= 60 || stats.worstFrameTimeMilliseconds >= 32 {
             severity = .severe
@@ -95,6 +116,7 @@ final class SoundtimeDiagnostics: @unchecked Sendable {
         let underrunDelta: Int
         let droppedCommandDelta: Int
         lock.lock()
+        latestAudioSnapshot = snapshot
         underrunDelta = max(snapshot.underrunCount - lastUnderrunCount, 0)
         droppedCommandDelta = max(snapshot.droppedCommandCount - lastDroppedCommandCount, 0)
         lastUnderrunCount = max(lastUnderrunCount, snapshot.underrunCount)
@@ -131,6 +153,39 @@ final class SoundtimeDiagnostics: @unchecked Sendable {
                 ]
             )
         }
+    }
+
+    func recordMainThreadStall(milliseconds: Double) {
+        lock.lock()
+        mainThreadStallCount += 1
+        lastMainThreadStallMilliseconds = milliseconds
+        lock.unlock()
+
+        record(
+            category: .threading,
+            severity: milliseconds >= 120 ? .severe : .warning,
+            name: "main-thread-stall",
+            message: "Main thread heartbeat was delayed.",
+            fields: [
+                "delayMs": String(format: "%.2f", milliseconds),
+            ]
+        )
+    }
+
+    func snapshot(limit: Int = 128) -> SoundtimeDiagnosticsSnapshot {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        return SoundtimeDiagnosticsSnapshot(
+            frameStats: latestFrameStats,
+            audioSnapshot: latestAudioSnapshot,
+            events: Array(events.suffix(max(limit, 0))),
+            mainThreadStallCount: mainThreadStallCount,
+            lastMainThreadStallMilliseconds: lastMainThreadStallMilliseconds,
+            severeEventCount: severeEventCount,
+            warningEventCount: warningEventCount
+        )
     }
 
     func recentEvents(limit: Int = 256) -> [SoundtimeDiagnosticEvent] {
@@ -170,6 +225,14 @@ final class SoundtimeDiagnostics: @unchecked Sendable {
     private func append(_ event: SoundtimeDiagnosticEvent) {
         lock.lock()
         events.append(event)
+        switch event.severity {
+        case .info:
+            break
+        case .warning:
+            warningEventCount += 1
+        case .severe:
+            severeEventCount += 1
+        }
         if events.count > maximumEventCount {
             events.removeFirst(events.count - maximumEventCount)
         }
