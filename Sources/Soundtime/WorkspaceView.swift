@@ -2953,6 +2953,52 @@ final class WorkspaceView: NSView {
         return nil
     }
 
+    private func editableClipAtPlayheadTarget() -> EditableSelectionTarget? {
+        guard
+            let trackIndex = activeProjectTrackIndex(),
+            projectTracks.indices.contains(trackIndex)
+        else {
+            return nil
+        }
+
+        let track = projectTracks[trackIndex]
+        let projectDuration = projectSelectionDuration
+        let trackDuration = trackDuration(for: track)
+        guard projectDuration > 0, trackDuration > 0 else {
+            return nil
+        }
+
+        let playheadTime = Double(playbackController.snapshot().progress) * projectDuration
+        let localProgress = min(max(playheadTime / trackDuration, 0), 1)
+        let clipRanges = timelineClipRanges(for: track)
+        guard let clipRange = clipRanges.first(where: {
+            localProgress >= $0.startProgress && localProgress <= $0.endProgress
+        }) ?? clipRanges.first else {
+            return nil
+        }
+
+        let trackDurationProgress = trackDuration / projectDuration
+        let displaySelection = TimelineSelection(
+            startProgress: clipRange.startProgress * trackDurationProgress,
+            endProgress: clipRange.endProgress * trackDurationProgress,
+            trackID: track.id
+        )
+        let editSelection = TimelineSelection(
+            startProgress: clipRange.startProgress,
+            endProgress: clipRange.endProgress,
+            trackID: track.id
+        )
+        guard editSelection.durationProgress > 0 else {
+            return nil
+        }
+
+        return EditableSelectionTarget(
+            trackIndex: trackIndex,
+            displaySelection: displaySelection,
+            editSelection: editSelection
+        )
+    }
+
     private func materializeEditedTimeline(
         trackID: UUID,
         timeline: AudioEditTimeline,
@@ -3797,13 +3843,13 @@ final class WorkspaceView: NSView {
             applyNormalizeEffect()
             return AgentCommandResult(status: .accepted, message: "Agent: normalize requested")
         case .fadeInSelection:
-            guard canApplyGainEffect else {
+            guard canApplyFadeEffect else {
                 return AgentCommandResult(status: .failed, message: "Agent: select audio for fade in")
             }
             applyFadeEffect(.fadeIn)
             return AgentCommandResult(status: .accepted, message: "Agent: fade in requested")
         case .fadeOutSelection:
-            guard canApplyGainEffect else {
+            guard canApplyFadeEffect else {
                 return AgentCommandResult(status: .failed, message: "Agent: select audio for fade out")
             }
             applyFadeEffect(.fadeOut)
@@ -5630,20 +5676,26 @@ final class WorkspaceView: NSView {
     }
 
     private func reapplyLastEffect() {
-        guard
-            canApplyGainEffect,
-            let lastEffect
-        else {
+        guard let lastEffect else {
             return
         }
 
         switch lastEffect {
         case let .gain(decibels):
+            guard canApplyGainEffect else {
+                return
+            }
             let gain = GainEffectOverlayView.linearGain(forDecibels: decibels)
             applyGainEffect(decibels: decibels, gain: gain)
         case .normalize:
+            guard canApplyGainEffect else {
+                return
+            }
             applyNormalizeEffect()
         case let .fade(fadeEffect):
+            guard canApplyFadeEffect else {
+                return
+            }
             applyFadeEffect(fadeEffect)
         }
     }
@@ -5867,7 +5919,7 @@ final class WorkspaceView: NSView {
 
     private func applyFadeEffect(_ fadeEffect: FadeEffect) {
         guard
-            let target = currentEditableSelectionTarget()
+            let target = currentEditableSelectionTarget() ?? editableClipAtPlayheadTarget()
         else {
             return
         }
@@ -7211,6 +7263,22 @@ final class WorkspaceView: NSView {
         return hasEditableTimeline && target.editSelection.durationProgress > 0
     }
 
+    private var canApplyFadeEffect: Bool {
+        guard
+            let target = currentEditableSelectionTarget() ?? editableClipAtPlayheadTarget(),
+            projectTracks.indices.contains(target.trackIndex)
+        else {
+            return false
+        }
+
+        let track = projectTracks[target.trackIndex]
+        let hasEditableTimeline =
+            track.audioTimeline != nil ||
+            track.fileTimeline != nil ||
+            WAVAudioDecoder.canDecode(track.sourceURL)
+        return hasEditableTimeline && target.editSelection.durationProgress > 0
+    }
+
     private var canSplitAtPlayhead: Bool {
         guard
             let trackIndex = activeProjectTrackIndex(),
@@ -7334,14 +7402,27 @@ final class WorkspaceView: NSView {
 
     private func updateEffectCommandState() {
         timelineSurface.canApplyGainEffect = canApplyGainEffect
-        timelineSurface.canApplyFadeEffect = canApplyGainEffect
-        timelineSurface.canReapplyLastEffect = lastEffect != nil && canApplyGainEffect
+        timelineSurface.canApplyFadeEffect = canApplyFadeEffect
+        timelineSurface.canReapplyLastEffect = canReapplyLastEffect
         timelineSurface.canSplitAtPlayhead = canSplitAtPlayhead
         timelineSurface.canDeleteSelection = canDeleteSelection
         timelineSurface.canClearSelection = canClearSelection
         timelineSurface.canDeleteSilence = canDeleteSilence
         timelineSurface.canUseDeadAirCandidate = activeDeadAirCandidate() != nil
         updateEditScopeHint()
+    }
+
+    private var canReapplyLastEffect: Bool {
+        guard let lastEffect else {
+            return false
+        }
+
+        switch lastEffect {
+        case .gain, .normalize:
+            return canApplyGainEffect
+        case .fade:
+            return canApplyFadeEffect
+        }
     }
 
     private func updateStatus(_ status: String) {
