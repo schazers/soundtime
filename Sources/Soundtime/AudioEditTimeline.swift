@@ -139,6 +139,16 @@ struct AudioEditTimeline: Sendable {
                 startsNewClip: startsNewClip
             )
         }
+
+        func shifted(by frameDelta: Int) -> Segment {
+            Segment(
+                sourceStartFrame: sourceStartFrame + frameDelta,
+                frameCount: frameCount,
+                gainStart: gainStart,
+                gainEnd: gainEnd,
+                startsNewClip: startsNewClip
+            )
+        }
     }
 
     private let sourceBuffer: DecodedAudioBuffer
@@ -402,6 +412,76 @@ struct AudioEditTimeline: Sendable {
         segments = Self.coalescedSegments(segments)
         timelineFrameCount = Self.totalFrameCount(segments)
         return true
+    }
+
+    mutating func slipClip(
+        _ clipRange: ClipRange,
+        byFrameCount requestedFrameDelta: Int
+    ) -> Int {
+        guard
+            requestedFrameDelta != 0,
+            sourceBuffer.frameCount > 0,
+            clipRange.startProgress < clipRange.endProgress
+        else {
+            return 0
+        }
+
+        let clipFrameRange = frameRange(for: TimelineSelection(
+            startProgress: clipRange.startProgress,
+            endProgress: clipRange.endProgress
+        ))
+        let clipSegments = segments(in: clipFrameRange)
+        guard !clipSegments.isEmpty else {
+            return 0
+        }
+
+        let minimumDelta = clipSegments.map { -$0.sourceStartFrame }.max() ?? 0
+        let maximumDelta = clipSegments.map { sourceBuffer.frameCount - $0.sourceEndFrame }.min() ?? 0
+        let frameDelta = min(max(requestedFrameDelta, minimumDelta), maximumDelta)
+        guard frameDelta != 0 else {
+            return 0
+        }
+
+        var nextSegments: [Segment] = []
+        nextSegments.reserveCapacity(segments.count + 2)
+        var timelineFrame = 0
+        for segment in segments {
+            let segmentStartFrame = timelineFrame
+            let segmentEndFrame = timelineFrame + segment.frameCount
+            timelineFrame = segmentEndFrame
+
+            let overlapStartFrame = max(segmentStartFrame, clipFrameRange.lowerBound)
+            let overlapEndFrame = min(segmentEndFrame, clipFrameRange.upperBound)
+            guard overlapStartFrame < overlapEndFrame else {
+                nextSegments.append(segment)
+                continue
+            }
+
+            let beforeCount = overlapStartFrame - segmentStartFrame
+            if beforeCount > 0 {
+                nextSegments.append(slice(segment, offset: 0, count: beforeCount))
+            }
+
+            let selectedSegment = slice(
+                segment,
+                offset: overlapStartFrame - segmentStartFrame,
+                count: overlapEndFrame - overlapStartFrame
+            ).shifted(by: frameDelta)
+            nextSegments.append(selectedSegment)
+
+            let afterCount = segmentEndFrame - overlapEndFrame
+            if afterCount > 0 {
+                nextSegments.append(slice(
+                    segment,
+                    offset: overlapEndFrame - segmentStartFrame,
+                    count: afterCount
+                ))
+            }
+        }
+
+        segments = Self.coalescedSegments(nextSegments)
+        timelineFrameCount = Self.totalFrameCount(segments)
+        return frameDelta
     }
 
     mutating func trim(to trimRange: TimelineTrimRange) -> Int {

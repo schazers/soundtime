@@ -40,6 +40,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onInsertSilenceRequested: (() -> Void)?
     var onHealAdjacentClipsRequested: (() -> Void)?
     var onNudgeSelectionRequested: ((Int) -> Void)?
+    var onSlipClipContentsRequested: ((Int) -> Void)?
     var onSnapSelectionRequested: (() -> Void)?
     var onSelectTimeAcrossLinkedTracksRequested: (() -> Void)?
     var onSelectAllClipsOnTrackRequested: (() -> Void)?
@@ -901,11 +902,19 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         if event.modifierFlags.contains(.option), event.keyCode == 123 {
+            if event.modifierFlags.contains(.command) {
+                onSlipClipContentsRequested?(-1)
+                return
+            }
             onNudgeSelectionRequested?(-1)
             return
         }
 
         if event.modifierFlags.contains(.option), event.keyCode == 124 {
+            if event.modifierFlags.contains(.command) {
+                onSlipClipContentsRequested?(1)
+                return
+            }
             onNudgeSelectionRequested?(1)
             return
         }
@@ -1081,6 +1090,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onNudgeSelectionRequested?(1)
     }
 
+    @objc func slipClipContentsLeft(_ sender: Any?) {
+        onSlipClipContentsRequested?(-1)
+    }
+
+    @objc func slipClipContentsRight(_ sender: Any?) {
+        onSlipClipContentsRequested?(1)
+    }
+
     @objc func snapSelectionToPlayheadEdgesOrSilence(_ sender: Any?) {
         onSnapSelectionRequested?()
     }
@@ -1165,6 +1182,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         case #selector(nudgeSelectionLeft(_:)),
              #selector(nudgeSelectionRight(_:)):
             return currentSelection?.durationProgress ?? 0 > 0
+        case #selector(slipClipContentsLeft(_:)),
+             #selector(slipClipContentsRight(_:)):
+            return canSplitAtPlayhead
         case #selector(snapSelectionToPlayheadEdgesOrSilence(_:)):
             return currentSelection?.durationProgress ?? 0 > 0 || canUseDeadAirCandidate
         case #selector(selectTimeAcrossLinkedTracks(_:)):
