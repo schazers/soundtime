@@ -603,6 +603,9 @@ final class WorkspaceView: NSView {
         timelineSurface.onNudgeSelectionRequested = { [weak self] direction in
             self?.nudgeSelection(direction: direction)
         }
+        timelineSurface.onSnapSelectionRequested = { [weak self] in
+            self?.snapSelectionToPlayheadEdgesOrSilence()
+        }
         timelineSurface.onUndo = { [weak self] in
             self?.undoLastEdit()
         }
@@ -4401,6 +4404,95 @@ final class WorkspaceView: NSView {
         timelineSurface.displaySelection(nudgedSelection)
         updateEffectCommandState()
         updateStatus("nudged selection \(direction < 0 ? "left" : "right") \(formatDuration(nudgeDuration))")
+    }
+
+    private func snapSelectionToPlayheadEdgesOrSilence() {
+        if let candidate = activeDeadAirCandidate() {
+            selectedTimelineRange = candidate.displaySelection
+            activeTrackID = candidate.trackID
+            timelineSurface.displaySelection(candidate.displaySelection)
+            timelineSurface.focusSelection(candidate.displaySelection)
+            updateEffectCommandState()
+            updateStatus("snapped selection to silence candidate")
+            return
+        }
+
+        guard
+            let selection = selectedTimelineRange,
+            selection.durationProgress > 0
+        else {
+            updateStatus("select time to snap")
+            return
+        }
+
+        let projectDuration = projectSelectionDuration
+        guard projectDuration > 0 else {
+            updateStatus("load audio before snapping")
+            return
+        }
+
+        var snappedSelection: TimelineSelection?
+        if
+            let trackIndex = trackIndex(for: selection),
+            projectTracks.indices.contains(trackIndex)
+        {
+            let track = projectTracks[trackIndex]
+            let trackDuration = trackDuration(for: track)
+            if trackDuration > 0 {
+                let trackDurationProgress = trackDuration / projectDuration
+                let boundaryProgresses = timelineClipRanges(for: track).flatMap { clipRange in
+                    [
+                        clipRange.startProgress * trackDurationProgress,
+                        clipRange.endProgress * trackDurationProgress,
+                    ]
+                }
+                if !boundaryProgresses.isEmpty {
+                    let snappedStart = nearestProgress(to: selection.startProgress, in: boundaryProgresses)
+                    let snappedEnd = nearestProgress(to: selection.endProgress, in: boundaryProgresses)
+                    if snappedEnd > snappedStart {
+                        snappedSelection = TimelineSelection(
+                            startProgress: snappedStart,
+                            endProgress: snappedEnd,
+                            trackID: track.id
+                        )
+                    }
+                }
+            }
+        }
+
+        if snappedSelection == nil {
+            let playheadProgress = Double(min(max(playbackController.snapshot().progress, 0), 1))
+            let startDistance = abs(selection.startProgress - playheadProgress)
+            let endDistance = abs(selection.endProgress - playheadProgress)
+            snappedSelection = startDistance <= endDistance ?
+                TimelineSelection(
+                    startProgress: playheadProgress,
+                    endProgress: selection.endProgress,
+                    trackID: selection.trackID
+                ) :
+                TimelineSelection(
+                    startProgress: selection.startProgress,
+                    endProgress: playheadProgress,
+                    trackID: selection.trackID
+                )
+        }
+
+        guard let snappedSelection, snappedSelection.durationProgress > 0 else {
+            updateStatus("no snap target found")
+            return
+        }
+
+        selectedTimelineRange = snappedSelection
+        timelineSurface.displaySelection(snappedSelection)
+        timelineSurface.focusSelection(snappedSelection)
+        updateEffectCommandState()
+        updateStatus("snapped selection")
+    }
+
+    private func nearestProgress(to progress: Double, in candidates: [Double]) -> Double {
+        candidates.min { lhs, rhs in
+            abs(lhs - progress) < abs(rhs - progress)
+        } ?? progress
     }
 
     private func silenceCleanupTarget() -> EditableSelectionTarget? {
