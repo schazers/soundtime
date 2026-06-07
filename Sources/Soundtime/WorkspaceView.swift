@@ -591,6 +591,9 @@ final class WorkspaceView: NSView {
         timelineSurface.onSplitAtPlayhead = { [weak self] in
             self?.splitAtPlayhead()
         }
+        timelineSurface.onInsertSilenceRequested = { [weak self] in
+            self?.insertSilenceOrTime()
+        }
         timelineSurface.onUndo = { [weak self] in
             self?.undoLastEdit()
         }
@@ -4092,6 +4095,160 @@ final class WorkspaceView: NSView {
         updateEffectCommandState()
         let scopeSuffix = trackEdits.count > 1 ? " across \(trackEdits.count) tracks" : ""
         updateStatus("split at \(formatClockTime(Double(projectProgress) * displayedDuration))\(scopeSuffix)")
+    }
+
+    private func insertSilenceOrTime() {
+        let snapshot = playbackController.snapshot()
+        let projectDuration = projectSelectionDuration
+        guard projectDuration > 0 else {
+            updateStatus("load audio before inserting time")
+            return
+        }
+
+        let anchorTrackIndex: Int
+        let insertionProjectProgress: Float
+        let insertedDuration: TimeInterval
+        if
+            let target = currentEditableSelectionTarget(),
+            projectTracks.indices.contains(target.trackIndex)
+        {
+            anchorTrackIndex = target.trackIndex
+            insertionProjectProgress = target.displaySelection.startProgressFloat
+            insertedDuration = max(target.displaySelection.duration(in: projectDuration), 0)
+        } else if
+            let activeTrackIndex = activeProjectTrackIndex(),
+            projectTracks.indices.contains(activeTrackIndex)
+        {
+            anchorTrackIndex = activeTrackIndex
+            insertionProjectProgress = min(max(snapshot.progress, 0), 1)
+            insertedDuration = 1
+        } else {
+            updateStatus("select a track to insert time")
+            return
+        }
+
+        guard insertedDuration > 0 else {
+            updateStatus("select time to insert")
+            return
+        }
+
+        let scopedTrackIndices = scopedTrackIndices(anchorTrackIndex: anchorTrackIndex, scope: editScope)
+        let undoSnapshot = ProjectTrackUndoSnapshot(
+            tracks: projectTracks,
+            activeTrackID: activeTrackID,
+            selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
+            selectedTimelineRange: selectedTimelineRange,
+            restoreProgress: insertionProjectProgress
+        )
+
+        var editedTrackCount = 0
+        var materializationEdits: [(trackID: UUID, timeline: AudioEditTimeline, editRevision: Int)] = []
+        for trackIndex in scopedTrackIndices where projectTracks.indices.contains(trackIndex) {
+            let track = projectTracks[trackIndex]
+            let trackDuration = trackDuration(for: track)
+            guard trackDuration > 0 else {
+                continue
+            }
+
+            let insertionTime = Double(insertionProjectProgress) * projectDuration
+            let localProgress = min(max(insertionTime / trackDuration, 0), 1)
+            let insertedFrameCount: Int
+            let editedAudioTimeline: AudioEditTimeline?
+            let editedFileTimeline: AudioFileEditTimeline?
+            let editedDuration: TimeInterval
+
+            if let currentFileTimeline = try? preferredFileTimelineForEditing(trackIndex: trackIndex) {
+                var timeline = currentFileTimeline
+                let frameCount = max(Int((insertedDuration * timeline.sourceSampleRate).rounded()), 1)
+                insertedFrameCount = timeline.insertSilence(frameCount: frameCount, atProgress: localProgress)
+                editedAudioTimeline = nil
+                editedFileTimeline = timeline
+                editedDuration = timeline.duration
+            } else if let currentTimeline = projectTracks[trackIndex].audioTimeline {
+                var timeline = currentTimeline
+                let frameCount = max(Int((insertedDuration * timeline.sourceAudioBuffer.sampleRate).rounded()), 1)
+                insertedFrameCount = timeline.insertSilence(frameCount: frameCount, atProgress: localProgress)
+                editedAudioTimeline = timeline
+                editedFileTimeline = nil
+                editedDuration = timeline.duration
+            } else {
+                continue
+            }
+
+            guard insertedFrameCount > 0 else {
+                continue
+            }
+
+            if editedTrackCount == 0 {
+                editUndoStack.append(.projectTracks(undoSnapshot))
+            }
+            editedTrackCount += 1
+            let trackID = projectTracks[trackIndex].id
+            cancelEditMaterialization(for: trackID)
+            projectTracks[trackIndex].editRevision += 1
+            let editRevision = projectTracks[trackIndex].editRevision
+            projectTracks[trackIndex].audioTimeline = editedAudioTimeline
+            projectTracks[trackIndex].fileTimeline = editedFileTimeline
+            projectTracks[trackIndex].decodedAudioBuffer = editedAudioTimeline?.sourceAudioBuffer
+            projectTracks[trackIndex].durationHint = editedDuration
+
+            let currentOverview = projectTracks[trackIndex].waveformOverview
+            if let editedFileTimeline {
+                projectTracks[trackIndex].waveformOverview =
+                    optimisticWaveformOverview(
+                        for: editedFileTimeline,
+                        sourceOverview: projectTracks[trackIndex].sourceWaveformOverview,
+                        fallbackOverview: currentOverview
+                    )
+                scheduleFileTimelineWaveformRefinement(
+                    trackID: trackID,
+                    fileTimeline: editedFileTimeline,
+                    sourceOverview: projectTracks[trackIndex].sourceWaveformOverview ?? currentOverview,
+                    editRevision: editRevision,
+                    delay: editMaterializationDelay
+                )
+            } else if let currentOverview {
+                projectTracks[trackIndex].waveformOverview = WaveformOverview(
+                    duration: editedDuration,
+                    bins: currentOverview.bins
+                )
+            }
+
+            if let editedAudioTimeline {
+                materializationEdits.append((trackID, editedAudioTimeline, editRevision))
+            }
+        }
+
+        guard editedTrackCount > 0 else {
+            updateStatus("could not insert time")
+            return
+        }
+
+        selectedTimelineRange = nil
+        timelineSurface.displaySelection(nil)
+        refreshProjectTimelineDisplay(rebuildControls: false, animateWaveformTransition: false)
+        updateProjectDisplayTiming()
+        reloadPlaybackFromProjectTracks(
+            preserveProgress: true,
+            resumeIfPlaying: playbackController.isPlaying
+        )
+        updateEffectCommandState()
+
+        let scopeSuffix = editedTrackCount > 1 ? " across \(editedTrackCount) tracks" : ""
+        let status = "inserted \(formatDuration(insertedDuration)) silence\(scopeSuffix)"
+        updateStatus(status)
+        for edit in materializationEdits {
+            materializeEditedTimeline(
+                trackID: edit.trackID,
+                timeline: edit.timeline,
+                editRevision: edit.editRevision,
+                status: status,
+                preservePlaybackProgress: true,
+                startDelay: editMaterializationDelay,
+                animateWaveformTransition: false
+            )
+        }
     }
 
     private func silenceCleanupTarget() -> EditableSelectionTarget? {

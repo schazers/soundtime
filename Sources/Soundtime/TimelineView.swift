@@ -35,6 +35,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onCopySelection: (() -> Void)?
     var onPasteAudio: (() -> Void)?
     var onSplitAtPlayhead: (() -> Void)?
+    var onInsertSilenceRequested: (() -> Void)?
     var onUndo: (() -> Void)?
     var onExportRequested: (() -> Void)?
     var onOpenProjectRequested: (() -> Void)?
@@ -847,6 +848,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         if
+            event.charactersIgnoringModifiers?.lowercased() == "i",
+            event.modifierFlags.contains(.command)
+        {
+            onInsertSilenceRequested?()
+            return
+        }
+
+        if
             event.charactersIgnoringModifiers?.lowercased() == "j",
             event.modifierFlags.contains(.command)
         {
@@ -1022,6 +1031,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onSplitAtPlayhead?()
     }
 
+    @objc func insertSilenceAtPlayhead(_ sender: Any?) {
+        onInsertSilenceRequested?()
+    }
+
     @objc func zoomToSelection(_ sender: Any?) {
         zoomToSelection()
     }
@@ -1104,6 +1117,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         case #selector(pasteTimelineAudio(_:)):
             return canPasteAudio
         case #selector(splitAtPlayhead(_:)):
+            return canSplitAtPlayhead
+        case #selector(insertSilenceAtPlayhead(_:)):
             return canSplitAtPlayhead
         case #selector(zoomToSelection(_:)):
             return currentSelection?.durationProgress ?? 0 > 0
