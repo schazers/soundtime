@@ -353,6 +353,17 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             }
         }
 
+        func containsAllAllocated(_ keys: [WaveformMipCacheKey]) -> Bool {
+            lock.lock()
+            defer {
+                lock.unlock()
+            }
+
+            return keys.allSatisfy { key in
+                allocations[key] != nil
+            }
+        }
+
         func trim(toMaximumCount maximumCount: Int, maximumByteCount: Int) {
             lock.lock()
             if allocations.count > maximumCount || diagnosticsByteCountLocked() > maximumByteCount {
@@ -793,6 +804,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let waveformShaderBufferStore: WaveformShaderBufferStore
     private var waveformShaderBatchScratch: [WaveformShaderBatch] = []
     private var lastInteractiveWaveformPrewarmKeys: [WaveformMipCacheKey] = []
+    private var waveformShaderPrewarmGeneration = 0
     private var selectedTrackVertexScratch: [TimelineVertex] = []
     private var selectionVertexScratch: [TimelineVertex] = []
     private var gridCache: GridCache?
@@ -1109,6 +1121,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         currentPrimaryWaveformTrackID = renderTracks.first?.id
         waveformMipLevelStateLock.unlock()
         lastInteractiveWaveformPrewarmKeys.removeAll()
+        waveformShaderPrewarmGeneration += 1
         prewarmInitialWaveformShaderBuffers(
             tracks: renderTracks,
             trackWaveformMipLevels: nextTrackWaveformMipLevels,
@@ -2392,7 +2405,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private func prepareWaveformShaderBinBuffer(
         track: TimelineRenderState.Track,
         mipLevel: WaveformMipLevel,
-        allowsSynchronousUpload: Bool
+        allowsSynchronousUpload: Bool,
+        generation: Int? = nil
     ) {
         let key = waveformShaderBufferKey(track: track, mipLevel: mipLevel)
         guard waveformShaderBufferStore.beginPreparing(
@@ -2417,6 +2431,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         waveformGeometryQueue.async { [weak self] in
+            guard
+                generation == nil ||
+                    generation == self?.waveformShaderPrewarmGeneration
+            else {
+                self?.waveformShaderBufferStore.publish(Optional<[WaveformShaderBin]>.none, for: key)
+                return
+            }
+
             let shaderBins = self?.makeWaveformShaderBins(
                 from: bins,
                 shouldYieldForPlayback: true
@@ -2451,7 +2473,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             prepareWaveformShaderBinBuffer(
                 track: track,
                 mipLevel: mipLevel,
-                allowsSynchronousUpload: true
+                allowsSynchronousUpload: true,
+                generation: waveformShaderPrewarmGeneration
             )
         }
 
@@ -2515,7 +2538,68 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return
         }
         lastInteractiveWaveformPrewarmKeys = jobKeys
-        enqueueWaveformShaderPrewarmJobs(visibleJobs)
+        let usesPriorityConversion = visibleJobs.count == 1 &&
+            (visibleJobs.first?.1.binCount ?? 0) > maximumBackgroundPrewarmedWaveformShaderBins
+        enqueueWaveformShaderPrewarmJobs(
+            visibleJobs,
+            generation: waveformShaderPrewarmGeneration,
+            usesPriorityConversion: usesPriorityConversion
+        )
+    }
+
+    func visibleWaveformShaderBuffersAreResident(drawableSize: CGSize) -> Bool {
+        guard drawableSize.width > 0, drawableSize.height > 0 else {
+            return true
+        }
+
+        let state = renderStateStore.snapshot()
+        guard !state.tracks.isEmpty else {
+            return true
+        }
+
+        waveformMipLevelStateLock.lock()
+        let mipLevels = trackWaveformMipLevels
+        waveformMipLevelStateLock.unlock()
+
+        let keys = visibleInteractiveWaveformShaderKeys(
+            tracks: state.tracks,
+            trackWaveformMipLevels: mipLevels,
+            renderState: state,
+            drawableSize: drawableSize
+        )
+        return waveformShaderBufferStore.containsAllAllocated(keys)
+    }
+
+    private func visibleInteractiveWaveformShaderKeys(
+        tracks: [TimelineRenderState.Track],
+        trackWaveformMipLevels: [UUID: [WaveformMipLevel]],
+        renderState: TimelineRenderState,
+        drawableSize: CGSize
+    ) -> [WaveformMipCacheKey] {
+        let visibleIDs = visiblePrewarmTrackIDs(
+            tracks: tracks,
+            renderState: renderState,
+            drawableSize: drawableSize
+        )
+        let viewportBinLimit = viewportAwarePrewarmBinLimit(
+            renderState: renderState,
+            drawableSize: drawableSize
+        )
+        return tracks.compactMap { track -> WaveformMipCacheKey? in
+            guard visibleIDs.contains(track.id) else {
+                return nil
+            }
+            guard let mipLevels = trackWaveformMipLevels[track.id] else {
+                return nil
+            }
+            guard let interactiveMipLevel = mipLevels.first(where: {
+                $0.binCount <= viewportBinLimit
+            }) else {
+                return nil
+            }
+
+            return waveformShaderBufferKey(track: track, mipLevel: interactiveMipLevel)
+        }
     }
 
     private func visiblePrewarmTrackIDs(
@@ -2540,18 +2624,27 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
 
     private func enqueueWaveformShaderPrewarmJobs(
-        _ jobs: [(TimelineRenderState.Track, WaveformMipLevel)]
+        _ jobs: [(TimelineRenderState.Track, WaveformMipLevel)],
+        generation: Int,
+        usesPriorityConversion: Bool
     ) {
         guard !jobs.isEmpty else {
             return
         }
 
-        enqueueWaveformShaderPrewarmJobs(jobs, startIndex: 0)
+        enqueueWaveformShaderPrewarmJobs(
+            jobs,
+            startIndex: 0,
+            generation: generation,
+            usesPriorityConversion: usesPriorityConversion
+        )
     }
 
     private func enqueueWaveformShaderPrewarmJobs(
         _ jobs: [(TimelineRenderState.Track, WaveformMipLevel)],
-        startIndex: Int
+        startIndex: Int,
+        generation: Int,
+        usesPriorityConversion: Bool
     ) {
         guard startIndex < jobs.count else {
             return
@@ -2561,10 +2654,17 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             guard let self else {
                 return
             }
+            guard generation == self.waveformShaderPrewarmGeneration else {
+                return
+            }
 
             var publishedCount = 0
             let endIndex = min(startIndex + self.waveformPrewarmJobBatchSize, jobs.count)
             for jobIndex in startIndex..<endIndex {
+                guard generation == self.waveformShaderPrewarmGeneration else {
+                    return
+                }
+
                 let (track, mipLevel) = jobs[jobIndex]
                 let key = self.waveformShaderBufferKey(track: track, mipLevel: mipLevel)
                 if self.waveformShaderBufferStore.allocation(for: key) != nil {
@@ -2580,7 +2680,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
                 let shaderBins = self.makeWaveformShaderBins(
                     from: mipLevel.overview.bins,
-                    shouldYieldForPlayback: true
+                    shouldYieldForPlayback: !usesPriorityConversion
                 )
                 self.waveformShaderBufferStore.publish(shaderBins, for: key)
                 publishedCount += 1
@@ -2603,7 +2703,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             }
 
             if endIndex < jobs.count {
-                self.enqueueWaveformShaderPrewarmJobs(jobs, startIndex: endIndex)
+                self.enqueueWaveformShaderPrewarmJobs(
+                    jobs,
+                    startIndex: endIndex,
+                    generation: generation,
+                    usesPriorityConversion: usesPriorityConversion
+                )
             }
         }
     }

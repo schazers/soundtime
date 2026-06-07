@@ -219,8 +219,9 @@ struct AudioFileEditTimeline: Sendable {
             return WaveformOverview(duration: duration, bins: [])
         }
 
-        var editedBins: [WaveformOverview.Bin] = []
         let sourceBinCount = sourceOverview.bins.count
+        var editedBins: [WaveformOverview.Bin] = []
+        editedBins.reserveCapacity(sourceBinCount)
         let sourceFramesPerBin = Double(sourceFrameCount) / Double(sourceBinCount)
         for segment in segments {
             let startBin = min(
@@ -235,7 +236,18 @@ struct AudioFileEditTimeline: Sendable {
                 continue
             }
 
-            editedBins.reserveCapacity(editedBins.count + endBin - startBin)
+            if segment.hasConstantGain {
+                let gain = segment.gainStart
+                if abs(gain - 1) <= Self.gainEpsilon {
+                    editedBins.append(contentsOf: sourceOverview.bins[startBin..<endBin])
+                } else {
+                    for sourceBinIndex in startBin..<endBin {
+                        editedBins.append(sourceOverview.bins[sourceBinIndex].scaled(by: gain))
+                    }
+                }
+                continue
+            }
+
             for sourceBinIndex in startBin..<endBin {
                 let binCenterFrame = min(
                     max(Int((Double(sourceBinIndex) + 0.5) * sourceFramesPerBin), segment.sourceStartFrame),

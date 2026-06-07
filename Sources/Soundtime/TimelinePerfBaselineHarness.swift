@@ -516,7 +516,11 @@ enum TimelinePerfBaselineHarness {
 
                 let statsAfterFrame = rendererStats()
                 if !hasSettledRendererResidency, frame >= minimumSettleFrame {
-                    let isResidencySettled = statsAfterFrame.shaderBufferUploadCount == 0 &&
+                    let visibleBuffersAreResident = renderer.visibleWaveformShaderBuffersAreResident(
+                        drawableSize: viewportSize
+                    )
+                    let isResidencySettled = visibleBuffersAreResident &&
+                        statsAfterFrame.shaderBufferUploadCount == 0 &&
                         statsAfterFrame.shaderBufferUploadInFlightCount == 0
                     settledResidencyFrameCount = isResidencySettled ?
                         settledResidencyFrameCount + 1 :
