@@ -3826,9 +3826,11 @@ final class WorkspaceView: NSView {
                 zeroCrossingProbe: previewResult.zeroCrossingProbe
             )
             currentPlaybackStatus = "press Space to play - resolving waveform"
+            updateTransportControlState(isPlaying: false)
         } catch {
             playbackController.clear()
             currentPlaybackStatus = "preview ready - playback failed: \(error.localizedDescription)"
+            updateTransportControlState(isPlaying: false)
         }
 
         updateStatus(currentPlaybackStatus)

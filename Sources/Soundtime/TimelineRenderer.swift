@@ -1860,7 +1860,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             backingScale: backingScale,
             renderState: renderState
         )
-        let usesWaveformShader = shouldRenderShaderWaveforms(
+        let canUseWaveformShader = shouldRenderShaderWaveforms(
             drawableSize: viewportSize,
             renderState: renderState
         )
@@ -1868,10 +1868,26 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let previousShaderRenderState = hasWaveformTransition ?
             renderState.replacingTracks(previousTransitionTracks(withCurrentMixFrom: renderState.tracks)) :
             nil
-        let usesPreviousWaveformShader = previousShaderRenderState.map {
+        let canUsePreviousWaveformShader = previousShaderRenderState.map {
             shouldRenderShaderWaveforms(
                 drawableSize: viewportSize,
                 renderState: $0
+            )
+        } ?? false
+        let usesWaveformShader = canUseWaveformShader && shaderWaveformsAreDrawable(
+            drawableSize: viewportSize,
+            backingScale: backingScale,
+            renderState: renderState,
+            trackWaveformMipLevels: mipLevelSnapshot.currentByTrack,
+            fallbackPolicy: .allowFallbacks
+        )
+        let usesPreviousWaveformShader = previousShaderRenderState.map { previousRenderState in
+            canUsePreviousWaveformShader && shaderWaveformsAreDrawable(
+                drawableSize: viewportSize,
+                backingScale: backingScale,
+                renderState: previousRenderState,
+                trackWaveformMipLevels: mipLevelSnapshot.previousByTrack,
+                fallbackPolicy: .allowFallbacks
             )
         } ?? false
         let waveformTouchParameters = (usesWaveformShader || usesPreviousWaveformShader) ?
@@ -1895,13 +1911,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 mipLevelSnapshot: mipLevelSnapshot
             ) :
             nil
-        let currentShaderWaveformsReady = usesWaveformShader &&
-            (!hasWaveformTransition || preferredShaderWaveformsAreReady(
-                drawableSize: viewportSize,
-                backingScale: backingScale,
-                renderState: renderState,
-                trackWaveformMipLevels: mipLevelSnapshot.currentByTrack
-            ))
+        let currentShaderWaveformsReady = usesWaveformShader
         let waveformTransitionOpacities = waveformTransitionOpacities(
             at: displayTimestamp,
             hasCurrent: currentShaderWaveformsReady || waveformVertices != nil,
@@ -2355,6 +2365,22 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         renderState: TimelineRenderState,
         trackWaveformMipLevels: [UUID: [WaveformMipLevel]]
     ) -> Bool {
+        shaderWaveformsAreDrawable(
+            drawableSize: drawableSize,
+            backingScale: backingScale,
+            renderState: renderState,
+            trackWaveformMipLevels: trackWaveformMipLevels,
+            fallbackPolicy: .preferredOnly
+        )
+    }
+
+    private func shaderWaveformsAreDrawable(
+        drawableSize: CGSize,
+        backingScale: Float,
+        renderState: TimelineRenderState,
+        trackWaveformMipLevels: [UUID: [WaveformMipLevel]],
+        fallbackPolicy: WaveformShaderFallbackPolicy
+    ) -> Bool {
         guard
             let projectDuration = renderState.duration,
             projectDuration.isFinite,
@@ -2397,7 +2423,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 drawableSize: drawableSize,
                 backingScale: backingScale,
                 renderState: renderState,
-                fallbackPolicy: .preferredOnly
+                fallbackPolicy: fallbackPolicy
             ) != nil else {
                 return false
             }
@@ -3438,15 +3464,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
             let contentSignature = waveformContentSignature(renderState: renderState)
             let visualSignature = waveformVisualSignature(renderState: renderState)
-            if renderState.isPlaybackActive, isGPUWaveformRendererEnabled {
-                return waveformGeometryStore.fallback(
-                    contentSignature: contentSignature,
-                    target: target
-                ).map { waveformDrawCache($0, renderViewport: renderState.viewport) } ??
-                waveformGeometryStore.fallbackAny(target: target).map {
-                    waveformDrawCache($0, renderViewport: renderState.viewport)
-                }
-            }
             let geometryRenderState = renderState.withViewport(geometryViewport)
             prepareWaveformGeometry(
                 key: key,
@@ -3493,15 +3510,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         let contentSignature = waveformContentSignature(renderState: renderState)
         let visualSignature = waveformVisualSignature(renderState: renderState)
-        if renderState.isPlaybackActive, isGPUWaveformRendererEnabled {
-            return waveformGeometryStore.fallback(
-                contentSignature: contentSignature,
-                target: target
-            ).map { waveformDrawCache($0, renderViewport: renderState.viewport) } ??
-            waveformGeometryStore.fallbackAny(target: target).map {
-                waveformDrawCache($0, renderViewport: renderState.viewport)
-            }
-        }
         let geometryRenderState = renderState.withViewport(geometryViewport)
         prepareWaveformGeometry(
             key: key,
