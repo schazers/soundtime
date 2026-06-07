@@ -13,6 +13,7 @@ enum DiagnosticsSmokeHarness {
     }
 
     static func runFromCommandLine(arguments: [String]) throws {
+        let startedAtNanoseconds = DispatchTime.now().uptimeNanoseconds
         let diagnostics = SoundtimeDiagnostics.shared
         diagnostics.resetForSmokeTesting()
 
@@ -23,6 +24,22 @@ enum DiagnosticsSmokeHarness {
         try verifyEventRetentionLimit(diagnostics)
 
         diagnostics.resetForSmokeTesting()
+        let checks = [
+            "basic event accounting",
+            "frame stats warning/severe escalation",
+            "audio snapshot escalation",
+            "diagnostics trace writing",
+            "event retention limit",
+        ]
+        if let reportURL = StabilityReportWriter.writePassedSuite(
+            name: "diagnostics-smoke",
+            startedAtNanoseconds: startedAtNanoseconds,
+            checks: checks,
+            metadata: ["traceBackend": "json"],
+            arguments: arguments
+        ) {
+            print("wrote stability report: \(reportURL.path)")
+        }
         print("Soundtime diagnostics smoke passed")
     }
 
