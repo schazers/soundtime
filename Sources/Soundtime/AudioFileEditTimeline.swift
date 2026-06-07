@@ -16,6 +16,25 @@ struct AudioFileEditTimeline: Sendable {
         var segments: [PersistentSegment]
     }
 
+    struct Clip: Sendable {
+        var sourceFrameCount: Int
+        var sourceSampleRate: Double
+        var segments: [PersistentSegment]
+
+        var frameCount: Int {
+            segments.reduce(0) { total, segment in
+                total + segment.frameCount
+            }
+        }
+
+        var duration: TimeInterval {
+            guard sourceSampleRate > 0 else {
+                return 0
+            }
+            return Double(frameCount) / sourceSampleRate
+        }
+    }
+
     private struct Segment: Sendable {
         let sourceStartFrame: Int
         let frameCount: Int
@@ -214,6 +233,60 @@ struct AudioFileEditTimeline: Sendable {
             abs(sourceSampleRate - fileInfo.sampleRate) < 0.001
     }
 
+    func isCompatible(with clip: Clip) -> Bool {
+        sourceFrameCount == clip.sourceFrameCount &&
+            abs(sourceSampleRate - clip.sourceSampleRate) < 0.001
+    }
+
+    func clip(for selection: TimelineSelection) -> Clip? {
+        let selectedSegments = segments(in: frameRange(for: selection))
+        guard !selectedSegments.isEmpty else {
+            return nil
+        }
+
+        return Clip(
+            sourceFrameCount: sourceFrameCount,
+            sourceSampleRate: sourceSampleRate,
+            segments: selectedSegments.map { segment in
+                PersistentSegment(
+                    sourceStartFrame: segment.sourceStartFrame,
+                    frameCount: segment.frameCount,
+                    gainStart: segment.gainStart,
+                    gainEnd: segment.gainEnd
+                )
+            }
+        )
+    }
+
+    mutating func replace(_ selection: TimelineSelection, with clip: Clip) -> Int? {
+        guard isCompatible(with: clip) else {
+            return nil
+        }
+
+        let replacementSegments = Self.validatedSegments(
+            clip.segments.map { persistentSegment in
+                Segment(
+                    sourceStartFrame: persistentSegment.sourceStartFrame,
+                    frameCount: persistentSegment.frameCount,
+                    gainStart: persistentSegment.gainStart,
+                    gainEnd: persistentSegment.gainEnd
+                )
+            },
+            sourceFrameCount: sourceFrameCount
+        )
+        guard !replacementSegments.isEmpty else {
+            return nil
+        }
+
+        let replacementRange = clampedFrameRange(for: selection)
+        let beforeSegments = segments(in: 0..<replacementRange.lowerBound)
+        let afterSegments = segments(in: replacementRange.upperBound..<frameCount)
+        segments = Self.coalescedSegments(beforeSegments + replacementSegments + afterSegments)
+        return replacementSegments.reduce(0) { total, segment in
+            total + segment.frameCount
+        }
+    }
+
     func waveformOverview(from sourceOverview: WaveformOverview) -> WaveformOverview {
         guard sourceFrameCount > 0, !sourceOverview.bins.isEmpty else {
             return WaveformOverview(duration: duration, bins: [])
@@ -278,6 +351,49 @@ struct AudioFileEditTimeline: Sendable {
         let startFrame = Int((selection.startProgress * Double(frameCount)).rounded(.down))
         let endFrame = Int((selection.endProgress * Double(frameCount)).rounded(.up))
         return max(startFrame, 0)..<min(max(endFrame, startFrame), frameCount)
+    }
+
+    private func clampedFrameRange(for selection: TimelineSelection) -> Range<Int> {
+        let startFrame = Int((selection.startProgress * Double(frameCount)).rounded(.down))
+        let endFrame = Int((selection.endProgress * Double(frameCount)).rounded(.up))
+        let lowerBound = min(max(startFrame, 0), frameCount)
+        let upperBound = min(max(endFrame, lowerBound), frameCount)
+        return lowerBound..<upperBound
+    }
+
+    private func segments(in frameRange: Range<Int>) -> [Segment] {
+        guard
+            frameRange.lowerBound < frameRange.upperBound,
+            frameRange.lowerBound < frameCount,
+            frameRange.upperBound > 0
+        else {
+            return []
+        }
+
+        let clampedRange = max(frameRange.lowerBound, 0)..<min(frameRange.upperBound, frameCount)
+        var outputSegments: [Segment] = []
+        var timelineFrame = 0
+
+        for segment in segments {
+            let segmentStartFrame = timelineFrame
+            let segmentEndFrame = timelineFrame + segment.frameCount
+            timelineFrame = segmentEndFrame
+
+            let overlapStartFrame = max(segmentStartFrame, clampedRange.lowerBound)
+            let overlapEndFrame = min(segmentEndFrame, clampedRange.upperBound)
+
+            guard overlapStartFrame < overlapEndFrame else {
+                continue
+            }
+
+            outputSegments.append(slice(
+                segment,
+                offset: overlapStartFrame - segmentStartFrame,
+                count: overlapEndFrame - overlapStartFrame
+            ))
+        }
+
+        return Self.coalescedSegments(outputSegments)
     }
 
     private mutating func deleteFrames(in frameRange: Range<Int>) -> Int {

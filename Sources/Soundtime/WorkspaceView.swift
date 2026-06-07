@@ -81,6 +81,20 @@ final class WorkspaceView: NSView {
     private struct AudioClipboard: Sendable {
         let buffer: DecodedAudioBuffer
         let waveformOverview: WaveformOverview
+        let fileClipSourceURL: URL?
+        let fileClip: AudioFileEditTimeline.Clip?
+
+        init(
+            buffer: DecodedAudioBuffer,
+            waveformOverview: WaveformOverview,
+            fileClipSourceURL: URL? = nil,
+            fileClip: AudioFileEditTimeline.Clip? = nil
+        ) {
+            self.buffer = buffer
+            self.waveformOverview = waveformOverview
+            self.fileClipSourceURL = fileClipSourceURL
+            self.fileClip = fileClip
+        }
     }
 
     private struct EditableSelectionTarget {
@@ -3516,15 +3530,18 @@ final class WorkspaceView: NSView {
         }
 
         let sourceURL = projectTracks[trackIndex].sourceURL
+        let fileClip = fileTimeline.clip(for: selectedTimelineRange)
         updateStatus("copying selection")
-        Task { [weak self, fileTimeline, selectedTimelineRange, sourceURL] in
+        Task { [weak self, fileTimeline, selectedTimelineRange, sourceURL, fileClip] in
             let clipboard = await Task.detached(priority: .userInitiated) {
                 let sourceBuffer = try WAVAudioDecoder.decode(url: sourceURL)
                 let timeline = fileTimeline.audioTimeline(sourceBuffer: sourceBuffer)
                 let buffer = timeline.render(selection: selectedTimelineRange)
                 return AudioClipboard(
                     buffer: buffer,
-                    waveformOverview: WaveformOverviewBuilder.build(from: buffer)
+                    waveformOverview: WaveformOverviewBuilder.build(from: buffer),
+                    fileClipSourceURL: fileClip == nil ? nil : sourceURL,
+                    fileClip: fileClip
                 )
             }.result
 
@@ -3656,6 +3673,67 @@ final class WorkspaceView: NSView {
         let currentOverview = projectTracks[trackIndex].waveformOverview
         let trackID = projectTracks[trackIndex].id
         let sourceURL = projectTracks[trackIndex].sourceURL
+        if
+            currentTimeline == nil,
+            let currentFileTimeline,
+            let fileClipSourceURL = audioClipboard.fileClipSourceURL,
+            let fileClip = audioClipboard.fileClip,
+            fileClipSourceURL.standardizedFileURL == sourceURL.standardizedFileURL,
+            currentFileTimeline.isCompatible(with: fileClip)
+        {
+            var editedFileTimeline = currentFileTimeline
+            guard let insertedFrameCount = editedFileTimeline.replace(pasteSelection, with: fileClip) else {
+                updateStatus("paste failed: incompatible clipboard")
+                return
+            }
+
+            let snapshot = ProjectTrackUndoSnapshot(
+                tracks: projectTracks,
+                activeTrackID: activeTrackID,
+                selectedTrackID: selectedTrackID,
+                selectedTimelineRange: selectedTimelineRange,
+                restoreProgress: nil
+            )
+            editUndoStack.append(.projectTracks(snapshot))
+            cancelEditMaterialization(for: trackID)
+            projectTracks[trackIndex].editRevision += 1
+            let editRevision = projectTracks[trackIndex].editRevision
+
+            projectTracks[trackIndex].audioTimeline = nil
+            projectTracks[trackIndex].fileTimeline = editedFileTimeline
+            projectTracks[trackIndex].decodedAudioBuffer = nil
+            projectTracks[trackIndex].durationHint = editedFileTimeline.duration
+            projectTracks[trackIndex].waveformOverview =
+                optimisticWaveformOverview(
+                    currentOverview,
+                    replacing: pasteSelection,
+                    with: audioClipboard.waveformOverview,
+                    targetDuration: editedFileTimeline.duration
+                ) ??
+                optimisticWaveformOverview(
+                    for: editedFileTimeline,
+                    sourceOverview: projectTracks[trackIndex].sourceWaveformOverview,
+                    fallbackOverview: currentOverview
+                )
+            scheduleFileTimelineWaveformRefinement(
+                trackID: trackID,
+                fileTimeline: editedFileTimeline,
+                sourceOverview: projectTracks[trackIndex].sourceWaveformOverview ?? currentOverview,
+                editRevision: editRevision
+            )
+
+            selectedTimelineRange = nil
+            timelineSurface.displaySelection(nil)
+            timelineSurface.displayGainPreview(selection: nil, gain: 1)
+            refreshProjectTimelineDisplay(rebuildControls: false, animateWaveformTransition: false)
+            updateProjectDisplayTiming()
+            reloadPlaybackFromProjectTracks(preserveProgress: true)
+            updateEffectCommandState()
+            let insertedDuration = Double(insertedFrameCount) / max(editedFileTimeline.sourceSampleRate, 1)
+            updateStatus("pasted \(formatDuration(insertedDuration))")
+            return
+        }
+
         if let currentTimeline {
             editUndoStack.append(.timeline(trackID: trackID, timeline: currentTimeline))
         } else {
