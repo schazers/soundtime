@@ -2551,9 +2551,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 return nil
             }
 
-            guard let interactiveMipLevel = mipLevels.first(where: {
-                $0.binCount <= viewportBinLimit
-            }) else {
+            guard let interactiveMipLevel = preferredInteractiveWaveformShaderMipLevel(
+                from: mipLevels,
+                drawableSize: drawableSize,
+                backingScale: backingScale,
+                renderState: renderState,
+                fallbackBinLimit: viewportBinLimit
+            ) else {
                 return nil
             }
 
@@ -2624,14 +2628,37 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             guard let mipLevels = trackWaveformMipLevels[track.id] else {
                 return nil
             }
-            guard let interactiveMipLevel = mipLevels.first(where: {
-                $0.binCount <= viewportBinLimit
-            }) else {
+            guard let interactiveMipLevel = preferredInteractiveWaveformShaderMipLevel(
+                from: mipLevels,
+                drawableSize: drawableSize,
+                backingScale: backingScale,
+                renderState: renderState,
+                fallbackBinLimit: viewportBinLimit
+            ) else {
                 return nil
             }
 
             return waveformShaderBufferKey(track: track, mipLevel: interactiveMipLevel)
         }
+    }
+
+    private func preferredInteractiveWaveformShaderMipLevel(
+        from mipLevels: [WaveformMipLevel],
+        drawableSize: CGSize,
+        backingScale: Float,
+        renderState: TimelineRenderState,
+        fallbackBinLimit: Int
+    ) -> WaveformMipLevel? {
+        if let preferredIndex = waveformMipLevelIndex(
+            for: drawableSize,
+            backingScale: backingScale,
+            renderState: renderState,
+            mipLevels: mipLevels
+        ) {
+            return mipLevels[preferredIndex]
+        }
+
+        return mipLevels.first { $0.binCount <= fallbackBinLimit }
     }
 
     private func visiblePrewarmTracks(
@@ -2717,7 +2744,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
                 let shaderBins = self.makeWaveformShaderBins(
                     from: mipLevel.overview.bins,
-                    shouldYieldForPlayback: !usesPriorityConversion
+                    shouldYieldForPlayback: true
                 )
                 self.waveformShaderBufferStore.publish(shaderBins, for: key)
                 publishedCount += 1
