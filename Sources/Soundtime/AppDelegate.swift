@@ -230,6 +230,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: ""
         ))
         menu.addItem(NSMenuItem(
+            title: "Nudge Selection Left",
+            action: #selector(TimelineView.nudgeSelectionLeft(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Nudge Selection Right",
+            action: #selector(TimelineView.nudgeSelectionRight(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
             title: "Zoom to Selection",
             action: #selector(TimelineView.zoomToSelection(_:)),
             keyEquivalent: "j"
