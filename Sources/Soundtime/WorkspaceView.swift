@@ -139,6 +139,16 @@ final class WorkspaceView: NSView {
         let editedFileTimeline: AudioFileEditTimeline?
     }
 
+    private struct ClearTrackEdit {
+        let trackIndex: Int
+        let trackID: UUID
+        let editSelection: TimelineSelection
+        let clearedDuration: TimeInterval
+        let editedDuration: TimeInterval
+        let editedAudioTimeline: AudioEditTimeline?
+        let editedFileTimeline: AudioFileEditTimeline?
+    }
+
     private struct SilenceCleanupResult: Sendable {
         let frameRanges: [Range<Int>]
         let detectedRegionCount: Int
@@ -3765,17 +3775,26 @@ final class WorkspaceView: NSView {
 
     private func clearSelection() {
         guard
-            let target = currentEditableSelectionTarget(),
-            projectTracks.indices.contains(target.trackIndex)
+            let target = currentEditableSelectionTarget()
         else {
             updateStatus("select audio to clear")
             return
         }
 
-        let trackIndex = target.trackIndex
         let displaySelectionToClear = target.displaySelection
-        let selectionToClear = target.editSelection
-        let trackID = projectTracks[trackIndex].id
+        let clearTargets = rippleDeleteTargets(for: target, scope: editScope)
+        let trackEdits: [ClearTrackEdit]
+        do {
+            trackEdits = try clearTargets.compactMap { try preparedClearTrackEdit(for: $0) }
+        } catch {
+            updateStatus("clear failed: \(error.localizedDescription)")
+            return
+        }
+        guard !trackEdits.isEmpty else {
+            updateStatus("no audio in selected time")
+            return
+        }
+
         let undoSnapshot = ProjectTrackUndoSnapshot(
             tracks: projectTracks,
             activeTrackID: activeTrackID,
@@ -3789,92 +3808,65 @@ final class WorkspaceView: NSView {
             category: .edit,
             severity: .info,
             name: "clear-selection",
-            message: "User requested a non-ripple clear edit.",
+            message: "User requested a scoped non-ripple clear edit.",
             fields: [
-                "trackIndex": "\(trackIndex)",
-                "startProgress": String(format: "%.9f", selectionToClear.startProgress),
-                "endProgress": String(format: "%.9f", selectionToClear.endProgress),
+                "scope": editScope.title,
+                "trackCount": "\(trackEdits.count)",
+                "startProgress": String(format: "%.9f", displaySelectionToClear.startProgress),
+                "endProgress": String(format: "%.9f", displaySelectionToClear.endProgress),
             ]
         )
 
-        let selectedDuration: TimeInterval
-        let editedDuration: TimeInterval
-        let editedAudioTimeline: AudioEditTimeline?
-        let editedFileTimeline: AudioFileEditTimeline?
-
-        if let currentFileTimeline = try? preferredFileTimelineForEditing(trackIndex: trackIndex) {
-            var timeline = currentFileTimeline
-            selectedDuration = selectionToClear.duration(in: currentFileTimeline.duration)
-            let affectedFrameCount = timeline.clear(selectionToClear)
-            guard affectedFrameCount > 0 else {
-                return
-            }
-            editedDuration = timeline.duration
-            editedAudioTimeline = nil
-            editedFileTimeline = timeline
-        } else if let currentTimeline = projectTracks[trackIndex].audioTimeline {
-            var timeline = currentTimeline
-            selectedDuration = selectionToClear.duration(in: currentTimeline.duration)
-            let affectedFrameCount = timeline.clear(selectionToClear)
-            guard affectedFrameCount > 0 else {
-                return
-            }
-            editedDuration = timeline.duration
-            editedAudioTimeline = timeline
-            editedFileTimeline = nil
-        } else {
-            let currentFileTimeline: AudioFileEditTimeline
-            do {
-                currentFileTimeline = try editableFileTimeline(forTrackAt: trackIndex)
-            } catch {
-                updateStatus("clear failed: \(error.localizedDescription)")
-                return
-            }
-
-            var timeline = currentFileTimeline
-            selectedDuration = selectionToClear.duration(in: currentFileTimeline.duration)
-            let affectedFrameCount = timeline.clear(selectionToClear)
-            guard affectedFrameCount > 0 else {
-                return
-            }
-            editedDuration = timeline.duration
-            editedAudioTimeline = nil
-            editedFileTimeline = timeline
-        }
-
         editUndoStack.append(.projectTracks(undoSnapshot))
-        projectTracks[trackIndex].editRevision += 1
-        let editRevision = projectTracks[trackIndex].editRevision
-        projectTracks[trackIndex].audioTimeline = editedAudioTimeline
-        projectTracks[trackIndex].fileTimeline = editedFileTimeline
-        projectTracks[trackIndex].decodedAudioBuffer = nil
-        projectTracks[trackIndex].durationHint = editedDuration
-        let currentOverview = projectTracks[trackIndex].waveformOverview
-        if let editedFileTimeline {
-            projectTracks[trackIndex].waveformOverview =
-                optimisticWaveformOverview(
+        var materializationEdits: [(trackID: UUID, timeline: AudioEditTimeline, editRevision: Int)] = []
+        var statusDuration = TimeInterval(0)
+        for edit in trackEdits {
+            guard projectTracks.indices.contains(edit.trackIndex) else {
+                continue
+            }
+
+            projectTracks[edit.trackIndex].editRevision += 1
+            let editRevision = projectTracks[edit.trackIndex].editRevision
+            projectTracks[edit.trackIndex].audioTimeline = edit.editedAudioTimeline
+            projectTracks[edit.trackIndex].fileTimeline = edit.editedFileTimeline
+            projectTracks[edit.trackIndex].decodedAudioBuffer = nil
+            projectTracks[edit.trackIndex].durationHint = edit.editedDuration
+            let currentOverview = projectTracks[edit.trackIndex].waveformOverview
+            if let editedFileTimeline = edit.editedFileTimeline {
+                projectTracks[edit.trackIndex].waveformOverview =
+                    optimisticWaveformOverview(
+                        currentOverview,
+                        applyingGain: 0,
+                        to: edit.editSelection
+                    ) ??
+                    optimisticWaveformOverview(
+                        for: editedFileTimeline,
+                        sourceOverview: projectTracks[edit.trackIndex].sourceWaveformOverview,
+                        fallbackOverview: currentOverview
+                    )
+                scheduleFileTimelineWaveformRefinement(
+                    trackID: edit.trackID,
+                    fileTimeline: editedFileTimeline,
+                    sourceOverview: projectTracks[edit.trackIndex].sourceWaveformOverview ?? currentOverview,
+                    editRevision: editRevision
+                )
+            } else {
+                projectTracks[edit.trackIndex].waveformOverview = optimisticWaveformOverview(
                     currentOverview,
                     applyingGain: 0,
-                    to: selectionToClear
-                ) ??
-                optimisticWaveformOverview(
-                    for: editedFileTimeline,
-                    sourceOverview: projectTracks[trackIndex].sourceWaveformOverview,
-                    fallbackOverview: currentOverview
+                    to: edit.editSelection
                 )
-            scheduleFileTimelineWaveformRefinement(
-                trackID: trackID,
-                fileTimeline: editedFileTimeline,
-                sourceOverview: projectTracks[trackIndex].sourceWaveformOverview ?? currentOverview,
-                editRevision: editRevision
-            )
-        } else {
-            projectTracks[trackIndex].waveformOverview = optimisticWaveformOverview(
-                currentOverview,
-                applyingGain: 0,
-                to: selectionToClear
-            )
-            cancelEditWaveformRefinement(for: trackID)
+                cancelEditWaveformRefinement(for: edit.trackID)
+            }
+
+            statusDuration = max(statusDuration, edit.clearedDuration)
+            if let editedAudioTimeline = edit.editedAudioTimeline {
+                materializationEdits.append((
+                    trackID: edit.trackID,
+                    timeline: editedAudioTimeline,
+                    editRevision: editRevision
+                ))
+            }
         }
 
         selectedTimelineRange = nil
@@ -3885,14 +3877,29 @@ final class WorkspaceView: NSView {
         updateProjectDisplayTiming()
         reloadPlaybackFromProjectTracks(preserveProgress: true)
         updateEffectCommandState()
-        let status = "cleared \(formatDuration(selectedDuration))"
+        let scopeSuffix: String
+        if trackEdits.count > 1 {
+            switch editScope {
+            case .track:
+                scopeSuffix = ""
+            case .selected:
+                scopeSuffix = " across \(trackEdits.count) selected tracks"
+            case .group:
+                scopeSuffix = " across \(trackEdits.count) grouped tracks"
+            case .all:
+                scopeSuffix = " across \(trackEdits.count) tracks"
+            }
+        } else {
+            scopeSuffix = ""
+        }
+        let status = "cleared \(formatDuration(statusDuration))\(scopeSuffix)"
         updateStatus(status)
 
-        if let editedAudioTimeline {
+        for edit in materializationEdits {
             materializeEditedTimeline(
-                trackID: trackID,
-                timeline: editedAudioTimeline,
-                editRevision: editRevision,
+                trackID: edit.trackID,
+                timeline: edit.timeline,
+                editRevision: edit.editRevision,
                 status: status,
                 preservePlaybackProgress: true,
                 startDelay: editMaterializationDelay,
@@ -5245,6 +5252,56 @@ final class WorkspaceView: NSView {
                 displaySelection: target.displaySelection,
                 editSelection: selectionToDelete,
                 deletedDuration: deletedDuration,
+                editedDuration: timeline.duration,
+                editedAudioTimeline: timeline,
+                editedFileTimeline: nil
+            )
+        }
+
+        return nil
+    }
+
+    private func preparedClearTrackEdit(
+        for target: EditableSelectionTarget
+    ) throws -> ClearTrackEdit? {
+        guard projectTracks.indices.contains(target.trackIndex) else {
+            return nil
+        }
+
+        let trackIndex = target.trackIndex
+        let trackID = projectTracks[trackIndex].id
+        let selectionToClear = target.editSelection
+
+        if let currentFileTimeline = try preferredFileTimelineForEditing(trackIndex: trackIndex) {
+            var timeline = currentFileTimeline
+            let clearedDuration = selectionToClear.duration(in: currentFileTimeline.duration)
+            let affectedFrameCount = timeline.clear(selectionToClear)
+            guard affectedFrameCount > 0 else {
+                return nil
+            }
+            return ClearTrackEdit(
+                trackIndex: trackIndex,
+                trackID: trackID,
+                editSelection: selectionToClear,
+                clearedDuration: clearedDuration,
+                editedDuration: timeline.duration,
+                editedAudioTimeline: nil,
+                editedFileTimeline: timeline
+            )
+        }
+
+        if let currentTimeline = projectTracks[trackIndex].audioTimeline {
+            var timeline = currentTimeline
+            let clearedDuration = selectionToClear.duration(in: currentTimeline.duration)
+            let affectedFrameCount = timeline.clear(selectionToClear)
+            guard affectedFrameCount > 0 else {
+                return nil
+            }
+            return ClearTrackEdit(
+                trackIndex: trackIndex,
+                trackID: trackID,
+                editSelection: selectionToClear,
+                clearedDuration: clearedDuration,
                 editedDuration: timeline.duration,
                 editedAudioTimeline: timeline,
                 editedFileTimeline: nil
