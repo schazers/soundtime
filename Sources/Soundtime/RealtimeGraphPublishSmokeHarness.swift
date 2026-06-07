@@ -28,6 +28,11 @@ enum RealtimeGraphPublishSmokeHarness {
             sourceFrameCount: sourceFrameCount,
             renderBlockFrameCount: renderBlockFrameCount
         )
+        let fileBackedPublishSummary = try runFileBackedEditPublishSmoke(
+            sampleRate: sampleRate,
+            sourceFrameCount: sourceFrameCount,
+            isFull: isFull
+        )
         let outputDevice = RealtimeGraphPublishSmokeOutputDevice()
 
         guard let playbackEngine = RealtimeCorePlaybackEngine(outputDevice: outputDevice) else {
@@ -163,6 +168,7 @@ enum RealtimeGraphPublishSmokeHarness {
                 duplicateTrackPhaseMaxError
             )
         )
+        print(fileBackedPublishSummary)
     }
 
     private static func runDuplicateTrackPhaseSmoke(
@@ -316,6 +322,235 @@ enum RealtimeGraphPublishSmokeHarness {
             _ = timeline.delete(selection)
         default:
             _ = timeline.applyGain(0.91, to: selection)
+        }
+    }
+
+    private static func runFileBackedEditPublishSmoke(
+        sampleRate: Double,
+        sourceFrameCount: Int,
+        isFull: Bool
+    ) throws -> String {
+        let trackCount = isFull ? 96 : 48
+        let updateCount = isFull ? 180 : 72
+        let renderBlockCount = isFull ? 7_500 : 2_800
+        let renderBlockFrameCount = 256
+        let wavURL = URL(fileURLWithPath: "/tmp/SoundtimeRealtimeFileBackedPublishSmoke.wav")
+        try writeSyntheticPCM16WAV(
+            to: wavURL,
+            frameCount: sourceFrameCount,
+            sampleRate: sampleRate
+        )
+        let fileInfo = try WAVAudioDecoder.inspect(url: wavURL)
+        let baseTimeline = AudioFileEditTimeline(fileInfo: fileInfo)
+        var timelines = Array(repeating: baseTimeline, count: trackCount)
+        var sourceRevisions = Array(repeating: 0, count: trackCount)
+        let trackIDs = (0..<trackCount).map { index in
+            UUID(uuidString: String(format: "00000000-0000-4000-a000-%012d", index)) ?? UUID()
+        }
+        let outputDevice = RealtimeGraphPublishSmokeOutputDevice()
+
+        guard let playbackEngine = RealtimeCorePlaybackEngine(outputDevice: outputDevice) else {
+            throw SmokeError.failed("could not create file-backed realtime playback engine")
+        }
+
+        try playbackEngine.loadProjectTracks(fileBackedProjectTracks(
+            ids: trackIDs,
+            url: wavURL,
+            timelines: timelines,
+            sourceRevisions: sourceRevisions,
+            iteration: 0
+        ))
+        try playbackEngine.play()
+
+        guard let corePointer = outputDevice.corePointer else {
+            throw SmokeError.failed("file-backed realtime output device was not configured")
+        }
+
+        let renderGroup = DispatchGroup()
+        renderGroup.enter()
+        let uncheckedCorePointer = UncheckedAudioCorePointer(pointer: corePointer)
+        DispatchQueue.global(qos: .userInitiated).async {
+            render(
+                corePointer: uncheckedCorePointer.pointer,
+                blockCount: renderBlockCount,
+                frameCount: renderBlockFrameCount,
+                sampleRate: sampleRate
+            )
+            renderGroup.leave()
+        }
+
+        var publishDurations: [Double] = []
+        var seekDurations: [Double] = []
+        publishDurations.reserveCapacity(updateCount)
+        seekDurations.reserveCapacity(updateCount / 6)
+        let startTime = DispatchTime.now().uptimeNanoseconds
+
+        for iteration in 0..<updateCount {
+            let editedTrackIndex = (iteration * 23) % trackCount
+            applySyntheticFileEdit(
+                to: &timelines[editedTrackIndex],
+                iteration: iteration
+            )
+            sourceRevisions[editedTrackIndex] += 1
+
+            let updatedTracks = fileBackedProjectTracks(
+                ids: trackIDs,
+                url: wavURL,
+                timelines: timelines,
+                sourceRevisions: sourceRevisions,
+                iteration: iteration
+            )
+            let publishStart = DispatchTime.now().uptimeNanoseconds
+            try playbackEngine.updateProjectTracks(updatedTracks)
+            publishDurations.append(milliseconds(since: publishStart))
+
+            if iteration.isMultiple(of: 6) {
+                let seekStart = DispatchTime.now().uptimeNanoseconds
+                try playbackEngine.seekExactly(toProgress: Float(Double(iteration % 89) / 89.0))
+                seekDurations.append(milliseconds(since: seekStart))
+            }
+        }
+
+        renderGroup.wait()
+        playbackEngine.pause()
+
+        let elapsedMilliseconds = milliseconds(since: startTime)
+        let publishP95 = percentile(publishDurations, percentile: 0.95)
+        let publishMax = publishDurations.max() ?? 0
+        let seekP95 = percentile(seekDurations, percentile: 0.95)
+        let snapshot = soundtime_audio_core_snapshot(corePointer)
+        try require(snapshot.droppedCommandCount == 0, "file-backed realtime core dropped \(snapshot.droppedCommandCount) commands")
+        try require(
+            publishP95 < (isFull ? 6.0 : 4.0),
+            String(format: "file-backed graph publish p95 too slow: %.3fms", publishP95)
+        )
+        try require(
+            publishMax < (isFull ? 18.0 : 14.0),
+            String(format: "file-backed graph publish outlier too slow: %.3fms", publishMax)
+        )
+        try require(
+            seekP95 < 1.0,
+            String(format: "file-backed seek p95 too slow during graph churn: %.3fms", seekP95)
+        )
+
+        return String(
+            format: "Soundtime file-backed realtime edit smoke passed: %d tracks, %d updates, publish %.3fms p95 / %.3fms max, seek %.3fms p95, %.2fms total",
+            trackCount,
+            updateCount,
+            publishP95,
+            publishMax,
+            seekP95,
+            elapsedMilliseconds
+        )
+    }
+
+    private static func fileBackedProjectTracks(
+        ids: [UUID],
+        url: URL,
+        timelines: [AudioFileEditTimeline],
+        sourceRevisions: [Int],
+        iteration: Int
+    ) -> [ProjectPlaybackTrack] {
+        var tracks: [ProjectPlaybackTrack] = []
+        tracks.reserveCapacity(ids.count)
+        for index in ids.indices {
+            let volume = Float(0.58 + 0.34 * (Double((index + iteration) % 17) / 16.0))
+            tracks.append(ProjectPlaybackTrack(
+                id: ids[index],
+                source: .fileTimeline(url: url, timeline: timelines[index], zeroCrossingProbe: nil),
+                sourceRevision: sourceRevisions[index],
+                volume: volume,
+                isMuted: (index + iteration).isMultiple(of: 31),
+                isSoloed: false
+            ))
+        }
+        return tracks
+    }
+
+    private static func applySyntheticFileEdit(
+        to timeline: inout AudioFileEditTimeline,
+        iteration: Int
+    ) {
+        let startProgress = Double((iteration * 12_271) % 880_000) / 1_000_000.0
+        let endProgress = min(startProgress + 0.001_2 + Double(iteration % 5) * 0.000_18, 0.995)
+        let selection = TimelineSelection(startProgress: startProgress, endProgress: endProgress)
+
+        switch iteration % 6 {
+        case 0:
+            _ = timeline.applyGain(0.62, to: selection)
+        case 1:
+            _ = timeline.applyGain(1.22, to: selection)
+        case 2:
+            _ = timeline.applyFade(.fadeIn, to: selection)
+        case 3:
+            _ = timeline.applyFade(.fadeOut, to: selection)
+        case 4:
+            _ = timeline.delete(selection)
+        default:
+            _ = timeline.applyGain(0.88, to: selection)
+        }
+    }
+
+    private static func writeSyntheticPCM16WAV(
+        to url: URL,
+        frameCount: Int,
+        sampleRate: Double
+    ) throws {
+        let channelCount = 2
+        let bitsPerSample = 16
+        let blockAlign = channelCount * bitsPerSample / 8
+        let byteRate = Int(sampleRate) * blockAlign
+        let dataByteCount = frameCount * blockAlign
+        var data = Data()
+        data.reserveCapacity(44 + dataByteCount)
+        appendASCII("RIFF", to: &data)
+        appendUInt32LE(UInt32(36 + dataByteCount), to: &data)
+        appendASCII("WAVE", to: &data)
+        appendASCII("fmt ", to: &data)
+        appendUInt32LE(16, to: &data)
+        appendUInt16LE(1, to: &data)
+        appendUInt16LE(UInt16(channelCount), to: &data)
+        appendUInt32LE(UInt32(sampleRate), to: &data)
+        appendUInt32LE(UInt32(byteRate), to: &data)
+        appendUInt16LE(UInt16(blockAlign), to: &data)
+        appendUInt16LE(UInt16(bitsPerSample), to: &data)
+        appendASCII("data", to: &data)
+        appendUInt32LE(UInt32(dataByteCount), to: &data)
+
+        for frame in 0..<frameCount {
+            let phase = Double(frame) / sampleRate
+            let left = sin(phase * 330.0 * 2.0 * .pi) * 0.34 +
+                sin(phase * 1_240.0 * 2.0 * .pi) * 0.08
+            let right = -left * 0.74
+            appendInt16LE(Int16(max(min(left, 0.98), -0.98) * 32_767), to: &data)
+            appendInt16LE(Int16(max(min(right, 0.98), -0.98) * 32_767), to: &data)
+        }
+
+        try data.write(to: url, options: [.atomic])
+    }
+
+    private static func appendASCII(_ string: String, to data: inout Data) {
+        data.append(contentsOf: string.utf8)
+    }
+
+    private static func appendUInt16LE(_ value: UInt16, to data: inout Data) {
+        var littleEndian = value.littleEndian
+        withUnsafeBytes(of: &littleEndian) { bytes in
+            data.append(contentsOf: bytes)
+        }
+    }
+
+    private static func appendUInt32LE(_ value: UInt32, to data: inout Data) {
+        var littleEndian = value.littleEndian
+        withUnsafeBytes(of: &littleEndian) { bytes in
+            data.append(contentsOf: bytes)
+        }
+    }
+
+    private static func appendInt16LE(_ value: Int16, to data: inout Data) {
+        var littleEndian = value.littleEndian
+        withUnsafeBytes(of: &littleEndian) { bytes in
+            data.append(contentsOf: bytes)
         }
     }
 
