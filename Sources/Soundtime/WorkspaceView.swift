@@ -2584,6 +2584,7 @@ final class WorkspaceView: NSView {
             currentPlayheadFrame = 0
             displayPlaybackVisuals(progress: 0, isPlaying: false)
             updateTimeReadout()
+            updateTransportControlState(isPlaying: false)
             return
         }
 
@@ -2611,9 +2612,12 @@ final class WorkspaceView: NSView {
                 anchorTimestamp: snapshot.hostTimestamp
             )
         } catch {
+            stopPlaybackTimer()
+            displayPlaybackVisuals(progress: 0, isPlaying: false)
             updateStatus("project playback failed: \(error.localizedDescription)")
         }
         updateTimeReadout()
+        updateTransportControlState(isPlaying: playbackController.isPlaying)
     }
 
     private func updateProjectPlaybackTrackMix() {

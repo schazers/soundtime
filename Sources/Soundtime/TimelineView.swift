@@ -362,13 +362,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         currentTrackIDs = tracks.map(\.id)
         let mergedTracks = mergeTrackMetadata(tracks)
         currentRenderTracks = mergedTracks
-        timelineDuration = Self.timelineDuration(for: tracks)
+        timelineDuration = Self.timelineDuration(for: mergedTracks)
         let wasSelectionEnabled = isSelectionEnabled
         isSelectionEnabled = mergedTracks.contains { $0.hasWaveform }
         updateTrackLayoutForCurrentBounds(requestRender: false)
 
         updateTimelineRenderer { renderer in
-            renderer.displayTrackMixSettings(tracks)
+            renderer.displayTrackMixSettings(mergedTracks)
         }
         requestTimelineRender()
 
@@ -389,8 +389,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             let current = currentByID[track.id]
             return TimelineRenderState.Track(
                 id: track.id,
-                waveformVersion: track.waveformVersion,
-                waveformOverview: track.waveformOverview,
+                waveformVersion: track.waveformOverview == nil ?
+                    (current?.waveformVersion ?? track.waveformVersion) :
+                    track.waveformVersion,
+                waveformOverview: track.waveformOverview ?? current?.waveformOverview,
                 durationHint: track.durationHint ?? current?.durationHint,
                 volume: track.volume,
                 isMuted: track.isMuted,

@@ -32,6 +32,11 @@ final class AgentCommandBarView: NSView, NSTextViewDelegate {
         false
     }
 
+    override var intrinsicContentSize: NSSize {
+        let textHeight = textHeightConstraint?.constant ?? 46
+        return NSSize(width: NSView.noIntrinsicMetric, height: textHeight + 22)
+    }
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         configure()
@@ -55,6 +60,20 @@ final class AgentCommandBarView: NSView, NSTextViewDelegate {
         super.layout()
         updateTextHeight()
         syncTextViewFrame()
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden, alphaValue > 0.01, bounds.contains(point) else {
+            return nil
+        }
+
+        let textRect = convert(textBackgroundView.bounds, from: textBackgroundView).insetBy(dx: -2, dy: -2)
+        let sendRect = convert(sendButton.bounds, from: sendButton).insetBy(dx: -2, dy: -2)
+        guard textRect.contains(point) || sendRect.contains(point) else {
+            return nil
+        }
+
+        return super.hitTest(point)
     }
 
     override func mouseDown(with event: NSEvent) {
