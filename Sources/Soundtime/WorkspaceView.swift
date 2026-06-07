@@ -4321,7 +4321,7 @@ final class WorkspaceView: NSView {
         )
         updateEffectCommandState()
         cleanupOwnedSourceFiles(replacedTracks: replacedTracks)
-        updateStatus(snapshot.restoreProgress == nil ? "undo track delete" : "undo")
+        updateStatus("undo")
     }
 
     private func cancelEditMaterialization(for trackID: UUID) {
