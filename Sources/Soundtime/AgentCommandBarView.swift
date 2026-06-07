@@ -188,7 +188,7 @@ final class AgentCommandBarView: NSView, NSTextViewDelegate {
             sendButton.trailingAnchor.constraint(equalTo: panelView.trailingAnchor, constant: -10),
             sendButton.topAnchor.constraint(equalTo: textBackgroundView.topAnchor),
             sendButton.bottomAnchor.constraint(equalTo: textBackgroundView.bottomAnchor),
-            sendButton.widthAnchor.constraint(equalToConstant: 50),
+            sendButton.widthAnchor.constraint(equalTo: sendButton.heightAnchor),
         ])
 
         updatePlaceholder()
@@ -587,13 +587,18 @@ private final class AgentSendButton: NSControl {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
 
-        let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
-        let radius = min(rect.height * 0.36, 15)
-        let buttonPath = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
+        let diameter = max(min(bounds.width, bounds.height) - 1, 1)
+        let rect = NSRect(
+            x: bounds.midX - diameter * 0.5,
+            y: bounds.midY - diameter * 0.5,
+            width: diameter,
+            height: diameter
+        )
+        let buttonPath = NSBezierPath(ovalIn: rect)
 
         if isEnabled, isHovered || isPressed {
             let glowRect = rect.insetBy(dx: -2.5, dy: -2.5)
-            let glowPath = NSBezierPath(roundedRect: glowRect, xRadius: radius + 2.5, yRadius: radius + 2.5)
+            let glowPath = NSBezierPath(ovalIn: glowRect)
             NSColor(white: 1, alpha: isPressed ? 0.16 : 0.10).setFill()
             glowPath.fill()
         }
