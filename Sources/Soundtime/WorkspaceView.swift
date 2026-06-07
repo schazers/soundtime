@@ -146,6 +146,28 @@ final class WorkspaceView: NSView {
         let deletedDuration: TimeInterval
     }
 
+    private struct DeadAirReviewCandidate: Sendable, Identifiable {
+        let id: UUID
+        let trackID: UUID
+        let trackEditRevision: Int
+        let displaySelection: TimelineSelection
+        let editSelection: TimelineSelection
+        let frameRange: Range<Int>
+
+        var displayStartProgress: Float {
+            displaySelection.startProgressFloat
+        }
+
+        var displayEndProgress: Float {
+            displaySelection.endProgressFloat
+        }
+    }
+
+    private struct DeadAirReviewResult: Sendable {
+        let candidates: [DeadAirReviewCandidate]
+        let detectedRegionCount: Int
+    }
+
     private enum ProjectMixTrackSource: Sendable {
         case decoded(DecodedAudioBuffer)
         case timeline(AudioEditTimeline)
@@ -236,6 +258,9 @@ final class WorkspaceView: NSView {
     private var editUndoStack: [UndoAction] = []
     private var loadedAudioSummary: String?
     private var selectedTimelineRange: TimelineSelection?
+    private var deadAirCandidates: [DeadAirReviewCandidate] = []
+    private var activeDeadAirCandidateID: UUID?
+    private var deadAirAuditionStopTask: Task<Void, Never>?
     private var lastEffect: LastEffect?
     private var currentPlayheadFrame = 0
     private var displayedFrameCount = 0
@@ -563,7 +588,16 @@ final class WorkspaceView: NSView {
             self?.applyNormalizeEffect()
         }
         timelineSurface.onDeleteSilenceRequested = { [weak self] in
-            self?.deleteDetectedSilence()
+            self?.reviewDeadAir()
+        }
+        timelineSurface.onAcceptDeadAirCandidateRequested = { [weak self] in
+            self?.acceptActiveDeadAirCandidate()
+        }
+        timelineSurface.onRejectDeadAirCandidateRequested = { [weak self] in
+            self?.rejectActiveDeadAirCandidate()
+        }
+        timelineSurface.onAuditionDeadAirCandidateRequested = { [weak self] in
+            self?.auditionActiveDeadAirCandidate()
         }
         timelineSurface.onFadeInRequested = { [weak self] in
             self?.applyFadeEffect(.fadeIn)
@@ -3682,8 +3716,8 @@ final class WorkspaceView: NSView {
             guard canDeleteSilence else {
                 return AgentCommandResult(status: .failed, message: "Agent: select a track to clean")
             }
-            deleteDetectedSilence()
-            return AgentCommandResult(status: .accepted, message: "Agent: silence cleanup started")
+            reviewDeadAir()
+            return AgentCommandResult(status: .accepted, message: "Agent: dead air review started")
         case .normalizeSelection:
             guard canApplyGainEffect else {
                 return AgentCommandResult(status: .failed, message: "Agent: select audio to normalize")
@@ -3947,6 +3981,311 @@ final class WorkspaceView: NSView {
             displaySelection: fullTrackDisplaySelection(for: trackID),
             editSelection: fullTrackEditSelection(for: trackID)
         )
+    }
+
+    private func reviewDeadAir() {
+        guard
+            let target = silenceCleanupTarget(),
+            projectTracks.indices.contains(target.trackIndex)
+        else {
+            updateStatus("select a track to review")
+            return
+        }
+
+        let trackIndex = target.trackIndex
+        let track = projectTracks[trackIndex]
+        let sourceURL = track.sourceURL
+        let trackID = track.id
+        let editRevision = track.editRevision
+        let audioTimeline = track.audioTimeline
+        let fileTimeline = try? preferredFileTimelineForEditing(trackIndex: trackIndex)
+        let displaySelection = target.displaySelection
+        let editSelection = target.editSelection
+        let configuration = AudioSilenceAnalyzer.Configuration.podcastCleanup
+
+        clearDeadAirReview(publish: true)
+        updateStatus("reviewing dead air")
+        Task { [weak self, sourceURL, audioTimeline, fileTimeline, displaySelection, editSelection, trackID, editRevision, configuration] in
+            let result = await Task.detached(priority: .userInitiated) {
+                try Self.detectDeadAirReviewCandidates(
+                    sourceURL: sourceURL,
+                    audioTimeline: audioTimeline,
+                    fileTimeline: fileTimeline,
+                    displaySelection: displaySelection,
+                    editSelection: editSelection,
+                    trackID: trackID,
+                    trackEditRevision: editRevision,
+                    configuration: configuration
+                )
+            }.result
+
+            guard let self else {
+                return
+            }
+
+            switch result {
+            case let .success(reviewResult):
+                self.publishDeadAirReviewResult(
+                    reviewResult,
+                    trackID: trackID,
+                    expectedEditRevision: editRevision
+                )
+            case let .failure(error):
+                self.updateStatus("dead air review failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private nonisolated static func detectDeadAirReviewCandidates(
+        sourceURL: URL,
+        audioTimeline: AudioEditTimeline?,
+        fileTimeline: AudioFileEditTimeline?,
+        displaySelection: TimelineSelection,
+        editSelection: TimelineSelection,
+        trackID: UUID,
+        trackEditRevision: Int,
+        configuration: AudioSilenceAnalyzer.Configuration
+    ) throws -> DeadAirReviewResult {
+        let renderedBuffer: DecodedAudioBuffer
+        let timelineFrameCount: Int
+
+        if let fileTimeline {
+            let sourceBuffer = try WAVAudioDecoder.decode(url: sourceURL)
+            renderedBuffer = fileTimeline.audioTimeline(sourceBuffer: sourceBuffer).render(selection: editSelection)
+            timelineFrameCount = fileTimeline.frameCount
+        } else if let audioTimeline {
+            renderedBuffer = audioTimeline.render(selection: editSelection)
+            timelineFrameCount = audioTimeline.frameCount
+        } else {
+            let sourceBuffer = try WAVAudioDecoder.decode(url: sourceURL)
+            let timeline = AudioEditTimeline(sourceBuffer: sourceBuffer)
+            renderedBuffer = timeline.render(selection: editSelection)
+            timelineFrameCount = timeline.frameCount
+        }
+
+        guard timelineFrameCount > 0, renderedBuffer.frameCount > 0 else {
+            return DeadAirReviewResult(candidates: [], detectedRegionCount: 0)
+        }
+
+        let detectedRegions = AudioSilenceAnalyzer.detectSilence(
+            in: renderedBuffer,
+            configuration: configuration
+        )
+        let localDeletionRanges = AudioSilenceAnalyzer.deletionRanges(
+            for: detectedRegions,
+            sampleRate: renderedBuffer.sampleRate,
+            configuration: configuration
+        )
+        let selectionStartFrame = min(
+            max(Int((editSelection.startProgress * Double(timelineFrameCount)).rounded(.down)), 0),
+            timelineFrameCount
+        )
+        let renderedFrameCount = max(renderedBuffer.frameCount, 1)
+        let timelineFrameCountDouble = Double(timelineFrameCount)
+
+        let candidates = localDeletionRanges.compactMap { localRange -> DeadAirReviewCandidate? in
+            let lowerBound = min(max(selectionStartFrame + localRange.lowerBound, 0), timelineFrameCount)
+            let upperBound = min(max(selectionStartFrame + localRange.upperBound, lowerBound), timelineFrameCount)
+            guard lowerBound < upperBound else {
+                return nil
+            }
+
+            let localStartFraction = min(max(Double(localRange.lowerBound) / Double(renderedFrameCount), 0), 1)
+            let localEndFraction = min(max(Double(localRange.upperBound) / Double(renderedFrameCount), localStartFraction), 1)
+            let displayStart = displaySelection.startProgress +
+                displaySelection.durationProgress * localStartFraction
+            let displayEnd = displaySelection.startProgress +
+                displaySelection.durationProgress * localEndFraction
+            let candidateDisplaySelection = TimelineSelection(
+                startProgress: displayStart,
+                endProgress: displayEnd,
+                trackID: trackID
+            )
+            let candidateEditSelection = TimelineSelection(
+                startProgress: Double(lowerBound) / timelineFrameCountDouble,
+                endProgress: Double(upperBound) / timelineFrameCountDouble,
+                trackID: trackID
+            )
+            guard candidateDisplaySelection.durationProgress > 0, candidateEditSelection.durationProgress > 0 else {
+                return nil
+            }
+
+            return DeadAirReviewCandidate(
+                id: UUID(),
+                trackID: trackID,
+                trackEditRevision: trackEditRevision,
+                displaySelection: candidateDisplaySelection,
+                editSelection: candidateEditSelection,
+                frameRange: lowerBound..<upperBound
+            )
+        }
+
+        return DeadAirReviewResult(
+            candidates: candidates,
+            detectedRegionCount: detectedRegions.count
+        )
+    }
+
+    private func publishDeadAirReviewResult(
+        _ result: DeadAirReviewResult,
+        trackID: UUID,
+        expectedEditRevision: Int
+    ) {
+        guard
+            let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }),
+            projectTracks[trackIndex].editRevision == expectedEditRevision
+        else {
+            updateStatus("dead air review skipped: track changed")
+            return
+        }
+
+        guard !result.candidates.isEmpty else {
+            clearDeadAirReview(publish: true)
+            updateStatus("no removable dead air found")
+            return
+        }
+
+        deadAirCandidates = result.candidates
+        activeDeadAirCandidateID = result.candidates.first?.id
+        publishDeadAirCandidateRegions()
+        updateEffectCommandState()
+        let candidateWord = result.candidates.count == 1 ? "candidate" : "candidates"
+        updateStatus("found \(result.candidates.count) dead air \(candidateWord)")
+    }
+
+    private func activeDeadAirCandidate() -> DeadAirReviewCandidate? {
+        guard let activeDeadAirCandidateID else {
+            return deadAirCandidates.first
+        }
+        return deadAirCandidates.first { $0.id == activeDeadAirCandidateID } ?? deadAirCandidates.first
+    }
+
+    private func publishDeadAirCandidateRegions() {
+        let activeID = activeDeadAirCandidate()?.id
+        let regions = deadAirCandidates.map { candidate in
+            TimelineRenderState.CandidateRegion(
+                id: candidate.id,
+                selection: candidate.displaySelection,
+                isActive: candidate.id == activeID
+            )
+        }
+        timelineSurface.displayCandidateRegions(regions)
+    }
+
+    private func clearDeadAirReview(publish: Bool) {
+        deadAirAuditionStopTask?.cancel()
+        deadAirAuditionStopTask = nil
+        deadAirCandidates.removeAll()
+        activeDeadAirCandidateID = nil
+        if publish {
+            timelineSurface.displayCandidateRegions([])
+        }
+        updateEffectCommandState()
+    }
+
+    private func acceptActiveDeadAirCandidate() {
+        guard let candidate = activeDeadAirCandidate() else {
+            updateStatus("no dead air candidate to accept")
+            return
+        }
+        guard
+            let trackIndex = projectTracks.firstIndex(where: { $0.id == candidate.trackID }),
+            projectTracks[trackIndex].editRevision == candidate.trackEditRevision
+        else {
+            clearDeadAirReview(publish: true)
+            updateStatus("dead air candidate expired; review again")
+            return
+        }
+
+        let target = EditableSelectionTarget(
+            trackIndex: trackIndex,
+            displaySelection: candidate.displaySelection,
+            editSelection: candidate.editSelection
+        )
+        clearDeadAirReview(publish: true)
+        performOptimisticDelete(
+            target: target,
+            copyBeforeDeleting: false,
+            scope: .track
+        )
+    }
+
+    private func rejectActiveDeadAirCandidate() {
+        guard let candidate = activeDeadAirCandidate(),
+              let candidateIndex = deadAirCandidates.firstIndex(where: { $0.id == candidate.id })
+        else {
+            updateStatus("no dead air candidate to reject")
+            return
+        }
+
+        deadAirCandidates.remove(at: candidateIndex)
+        activeDeadAirCandidateID = deadAirCandidates.indices.contains(candidateIndex) ?
+            deadAirCandidates[candidateIndex].id :
+            deadAirCandidates.first?.id
+        if deadAirCandidates.isEmpty {
+            clearDeadAirReview(publish: true)
+            updateStatus("dead air review complete")
+        } else {
+            publishDeadAirCandidateRegions()
+            updateEffectCommandState()
+            updateStatus("rejected dead air candidate")
+        }
+    }
+
+    private func auditionActiveDeadAirCandidate() {
+        guard let candidate = activeDeadAirCandidate() else {
+            updateStatus("no dead air candidate to audition")
+            return
+        }
+        guard playbackController.hasSource else {
+            updateStatus("load audio before auditioning")
+            return
+        }
+
+        let projectDuration = projectSelectionDuration
+        guard projectDuration > 0 else {
+            updateStatus("cannot audition without project duration")
+            return
+        }
+
+        let preRoll: TimeInterval = 1.25
+        let postRoll: TimeInterval = 1.25
+        let startTime = max(TimeInterval(candidate.displayStartProgress) * projectDuration - preRoll, 0)
+        let endTime = min(TimeInterval(candidate.displayEndProgress) * projectDuration + postRoll, projectDuration)
+        let startProgress = Float(startTime / projectDuration)
+        let auditionDuration = max(endTime - startTime, 0.1)
+
+        do {
+            try playbackController.seek(toProgress: startProgress)
+            if !playbackController.isPlaying {
+                try playbackController.play()
+            }
+            refreshPlaybackProgress(syncPlayheadWhenPlaying: true)
+            startPlaybackTimer()
+            updateStatus("auditioning dead air")
+        } catch {
+            stopPlaybackTimer()
+            updateStatus("audition failed: \(error.localizedDescription)")
+            return
+        }
+
+        deadAirAuditionStopTask?.cancel()
+        deadAirAuditionStopTask = Task { [weak self, candidateID = candidate.id, auditionDuration] in
+            try? await Task.sleep(nanoseconds: UInt64(auditionDuration * 1_000_000_000))
+            await MainActor.run { [weak self] in
+                guard
+                    let self,
+                    self.activeDeadAirCandidateID == candidateID,
+                    self.playbackController.isPlaying
+                else {
+                    return
+                }
+                self.playbackController.pause()
+                self.refreshPlaybackProgress(syncPlayheadWhenPlaying: false)
+                self.stopPlaybackTimer()
+                self.updateStatus("auditioned dead air candidate")
+            }
+        }
     }
 
     private func deleteDetectedSilence() {
@@ -4601,6 +4940,19 @@ final class WorkspaceView: NSView {
             updateStatus("select audio to delete")
             return
         }
+
+        performOptimisticDelete(
+            target: target,
+            copyBeforeDeleting: copyBeforeDeleting,
+            scope: scope
+        )
+    }
+
+    private func performOptimisticDelete(
+        target: EditableSelectionTarget,
+        copyBeforeDeleting: Bool,
+        scope: EditScope
+    ) {
 
         guard
             projectTracks.indices.contains(target.trackIndex)
@@ -6312,6 +6664,9 @@ final class WorkspaceView: NSView {
     }
 
     private func updateSelection(_ selection: TimelineSelection?) {
+        if !deadAirCandidates.isEmpty {
+            clearDeadAirReview(publish: true)
+        }
         if selectedTrackID != nil || !selectedTrackIDs.isEmpty {
             selectedTrackID = nil
             selectedTrackIDs.removeAll()
@@ -6493,6 +6848,7 @@ final class WorkspaceView: NSView {
         timelineSurface.canDeleteSelection = canDeleteSelection
         timelineSurface.canClearSelection = canClearSelection
         timelineSurface.canDeleteSilence = canDeleteSilence
+        timelineSurface.canUseDeadAirCandidate = activeDeadAirCandidate() != nil
         updateEditScopeHint()
     }
 
