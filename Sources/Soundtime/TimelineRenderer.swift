@@ -921,7 +921,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let maximumInFlightWaveformMipBuilds = 4
     private let maximumGeneratedWaveformMipBins = 2_097_152
     private let generatedWaveformMipSamplesPerBin = 4
-    private let highResolutionWaveformVisibleDurationThreshold: TimeInterval = 90
+    private let highResolutionWaveformVisibleDurationThreshold: TimeInterval = 120
     private let waveformMipTargetBinsPerPoint: Float = 96
     private let maximumCachedWaveformMipPyramids = 512
     private let maximumCachedWaveformShaderBinBuffers = 2_048
@@ -929,7 +929,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let maximumBackgroundPrewarmedWaveformShaderBins = 16_384
     private let maximumViewportPrewarmedWaveformShaderBins = WaveformOverviewBuilder.defaultTargetBinCount
     private let maximumViewportPrewarmTrackCount = 32
+    private let maximumHighResolutionPrewarmTrackCount = 8
     private let waveformShaderPrewarmTrackOverscan = 8
+    private let waveformShaderHighResolutionPrewarmTrackOverscan = 1
     private let waveformPrewarmJobBatchSize = 8
     private let maximumInFlightWaveformShaderBufferUploads = 8
     private let maximumSynchronousWaveformShaderBinBufferBins = 4_096
@@ -2554,10 +2556,17 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         drawableSize: CGSize,
         backingScale: Float
     ) {
+        let prefersExactMip = prefersExactWaveformMip(renderState: renderState)
         let visibleTracks = visiblePrewarmTracks(
             tracks: tracks,
             renderState: renderState,
-            drawableSize: drawableSize
+            drawableSize: drawableSize,
+            overscan: prefersExactMip ?
+                waveformShaderHighResolutionPrewarmTrackOverscan :
+                waveformShaderPrewarmTrackOverscan,
+            maximumCount: prefersExactMip ?
+                maximumHighResolutionPrewarmTrackCount :
+                maximumViewportPrewarmTrackCount
         )
         let viewportBinLimit = viewportAwarePrewarmBinLimit(
             renderState: renderState,
@@ -2682,18 +2691,23 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private func visiblePrewarmTracks(
         tracks: [TimelineRenderState.Track],
         renderState: TimelineRenderState,
-        drawableSize: CGSize
+        drawableSize: CGSize,
+        overscan: Int = -1,
+        maximumCount: Int = -1
     ) -> [TimelineRenderState.Track] {
         guard !tracks.isEmpty else {
             return []
         }
 
         let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
-        let visibleRange = trackLayout.visibleRange(overscan: waveformShaderPrewarmTrackOverscan)
+        let visibleRange = trackLayout.visibleRange(
+            overscan: overscan >= 0 ? overscan : waveformShaderPrewarmTrackOverscan
+        )
+        let maximumCount = maximumCount > 0 ? maximumCount : maximumViewportPrewarmTrackCount
         var visibleTracks: [TimelineRenderState.Track] = []
-        visibleTracks.reserveCapacity(min(maximumViewportPrewarmTrackCount, visibleRange.count))
+        visibleTracks.reserveCapacity(min(maximumCount, visibleRange.count))
         for trackIndex in visibleRange {
-            guard visibleTracks.count < maximumViewportPrewarmTrackCount else {
+            guard visibleTracks.count < maximumCount else {
                 break
             }
             guard tracks.indices.contains(trackIndex) else {
@@ -2703,6 +2717,19 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             visibleTracks.append(tracks[trackIndex])
         }
         return visibleTracks
+    }
+
+    private func prefersExactWaveformMip(renderState: TimelineRenderState) -> Bool {
+        guard
+            let projectDuration = renderState.duration,
+            projectDuration.isFinite,
+            projectDuration > 0
+        else {
+            return false
+        }
+
+        let visibleDuration = projectDuration * Double(renderState.viewport.durationProgress)
+        return visibleDuration <= highResolutionWaveformVisibleDurationThreshold
     }
 
     private func enqueueWaveformShaderPrewarmJobs(
