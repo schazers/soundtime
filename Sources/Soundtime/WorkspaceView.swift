@@ -45,9 +45,21 @@ final class WorkspaceView: NSView {
         case coalesced
     }
 
-    private enum RippleDeleteScope: Equatable {
-        case activeTrack
-        case linkedProject
+    private enum EditScope: Int, CaseIterable {
+        case track = 0
+        case selected = 1
+        case all = 2
+
+        var title: String {
+            switch self {
+            case .track:
+                return "Track"
+            case .selected:
+                return "Selected"
+            case .all:
+                return "All"
+            }
+        }
     }
 
     private struct ProjectTrack {
@@ -229,6 +241,7 @@ final class WorkspaceView: NSView {
     private var keyDownMonitor: Any?
     private var audioDevicePreferencesObserver: NSObjectProtocol?
     private var debugToolsVisible = false
+    private var editScope: EditScope = .all
     private let editMaterializationDelay: TimeInterval = 0.75
     private let deleteMaterializationDelay: TimeInterval = 2.0
     private let deleteVisualRefreshDelay: TimeInterval = 0.13
@@ -359,6 +372,45 @@ final class WorkspaceView: NSView {
     private let volumeControl = VolumeControlView()
     private let loudnessMeter = LoudnessMeterView()
     private let transportControlPanel = TransportControlPanelView()
+    private let editScopeStack: NSStackView = {
+        let stack = NSStackView()
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 8
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        return stack
+    }()
+    private let editScopeTitleLabel: NSTextField = {
+        let label = NSTextField(labelWithString: "Delete scope")
+        label.font = .systemFont(ofSize: 11, weight: .semibold)
+        label.textColor = NSColor.secondaryLabelColor
+        label.lineBreakMode = .byClipping
+        label.setContentCompressionResistancePriority(.required, for: .horizontal)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        return label
+    }()
+    private let editScopeControl: NSSegmentedControl = {
+        let control = NSSegmentedControl()
+        control.segmentCount = EditScope.allCases.count
+        for scope in EditScope.allCases {
+            control.setLabel(scope.title, forSegment: scope.rawValue)
+            control.setWidth(scope == .selected ? 72 : 54, forSegment: scope.rawValue)
+        }
+        control.segmentStyle = .rounded
+        control.trackingMode = .selectOne
+        control.selectedSegment = EditScope.all.rawValue
+        control.translatesAutoresizingMaskIntoConstraints = false
+        return control
+    }()
+    private let editScopeHintLabel: NSTextField = {
+        let label = NSTextField(labelWithString: "")
+        label.font = .systemFont(ofSize: 11, weight: .medium)
+        label.textColor = NSColor.secondaryLabelColor
+        label.lineBreakMode = .byTruncatingTail
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        return label
+    }()
     private let agentCommandController = AgentCommandController()
     private let agentCommandBar = AgentCommandBarView()
     private let fisheyeRadiusControl = TimelineTuningSliderView(
@@ -550,6 +602,11 @@ final class WorkspaceView: NSView {
         performanceDashboardButton.onPressed = { [weak self] in
             PerformanceDashboardWindowController.shared.showDashboard(relativeTo: self?.window)
         }
+        editScopeControl.target = self
+        editScopeControl.action = #selector(editScopeChanged(_:))
+        editScopeStack.addArrangedSubview(editScopeTitleLabel)
+        editScopeStack.addArrangedSubview(editScopeControl)
+        editScopeStack.addArrangedSubview(editScopeHintLabel)
         transportControlPanel.onAction = { [weak self] action in
             self?.handleTransportAction(action)
         }
@@ -599,6 +656,7 @@ final class WorkspaceView: NSView {
         addSubview(volumeControl)
         addSubview(timeReadoutLabel)
         addSubview(loudnessMeter)
+        addSubview(editScopeStack)
         addSubview(fisheyeControlsStack)
         addSubview(trackControlsStack)
         addSubview(addTrackButton)
@@ -686,6 +744,12 @@ final class WorkspaceView: NSView {
             loudnessMeter.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -22),
             loudnessMeterWidthConstraint,
             loudnessMeter.heightAnchor.constraint(equalToConstant: 34),
+
+            editScopeStack.leadingAnchor.constraint(equalTo: trackControlsStack.trailingAnchor, constant: 10),
+            editScopeStack.trailingAnchor.constraint(lessThanOrEqualTo: loudnessMeter.leadingAnchor, constant: -20),
+            editScopeStack.bottomAnchor.constraint(equalTo: trackControlsStack.topAnchor, constant: -10),
+            editScopeStack.heightAnchor.constraint(equalToConstant: 26),
+            editScopeHintLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 220),
 
             fisheyeControlsStack.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 12),
             fisheyeControlsStack.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
@@ -824,6 +888,7 @@ final class WorkspaceView: NSView {
         let showsVolume = width >= 620
         let showsLoudness = width >= 760
         let showsFrameHistory = width >= 380
+        let showsEditScope = width >= 720
         let showsDebugText = debugToolsVisible && width >= 760
         let showsDebugSliders = SoundtimeFeatureFlags.waveformFisheye && debugToolsVisible && width >= 980
 
@@ -834,10 +899,23 @@ final class WorkspaceView: NSView {
         loudnessMeter.isHidden = !showsLoudness
         frameRateHistoryView.isHidden = !showsFrameHistory
         framesPerSecondLabel.isHidden = !showsDebugText
+        editScopeStack.isHidden = !showsEditScope
         fisheyeControlsStack.isHidden = !showsDebugSliders
         framesPerSecondWidthConstraint?.constant = showsDebugText ? 390 : 0
         trackControlsBelowDebugConstraint?.isActive = showsDebugSliders
         trackControlsBelowHeaderConstraint?.isActive = !showsDebugSliders
+    }
+
+    @objc private func editScopeChanged(_ sender: NSSegmentedControl) {
+        guard let nextScope = EditScope(rawValue: sender.selectedSegment) else {
+            sender.selectedSegment = editScope.rawValue
+            return
+        }
+
+        editScope = nextScope
+        updateEditScopeHint()
+        updateStatus(currentPlaybackStatus)
+        window?.makeFirstResponder(timelineSurface)
     }
 
     private func handleTransportAction(_ action: TransportControlPanelView.TransportAction) {
@@ -3562,7 +3640,7 @@ final class WorkspaceView: NSView {
     }
 
     private func deleteSelection() {
-        performOptimisticDelete(copyBeforeDeleting: false, scope: .linkedProject)
+        performOptimisticDelete(copyBeforeDeleting: false, scope: editScope)
     }
 
     private func clearSelection() {
@@ -4071,7 +4149,7 @@ final class WorkspaceView: NSView {
     }
 
     private func cutSelection() {
-        performOptimisticDelete(copyBeforeDeleting: true, scope: .activeTrack)
+        performOptimisticDelete(copyBeforeDeleting: true, scope: .track)
     }
 
     private func copySelection() {
@@ -4426,7 +4504,7 @@ final class WorkspaceView: NSView {
         }
     }
 
-    private func performOptimisticDelete(copyBeforeDeleting: Bool, scope: RippleDeleteScope) {
+    private func performOptimisticDelete(copyBeforeDeleting: Bool, scope: EditScope) {
         guard
             let target = currentEditableSelectionTarget()
         else {
@@ -4466,7 +4544,7 @@ final class WorkspaceView: NSView {
             name: copyBeforeDeleting ? "cut-selection" : "delete-time",
             message: "User requested an optimistic audio edit.",
             fields: [
-                "scope": scope == .linkedProject ? "linkedProject" : "activeTrack",
+                "scope": scope.title,
                 "trackCount": "\(trackEdits.count)",
                 "startProgress": String(format: "%.9f", displaySelectionToDelete.startProgress),
                 "endProgress": String(format: "%.9f", displaySelectionToDelete.endProgress),
@@ -4563,7 +4641,7 @@ final class WorkspaceView: NSView {
             resumeIfPlaying: playbackController.isPlaying
         )
         updateEffectCommandState()
-        let scopeSuffix = scope == .linkedProject && trackEdits.count > 1 ?
+        let scopeSuffix = scope == .all && trackEdits.count > 1 ?
             " across \(trackEdits.count) tracks" :
             ""
         let status = "\(copyBeforeDeleting ? "cut" : "deleted") \(formatDuration(statusDuration))\(scopeSuffix)"
@@ -4584,12 +4662,31 @@ final class WorkspaceView: NSView {
 
     private func rippleDeleteTargets(
         for target: EditableSelectionTarget,
-        scope: RippleDeleteScope
+        scope: EditScope
     ) -> [EditableSelectionTarget] {
         switch scope {
-        case .activeTrack:
+        case .track:
             return [target]
-        case .linkedProject:
+        case .selected:
+            if
+                let selectedTrackID,
+                let selectedTrackIndex = projectTracks.firstIndex(where: { $0.id == selectedTrackID }),
+                let editSelection = editSelection(from: target.displaySelection, trackIndex: selectedTrackIndex)
+            {
+                return [
+                    EditableSelectionTarget(
+                        trackIndex: selectedTrackIndex,
+                        displaySelection: TimelineSelection(
+                            startProgress: target.displaySelection.startProgress,
+                            endProgress: target.displaySelection.endProgress,
+                            trackID: selectedTrackID
+                        ),
+                        editSelection: editSelection
+                    )
+                ]
+            }
+            return [target]
+        case .all:
             return projectTracks.indices.compactMap { trackIndex in
                 let trackID = projectTracks[trackIndex].id
                 let displaySelection = TimelineSelection(
@@ -6186,6 +6283,66 @@ final class WorkspaceView: NSView {
         currentEditableSelectionTarget() != nil
     }
 
+    private func isEditableRippleDeleteTarget(_ target: EditableSelectionTarget) -> Bool {
+        guard
+            projectTracks.indices.contains(target.trackIndex),
+            target.editSelection.durationProgress > 0
+        else {
+            return false
+        }
+
+        let track = projectTracks[target.trackIndex]
+        return track.audioTimeline != nil ||
+            track.fileTimeline != nil ||
+            WAVAudioDecoder.canDecode(track.sourceURL)
+    }
+
+    private func updateEditScopeHint() {
+        editScopeControl.selectedSegment = editScope.rawValue
+
+        guard
+            let selectedTimelineRange,
+            selectedTimelineRange.durationProgress > 0
+        else {
+            editScopeHintLabel.stringValue = ""
+            return
+        }
+
+        if
+            let selectedTrackID,
+            isFullTrackSelection(selectedTimelineRange, trackID: selectedTrackID)
+        {
+            editScopeHintLabel.stringValue = "Backspace deletes track"
+            return
+        }
+
+        guard let target = currentEditableSelectionTarget() else {
+            editScopeHintLabel.stringValue = ""
+            return
+        }
+
+        let affectedTrackCount = rippleDeleteTargets(for: target, scope: editScope)
+            .filter(isEditableRippleDeleteTarget)
+            .count
+        guard affectedTrackCount > 0 else {
+            editScopeHintLabel.stringValue = "No overlapping audio"
+            return
+        }
+
+        switch editScope {
+        case .track:
+            editScopeHintLabel.stringValue = "Delete affects this track"
+        case .selected:
+            editScopeHintLabel.stringValue = affectedTrackCount == 1 ?
+                "Delete affects selected track" :
+                "Delete affects \(affectedTrackCount) selected tracks"
+        case .all:
+            editScopeHintLabel.stringValue = affectedTrackCount == 1 ?
+                "Delete affects 1 track" :
+                "Delete affects \(affectedTrackCount) tracks"
+        }
+    }
+
     private func updateEffectCommandState() {
         timelineSurface.canApplyGainEffect = canApplyGainEffect
         timelineSurface.canApplyFadeEffect = canApplyGainEffect
@@ -6194,6 +6351,7 @@ final class WorkspaceView: NSView {
         timelineSurface.canDeleteSelection = canDeleteSelection
         timelineSurface.canClearSelection = canClearSelection
         timelineSurface.canDeleteSilence = canDeleteSilence
+        updateEditScopeHint()
     }
 
     private func updateStatus(_ status: String) {
