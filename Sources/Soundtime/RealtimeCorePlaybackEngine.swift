@@ -402,7 +402,10 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         let snapshotTimestamp = CACurrentMediaTime()
         if
             let pendingCommandRenderedFrameCount,
-            detailedSnapshot.renderedFrameCount <= pendingCommandRenderedFrameCount
+            !hasCoreReachedPendingCommand(
+                detailedSnapshot,
+                pendingCommandRenderedFrameCount: pendingCommandRenderedFrameCount
+            )
         {
             return PlaybackSnapshot(
                 frameIndex: mirroredFrameIndex,
@@ -432,6 +435,22 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             isPlaying: mirroredIsPlaying,
             hostTimestamp: mirroredHostTimestamp
         )
+    }
+
+    private func hasCoreReachedPendingCommand(
+        _ detailedSnapshot: RealtimeAudioCoreSnapshot,
+        pendingCommandRenderedFrameCount: Int
+    ) -> Bool {
+        guard detailedSnapshot.renderedFrameCount > pendingCommandRenderedFrameCount else {
+            return false
+        }
+
+        if mirroredIsPlaying {
+            return detailedSnapshot.isPlaying
+        }
+
+        return !detailedSnapshot.isPlaying &&
+            abs(detailedSnapshot.frameIndex - mirroredFrameIndex) <= 1
     }
 
     func drainMeterSamples() -> [PlaybackMeterSample] {
