@@ -4303,6 +4303,97 @@ final class WorkspaceView: NSView {
         return "silence \(index + 1)/\(total): \(duration), \(confidence)% confidence, \(candidate.reason)"
     }
 
+    private func currentSilenceReviewState() -> SoundtimeProject.SilenceReviewState? {
+        guard !deadAirCandidates.isEmpty else {
+            return nil
+        }
+
+        return SoundtimeProject.SilenceReviewState(
+            candidates: deadAirCandidates.map { candidate in
+                SoundtimeProject.SilenceReviewCandidate(
+                    id: candidate.id,
+                    trackID: candidate.trackID,
+                    trackEditRevision: candidate.trackEditRevision,
+                    displaySelection: projectSelectionRange(candidate.displaySelection),
+                    editSelection: projectSelectionRange(candidate.editSelection),
+                    frameStart: candidate.frameRange.lowerBound,
+                    frameEnd: candidate.frameRange.upperBound,
+                    confidence: candidate.confidence,
+                    reason: candidate.reason,
+                    estimatedRemovedDuration: candidate.estimatedRemovedDuration
+                )
+            },
+            activeCandidateID: activeDeadAirCandidateID
+        )
+    }
+
+    private func restoreSilenceReviewState(_ state: SoundtimeProject.SilenceReviewState?) {
+        guard let state, !state.candidates.isEmpty else {
+            clearDeadAirReview(publish: true)
+            return
+        }
+
+        let restoredCandidates = state.candidates.compactMap { candidate -> DeadAirReviewCandidate? in
+            guard
+                let track = projectTracks.first(where: { $0.id == candidate.trackID }),
+                track.editRevision == candidate.trackEditRevision,
+                candidate.frameEnd > candidate.frameStart
+            else {
+                return nil
+            }
+
+            let displaySelection = timelineSelection(from: candidate.displaySelection)
+            let editSelection = timelineSelection(from: candidate.editSelection)
+            guard displaySelection.durationProgress > 0, editSelection.durationProgress > 0 else {
+                return nil
+            }
+
+            return DeadAirReviewCandidate(
+                id: candidate.id,
+                trackID: candidate.trackID,
+                trackEditRevision: candidate.trackEditRevision,
+                displaySelection: displaySelection,
+                editSelection: editSelection,
+                frameRange: candidate.frameStart..<candidate.frameEnd,
+                confidence: candidate.confidence,
+                reason: candidate.reason,
+                estimatedRemovedDuration: candidate.estimatedRemovedDuration
+            )
+        }
+
+        guard !restoredCandidates.isEmpty else {
+            clearDeadAirReview(publish: true)
+            return
+        }
+
+        deadAirCandidates = restoredCandidates
+        activeDeadAirCandidateID = state.activeCandidateID.flatMap { activeID in
+            restoredCandidates.contains { $0.id == activeID } ? activeID : nil
+        } ?? restoredCandidates.first?.id
+        publishDeadAirCandidateRegions()
+        updateEffectCommandState()
+    }
+
+    private func projectSelectionRange(
+        _ selection: TimelineSelection
+    ) -> SoundtimeProject.TimelineSelectionRange {
+        SoundtimeProject.TimelineSelectionRange(
+            startProgress: selection.startProgress,
+            endProgress: selection.endProgress,
+            trackID: selection.trackID
+        )
+    }
+
+    private func timelineSelection(
+        from range: SoundtimeProject.TimelineSelectionRange
+    ) -> TimelineSelection {
+        TimelineSelection(
+            startProgress: range.startProgress,
+            endProgress: range.endProgress,
+            trackID: range.trackID
+        )
+    }
+
     private func publishDeadAirReviewResult(
         _ result: DeadAirReviewResult,
         trackID: UUID,
@@ -6608,6 +6699,7 @@ final class WorkspaceView: NSView {
                 )
             }
             isLoadingProject = false
+            restoreSilenceReviewState(project.silenceReviewState)
             reloadPlaybackFromProjectTracks(preserveProgress: false)
             window?.title = projectWindowTitle()
             updateLoadedProjectSummary()
@@ -6637,6 +6729,7 @@ final class WorkspaceView: NSView {
                 )
             }
             isLoadingProject = false
+            restoreSilenceReviewState(project.silenceReviewState)
             reloadPlaybackFromProjectTracks(preserveProgress: false)
             window?.title = projectWindowTitle()
             updateLoadedProjectSummary()
@@ -6761,7 +6854,8 @@ final class WorkspaceView: NSView {
             },
             windowLayout: currentWindowLayout(),
             masterVolume: volumeControl.perceptualVolume,
-            timelineViewport: currentTimelineViewport()
+            timelineViewport: currentTimelineViewport(),
+            silenceReviewState: currentSilenceReviewState()
         )
     }
 

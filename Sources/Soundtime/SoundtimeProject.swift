@@ -1,7 +1,7 @@
 import Foundation
 
 struct SoundtimeProject: Codable, Sendable {
-    static let currentSchemaVersion = 2
+    static let currentSchemaVersion = 3
 
     struct WindowLayout: Codable, Sendable {
         var x: Double
@@ -13,6 +13,30 @@ struct SoundtimeProject: Codable, Sendable {
     struct TimelineViewport: Codable, Sendable {
         var startProgress: Float
         var durationProgress: Float
+    }
+
+    struct TimelineSelectionRange: Codable, Sendable {
+        var startProgress: Double
+        var endProgress: Double
+        var trackID: UUID?
+    }
+
+    struct SilenceReviewCandidate: Codable, Sendable {
+        var id: UUID
+        var trackID: UUID
+        var trackEditRevision: Int
+        var displaySelection: TimelineSelectionRange
+        var editSelection: TimelineSelectionRange
+        var frameStart: Int
+        var frameEnd: Int
+        var confidence: Float
+        var reason: String
+        var estimatedRemovedDuration: TimeInterval
+    }
+
+    struct SilenceReviewState: Codable, Sendable {
+        var candidates: [SilenceReviewCandidate]
+        var activeCandidateID: UUID?
     }
 
     struct Track: Codable, Sendable {
@@ -30,6 +54,7 @@ struct SoundtimeProject: Codable, Sendable {
     var windowLayout: WindowLayout?
     var masterVolume: Float?
     var timelineViewport: TimelineViewport?
+    var silenceReviewState: SilenceReviewState?
 
     var schemaVersion: Int
 
@@ -38,12 +63,14 @@ struct SoundtimeProject: Codable, Sendable {
         windowLayout: WindowLayout?,
         masterVolume: Float?,
         timelineViewport: TimelineViewport?,
+        silenceReviewState: SilenceReviewState? = nil,
         schemaVersion: Int = SoundtimeProject.currentSchemaVersion
     ) {
         self.tracks = tracks
         self.windowLayout = windowLayout
         self.masterVolume = masterVolume
         self.timelineViewport = timelineViewport
+        self.silenceReviewState = silenceReviewState
         self.schemaVersion = schemaVersion
     }
 
@@ -53,6 +80,7 @@ struct SoundtimeProject: Codable, Sendable {
         case windowLayout
         case masterVolume
         case timelineViewport
+        case silenceReviewState
     }
 
     init(from decoder: Decoder) throws {
@@ -62,6 +90,7 @@ struct SoundtimeProject: Codable, Sendable {
         windowLayout = try container.decodeIfPresent(WindowLayout.self, forKey: .windowLayout)
         masterVolume = try container.decodeIfPresent(Float.self, forKey: .masterVolume)
         timelineViewport = try container.decodeIfPresent(TimelineViewport.self, forKey: .timelineViewport)
+        silenceReviewState = try container.decodeIfPresent(SilenceReviewState.self, forKey: .silenceReviewState)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -71,6 +100,7 @@ struct SoundtimeProject: Codable, Sendable {
         try container.encodeIfPresent(windowLayout, forKey: .windowLayout)
         try container.encodeIfPresent(masterVolume, forKey: .masterVolume)
         try container.encodeIfPresent(timelineViewport, forKey: .timelineViewport)
+        try container.encodeIfPresent(silenceReviewState, forKey: .silenceReviewState)
     }
 }
 
