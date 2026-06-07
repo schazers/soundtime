@@ -2689,7 +2689,8 @@ final class WorkspaceView: NSView {
         trackID: UUID,
         fileTimeline: AudioFileEditTimeline?,
         sourceOverview: WaveformOverview?,
-        editRevision: Int
+        editRevision: Int,
+        delay: TimeInterval? = nil
     ) {
         guard
             let fileTimeline,
@@ -2710,7 +2711,7 @@ final class WorkspaceView: NSView {
             fileTimeline,
             sourceOverview,
             editRevision,
-            editWaveformRefinementDelay = editWaveformRefinementDelay,
+            editWaveformRefinementDelay = delay ?? editWaveformRefinementDelay,
             requestID
         ] in
             try? await Task.sleep(nanoseconds: UInt64(editWaveformRefinementDelay * 1_000_000_000))
@@ -2740,7 +2741,10 @@ final class WorkspaceView: NSView {
 
             self.clearEditWaveformRefinementTask(trackID: trackID, requestID: requestID)
             self.projectTracks[trackIndex].waveformOverview = refinedOverview
-            self.refreshProjectTimelineDisplay(rebuildControls: false)
+            self.refreshProjectTimelineDisplay(
+                rebuildControls: false,
+                animateWaveformTransition: false
+            )
             self.updateProjectDisplayTiming()
         }
         editWaveformRefinementTasks[trackID] = task
@@ -3828,21 +3832,22 @@ final class WorkspaceView: NSView {
         if let editedFileTimeline {
             projectTracks[trackIndex].waveformOverview =
                 optimisticWaveformOverview(
-                    for: editedFileTimeline,
-                    sourceOverview: projectTracks[trackIndex].sourceWaveformOverview,
-                    fallbackOverview: currentOverview
-                ) ??
-                optimisticWaveformOverview(
                     currentOverview,
                     replacing: selectionToDelete,
                     with: nil,
                     targetDuration: editedDuration
+                ) ??
+                optimisticWaveformOverview(
+                    for: editedFileTimeline,
+                    sourceOverview: projectTracks[trackIndex].sourceWaveformOverview,
+                    fallbackOverview: currentOverview
                 )
             scheduleFileTimelineWaveformRefinement(
                 trackID: trackID,
                 fileTimeline: editedFileTimeline,
                 sourceOverview: projectTracks[trackIndex].sourceWaveformOverview ?? currentOverview,
-                editRevision: editRevision
+                editRevision: editRevision,
+                delay: deleteMaterializationDelay
             )
         } else {
             projectTracks[trackIndex].waveformOverview = optimisticWaveformOverview(
