@@ -37,6 +37,16 @@ struct AudioEditTimeline: Sendable {
         }
     }
 
+    struct ClipRange: Equatable, Sendable {
+        let startProgress: Double
+        let endProgress: Double
+    }
+
+    enum ClipEdge: Sendable {
+        case leading
+        case trailing
+    }
+
     private struct Segment: Sendable {
         let sourceStartFrame: Int
         let frameCount: Int
@@ -181,6 +191,33 @@ struct AudioEditTimeline: Sendable {
         }
     }
 
+    var clipRanges: [ClipRange] {
+        guard timelineFrameCount > 0 else {
+            return []
+        }
+
+        var ranges: [ClipRange] = []
+        var clipStartFrame = 0
+        var timelineFrame = 0
+        for segment in segments {
+            if segment.startsNewClip, timelineFrame > clipStartFrame {
+                ranges.append(ClipRange(
+                    startProgress: Double(clipStartFrame) / Double(timelineFrameCount),
+                    endProgress: Double(timelineFrame) / Double(timelineFrameCount)
+                ))
+                clipStartFrame = timelineFrame
+            }
+            timelineFrame += segment.frameCount
+        }
+        if timelineFrame > clipStartFrame {
+            ranges.append(ClipRange(
+                startProgress: Double(clipStartFrame) / Double(timelineFrameCount),
+                endProgress: Double(timelineFrame) / Double(timelineFrameCount)
+            ))
+        }
+        return ranges
+    }
+
     var duration: TimeInterval {
         guard sourceBuffer.sampleRate > 0 else {
             return 0
@@ -243,6 +280,52 @@ struct AudioEditTimeline: Sendable {
         let trailingDeletedFrameCount = deleteFrames(in: keepEndFrame..<originalFrameCount)
         let leadingDeletedFrameCount = deleteFrames(in: 0..<keepStartFrame)
         return trailingDeletedFrameCount + leadingDeletedFrameCount
+    }
+
+    mutating func trimClip(
+        _ clipRange: ClipRange,
+        edge: ClipEdge,
+        toProgress targetProgress: Double
+    ) -> Int {
+        let originalFrameCount = frameCount
+        guard
+            originalFrameCount > 1,
+            targetProgress.isFinite,
+            clipRange.startProgress < clipRange.endProgress
+        else {
+            return 0
+        }
+
+        let clipStartFrame = min(
+            max(Int((clipRange.startProgress * Double(originalFrameCount)).rounded()), 0),
+            originalFrameCount
+        )
+        let clipEndFrame = min(
+            max(Int((clipRange.endProgress * Double(originalFrameCount)).rounded()), clipStartFrame),
+            originalFrameCount
+        )
+        guard clipEndFrame - clipStartFrame > 1 else {
+            return 0
+        }
+
+        switch edge {
+        case .leading:
+            let targetFrame = min(
+                max(Int((targetProgress * Double(originalFrameCount)).rounded()), clipStartFrame + 1),
+                clipEndFrame - 1
+            )
+            let deletedFrameCount = deleteFrames(in: clipStartFrame..<targetFrame)
+            if deletedFrameCount > 0, clipStartFrame > 0 {
+                _ = split(atFrame: clipStartFrame)
+            }
+            return deletedFrameCount
+        case .trailing:
+            let targetFrame = min(
+                max(Int((targetProgress * Double(originalFrameCount)).rounded()), clipStartFrame + 1),
+                clipEndFrame - 1
+            )
+            return deleteFrames(in: targetFrame..<clipEndFrame)
+        }
     }
 
     func render() -> DecodedAudioBuffer {

@@ -841,6 +841,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var selectedTrackVertexScratch: [TimelineVertex] = []
     private var candidateRegionVertexScratch: [TimelineVertex] = []
     private var selectionVertexScratch: [TimelineVertex] = []
+    private var clipBoundaryVertexScratch: [TimelineVertex] = []
     private var gridCache: GridCache?
     private var waveformTransitionStartTime: CFTimeInterval?
     private var previousRenderedPlayheadX: Float?
@@ -1224,7 +1225,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             volume: track.volume,
             isMuted: track.isMuted,
             isSoloed: track.isSoloed,
-            hasWaveform: hasWaveform
+            hasWaveform: hasWaveform,
+            clipRanges: track.clipRanges.isEmpty ? (currentTrack?.clipRanges ?? []) : track.clipRanges
         )
     }
 
@@ -1853,6 +1855,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             drawableSize: viewportSize,
             renderState: renderState
         )
+        let clipBoundaryVertices = makeClipBoundaryVertices(
+            drawableSize: viewportSize,
+            backingScale: backingScale,
+            renderState: renderState
+        )
         let usesWaveformShader = shouldRenderShaderWaveforms(
             drawableSize: viewportSize,
             renderState: renderState
@@ -2036,6 +2043,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             encoder: encoder
         )
         encoder.setRenderPipelineState(pipelineState)
+        draw(vertices: clipBoundaryVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: trimPreviewVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: hoverGuideVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: playheadVertices, primitiveType: .triangle, encoder: encoder)
@@ -3396,7 +3404,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 volume: currentTrack?.volume ?? previousTrack.volume,
                 isMuted: currentTrack?.isMuted ?? previousTrack.isMuted,
                 isSoloed: currentTrack?.isSoloed ?? previousTrack.isSoloed,
-                hasWaveform: previousTrack.hasWaveform
+                hasWaveform: previousTrack.hasWaveform,
+                clipRanges: currentTrack?.clipRanges ?? previousTrack.clipRanges
             )
         }
     }
@@ -4627,6 +4636,85 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             )
         }
         return selectedTrackVertexScratch
+    }
+
+    private func makeClipBoundaryVertices(
+        drawableSize: CGSize,
+        backingScale: Float,
+        renderState: TimelineRenderState
+    ) -> [TimelineVertex] {
+        clipBoundaryVertexScratch.removeAll(keepingCapacity: true)
+        guard renderState.hasWaveforms, !renderState.tracks.isEmpty else {
+            return clipBoundaryVertexScratch
+        }
+
+        let projectDuration = Float(renderState.duration ?? 0)
+        guard projectDuration > 0 else {
+            return clipBoundaryVertexScratch
+        }
+
+        let viewport = renderState.viewport
+        let width = Float(drawableSize.width)
+        let pixelWidth = width > 0 ? max(pixelLength(backingScale: backingScale) / width, 0.0012) : 0.0012
+        let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
+        let visibleRange = trackLayout.visibleRange(overscan: 1)
+        clipBoundaryVertexScratch.reserveCapacity(visibleRange.count * 24)
+
+        for trackIndex in visibleRange {
+            guard renderState.tracks.indices.contains(trackIndex) else {
+                continue
+            }
+
+            let track = renderState.tracks[trackIndex]
+            guard
+                track.hasWaveform,
+                !track.clipRanges.isEmpty,
+                let trackDuration = track.durationHint,
+                trackDuration > 0,
+                let laneFrame = trackLayout.laneFrame(forTrackIndex: trackIndex),
+                laneFrame.isVisible
+            else {
+                continue
+            }
+
+            let trackDurationProgress = min(max(Float(trackDuration) / projectDuration, 0), 1)
+            guard trackDurationProgress > 0 else {
+                continue
+            }
+
+            var emittedBoundaryKeys = Set<Int>()
+            for clipRange in track.clipRanges {
+                for localBoundary in [clipRange.startProgress, clipRange.endProgress] {
+                    let projectProgress = Float(localBoundary) * trackDurationProgress
+                    let viewportProgress = viewport.viewportProgress(forTimelineProgress: projectProgress)
+                    guard viewportProgress >= -pixelWidth, viewportProgress <= 1 + pixelWidth else {
+                        continue
+                    }
+
+                    let key = Int((projectProgress * 1_000_000).rounded())
+                    guard emittedBoundaryKeys.insert(key).inserted else {
+                        continue
+                    }
+
+                    let isOuterBoundary =
+                        projectProgress <= 0.000_001 ||
+                        abs(projectProgress - trackDurationProgress) <= 0.000_001
+                    let alpha: Float = isOuterBoundary ? 0.16 : 0.42
+                    let color = SIMD4<Float>(0.88, 0.94, 0.96, alpha)
+                    let x = min(max(viewportProgress, 0), 1)
+                    appendRectangle(
+                        to: &clipBoundaryVertexScratch,
+                        left: max(x - pixelWidth * 0.5, 0),
+                        right: min(x + pixelWidth * 0.5, 1),
+                        top: max(laneFrame.top + 0.035, 0),
+                        bottom: min(laneFrame.bottom - 0.035, 1),
+                        color: color
+                    )
+                }
+            }
+        }
+
+        return clipBoundaryVertexScratch
     }
 
     private func selectionVerticalRange(

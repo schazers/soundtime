@@ -646,6 +646,9 @@ final class WorkspaceView: NSView {
         timelineSurface.onTrimRequested = { [weak self] trimRange in
             self?.trimTimeline(to: trimRange)
         }
+        timelineSurface.onClipBoundaryTrimRequested = { [weak self] trim in
+            self?.trimClipBoundary(trim)
+        }
         timelineSurface.onFrameStatsChanged = { [weak self] frameStats in
             self?.updateFrameStats(frameStats)
         }
@@ -1175,7 +1178,8 @@ final class WorkspaceView: NSView {
                     track.durationHint,
                 volume: track.volume,
                 isMuted: track.isMuted,
-                isSoloed: track.isSoloed
+                isSoloed: track.isSoloed,
+                clipRanges: timelineClipRanges(for: track)
             )
         }
     }
@@ -1195,9 +1199,39 @@ final class WorkspaceView: NSView {
                 volume: track.volume,
                 isMuted: track.isMuted,
                 isSoloed: track.isSoloed,
-                hasWaveform: track.waveformOverview?.isEmpty == false
+                hasWaveform: track.waveformOverview?.isEmpty == false,
+                clipRanges: timelineClipRanges(for: track)
             )
         }
+    }
+
+    private func timelineClipRanges(for track: ProjectTrack) -> [TimelineRenderState.ClipRange] {
+        let ranges: [TimelineRenderState.ClipRange]
+        if let fileTimeline = track.fileTimeline {
+            ranges = fileTimeline.clipRanges.map {
+                TimelineRenderState.ClipRange(
+                    startProgress: $0.startProgress,
+                    endProgress: $0.endProgress
+                )
+            }
+        } else if let audioTimeline = track.audioTimeline {
+            ranges = audioTimeline.clipRanges.map {
+                TimelineRenderState.ClipRange(
+                    startProgress: $0.startProgress,
+                    endProgress: $0.endProgress
+                )
+            }
+        } else {
+            ranges = []
+        }
+
+        if !ranges.isEmpty {
+            return ranges
+        }
+
+        return trackDuration(for: track) > 0 ? [
+            TimelineRenderState.ClipRange(startProgress: 0, endProgress: 1)
+        ] : []
     }
 
     private func waveformVersion(for track: ProjectTrack) -> Int {
@@ -5458,6 +5492,125 @@ final class WorkspaceView: NSView {
         if let editedAudioTimeline {
             materializeEditedTimeline(
                 trackID: trackID,
+                timeline: editedAudioTimeline,
+                editRevision: editRevision,
+                status: status,
+                preservePlaybackProgress: true,
+                startDelay: editMaterializationDelay,
+                animateWaveformTransition: false
+            )
+        }
+    }
+
+    private func trimClipBoundary(_ trim: TimelineClipBoundaryTrim) {
+        guard
+            let trackIndex = projectTracks.firstIndex(where: { $0.id == trim.trackID }),
+            projectTracks.indices.contains(trackIndex)
+        else {
+            return
+        }
+
+        let undoSnapshot = ProjectTrackUndoSnapshot(
+            tracks: projectTracks,
+            activeTrackID: activeTrackID,
+            selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
+            selectedTimelineRange: selectedTimelineRange,
+            restoreProgress: playbackController.snapshot().progress
+        )
+        let editedAudioTimeline: AudioEditTimeline?
+        let editedFileTimeline: AudioFileEditTimeline?
+        let trimmedDuration: TimeInterval
+
+        if let currentFileTimeline = try? preferredFileTimelineForEditing(trackIndex: trackIndex) {
+            var timeline = currentFileTimeline
+            let originalDuration = currentFileTimeline.duration
+            let trimmedFrameCount = timeline.trimClip(
+                AudioFileEditTimeline.ClipRange(
+                    startProgress: trim.clipRange.startProgress,
+                    endProgress: trim.clipRange.endProgress
+                ),
+                edge: trim.edge == .leading ? .leading : .trailing,
+                toProgress: trim.targetProgress
+            )
+            guard trimmedFrameCount > 0 else {
+                return
+            }
+            trimmedDuration = max(originalDuration - timeline.duration, 0)
+            editedAudioTimeline = nil
+            editedFileTimeline = timeline
+        } else if let currentTimeline = projectTracks[trackIndex].audioTimeline {
+            var timeline = currentTimeline
+            let originalDuration = currentTimeline.duration
+            let trimmedFrameCount = timeline.trimClip(
+                AudioEditTimeline.ClipRange(
+                    startProgress: trim.clipRange.startProgress,
+                    endProgress: trim.clipRange.endProgress
+                ),
+                edge: trim.edge == .leading ? .leading : .trailing,
+                toProgress: trim.targetProgress
+            )
+            guard trimmedFrameCount > 0 else {
+                return
+            }
+            trimmedDuration = max(originalDuration - timeline.duration, 0)
+            editedAudioTimeline = timeline
+            editedFileTimeline = nil
+        } else {
+            updateStatus("track is not ready to trim")
+            return
+        }
+
+        editUndoStack.append(.projectTracks(undoSnapshot))
+        cancelEditMaterialization(for: trim.trackID)
+        projectTracks[trackIndex].editRevision += 1
+        let editRevision = projectTracks[trackIndex].editRevision
+        projectTracks[trackIndex].audioTimeline = editedAudioTimeline
+        projectTracks[trackIndex].fileTimeline = editedFileTimeline
+        projectTracks[trackIndex].decodedAudioBuffer = editedAudioTimeline?.sourceAudioBuffer
+        projectTracks[trackIndex].durationHint = editedFileTimeline?.duration ?? editedAudioTimeline?.duration
+        let currentOverview = projectTracks[trackIndex].waveformOverview
+        if let editedFileTimeline {
+            projectTracks[trackIndex].waveformOverview =
+                optimisticWaveformOverview(
+                    for: editedFileTimeline,
+                    sourceOverview: projectTracks[trackIndex].sourceWaveformOverview,
+                    fallbackOverview: currentOverview
+                )
+            scheduleFileTimelineWaveformRefinement(
+                trackID: trim.trackID,
+                fileTimeline: editedFileTimeline,
+                sourceOverview: projectTracks[trackIndex].sourceWaveformOverview ?? currentOverview,
+                editRevision: editRevision,
+                delay: editMaterializationDelay
+            )
+        } else if let currentOverview {
+            projectTracks[trackIndex].waveformOverview = WaveformOverview(
+                duration: editedAudioTimeline?.duration ?? currentOverview.duration,
+                bins: currentOverview.bins
+            )
+            cancelEditWaveformRefinement(for: trim.trackID)
+        }
+
+        activeTrackID = trim.trackID
+        selectedTimelineRange = nil
+        timelineSurface.displaySelection(nil)
+        timelineSurface.displayGainPreview(selection: nil, gain: 1)
+        syncActiveTrackFields()
+        refreshProjectTimelineDisplay(rebuildControls: false, animateWaveformTransition: false)
+        updateProjectDisplayTiming()
+        reloadPlaybackFromProjectTracks(
+            preserveProgress: true,
+            resumeIfPlaying: playbackController.isPlaying
+        )
+        updateEffectCommandState()
+        let edgeName = trim.edge == .leading ? "start" : "end"
+        let status = "trimmed clip \(edgeName) \(formatDuration(trimmedDuration))"
+        updateStatus(status)
+
+        if let editedAudioTimeline {
+            materializeEditedTimeline(
+                trackID: trim.trackID,
                 timeline: editedAudioTimeline,
                 editRevision: editRevision,
                 status: status,
