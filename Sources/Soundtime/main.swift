@@ -31,6 +31,16 @@ if CommandLine.arguments.contains("--recording-smoke") {
     }
 }
 
+if CommandLine.arguments.contains("--diagnostics-smoke") {
+    do {
+        try DiagnosticsSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        exit(0)
+    } catch {
+        fputs("Soundtime diagnostics smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
 if CommandLine.arguments.contains("--project-edit-roundtrip-smoke") ||
     CommandLine.arguments.contains("--project-edit-round-trip-smoke")
 {

@@ -228,11 +228,7 @@ final class SoundtimeDiagnostics: @unchecked Sendable {
             return nil
         }
 
-        let sanitizedReason = reason
-            .replacingOccurrences(of: "[^A-Za-z0-9_-]", with: "-", options: .regularExpression)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-        let fileName = "soundtime-diagnostics-\(Int(CACurrentMediaTime()))-\(sanitizedReason.isEmpty ? "trace" : sanitizedReason).json"
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+        let url = traceURL(reason: reason)
 
         traceWriteQueue.async {
             do {
@@ -245,6 +241,42 @@ final class SoundtimeDiagnostics: @unchecked Sendable {
             }
         }
         return url
+    }
+
+    @discardableResult
+    func writeTraceSynchronouslyForSmokeTesting(reason: String) -> URL? {
+        let snapshot = recentEvents(limit: maximumEventCount)
+        guard !snapshot.isEmpty else {
+            return nil
+        }
+
+        let url = traceURL(reason: reason)
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try encoder.encode(snapshot)
+            try data.write(to: url, options: [.atomic])
+            return url
+        } catch {
+            Swift.print("Soundtime could not write diagnostics smoke trace: \(error)")
+            return nil
+        }
+    }
+
+    func resetForSmokeTesting() {
+        lock.lock()
+        events.removeAll(keepingCapacity: true)
+        latestFrameStats = nil
+        latestAudioSnapshot = nil
+        lastUnderrunCount = 0
+        lastDroppedCommandCount = 0
+        lastRenderDeadlineMissCount = 0
+        lastTraceWriteByName.removeAll(keepingCapacity: true)
+        mainThreadStallCount = 0
+        lastMainThreadStallMilliseconds = 0
+        severeEventCount = 0
+        warningEventCount = 0
+        lock.unlock()
     }
 
     private func append(_ event: SoundtimeDiagnosticEvent) {
@@ -278,5 +310,13 @@ final class SoundtimeDiagnostics: @unchecked Sendable {
         if shouldWrite {
             _ = writeTrace(reason: event.name)
         }
+    }
+
+    private func traceURL(reason: String) -> URL {
+        let sanitizedReason = reason
+            .replacingOccurrences(of: "[^A-Za-z0-9_-]", with: "-", options: .regularExpression)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        let fileName = "soundtime-diagnostics-\(Int(CACurrentMediaTime()))-\(sanitizedReason.isEmpty ? "trace" : sanitizedReason).json"
+        return FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
     }
 }
