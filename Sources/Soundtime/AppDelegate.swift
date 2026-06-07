@@ -193,6 +193,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: "v"
         ))
         menu.addItem(.separator())
+        let deleteTimeItem = NSMenuItem(
+            title: "Delete Time",
+            action: #selector(TimelineView.deleteTimelineSelection(_:)),
+            keyEquivalent: "\u{7F}"
+        )
+        deleteTimeItem.keyEquivalentModifierMask = []
+        menu.addItem(deleteTimeItem)
+
+        let clearSelectionItem = NSMenuItem(
+            title: "Clear and Leave Gap",
+            action: #selector(TimelineView.clearTimelineSelection(_:)),
+            keyEquivalent: "\u{7F}"
+        )
+        clearSelectionItem.keyEquivalentModifierMask = [.command]
+        menu.addItem(clearSelectionItem)
+        menu.addItem(.separator())
         menu.addItem(NSMenuItem(
             title: "Split at Playhead",
             action: #selector(TimelineView.splitAtPlayhead(_:)),

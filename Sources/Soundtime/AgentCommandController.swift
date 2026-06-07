@@ -28,6 +28,7 @@ enum AgentResolvedCommand: Sendable, Equatable {
     case pause
     case togglePlayback
     case deleteSelection
+    case clearSelection
     case cutSelection
     case copySelection
     case pasteAudio
@@ -66,8 +67,15 @@ final class AgentCommandRegistry {
         register(
             AgentCommandCapability(
                 identifier: "timeline.deleteSelection",
-                title: "Delete Selection",
-                summary: "Delete the currently selected audio region using the app's edit graph."
+                title: "Delete Time",
+                summary: "Ripple-delete the currently selected audio region using the app's edit graph."
+            )
+        )
+        register(
+            AgentCommandCapability(
+                identifier: "timeline.clearSelection",
+                title: "Clear and Leave Gap",
+                summary: "Silence the current audio selection while preserving timeline time."
             )
         )
         register(
@@ -237,6 +245,14 @@ final class AgentCommandController {
         if normalized == "toggle playback" || normalized == "play pause" {
             return .togglePlayback
         }
+        if normalized.contains("silence") &&
+            (normalized.contains("delete") || normalized.contains("remove") || normalized.contains("clean"))
+        {
+            return .deleteSilence
+        }
+        if normalized.contains("clear") || normalized.contains("leave gap") {
+            return .clearSelection
+        }
         if normalized.contains("delete") || normalized == "remove selection" {
             return .deleteSelection
         }
@@ -251,11 +267,6 @@ final class AgentCommandController {
         }
         if normalized.contains("split") || normalized.contains("blade") {
             return .splitAtPlayhead
-        }
-        if normalized.contains("silence") &&
-            (normalized.contains("delete") || normalized.contains("remove") || normalized.contains("clean"))
-        {
-            return .deleteSilence
         }
         if normalized.contains("normalize") {
             return .normalizeSelection
