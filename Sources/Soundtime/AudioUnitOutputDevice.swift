@@ -21,6 +21,17 @@ final class AudioUnitOutputDevice: RealtimeAudioOutputDevice {
             configuredSampleRate != sampleRate ||
             configuredOutputDeviceID != selectedOutputDeviceID
         {
+            SoundtimeDiagnostics.shared.record(
+                category: .device,
+                severity: .info,
+                name: "configure-output-device",
+                message: "Configuring realtime output device.",
+                fields: [
+                    "sampleRate": String(format: "%.1f", sampleRate),
+                    "deviceID": selectedOutputDeviceID.map(String.init) ?? "system-default",
+                    "wasRunning": "\(isRunning)",
+                ]
+            )
             resetAudioUnit()
             let audioUnit = try configuredAudioUnit()
             if let selectedOutputDeviceID {
@@ -94,6 +105,12 @@ final class AudioUnitOutputDevice: RealtimeAudioOutputDevice {
     }
 
     func invalidateConfiguration() {
+        SoundtimeDiagnostics.shared.record(
+            category: .device,
+            severity: .info,
+            name: "invalidate-output-device",
+            message: "Invalidating realtime output device configuration."
+        )
         resetAudioUnit()
     }
 
