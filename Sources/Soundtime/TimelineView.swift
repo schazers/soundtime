@@ -385,11 +385,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     private static func hasInteractiveTimelineContent(_ tracks: [TimelineRenderState.Track]) -> Bool {
-        tracks.contains { track in
-            track.hasWaveform ||
-                (track.durationHint.map { $0.isFinite && $0 > 0 } ?? false) ||
-                (track.waveformOverview?.duration.isFinite == true && (track.waveformOverview?.duration ?? 0) > 0)
+        guard !tracks.isEmpty else {
+            return false
         }
+
+        return true
     }
 
     private func mergeTrackMetadata(_ tracks: [TimelineRenderState.Track]) -> [TimelineRenderState.Track] {
