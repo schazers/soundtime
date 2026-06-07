@@ -62,6 +62,7 @@ enum EditGraphSmokeHarness {
             elapsedMilliseconds < 1_500,
             String(format: "edit graph operations were too slow: %.2fms", elapsedMilliseconds)
         )
+        try runFileClipPasteSmoke(fileInfo: fileInfo)
 
         print(
             String(
@@ -70,6 +71,46 @@ enum EditGraphSmokeHarness {
                 state.segments.count,
                 elapsedMilliseconds
             )
+        )
+    }
+
+    private static func runFileClipPasteSmoke(fileInfo: WAVFileInfo) throws {
+        var timeline = AudioFileEditTimeline(fileInfo: fileInfo)
+        let gainedSelection = TimelineSelection(startProgress: 0.10, endProgress: 0.18)
+        let copiedSelection = TimelineSelection(startProgress: 0.12, endProgress: 0.145)
+        let insertionSelection = TimelineSelection(startProgress: 0.62, endProgress: 0.62)
+
+        let gainedFrameCount = timeline.applyGain(0.42, to: gainedSelection)
+        try require(gainedFrameCount > 0, "file clip smoke gain touched no frames")
+
+        let frameCountBeforePaste = timeline.frameCount
+        let clip = try requireValue(timeline.clip(for: copiedSelection), "file clip smoke could not copy clip")
+        try require(clip.frameCount > 0, "file clip smoke copied an empty clip")
+        try require(
+            clip.segments.contains { segment in
+                segment.gainStart < 0.99 || segment.gainEnd < 0.99
+            },
+            "file clip smoke did not preserve selected gain"
+        )
+
+        let insertedFrameCount = try requireValue(
+            timeline.replace(insertionSelection, with: clip),
+            "file clip smoke could not paste clip"
+        )
+        try require(insertedFrameCount == clip.frameCount, "file clip smoke inserted an unexpected frame count")
+        try require(
+            timeline.frameCount == frameCountBeforePaste + clip.frameCount,
+            "file clip smoke did not splice the pasted clip into the edit graph"
+        )
+
+        let state = try requireValue(timeline.persistentState, "file clip smoke did not persist")
+        let restoredTimeline = try requireValue(
+            AudioFileEditTimeline(persistentState: state),
+            "file clip smoke could not restore persisted edit graph"
+        )
+        try require(
+            restoredTimeline.frameCount == timeline.frameCount,
+            "file clip smoke persisted the wrong frame count"
         )
     }
 
