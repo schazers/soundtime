@@ -214,6 +214,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             action: #selector(TimelineView.splitAtPlayhead(_:)),
             keyEquivalent: "b"
         ))
+        menu.addItem(NSMenuItem(
+            title: "Zoom to Selection",
+            action: #selector(TimelineView.zoomToSelection(_:)),
+            keyEquivalent: "j"
+        ))
 
         return menu
     }
