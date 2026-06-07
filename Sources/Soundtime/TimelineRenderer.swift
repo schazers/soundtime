@@ -907,8 +907,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let playheadContactMinimumSpawnInterval: CFTimeInterval = 1.0 / 90.0
     private let transientParticleMaximumCount = 260
     private let maximumTransientParticleVerticesPerFrame = 10_000
-    private let deletionEffectDuration: CFTimeInterval = 0.14
-    private let deletionShardCount = 28
+    private let deletionEffectDuration: CFTimeInterval = 0.11
+    private let deletionShardCount = 20
     private let deletionEffectMaximumCount = 8
     private let deletionEffectMaximumCapturedBins = 512
     private let deletionRippleMaximumCapturedBins = 1_024
@@ -1097,9 +1097,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             }
         }
         let nextWaveformMipLevels = tracks.first.flatMap { nextTrackWaveformMipLevels[$0.id] } ?? []
-        let previousTrackIDs = Set(previousTracks.map(\.id))
+        let previousTrackIDsInOrder = previousTracks.map(\.id)
+        let nextTrackIDsInOrder = renderTracks.map(\.id)
+        let previousTrackIDs = Set(previousTrackIDsInOrder)
         let nextTrackIDs = Set(renderTracks.map(\.id))
         let hasSharedTransitionTracks = !previousTrackIDs.isDisjoint(with: nextTrackIDs)
+        let preservesEffectContinuity = previousTrackIDsInOrder == nextTrackIDsInOrder &&
+            renderState.hasWaveforms &&
+            hasNextWaveforms
         if animateWaveformTransition, renderState.hasWaveforms, hasNextWaveforms, hasSharedTransitionTracks {
             waveformMipLevelStateLock.lock()
             previousTrackWaveformMipLevels = trackWaveformMipLevels
@@ -1143,11 +1148,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         } else {
             waveformGeometryStore.clearCurrent()
         }
-        playheadContactEvents.removeAll()
-        lastPlayheadContactEventTimestamp = nil
-        transientParticles.removeAll()
-        previousTransientScanProgress = nil
-        lastTransientParticleBins.removeAll()
+        if !preservesEffectContinuity {
+            playheadContactEvents.removeAll()
+            lastPlayheadContactEventTimestamp = nil
+            transientParticles.removeAll()
+            previousTransientScanProgress = nil
+            lastTransientParticleBins.removeAll()
+        }
         previousRenderedPlayheadX = nil
         previousRenderedPlayheadTime = nil
         resetTrackFisheyeAudibility(for: nextRenderState, at: CACurrentMediaTime())
@@ -4283,9 +4290,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         let selectionWidth = max(rightX - leftX, 1)
         let pullDistance = max(selectionWidth, 22)
-        let slideTime = min(max(progress / 0.18, 0), 1)
+        let slideTime = min(max(progress / 0.74, 0), 1)
         let easedSlideTime = smoothStep(slideTime)
-        let slideProgress = 1 - pow(1 - easedSlideTime, 2.45)
+        let slideProgress = pow(easedSlideTime, 1.42)
         let maximumAnimatedTrailingWidth = min(
             max(selectionWidth * 1.2 + 96, 140),
             max(width * 0.18, 160)
@@ -8142,14 +8149,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float sourceY = centerY + (yBias * 2.0 - 1.0) * laneHeightPixels * 0.39;
         float angle = hash11(seed + 47.0) * 6.2831853;
         float2 direction = float2(cos(angle), sin(angle));
-        float speed = 34.0 + 210.0 * hash11(seed + 71.0);
+        float speed = 32.0 + 172.0 * hash11(seed + 71.0);
         float ageSeconds = progress * duration;
         float2 center = float2(sourceX, sourceY) +
             direction * speed * ageSeconds * (0.35 + blast * 1.25);
-        float radius = 0.18 + 0.52 * hash11(seed + 89.0);
+        float radius = 0.10 + 0.32 * hash11(seed + 89.0);
         float dissolve = 1.0 - smoothstep(0.0, 1.0, progress);
         float alpha = progress < 0.78 ?
-            dissolve * dissolve * (0.10 + 0.07 * hash11(seed + 167.0)) :
+            dissolve * dissolve * (0.08 + 0.045 * hash11(seed + 167.0)) :
             0.0;
         float3 color = float3(
             0.70 + 0.30 * hash11(seed + 131.0),
