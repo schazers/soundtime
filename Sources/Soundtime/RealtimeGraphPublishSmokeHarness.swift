@@ -28,6 +28,16 @@ enum RealtimeGraphPublishSmokeHarness {
             sourceFrameCount: sourceFrameCount,
             renderBlockFrameCount: renderBlockFrameCount
         )
+        let fileBackedDuplicateTrackPhaseMaxError = try runFileBackedDuplicateTrackPhaseSmoke(
+            sampleRate: sampleRate,
+            sourceFrameCount: sourceFrameCount,
+            renderBlockFrameCount: renderBlockFrameCount
+        )
+        try runVisualClockSyncSmoke(
+            sampleRate: sampleRate,
+            sourceFrameCount: sourceFrameCount,
+            renderBlockFrameCount: renderBlockFrameCount
+        )
         let fileBackedPublishSummary = try runFileBackedEditPublishSmoke(
             sampleRate: sampleRate,
             sourceFrameCount: sourceFrameCount,
@@ -170,6 +180,12 @@ enum RealtimeGraphPublishSmokeHarness {
                 duplicateTrackPhaseMaxError
             )
         )
+        print(
+            String(
+                format: "Soundtime file-backed duplicate track phase smoke passed: max %.8f",
+                fileBackedDuplicateTrackPhaseMaxError
+            )
+        )
         print(fileBackedPublishSummary)
     }
 
@@ -265,6 +281,163 @@ enum RealtimeGraphPublishSmokeHarness {
         return maxError
     }
 
+    private static func runFileBackedDuplicateTrackPhaseSmoke(
+        sampleRate: Double,
+        sourceFrameCount: Int,
+        renderBlockFrameCount: Int
+    ) throws -> Float {
+        let wavURL = URL(fileURLWithPath: "/tmp/SoundtimeRealtimeFileBackedDuplicatePhaseSmoke.wav")
+        try writeSyntheticPCM16WAV(
+            to: wavURL,
+            frameCount: sourceFrameCount,
+            sampleRate: sampleRate
+        )
+        let fileInfo = try WAVAudioDecoder.inspect(url: wavURL)
+        let baseTimeline = AudioFileEditTimeline(fileInfo: fileInfo)
+        let singleDevice = RealtimeGraphPublishSmokeOutputDevice()
+        let duplicateDevice = RealtimeGraphPublishSmokeOutputDevice()
+
+        guard
+            let singleEngine = RealtimeCorePlaybackEngine(outputDevice: singleDevice),
+            let duplicateEngine = RealtimeCorePlaybackEngine(outputDevice: duplicateDevice)
+        else {
+            throw SmokeError.failed("could not create file-backed duplicate phase smoke engines")
+        }
+
+        try singleEngine.loadProjectTracks(fileBackedDuplicatePhaseTracks(url: wavURL, timeline: baseTimeline, trackCount: 1))
+        try duplicateEngine.loadProjectTracks(fileBackedDuplicatePhaseTracks(url: wavURL, timeline: baseTimeline, trackCount: 2))
+        try singleEngine.play()
+        try duplicateEngine.play()
+
+        guard
+            let singleCorePointer = singleDevice.corePointer,
+            let duplicateCorePointer = duplicateDevice.corePointer
+        else {
+            throw SmokeError.failed("file-backed duplicate phase smoke output devices were not configured")
+        }
+
+        let blockCount = 256
+        let singleRender = renderCaptured(
+            corePointer: singleCorePointer,
+            blockCount: blockCount,
+            frameCount: renderBlockFrameCount,
+            sampleRate: sampleRate
+        )
+        let duplicateRender = renderCaptured(
+            corePointer: duplicateCorePointer,
+            blockCount: blockCount,
+            frameCount: renderBlockFrameCount,
+            sampleRate: sampleRate
+        )
+        singleEngine.pause()
+        duplicateEngine.pause()
+
+        try require(
+            singleRender.left.count == duplicateRender.left.count &&
+                singleRender.right.count == duplicateRender.right.count,
+            "file-backed duplicate phase smoke rendered mismatched buffer sizes"
+        )
+
+        var maxError: Float = 0
+        var maxReference: Float = 0
+        for index in singleRender.left.indices {
+            let leftReference = singleRender.left[index] * 2
+            let rightReference = singleRender.right[index] * 2
+            let leftError = abs(duplicateRender.left[index] - leftReference)
+            let rightError = abs(duplicateRender.right[index] - rightReference)
+            maxError = max(maxError, leftError, rightError)
+            maxReference = max(
+                maxReference,
+                abs(leftReference),
+                abs(rightReference),
+                abs(duplicateRender.left[index]),
+                abs(duplicateRender.right[index])
+            )
+        }
+
+        let tolerance = max(0.000_1, maxReference * 0.000_08)
+        try require(
+            maxError <= tolerance,
+            String(
+                format: "file-backed duplicate tracks are not sample-synchronous: max error %.8f, tolerance %.8f",
+                maxError,
+                tolerance
+            )
+        )
+        return maxError
+    }
+
+    private static func runVisualClockSyncSmoke(
+        sampleRate: Double,
+        sourceFrameCount: Int,
+        renderBlockFrameCount: Int
+    ) throws {
+        let outputDevice = RealtimeGraphPublishSmokeOutputDevice()
+        guard let playbackEngine = RealtimeCorePlaybackEngine(outputDevice: outputDevice) else {
+            throw SmokeError.failed("could not create visual clock sync playback engine")
+        }
+
+        let sourceBuffer = syntheticAudioBuffer(frameCount: sourceFrameCount, sampleRate: sampleRate)
+        try playbackEngine.loadProjectTracks(duplicatePhaseTracks(
+            timeline: AudioEditTimeline(sourceBuffer: sourceBuffer),
+            trackCount: 2
+        ))
+        guard let corePointer = outputDevice.corePointer else {
+            throw SmokeError.failed("visual clock sync output device was not configured")
+        }
+
+        try playbackEngine.seekExactly(toProgress: 0.375)
+        try assertSnapshot(
+            playbackEngine.snapshot(),
+            expectedFrame: Int((Double(sourceFrameCount) * 0.375).rounded(.down)),
+            isPlaying: false,
+            label: "pending seek"
+        )
+
+        try playbackEngine.play()
+        try assertSnapshot(
+            playbackEngine.snapshot(),
+            expectedFrame: Int((Double(sourceFrameCount) * 0.375).rounded(.down)),
+            isPlaying: true,
+            label: "pending play"
+        )
+
+        render(
+            corePointer: corePointer,
+            blockCount: 1,
+            frameCount: renderBlockFrameCount,
+            sampleRate: sampleRate
+        )
+        playbackEngine.pause(atProgress: 0.5)
+        try assertSnapshot(
+            playbackEngine.snapshot(),
+            expectedFrame: Int((Double(sourceFrameCount) * 0.5).rounded(.down)),
+            isPlaying: false,
+            label: "pending pause"
+        )
+
+        render(
+            corePointer: corePointer,
+            blockCount: 1,
+            frameCount: renderBlockFrameCount,
+            sampleRate: sampleRate
+        )
+        try assertSnapshot(
+            playbackEngine.snapshot(),
+            expectedFrame: Int((Double(sourceFrameCount) * 0.5).rounded(.down)),
+            isPlaying: false,
+            label: "committed pause"
+        )
+
+        try playbackEngine.seekExactly(toProgress: 0.75)
+        try assertSnapshot(
+            playbackEngine.snapshot(),
+            expectedFrame: Int((Double(sourceFrameCount) * 0.75).rounded(.down)),
+            isPlaying: false,
+            label: "pending paused seek"
+        )
+    }
+
     private static func duplicatePhaseTracks(
         timeline: AudioEditTimeline,
         trackCount: Int
@@ -273,6 +446,23 @@ enum RealtimeGraphPublishSmokeHarness {
             ProjectPlaybackTrack(
                 id: UUID(uuidString: String(format: "00000000-0000-4000-9000-%012d", index)) ?? UUID(),
                 source: .timeline(audioTimeline: timeline, zeroCrossingIndex: nil),
+                sourceRevision: 0,
+                volume: 1,
+                isMuted: false,
+                isSoloed: false
+            )
+        }
+    }
+
+    private static func fileBackedDuplicatePhaseTracks(
+        url: URL,
+        timeline: AudioFileEditTimeline,
+        trackCount: Int
+    ) -> [ProjectPlaybackTrack] {
+        (0..<trackCount).map { index in
+            ProjectPlaybackTrack(
+                id: UUID(uuidString: String(format: "00000000-0000-4000-b000-%012d", index)) ?? UUID(),
+                source: .fileTimeline(url: url, timeline: timeline, zeroCrossingProbe: nil),
                 sourceRevision: 0,
                 volume: 1,
                 isMuted: false,
@@ -721,6 +911,22 @@ enum RealtimeGraphPublishSmokeHarness {
         guard condition else {
             throw SmokeError.failed(message)
         }
+    }
+
+    private static func assertSnapshot(
+        _ snapshot: PlaybackSnapshot,
+        expectedFrame: Int,
+        isPlaying: Bool,
+        label: String
+    ) throws {
+        try require(
+            abs(snapshot.frameIndex - expectedFrame) <= 1,
+            "\(label) visual clock frame mismatch: expected \(expectedFrame), got \(snapshot.frameIndex)"
+        )
+        try require(
+            snapshot.isPlaying == isPlaying,
+            "\(label) visual clock play state mismatch"
+        )
     }
 }
 
