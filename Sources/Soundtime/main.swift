@@ -21,7 +21,9 @@ if CommandLine.arguments.contains("--recording-smoke") {
     }
 }
 
-if CommandLine.arguments.contains("--project-edit-roundtrip-smoke") {
+if CommandLine.arguments.contains("--project-edit-roundtrip-smoke") ||
+    CommandLine.arguments.contains("--project-edit-round-trip-smoke")
+{
     do {
         try ProjectEditRoundTripSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
         exit(0)

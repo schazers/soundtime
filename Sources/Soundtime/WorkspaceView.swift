@@ -89,9 +89,16 @@ final class WorkspaceView: NSView {
         let editSelection: TimelineSelection
     }
 
+    private enum ProjectMixTrackSource: Sendable {
+        case decoded(DecodedAudioBuffer)
+        case timeline(AudioEditTimeline)
+        case file(URL)
+        case fileTimeline(URL, AudioFileEditTimeline)
+    }
+
     private struct ProjectMixTrackSnapshot: Sendable {
         let volume: Float
-        let decodedAudioBuffer: DecodedAudioBuffer
+        let source: ProjectMixTrackSource
         let zeroCrossingIndex: AudioZeroCrossingIndex?
     }
 
@@ -2247,13 +2254,6 @@ final class WorkspaceView: NSView {
         updateProjectPlaybackTrackMix()
     }
 
-    private func projectMixBuffer() -> DecodedAudioBuffer? {
-        Self.makeProjectMix(
-            from: projectMixTrackSnapshots(),
-            outputURL: currentProjectURL ?? URL(fileURLWithPath: "Soundtime Project Mix.wav")
-        )?.buffer
-    }
-
     private func projectPlaybackTracks() -> [ProjectPlaybackTrack] {
         return projectTracks.compactMap { track -> ProjectPlaybackTrack? in
             let source: ProjectPlaybackTrack.Source
@@ -2295,27 +2295,52 @@ final class WorkspaceView: NSView {
 
     private func projectMixTrackSnapshots() -> [ProjectMixTrackSnapshot] {
         audibleProjectTracks.compactMap { track in
-            guard let decodedAudioBuffer = track.decodedAudioBuffer else {
+            let source: ProjectMixTrackSource
+            if let fileTimeline = track.fileTimeline, WAVAudioDecoder.canDecode(track.sourceURL) {
+                source = .fileTimeline(track.sourceURL, fileTimeline)
+            } else if track.editRevision == 0, WAVAudioDecoder.canDecode(track.sourceURL) {
+                source = .file(track.sourceURL)
+            } else if let audioTimeline = track.audioTimeline {
+                source = .timeline(audioTimeline)
+            } else if let decodedAudioBuffer = track.decodedAudioBuffer {
+                source = .decoded(decodedAudioBuffer)
+            } else {
                 return nil
             }
 
             return ProjectMixTrackSnapshot(
                 volume: track.volume,
-                decodedAudioBuffer: decodedAudioBuffer,
+                source: source,
                 zeroCrossingIndex: track.zeroCrossingIndex
             )
+        }
+    }
+
+    private nonisolated static func decodedMixBuffer(
+        for track: ProjectMixTrackSnapshot
+    ) throws -> DecodedAudioBuffer {
+        switch track.source {
+        case let .decoded(buffer):
+            return buffer
+        case let .timeline(timeline):
+            return timeline.render()
+        case let .file(url):
+            return try WAVAudioDecoder.decode(url: url)
+        case let .fileTimeline(url, fileTimeline):
+            let sourceBuffer = try WAVAudioDecoder.decode(url: url)
+            return fileTimeline.audioTimeline(sourceBuffer: sourceBuffer).render()
         }
     }
 
     private nonisolated static func makeProjectMix(
         from decodedTracks: [ProjectMixTrackSnapshot],
         outputURL: URL
-    ) -> ProjectMixResult? {
+    ) throws -> ProjectMixResult? {
         guard let firstTrack = decodedTracks.first else {
             return nil
         }
 
-        let firstBuffer = firstTrack.decodedAudioBuffer
+        let firstBuffer = try decodedMixBuffer(for: firstTrack)
         if
             decodedTracks.count == 1,
             abs(firstTrack.volume - 1) <= Float.ulpOfOne
@@ -2338,9 +2363,17 @@ final class WorkspaceView: NSView {
         }
 
         let sampleRate = firstBuffer.sampleRate
-        let channelCount = max(decodedTracks.map(\.decodedAudioBuffer.channelCount).max() ?? 2, 2)
-        let frameCount = decodedTracks.reduce(0) { result, item in
-            max(result, item.decodedAudioBuffer.frameCount)
+        var renderedTracks: [(volume: Float, buffer: DecodedAudioBuffer)] = [
+            (volume: firstTrack.volume, buffer: firstBuffer),
+        ]
+        renderedTracks.reserveCapacity(decodedTracks.count)
+        for track in decodedTracks.dropFirst() {
+            renderedTracks.append((volume: track.volume, buffer: try decodedMixBuffer(for: track)))
+        }
+
+        let channelCount = max(renderedTracks.map(\.buffer.channelCount).max() ?? 2, 2)
+        let frameCount = renderedTracks.reduce(0) { result, item in
+            max(result, item.buffer.frameCount)
         }
         guard frameCount > 0 else {
             return nil
@@ -2350,8 +2383,8 @@ final class WorkspaceView: NSView {
             [Float](repeating: 0, count: frameCount)
         }
 
-        for track in decodedTracks {
-            let buffer = track.decodedAudioBuffer
+        for track in renderedTracks {
+            let buffer = track.buffer
             let gain = track.volume * track.volume
             for outputChannel in 0..<channelCount {
                 let sourceChannel = buffer.channelCount == 1 ? 0 : min(outputChannel, buffer.channelCount - 1)
@@ -4410,8 +4443,9 @@ final class WorkspaceView: NSView {
     }
 
     private func exportCurrentAudio() {
-        let exportBuffer = projectMixBuffer() ?? decodedAudioBuffer
-        guard let exportBuffer, exportBuffer.frameCount > 0 else {
+        let projectMixSnapshots = projectMixTrackSnapshots()
+        let fallbackDecodedAudioBuffer = decodedAudioBuffer
+        guard !projectMixSnapshots.isEmpty || (fallbackDecodedAudioBuffer?.frameCount ?? 0) > 0 else {
             return
         }
 
@@ -4422,7 +4456,8 @@ final class WorkspaceView: NSView {
         savePanel.isExtensionHidden = false
         savePanel.allowedContentTypes = [.wav]
 
-        let completion: (NSApplication.ModalResponse) -> Void = { [weak self, exportBuffer] response in
+        let completion: (NSApplication.ModalResponse) -> Void = {
+            [weak self, projectMixSnapshots, fallbackDecodedAudioBuffer] response in
             guard
                 response == .OK,
                 let destinationURL = savePanel.url
@@ -4430,13 +4465,21 @@ final class WorkspaceView: NSView {
                 return
             }
 
-            self?.writeExport(exportBuffer, to: destinationURL)
+            self?.prepareAndWriteExport(
+                projectMixSnapshots: projectMixSnapshots,
+                fallbackDecodedAudioBuffer: fallbackDecodedAudioBuffer,
+                to: destinationURL
+            )
         }
 
         if let window {
             savePanel.beginSheetModal(for: window, completionHandler: completion)
         } else if savePanel.runModal() == .OK, let destinationURL = savePanel.url {
-            writeExport(exportBuffer, to: destinationURL)
+            prepareAndWriteExport(
+                projectMixSnapshots: projectMixSnapshots,
+                fallbackDecodedAudioBuffer: fallbackDecodedAudioBuffer,
+                to: destinationURL
+            )
         }
     }
 
@@ -4769,6 +4812,42 @@ final class WorkspaceView: NSView {
         }
 
         return window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame
+    }
+
+    private func prepareAndWriteExport(
+        projectMixSnapshots: [ProjectMixTrackSnapshot],
+        fallbackDecodedAudioBuffer: DecodedAudioBuffer?,
+        to destinationURL: URL
+    ) {
+        updateStatus("preparing export")
+        Task { [weak self, projectMixSnapshots, fallbackDecodedAudioBuffer, destinationURL] in
+            let result = await Task.detached(priority: .userInitiated) {
+                if !projectMixSnapshots.isEmpty {
+                    return try Self.makeProjectMix(
+                        from: projectMixSnapshots,
+                        outputURL: destinationURL
+                    )?.buffer
+                }
+
+                return fallbackDecodedAudioBuffer
+            }.result
+
+            guard let self else {
+                return
+            }
+
+            switch result {
+            case let .success(buffer):
+                guard let buffer, buffer.frameCount > 0 else {
+                    self.updateStatus("export failed: no audio to write")
+                    return
+                }
+
+                self.writeExport(buffer, to: destinationURL)
+            case let .failure(error):
+                self.updateStatus("export failed: \(error.localizedDescription)")
+            }
+        }
     }
 
     private func writeExport(_ decodedAudioBuffer: DecodedAudioBuffer, to destinationURL: URL) {
