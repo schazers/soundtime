@@ -2,6 +2,8 @@ import AppKit
 import Metal
 
 final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
+    private static let timelineRenderQueueSpecificKey = DispatchSpecificKey<Bool>()
+
     private final class RenderFlightGate: @unchecked Sendable {
         private let lock = NSLock()
         private var isInFlight = false
@@ -184,12 +186,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     init() {
         let metalDevice = MTLCreateSystemDefaultDevice()
         super.init(frame: .zero, device: metalDevice)
+        timelineRenderQueue.setSpecific(key: Self.timelineRenderQueueSpecificKey, value: true)
         configure()
         configureRenderer(with: metalDevice)
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
+        timelineRenderQueue.setSpecific(key: Self.timelineRenderQueueSpecificKey, value: true)
         configure()
         configureRenderer(with: metalDevice)
     }
@@ -460,7 +464,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         pagingPlayheadProgress = clampedProgress
         pagingPlayheadAnchorTimestamp = anchorTimestamp ?? CACurrentMediaTime()
         pageViewportIfNeeded(forPlayheadProgress: clampedProgress)
-        updateTimelineRenderer { renderer in
+        updateTimelineRendererImmediately { renderer in
             renderer.displayPlayheadProgress(
                 clampedProgress,
                 force: syncRenderer,
@@ -484,7 +488,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     func displayPlaybackActive(_ isActive: Bool) {
         isTimelinePlaybackActive = isActive
-        updateTimelineRenderer { renderer in
+        updateTimelineRendererImmediately { renderer in
             renderer.displayPlaybackActive(isActive)
         }
         requestTimelineRender()
@@ -494,7 +498,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     func displayRecordingActive(_ isActive: Bool) {
-        updateTimelineRenderer { renderer in
+        updateTimelineRendererImmediately { renderer in
             renderer.displayRecordingActive(isActive)
         }
         requestTimelineRender()
@@ -502,38 +506,42 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     func displaySelection(_ selection: TimelineSelection?) {
         currentSelection = selection
-        timelineRenderer?.publishInteractionSelection(selection)
+        updateTimelineRendererImmediately { renderer in
+            renderer.displaySelection(selection)
+        }
         requestTimelineRender()
     }
 
     func displaySelectedTrack(_ trackID: UUID?) {
-        updateTimelineRenderer { renderer in
+        updateTimelineRendererImmediately { renderer in
             renderer.displaySelectedTrack(trackID)
         }
         requestTimelineRender()
     }
 
     func displaySelectedTracks(_ trackIDs: Set<UUID>, primaryTrackID: UUID?) {
-        updateTimelineRenderer { renderer in
+        updateTimelineRendererImmediately { renderer in
             renderer.displaySelectedTracks(trackIDs, primaryTrackID: primaryTrackID)
         }
         requestTimelineRender()
     }
 
     func displayTrimPreview(_ trimRange: TimelineTrimRange?) {
-        updateTimelineRenderer { renderer in
+        updateTimelineRendererImmediately { renderer in
             renderer.displayTrimPreview(trimRange)
         }
         requestTimelineRender()
     }
 
     func displayHoverProgress(_ progress: Float?, isArmed: Bool = false) {
-        timelineRenderer?.publishInteractionHover(progress: progress, isArmed: isArmed)
+        updateTimelineRendererImmediately { renderer in
+            renderer.displayHoverProgress(progress, isArmed: isArmed)
+        }
         requestTimelineRender()
     }
 
     func displayGainPreview(selection: TimelineSelection?, gain: Float) {
-        updateTimelineRenderer { renderer in
+        updateTimelineRendererImmediately { renderer in
             renderer.displayGainPreview(selection: selection, gain: gain)
         }
         requestTimelineRender()
@@ -640,6 +648,21 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         timelineRenderQueue.async { [timelineRenderer] in
+            update(timelineRenderer)
+        }
+    }
+
+    private func updateTimelineRendererImmediately(_ update: @escaping @Sendable (TimelineRenderer) -> Void) {
+        guard let timelineRenderer else {
+            return
+        }
+
+        if DispatchQueue.getSpecific(key: Self.timelineRenderQueueSpecificKey) == true {
+            update(timelineRenderer)
+            return
+        }
+
+        timelineRenderQueue.sync { [timelineRenderer] in
             update(timelineRenderer)
         }
     }
@@ -1870,6 +1893,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         let visualViewportProgress = min(max(Float(point.x / bounds.width), 0), 1)
         guard
+            SoundtimeFeatureFlags.waveformFisheye,
             followsVisualFisheye,
             let timelineRenderer
         else {
@@ -1889,7 +1913,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         viewport = nextViewport
-        updateTimelineRenderer { renderer in
+        updateTimelineRendererImmediately { renderer in
             renderer.displayViewport(nextViewport)
         }
         window?.invalidateCursorRects(for: self)
@@ -1933,7 +1957,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         trackLayout = nextTrackLayout
-        updateTimelineRenderer { renderer in
+        updateTimelineRendererImmediately { renderer in
             renderer.displayTrackLayout(nextTrackLayout)
         }
         updateTrackLayoutForCurrentBounds(requestRender: false)
@@ -1964,7 +1988,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
-        updateTimelineRenderer { renderer in
+        updateTimelineRendererImmediately { renderer in
             renderer.displayTrackLayout(clampedLayout)
         }
         if requestRender {

@@ -200,9 +200,17 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
 
         if let latestSample = renderSamples.last {
             if now > latestSample.timestamp {
+                if renderSamples.count == 1 {
+                    renderSamples.insert(HistorySample(
+                        timestamp: now - Float(historyDuration),
+                        framesPerSecond: latestSample.framesPerSecond
+                    ), at: 0)
+                }
+                let staleAge = now - latestSample.timestamp
+                let displayedFramesPerSecond = staleAge > 0.75 ? 0 : latestSample.framesPerSecond
                 renderSamples.append(HistorySample(
                     timestamp: now,
-                    framesPerSecond: latestSample.framesPerSecond
+                    framesPerSecond: displayedFramesPerSecond
                 ))
             }
         }
@@ -215,7 +223,9 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
 
     private func trimSamples(now: Float) {
         let oldestRetainedTimestamp = now - Float(historyDuration + historyExitDuration)
-        while samples.count > maximumSampleCount || (samples.first?.timestamp ?? now) < oldestRetainedTimestamp {
+        while samples.count > 1 &&
+            (samples.count > maximumSampleCount || (samples.first?.timestamp ?? now) < oldestRetainedTimestamp)
+        {
             samples.removeFirst()
         }
     }
@@ -230,6 +240,107 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
 
     private func relativeTimestamp() -> Float {
         Float(CACurrentMediaTime() - timeOrigin)
+    }
+
+    static func smokeRenderPixelSummary(
+        samples inputSamples: [(timestamp: Float, framesPerSecond: Float)],
+        now: Float = 16,
+        width: Int = 192,
+        height: Int = 64
+    ) throws -> MetalPixelSmokeSummary {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw MetalPixelSmokeError.metalDeviceUnavailable
+        }
+        guard let commandQueue = device.makeCommandQueue() else {
+            throw MetalPixelSmokeError.commandQueueUnavailable
+        }
+        let library = try device.makeLibrary(source: shaderSource, options: nil)
+        guard
+            let vertexFunction = library.makeFunction(name: "frame_rate_history_vertex"),
+            let fragmentFunction = library.makeFunction(name: "frame_rate_history_fragment")
+        else {
+            throw MetalPixelSmokeError.libraryUnavailable
+        }
+
+        let descriptor = MTLRenderPipelineDescriptor()
+        descriptor.vertexFunction = vertexFunction
+        descriptor.fragmentFunction = fragmentFunction
+        descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+        descriptor.colorAttachments[0].isBlendingEnabled = true
+        descriptor.colorAttachments[0].rgbBlendOperation = .add
+        descriptor.colorAttachments[0].alphaBlendOperation = .add
+        descriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        descriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+        descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        descriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        let pipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
+
+        let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        textureDescriptor.storageMode = .shared
+        textureDescriptor.usage = [.renderTarget]
+        guard let texture = device.makeTexture(descriptor: textureDescriptor) else {
+            throw MetalPixelSmokeError.textureUnavailable
+        }
+
+        let renderPassDescriptor = MTLRenderPassDescriptor()
+        renderPassDescriptor.colorAttachments[0].texture = texture
+        renderPassDescriptor.colorAttachments[0].loadAction = .clear
+        renderPassDescriptor.colorAttachments[0].storeAction = .store
+        renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColor(red: 0.055, green: 0.055, blue: 0.055, alpha: 1)
+
+        guard
+            let commandBuffer = commandQueue.makeCommandBuffer(),
+            let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor)
+        else {
+            throw MetalPixelSmokeError.commandBufferUnavailable
+        }
+
+        var vertices = [
+            HistoryVertex(position: SIMD2<Float>(0, 0)),
+            HistoryVertex(position: SIMD2<Float>(1, 0)),
+            HistoryVertex(position: SIMD2<Float>(0, 1)),
+            HistoryVertex(position: SIMD2<Float>(1, 0)),
+            HistoryVertex(position: SIMD2<Float>(1, 1)),
+            HistoryVertex(position: SIMD2<Float>(0, 1)),
+        ]
+        var samples = inputSamples
+            .prefix(192)
+            .map { HistorySample(timestamp: $0.timestamp, framesPerSecond: $0.framesPerSecond) }
+        if samples.isEmpty {
+            samples.append(HistorySample(timestamp: now, framesPerSecond: 0))
+        }
+        let maxFPS = samples.reduce(Float(144)) { max($0, $1.framesPerSecond) }
+        var uniforms = HistoryUniforms(
+            viewport: SIMD4<Float>(Float(width), Float(height), 1, min(max(ceil(maxFPS / 30) * 30, 144), 240)),
+            timing: SIMD4<Float>(now, 15, Float(samples.count), samples.last?.framesPerSecond ?? 0),
+            colors: SIMD4<Float>(0.0, 0.78, 0.84, 1.0)
+        )
+
+        encoder.setRenderPipelineState(pipelineState)
+        vertices.withUnsafeBytes { bytes in
+            if let baseAddress = bytes.baseAddress {
+                encoder.setVertexBytes(baseAddress, length: bytes.count, index: 0)
+            }
+        }
+        samples.withUnsafeBytes { bytes in
+            if let baseAddress = bytes.baseAddress {
+                encoder.setFragmentBytes(baseAddress, length: bytes.count, index: 0)
+            }
+        }
+        encoder.setFragmentBytes(&uniforms, length: MemoryLayout<HistoryUniforms>.stride, index: 1)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertices.count)
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        var bytes = [UInt8](repeating: 0, count: width * height * 4)
+        texture.getBytes(&bytes, bytesPerRow: width * 4, from: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0)
+        return MetalPixelSmokeSummary.analyzeBGRA8(bytes, width: width, height: height)
     }
 
     private static let shaderSource = """

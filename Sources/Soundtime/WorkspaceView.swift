@@ -8606,7 +8606,7 @@ final class WorkspaceView: NSView {
             progress: clampedProgress,
             anchorTimestamp: timestamp
         )
-        displayPlaybackActiveIfNeeded(isPlaying)
+        displayPlaybackActiveIfNeeded(isPlaying, forceTimelineUpdate: true)
     }
 
     private func hardSyncPlaybackVisuals(
@@ -8701,11 +8701,11 @@ final class WorkspaceView: NSView {
         return min(max(projectedProgress, 0), 1)
     }
 
-    private func displayPlaybackActiveIfNeeded(_ isPlaying: Bool) {
+    private func displayPlaybackActiveIfNeeded(_ isPlaying: Bool, forceTimelineUpdate: Bool = false) {
         visualPlaybackActive = isPlaying
         ImportWorkBudget.shared.setPlaybackActive(isPlaying)
         updateTransportControlState(isPlaying: isPlaying)
-        guard displayedPlaybackActive != isPlaying else {
+        guard forceTimelineUpdate || displayedPlaybackActive != isPlaying else {
             return
         }
 
