@@ -39,6 +39,8 @@ struct RenderSegment {
     uint64_t frameCount = 0;
     double sourceFrameScale = 1;
     bool usesExactSourceFrames = true;
+    bool spliceFadeIn = false;
+    bool spliceFadeOut = false;
     float gainStart = 1;
     float gainEnd = 1;
 };
@@ -463,6 +465,89 @@ float segment_gain(const RenderSegment& segment, uint64_t segmentFrameOffset) {
     return segment.gainStart + (segment.gainEnd - segment.gainStart) * smoothstep(progress);
 }
 
+uint64_t splice_fade_frame_count(const RenderSegment& segment, const AudioRenderConfig& config) {
+    constexpr auto spliceFadeDurationSeconds = 0.005;
+    if (segment.frameCount < 4 || config.sampleRate <= 0) {
+        return 0;
+    }
+
+    const auto requestedFrames = static_cast<uint64_t>(
+        spliceFadeDurationSeconds * config.sampleRate + 0.5
+    );
+    return std::min<uint64_t>(
+        std::max<uint64_t>(requestedFrames, 2),
+        std::max<uint64_t>(segment.frameCount / 2, 1)
+    );
+}
+
+float segment_splice_gain(
+    const RenderSegment& segment,
+    uint64_t segmentFrameOffset,
+    const AudioRenderConfig& config
+) {
+    auto gain = 1.0f;
+    const auto fadeFrameCount = splice_fade_frame_count(segment, config);
+    if (fadeFrameCount <= 1) {
+        return gain;
+    }
+
+    if (segment.spliceFadeIn && segmentFrameOffset < fadeFrameCount) {
+        const auto progress = static_cast<float>(
+            static_cast<double>(segmentFrameOffset) / static_cast<double>(fadeFrameCount - 1)
+        );
+        gain *= smoothstep(progress);
+    }
+    if (segment.spliceFadeOut && segment.frameCount > segmentFrameOffset) {
+        const auto framesFromEnd = segment.frameCount - segmentFrameOffset - 1;
+        if (framesFromEnd < fadeFrameCount) {
+            const auto progress = static_cast<float>(
+                static_cast<double>(fadeFrameCount - framesFromEnd - 1) /
+                    static_cast<double>(fadeFrameCount - 1)
+            );
+            gain *= 1.0f - smoothstep(progress);
+        }
+    }
+
+    return gain;
+}
+
+bool adjacent_segments_need_splice_fade(
+    const RenderSegment& previous,
+    const RenderSegment& next
+) {
+    if (previous.outputStartFrame + previous.frameCount != next.outputStartFrame) {
+        return false;
+    }
+    if (std::fabs(previous.gainEnd - next.gainStart) > 0.000'001f) {
+        return true;
+    }
+    if (std::fabs(previous.sourceFrameScale - next.sourceFrameScale) > 0.000'000'001) {
+        return true;
+    }
+
+    const auto previousSourceEnd = previous.sourceStartFrame + static_cast<uint64_t>(
+        static_cast<double>(previous.frameCount) * previous.sourceFrameScale + 0.5
+    );
+    return previousSourceEnd != next.sourceStartFrame;
+}
+
+void mark_splice_fades(RenderTrack& track) {
+    if (track.segments.size() < 2) {
+        return;
+    }
+
+    for (size_t segmentIndex = 1; segmentIndex < track.segments.size(); segmentIndex++) {
+        auto& previous = track.segments[segmentIndex - 1];
+        auto& next = track.segments[segmentIndex];
+        if (!adjacent_segments_need_splice_fade(previous, next)) {
+            continue;
+        }
+
+        previous.spliceFadeOut = true;
+        next.spliceFadeIn = true;
+    }
+}
+
 uint64_t output_frame_count_for_source(const AudioSource& source, double outputSampleRate) {
     if (source.frameCount == 0 || source.sampleRate <= 0 || outputSampleRate <= 0) {
         return 0;
@@ -842,6 +927,7 @@ std::shared_ptr<RenderGraph> make_graph_from_segmented_track_configs(
             }
         }
 
+        mark_splice_fades(track);
         graph->tracks.push_back(std::move(track));
     }
 
@@ -1480,7 +1566,10 @@ void soundtime_audio_core_render_at_host_time(
                     const auto segmentFrameOffset = outputFrameIndex - segment.outputStartFrame;
 
                     const auto sourceChannelCount = source->channelCount;
-                    const auto outputGain = outputGainBase * trackGain * segment_gain(segment, segmentFrameOffset);
+                    const auto outputGain = outputGainBase *
+                        trackGain *
+                        segment_gain(segment, segmentFrameOffset) *
+                        segment_splice_gain(segment, segmentFrameOffset, config);
                     for (uint32_t outputChannel = 0; outputChannel < channelCount; outputChannel++) {
                         auto* output = outputs[outputChannel];
                         if (output == nullptr) {
