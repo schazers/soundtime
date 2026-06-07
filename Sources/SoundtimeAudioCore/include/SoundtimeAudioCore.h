@@ -21,6 +21,10 @@ typedef struct SoundtimeAudioCoreSnapshot {
     uint64_t renderedFrameCount;
     uint64_t underrunCount;
     uint64_t droppedCommandCount;
+    uint64_t callbackCount;
+    uint64_t lastRenderNanoseconds;
+    uint64_t maxRenderNanoseconds;
+    uint64_t renderDeadlineMissCount;
 } SoundtimeAudioCoreSnapshot;
 
 typedef struct SoundtimeAudioCoreClockSample {

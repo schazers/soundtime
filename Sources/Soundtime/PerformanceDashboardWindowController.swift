@@ -239,10 +239,13 @@ private final class PerformanceDashboardView: NSView {
                 "Rendered      \(audio.renderedFrameCount)",
                 "Underruns     \(audio.underrunCount)",
                 "Dropped cmds  \(audio.droppedCommandCount)",
+                "Callbacks     \(audio.callbackCount)",
+                String(format: "Render ms     %.3f last  %.3f max", Double(audio.lastRenderNanoseconds) / 1_000_000, Double(audio.maxRenderNanoseconds) / 1_000_000),
+                "Deadline miss \(audio.renderDeadlineMissCount)",
                 "Sample rate   \(Int(audio.sampleRate.rounded())) Hz",
             ])
         } else {
-            audioCard.update(lines: ["State         waiting", "Underruns     0", "Dropped cmds  0"])
+            audioCard.update(lines: ["State         waiting", "Underruns     0", "Dropped cmds  0", "Deadline miss 0"])
         }
 
         threadCard.update(lines: [
