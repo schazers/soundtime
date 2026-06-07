@@ -36,6 +36,7 @@ enum EditGraphSmokeHarness {
         var touchedFrameCount = 0
         var deletedFrameCount = 0
         var operationDurations: [Double] = []
+        var operationDurationsByName: [String: [Double]] = [:]
         operationDurations.reserveCapacity(operationCount)
 
         for index in 0..<operationCount {
@@ -47,26 +48,44 @@ enum EditGraphSmokeHarness {
             )
 
             let operationStartTime = DispatchTime.now().uptimeNanoseconds
-            switch index % 7 {
+            let operationName: String
+            switch index % 10 {
             case 0:
+                operationName = "delete"
                 let removedFrameCount = timeline.delete(selection)
                 touchedFrameCount += removedFrameCount
                 deletedFrameCount += removedFrameCount
             case 1:
+                operationName = "gain-down"
                 touchedFrameCount += timeline.applyGain(0.72, to: selection)
             case 2:
+                operationName = "gain-up"
                 touchedFrameCount += timeline.applyGain(1.18, to: selection)
             case 3:
+                operationName = "fade-in"
                 touchedFrameCount += timeline.applyFade(.fadeIn, to: selection)
             case 4:
+                operationName = "fade-out"
                 touchedFrameCount += timeline.applyFade(.fadeOut, to: selection)
             case 5:
+                operationName = "paste"
                 touchedFrameCount += timeline.replace(selection, with: pasteClip) ?? 0
+            case 6:
+                operationName = "clear"
+                touchedFrameCount += timeline.clear(selection)
+            case 7:
+                operationName = "copy"
+                touchedFrameCount += timeline.clip(for: selection)?.frameCount ?? 0
+            case 8:
+                operationName = "split"
+                touchedFrameCount += timeline.split(atProgress: selection.startProgress) ? 1 : 0
             default:
+                operationName = "gain-boost"
                 touchedFrameCount += timeline.applyGain(1.36, to: selection)
             }
             let operationMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - operationStartTime) / 1_000_000
             operationDurations.append(operationMilliseconds)
+            operationDurationsByName[operationName, default: []].append(operationMilliseconds)
         }
 
         let elapsedMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - startTime) / 1_000_000
@@ -88,6 +107,7 @@ enum EditGraphSmokeHarness {
             elapsedMilliseconds < 1_500,
             String(format: "edit graph operations were too slow: %.2fms", elapsedMilliseconds)
         )
+        try requirePerOperationBudgets(operationDurationsByName)
         try runFileClipPasteSmoke(fileInfo: fileInfo)
         try runLinkedRippleDeleteSmoke(fileInfo: fileInfo)
         try runSplitPersistenceSmoke(fileInfo: fileInfo)
@@ -103,6 +123,21 @@ enum EditGraphSmokeHarness {
                 elapsedMilliseconds
             )
         )
+    }
+
+    private static func requirePerOperationBudgets(_ operationDurationsByName: [String: [Double]]) throws {
+        for (operationName, durations) in operationDurationsByName.sorted(by: { $0.key < $1.key }) {
+            let p95Milliseconds = percentile(durations, percentile: 0.95)
+            let maxMilliseconds = durations.max() ?? 0
+            try require(
+                p95Milliseconds < 2.5,
+                String(format: "%@ p95 was too slow: %.2fms", operationName, p95Milliseconds)
+            )
+            try require(
+                maxMilliseconds < 14,
+                String(format: "%@ outlier was too slow: %.2fms", operationName, maxMilliseconds)
+            )
+        }
     }
 
     private static func percentile(_ values: [Double], percentile: Double) -> Double {
