@@ -636,6 +636,12 @@ final class WorkspaceView: NSView {
         timelineSurface.onAuditionDeadAirCandidateRequested = { [weak self] in
             self?.auditionActiveDeadAirCandidate()
         }
+        timelineSurface.onNextDeadAirCandidateRequested = { [weak self] in
+            self?.stepActiveDeadAirCandidate(by: 1)
+        }
+        timelineSurface.onPreviousDeadAirCandidateRequested = { [weak self] in
+            self?.stepActiveDeadAirCandidate(by: -1)
+        }
         timelineSurface.onFadeInRequested = { [weak self] in
             self?.applyFadeEffect(.fadeIn)
         }
@@ -4287,6 +4293,16 @@ final class WorkspaceView: NSView {
         return "short pause"
     }
 
+    private func deadAirCandidateStatusText(
+        _ candidate: DeadAirReviewCandidate,
+        index: Int,
+        total: Int
+    ) -> String {
+        let duration = formatDuration(candidate.estimatedRemovedDuration)
+        let confidence = Int((candidate.confidence * 100).rounded())
+        return "silence \(index + 1)/\(total): \(duration), \(confidence)% confidence, \(candidate.reason)"
+    }
+
     private func publishDeadAirReviewResult(
         _ result: DeadAirReviewResult,
         trackID: UUID,
@@ -4311,7 +4327,19 @@ final class WorkspaceView: NSView {
         publishDeadAirCandidateRegions()
         updateEffectCommandState()
         let candidateWord = result.candidates.count == 1 ? "candidate" : "candidates"
-        updateStatus("found \(result.candidates.count) silence \(candidateWord)")
+        let totalRemovedDuration = result.candidates.reduce(0) { total, candidate in
+            total + candidate.estimatedRemovedDuration
+        }
+        let totalDuration = formatDuration(totalRemovedDuration)
+        if let firstCandidate = result.candidates.first {
+            updateStatus(
+                "found \(result.candidates.count) silence \(candidateWord), " +
+                    "\(totalDuration) removable - " +
+                    deadAirCandidateStatusText(firstCandidate, index: 0, total: result.candidates.count)
+            )
+        } else {
+            updateStatus("found \(result.candidates.count) silence \(candidateWord), \(totalDuration) removable")
+        }
     }
 
     private func activeDeadAirCandidate() -> DeadAirReviewCandidate? {
@@ -4319,6 +4347,25 @@ final class WorkspaceView: NSView {
             return deadAirCandidates.first
         }
         return deadAirCandidates.first { $0.id == activeDeadAirCandidateID } ?? deadAirCandidates.first
+    }
+
+    private func stepActiveDeadAirCandidate(by offset: Int) {
+        guard !deadAirCandidates.isEmpty else {
+            updateStatus("no silence candidates")
+            return
+        }
+
+        let currentIndex = activeDeadAirCandidateID.flatMap { activeID in
+            deadAirCandidates.firstIndex { $0.id == activeID }
+        } ?? 0
+        let candidateCount = deadAirCandidates.count
+        let nextIndex = (currentIndex + offset + candidateCount) % candidateCount
+        let candidate = deadAirCandidates[nextIndex]
+        activeDeadAirCandidateID = candidate.id
+        publishDeadAirCandidateRegions()
+        timelineSurface.focusSelection(candidate.displaySelection)
+        updateEffectCommandState()
+        updateStatus(deadAirCandidateStatusText(candidate, index: nextIndex, total: candidateCount))
     }
 
     private func publishDeadAirCandidateRegions() {

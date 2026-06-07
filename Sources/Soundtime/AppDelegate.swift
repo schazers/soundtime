@@ -252,21 +252,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             action: #selector(TimelineView.auditionDeadAirCandidate(_:)),
             keyEquivalent: ""
         ))
-        menu.addItem(NSMenuItem(
+        let acceptCandidateItem = NSMenuItem(
             title: "Accept Silence Candidate",
             action: #selector(TimelineView.acceptDeadAirCandidate(_:)),
-            keyEquivalent: ""
-        ))
-        menu.addItem(NSMenuItem(
+            keyEquivalent: "\r"
+        )
+        acceptCandidateItem.keyEquivalentModifierMask = [.command]
+        menu.addItem(acceptCandidateItem)
+        let acceptHighConfidenceItem = NSMenuItem(
             title: "Accept High-Confidence Silence Candidates",
             action: #selector(TimelineView.acceptHighConfidenceDeadAirCandidates(_:)),
-            keyEquivalent: ""
-        ))
+            keyEquivalent: "\r"
+        )
+        acceptHighConfidenceItem.keyEquivalentModifierMask = [.command, .shift]
+        menu.addItem(acceptHighConfidenceItem)
         menu.addItem(NSMenuItem(
             title: "Reject Silence Candidate",
             action: #selector(TimelineView.rejectDeadAirCandidate(_:)),
             keyEquivalent: ""
         ))
+        let previousCandidateItem = NSMenuItem(
+            title: "Previous Silence Candidate",
+            action: #selector(TimelineView.previousDeadAirCandidate(_:)),
+            keyEquivalent: "["
+        )
+        previousCandidateItem.keyEquivalentModifierMask = [.command]
+        menu.addItem(previousCandidateItem)
+        let nextCandidateItem = NSMenuItem(
+            title: "Next Silence Candidate",
+            action: #selector(TimelineView.nextDeadAirCandidate(_:)),
+            keyEquivalent: "]"
+        )
+        nextCandidateItem.keyEquivalentModifierMask = [.command]
+        menu.addItem(nextCandidateItem)
         menu.addItem(NSMenuItem(
             title: "Fade In",
             action: #selector(TimelineView.applyFadeInEffect(_:)),

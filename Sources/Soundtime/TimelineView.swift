@@ -52,6 +52,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onAcceptHighConfidenceDeadAirCandidatesRequested: (() -> Void)?
     var onRejectDeadAirCandidateRequested: (() -> Void)?
     var onAuditionDeadAirCandidateRequested: (() -> Void)?
+    var onNextDeadAirCandidateRequested: (() -> Void)?
+    var onPreviousDeadAirCandidateRequested: (() -> Void)?
     var onReapplyLastEffect: (() -> Void)?
     var onSeekRequested: ((Float) -> Void)?
     var onPlayFromProgress: ((Float) -> Void)?
@@ -852,6 +854,27 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        if event.modifierFlags.contains(.command),
+           event.charactersIgnoringModifiers == "]" {
+            onNextDeadAirCandidateRequested?()
+            return
+        }
+
+        if event.modifierFlags.contains(.command),
+           event.charactersIgnoringModifiers == "[" {
+            onPreviousDeadAirCandidateRequested?()
+            return
+        }
+
+        if event.modifierFlags.contains(.command), event.keyCode == 36 {
+            if event.modifierFlags.contains(.shift) {
+                onAcceptHighConfidenceDeadAirCandidatesRequested?()
+            } else {
+                onAcceptDeadAirCandidateRequested?()
+            }
+            return
+        }
+
         if event.keyCode == 14, event.modifierFlags.contains(.command) {
             onExportRequested?()
             return
@@ -1039,6 +1062,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onAuditionDeadAirCandidateRequested?()
     }
 
+    @objc func nextDeadAirCandidate(_ sender: Any?) {
+        onNextDeadAirCandidateRequested?()
+    }
+
+    @objc func previousDeadAirCandidate(_ sender: Any?) {
+        onPreviousDeadAirCandidateRequested?()
+    }
+
     @objc func reapplyLastEffect(_ sender: Any?) {
         onReapplyLastEffect?()
     }
@@ -1056,7 +1087,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         case #selector(acceptDeadAirCandidate(_:)),
              #selector(acceptHighConfidenceDeadAirCandidates(_:)),
              #selector(rejectDeadAirCandidate(_:)),
-             #selector(auditionDeadAirCandidate(_:)):
+             #selector(auditionDeadAirCandidate(_:)),
+             #selector(nextDeadAirCandidate(_:)),
+             #selector(previousDeadAirCandidate(_:)):
             return canUseDeadAirCandidate
         case #selector(reapplyLastEffect(_:)):
             return canReapplyLastEffect
@@ -1726,6 +1759,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             let selection = currentSelection,
             selection.durationProgress > 0
         else {
+            return
+        }
+
+        focusSelection(selection)
+    }
+
+    func focusSelection(_ selection: TimelineSelection) {
+        guard selection.durationProgress > 0 else {
             return
         }
 
