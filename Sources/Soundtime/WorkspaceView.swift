@@ -332,6 +332,7 @@ final class WorkspaceView: NSView {
     }()
 
     private let frameRateHistoryView = FrameRateHistoryView()
+    private let performanceDashboardButton = PerformanceDashboardButton()
     private let volumeControl = VolumeControlView()
     private let loudnessMeter = LoudnessMeterView()
     private let transportControlPanel = TransportControlPanelView()
@@ -417,9 +418,11 @@ final class WorkspaceView: NSView {
         wantsLayer = true
         layer?.backgroundColor = SoundtimeColors.windowBackground.cgColor
         installTransportKeyMonitor()
+        SoundtimeMainThreadStallMonitor.shared.start()
 
         timelineSurface.translatesAutoresizingMaskIntoConstraints = false
         frameRateHistoryView.translatesAutoresizingMaskIntoConstraints = false
+        performanceDashboardButton.translatesAutoresizingMaskIntoConstraints = false
         addTrackButton.translatesAutoresizingMaskIntoConstraints = false
         transportControlPanel.translatesAutoresizingMaskIntoConstraints = false
         timelineSurface.onAudioFileDropped = { [weak self] url in
@@ -512,6 +515,9 @@ final class WorkspaceView: NSView {
         volumeControl.onVolumeEditingEnded = { [weak self] in
             self?.updateLoudnessMeter()
         }
+        performanceDashboardButton.onPressed = { [weak self] in
+            PerformanceDashboardWindowController.shared.showDashboard(relativeTo: self?.window)
+        }
         transportControlPanel.onAction = { [weak self] action in
             self?.handleTransportAction(action)
         }
@@ -555,6 +561,7 @@ final class WorkspaceView: NSView {
         addSubview(titleLabel)
         addSubview(metadataLabel)
         addSubview(framesPerSecondLabel)
+        addSubview(performanceDashboardButton)
         addSubview(frameRateHistoryView)
         addSubview(transportControlPanel)
         addSubview(volumeControl)
@@ -616,8 +623,13 @@ final class WorkspaceView: NSView {
             metadataToTransportConstraint,
 
             framesPerSecondLabel.centerYAnchor.constraint(equalTo: frameRateHistoryView.centerYAnchor),
-            framesPerSecondLabel.trailingAnchor.constraint(equalTo: frameRateHistoryView.leadingAnchor, constant: -8),
+            framesPerSecondLabel.trailingAnchor.constraint(equalTo: performanceDashboardButton.leadingAnchor, constant: -8),
             framesPerSecondWidthConstraint,
+
+            performanceDashboardButton.centerYAnchor.constraint(equalTo: frameRateHistoryView.centerYAnchor),
+            performanceDashboardButton.trailingAnchor.constraint(equalTo: frameRateHistoryView.leadingAnchor, constant: -8),
+            performanceDashboardButton.widthAnchor.constraint(equalToConstant: 30),
+            performanceDashboardButton.heightAnchor.constraint(equalToConstant: 24),
 
             frameRateHistoryView.bottomAnchor.constraint(equalTo: loudnessMeter.topAnchor, constant: -6),
             frameRateHistoryView.trailingAnchor.constraint(equalTo: loudnessMeter.trailingAnchor),
@@ -5499,6 +5511,7 @@ final class WorkspaceView: NSView {
 
     private func updateFrameStats(_ frameStats: TimelineFrameStats) {
         SoundtimeDiagnostics.shared.recordFrameStats(frameStats)
+        PerformanceDashboardWindowController.shared.display(frameStats: frameStats)
         frameRateHistoryView.display(frameStats: frameStats)
         guard debugToolsVisible else {
             return
