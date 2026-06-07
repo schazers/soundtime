@@ -55,6 +55,34 @@ final class PerformanceDashboardWindowController: NSWindowController, NSWindowDe
         window.close()
     }
 
+    static func smokeRenderFPSGraphPixelSummary(
+        values: [Float],
+        width: Int = 192,
+        height: Int = 64
+    ) throws -> MetalPixelSmokeSummary {
+        try PerformanceSparklineView.smokeRenderPixelSummary(
+            values: values,
+            maximumValue: 144,
+            usesLowValueDangerColor: true,
+            width: width,
+            height: height
+        )
+    }
+
+    static func smokeRenderCPUGraphPixelSummary(
+        values: [Float],
+        width: Int = 192,
+        height: Int = 64
+    ) throws -> MetalPixelSmokeSummary {
+        try PerformanceSparklineView.smokeRenderPixelSummary(
+            values: values,
+            maximumValue: 400,
+            usesLowValueDangerColor: false,
+            width: width,
+            height: height
+        )
+    }
+
     func windowWillClose(_ notification: Notification) {
         dashboardView.pause()
     }
@@ -68,7 +96,11 @@ final class PerformanceDashboardWindowController: NSWindowController, NSWindowDe
 private final class PerformanceDashboardView: NSView {
     private let titleLabel = NSTextField(labelWithString: "Performance Monitor")
     private let subtitleLabel = NSTextField(labelWithString: "Audio, render, GPU, queues, and trace health")
-    private let fpsCard = PerformanceMetricCardView(title: "FPS", accent: NSColor(calibratedRed: 0.10, green: 0.86, blue: 0.96, alpha: 1))
+    private let fpsCard = PerformanceMetricCardView(
+        title: "FPS",
+        accent: NSColor(calibratedRed: 0.10, green: 0.86, blue: 0.96, alpha: 1),
+        usesLowValueDangerColor: true
+    )
     private let cpuCard = PerformanceMetricCardView(title: "CPU", accent: NSColor(calibratedRed: 0.95, green: 0.98, blue: 1.00, alpha: 1))
     private let audioCard = PerformanceInfoCardView(title: "Audio Realtime")
     private let renderCard = PerformanceInfoCardView(title: "Render / GPU")
@@ -300,8 +332,11 @@ private final class PerformanceMetricCardView: NSView {
     private let subtitleLabel = NSTextField(labelWithString: "")
     private let sparklineView: PerformanceSparklineView
 
-    init(title: String, accent: NSColor) {
-        sparklineView = PerformanceSparklineView(accentColor: accent)
+    init(title: String, accent: NSColor, usesLowValueDangerColor: Bool = false) {
+        sparklineView = PerformanceSparklineView(
+            accentColor: accent,
+            usesLowValueDangerColor: usesLowValueDangerColor
+        )
         super.init(frame: .zero)
         titleLabel.stringValue = title
         configure(accent: accent)
@@ -515,6 +550,7 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
     }
 
     private let accentColor: SIMD4<Float>
+    private let usesLowValueDangerColor: Bool
     private let historyDuration: CFTimeInterval = 15
     private let historyExitDuration: CFTimeInterval = 1.25
     private let maximumSampleCount = 192
@@ -537,14 +573,16 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
         false
     }
 
-    init(accentColor: NSColor) {
+    init(accentColor: NSColor, usesLowValueDangerColor: Bool = false) {
         self.accentColor = Self.colorVector(from: accentColor)
+        self.usesLowValueDangerColor = usesLowValueDangerColor
         super.init(frame: .zero, device: MTLCreateSystemDefaultDevice())
         configureSparklineRenderer()
     }
 
     required init?(coder: NSCoder) {
         self.accentColor = SIMD4<Float>(0.10, 0.86, 0.96, 1)
+        self.usesLowValueDangerColor = false
         super.init(coder: coder)
         configureSparklineRenderer()
     }
@@ -642,7 +680,7 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
                 0
             ),
             accentColor: accentColor,
-            style: SIMD4<Float>(0.070, 1.0, 0.0, 0.0)
+            style: SIMD4<Float>(0.070, usesLowValueDangerColor ? 1.0 : 0.0, 0.0, 0.0)
         )
 
         encoder.setRenderPipelineState(pipelineState)
@@ -674,7 +712,15 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
         sampleLock.unlock()
 
         if let latestSample = renderSamples.last, now > latestSample.timestamp {
-            renderSamples.append(SparkSample(timestamp: now, value: latestSample.value))
+            if renderSamples.count == 1 {
+                renderSamples.insert(SparkSample(
+                    timestamp: now - Float(historyDuration),
+                    value: latestSample.value
+                ), at: 0)
+            }
+            let staleAge = now - latestSample.timestamp
+            let displayedValue = usesLowValueDangerColor && staleAge > 0.75 ? 0 : latestSample.value
+            renderSamples.append(SparkSample(timestamp: now, value: displayedValue))
         }
 
         if renderSamples.count > maximumSampleCount {
@@ -705,7 +751,9 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
 
     private func trimSamples(now: Float) {
         let oldestTimestamp = now - Float(historyDuration + historyExitDuration)
-        while samples.count > maximumSampleCount || (samples.first?.timestamp ?? now) < oldestTimestamp {
+        while samples.count > 1 &&
+            (samples.count > maximumSampleCount || (samples.first?.timestamp ?? now) < oldestTimestamp)
+        {
             samples.removeFirst()
         }
     }
@@ -722,6 +770,108 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
             Float(resolvedColor.blueComponent),
             Float(resolvedColor.alphaComponent)
         )
+    }
+
+    static func smokeRenderPixelSummary(
+        values: [Float],
+        maximumValue: Float,
+        usesLowValueDangerColor: Bool,
+        now: Float = 16,
+        width: Int = 192,
+        height: Int = 64
+    ) throws -> MetalPixelSmokeSummary {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw MetalPixelSmokeError.metalDeviceUnavailable
+        }
+        guard let commandQueue = device.makeCommandQueue() else {
+            throw MetalPixelSmokeError.commandQueueUnavailable
+        }
+        let library = try device.makeLibrary(source: shaderSource, options: nil)
+        guard
+            let vertexFunction = library.makeFunction(name: "performance_sparkline_vertex"),
+            let fragmentFunction = library.makeFunction(name: "performance_sparkline_fragment")
+        else {
+            throw MetalPixelSmokeError.libraryUnavailable
+        }
+
+        let descriptor = MTLRenderPipelineDescriptor()
+        descriptor.vertexFunction = vertexFunction
+        descriptor.fragmentFunction = fragmentFunction
+        descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+        descriptor.colorAttachments[0].isBlendingEnabled = true
+        descriptor.colorAttachments[0].rgbBlendOperation = .add
+        descriptor.colorAttachments[0].alphaBlendOperation = .add
+        descriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        descriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+        descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        descriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        let pipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
+
+        let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        textureDescriptor.storageMode = .shared
+        textureDescriptor.usage = [.renderTarget]
+        guard let texture = device.makeTexture(descriptor: textureDescriptor) else {
+            throw MetalPixelSmokeError.textureUnavailable
+        }
+
+        let renderPassDescriptor = MTLRenderPassDescriptor()
+        renderPassDescriptor.colorAttachments[0].texture = texture
+        renderPassDescriptor.colorAttachments[0].loadAction = .clear
+        renderPassDescriptor.colorAttachments[0].storeAction = .store
+        renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColor(red: 0.045, green: 0.046, blue: 0.047, alpha: 1)
+
+        guard
+            let commandBuffer = commandQueue.makeCommandBuffer(),
+            let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor)
+        else {
+            throw MetalPixelSmokeError.commandBufferUnavailable
+        }
+
+        var vertices = [
+            SparkVertex(position: SIMD2<Float>(0, 0)),
+            SparkVertex(position: SIMD2<Float>(1, 0)),
+            SparkVertex(position: SIMD2<Float>(0, 1)),
+            SparkVertex(position: SIMD2<Float>(1, 0)),
+            SparkVertex(position: SIMD2<Float>(1, 1)),
+            SparkVertex(position: SIMD2<Float>(0, 1)),
+        ]
+        let clampedValues = values.isEmpty ? [Float(0)] : Array(values.prefix(192))
+        let spacing = 15 / Float(max(clampedValues.count - 1, 1))
+        var samples = clampedValues.enumerated().map { index, value in
+            SparkSample(timestamp: now - 15 + Float(index) * spacing, value: max(value, 0))
+        }
+        var uniforms = SparkUniforms(
+            viewport: SIMD4<Float>(Float(width), Float(height), 1, max(maximumValue, 1)),
+            timing: SIMD4<Float>(now, 15, Float(samples.count), 0),
+            accentColor: SIMD4<Float>(0.10, 0.86, 0.96, 1),
+            style: SIMD4<Float>(0.070, usesLowValueDangerColor ? 1.0 : 0.0, 0.0, 0.0)
+        )
+
+        encoder.setRenderPipelineState(pipelineState)
+        vertices.withUnsafeBytes { bytes in
+            if let baseAddress = bytes.baseAddress {
+                encoder.setVertexBytes(baseAddress, length: bytes.count, index: 0)
+            }
+        }
+        samples.withUnsafeBytes { bytes in
+            if let baseAddress = bytes.baseAddress {
+                encoder.setFragmentBytes(baseAddress, length: bytes.count, index: 0)
+            }
+        }
+        encoder.setFragmentBytes(&uniforms, length: MemoryLayout<SparkUniforms>.stride, index: 1)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertices.count)
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        var bytes = [UInt8](repeating: 0, count: width * height * 4)
+        texture.getBytes(&bytes, bytesPerRow: width * 4, from: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0)
+        return MetalPixelSmokeSummary.analyzeBGRA8(bytes, width: width, height: height)
     }
 
     private static let shaderSource = """
@@ -789,6 +939,14 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
         return mix(bottom, top, normalizedValue);
     }
 
+    static float low_value_danger(SparkSample sample, float enabled) {
+        if (enabled < 0.5) {
+            return 0.0;
+        }
+
+        return 1.0 - smoothstep(60.0, 80.0, sample.value);
+    }
+
     fragment float4 performance_sparkline_fragment(
         RasterizedVertex in [[stage_in]],
         constant SparkSample *samples [[buffer(0)]],
@@ -823,8 +981,11 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
         float edgeFadeWidth = max(uniforms.style.x, 0.001);
         float edgeFade = smoothstep(left, left + edgeFadeWidth, uv.x) *
             (1.0 - smoothstep(right - edgeFadeWidth, right, uv.x));
+        float dangerEnabled = uniforms.style.y;
         float line = 0.0;
         float glow = 0.0;
+        float lineDanger = 0.0;
+        float glowDanger = 0.0;
         float underFill = 0.0;
 
         if (sampleCount >= 2u) {
@@ -844,8 +1005,16 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
                 float distance = segment_distance(scaledUV, p0, p1);
                 float lineWidth = 1.35 / height;
                 float glowWidth = 8.5 / height;
-                line = max(line, (1.0 - smoothstep(lineWidth, lineWidth + 1.3 / height, distance)) * edgeFade);
-                glow = max(glow, (1.0 - smoothstep(lineWidth, glowWidth, distance)) * edgeFade);
+                float segmentLine = (1.0 - smoothstep(lineWidth, lineWidth + 1.3 / height, distance)) * edgeFade;
+                float segmentGlow = (1.0 - smoothstep(lineWidth, glowWidth, distance)) * edgeFade;
+                float danger = max(
+                    low_value_danger(previousSample, dangerEnabled),
+                    low_value_danger(currentSample, dangerEnabled)
+                );
+                line = max(line, segmentLine);
+                glow = max(glow, segmentGlow);
+                lineDanger = max(lineDanger, segmentLine * danger);
+                glowDanger = max(glowDanger, segmentGlow * danger);
 
                 float segmentLeft = min(x0, x1);
                 float segmentRight = max(x0, x1);
@@ -858,9 +1027,15 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
             }
         }
 
-        color += accent * glow * 0.26 * body;
+        float glowDangerAmount = clamp(glowDanger / max(glow, 0.0001), 0.0, 1.0);
+        float lineDangerAmount = clamp(lineDanger / max(line, 0.0001), 0.0, 1.0);
+        float3 dangerGlowColor = float3(1.0, 0.13, 0.08);
+        float3 dangerLineColor = mix(float3(0.96, 0.20, 0.12), float3(1.0, 0.62, 0.50), line * 0.30);
+        float3 glowColor = mix(accent, dangerGlowColor, glowDangerAmount);
+        color += glowColor * glow * 0.26 * body;
         color = mix(color, accent * 0.28, underFill * 0.16 * body);
-        float3 lineColor = mix(accent, float3(0.94, 0.99, 1.0), line * 0.35);
+        float3 calmLineColor = mix(accent, float3(0.94, 0.99, 1.0), line * 0.35);
+        float3 lineColor = mix(calmLineColor, dangerLineColor, lineDangerAmount);
         color = mix(color, lineColor, line * body);
 
         float sheen = smoothstep(top, top - 0.14, uv.y) * body * 0.05;

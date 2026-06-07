@@ -11,6 +11,16 @@ if CommandLine.arguments.contains("--timeline-perf-baseline") {
     }
 }
 
+if CommandLine.arguments.contains("--timeline-ux-smoke") {
+    do {
+        try TimelineUXSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        exit(0)
+    } catch {
+        fputs("Soundtime timeline UX smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
 if CommandLine.arguments.contains("--recording-smoke") {
     do {
         try RecordingSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
