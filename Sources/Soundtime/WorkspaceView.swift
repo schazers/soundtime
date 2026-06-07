@@ -79,17 +79,20 @@ final class WorkspaceView: NSView {
     }
 
     private struct AudioClipboard: Sendable {
-        let buffer: DecodedAudioBuffer
+        let id: UUID
+        let buffer: DecodedAudioBuffer?
         let waveformOverview: WaveformOverview
         let fileClipSourceURL: URL?
         let fileClip: AudioFileEditTimeline.Clip?
 
         init(
-            buffer: DecodedAudioBuffer,
+            id: UUID = UUID(),
+            buffer: DecodedAudioBuffer?,
             waveformOverview: WaveformOverview,
             fileClipSourceURL: URL? = nil,
             fileClip: AudioFileEditTimeline.Clip? = nil
         ) {
+            self.id = id
             self.buffer = buffer
             self.waveformOverview = waveformOverview
             self.fileClipSourceURL = fileClipSourceURL
@@ -3070,6 +3073,38 @@ final class WorkspaceView: NSView {
         return peak
     }
 
+    private func selectedWaveformOverview(
+        from overview: WaveformOverview?,
+        selection: TimelineSelection
+    ) -> WaveformOverview? {
+        guard let overview else {
+            return nil
+        }
+
+        let sourceOverview = overviewForOptimisticEdit(overview)
+        let binCount = sourceOverview.bins.count
+        guard binCount > 0 else {
+            return nil
+        }
+
+        let startIndex = min(
+            max(Int((selection.startProgress * Double(binCount)).rounded(.down)), 0),
+            binCount
+        )
+        let endIndex = min(
+            max(Int((selection.endProgress * Double(binCount)).rounded(.up)), startIndex),
+            binCount
+        )
+        guard startIndex < endIndex else {
+            return nil
+        }
+
+        return WaveformOverview(
+            duration: selection.duration(in: sourceOverview.duration),
+            bins: Array(sourceOverview.bins[startIndex..<endIndex])
+        )
+    }
+
     private nonisolated static func selectionsMatch(
         _ lhs: TimelineSelection,
         _ rhs: TimelineSelection
@@ -3516,7 +3551,7 @@ final class WorkspaceView: NSView {
                 }
 
                 self.audioClipboard = clipboard
-                self.updateStatus("copied \(self.formatDuration(clipboard.buffer.duration))")
+                self.updateStatus("copied \(self.formatDuration(clipboard.buffer?.duration ?? 0))")
             }
             return
         }
@@ -3531,13 +3566,30 @@ final class WorkspaceView: NSView {
 
         let sourceURL = projectTracks[trackIndex].sourceURL
         let fileClip = fileTimeline.clip(for: selectedTimelineRange)
-        updateStatus("copying selection")
-        Task { [weak self, fileTimeline, selectedTimelineRange, sourceURL, fileClip] in
+        let clipboardID = UUID()
+        if let fileClip {
+            let waveformOverview = selectedWaveformOverview(
+                from: projectTracks[trackIndex].waveformOverview,
+                selection: selectedTimelineRange
+            ) ?? WaveformOverview(duration: fileClip.duration, bins: [])
+            audioClipboard = AudioClipboard(
+                id: clipboardID,
+                buffer: nil,
+                waveformOverview: waveformOverview,
+                fileClipSourceURL: sourceURL,
+                fileClip: fileClip
+            )
+            updateStatus("copied \(formatDuration(fileClip.duration))")
+        } else {
+            updateStatus("copying selection")
+        }
+        Task { [weak self, fileTimeline, selectedTimelineRange, sourceURL, fileClip, clipboardID] in
             let clipboard = await Task.detached(priority: .userInitiated) {
                 let sourceBuffer = try WAVAudioDecoder.decode(url: sourceURL)
                 let timeline = fileTimeline.audioTimeline(sourceBuffer: sourceBuffer)
                 let buffer = timeline.render(selection: selectedTimelineRange)
                 return AudioClipboard(
+                    id: clipboardID,
                     buffer: buffer,
                     waveformOverview: WaveformOverviewBuilder.build(from: buffer),
                     fileClipSourceURL: fileClip == nil ? nil : sourceURL,
@@ -3551,8 +3603,14 @@ final class WorkspaceView: NSView {
 
             switch clipboard {
             case let .success(clipboard):
+                if
+                    let currentClipboard = self.audioClipboard,
+                    currentClipboard.id != clipboard.id
+                {
+                    return
+                }
                 self.audioClipboard = clipboard
-                self.updateStatus("copied \(self.formatDuration(clipboard.buffer.duration))")
+                self.updateStatus("copied \(self.formatDuration(clipboard.buffer?.duration ?? 0))")
             case let .failure(error):
                 self.updateStatus("copy failed: \(error.localizedDescription)")
             }
@@ -3734,6 +3792,11 @@ final class WorkspaceView: NSView {
             return
         }
 
+        guard let clipboardBuffer = audioClipboard.buffer else {
+            updateStatus("paste waiting for copied audio")
+            return
+        }
+
         if let currentTimeline {
             editUndoStack.append(.timeline(trackID: trackID, timeline: currentTimeline))
         } else {
@@ -3772,7 +3835,7 @@ final class WorkspaceView: NSView {
         updateStatus("pasting - playback updates shortly")
 
         Task {
-            [weak self, currentTimeline, currentFileTimeline, pasteSelection, audioClipboard, sourceURL, trackID, editRevision] in
+            [weak self, currentTimeline, currentFileTimeline, pasteSelection, clipboardBuffer, sourceURL, trackID, editRevision] in
             do {
                 let materialized = try await Task.detached(priority: .userInitiated) {
                     let timeline: AudioEditTimeline
@@ -3788,7 +3851,7 @@ final class WorkspaceView: NSView {
                     return try Self.materializePaste(
                         timeline: timeline,
                         selection: pasteSelection,
-                        clipboardBuffer: audioClipboard.buffer
+                        clipboardBuffer: clipboardBuffer
                     )
                 }.value
 
@@ -3800,7 +3863,7 @@ final class WorkspaceView: NSView {
                     trackID: trackID,
                     editRevision: editRevision,
                     materialized: materialized,
-                    status: "pasted \(self.formatDuration(audioClipboard.buffer.duration))",
+                    status: "pasted \(self.formatDuration(clipboardBuffer.duration))",
                     preservePlaybackProgress: true,
                     reloadPlaybackSource: true,
                     preserveTimelineSource: false
