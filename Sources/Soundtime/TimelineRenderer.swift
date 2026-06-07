@@ -7972,10 +7972,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float ageSeconds = progress * duration;
         float2 center = float2(sourceX, sourceY) +
             direction * speed * ageSeconds * (0.35 + blast * 1.25);
-        float radius = 0.45 + 1.35 * hash11(seed + 89.0);
+        float radius = 0.30 + 0.88 * hash11(seed + 89.0);
         float dissolve = 1.0 - smoothstep(0.0, 1.0, progress);
         float alpha = progress < 0.78 ?
-            dissolve * dissolve * (0.13 + 0.11 * hash11(seed + 167.0)) :
+            dissolve * dissolve * (0.12 + 0.09 * hash11(seed + 167.0)) :
             0.0;
         float3 color = float3(
             0.70 + 0.30 * hash11(seed + 131.0),
