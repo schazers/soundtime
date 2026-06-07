@@ -33,6 +33,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onCutSelection: (() -> Void)?
     var onCopySelection: (() -> Void)?
     var onPasteAudio: (() -> Void)?
+    var onSplitAtPlayhead: (() -> Void)?
     var onUndo: (() -> Void)?
     var onExportRequested: (() -> Void)?
     var onOpenProjectRequested: (() -> Void)?
@@ -56,6 +57,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var canApplyGainEffect = false
     var canApplyFadeEffect = false
     var canReapplyLastEffect = false
+    var canSplitAtPlayhead = false
     var isDebugToolsVisible = false
 
     private enum TimelineDragMode {
@@ -732,6 +734,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        if
+            event.charactersIgnoringModifiers?.lowercased() == "b",
+            event.modifierFlags.contains(.command)
+        {
+            onSplitAtPlayhead?()
+            return
+        }
+
         if event.keyCode == 14, event.modifierFlags.contains(.command) {
             onExportRequested?()
             return
@@ -848,6 +858,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onPasteAudio?()
     }
 
+    @objc func splitAtPlayhead(_ sender: Any?) {
+        onSplitAtPlayhead?()
+    }
+
     @objc func showGainEffect(_ sender: Any?) {
         onGainRequested?()
     }
@@ -878,6 +892,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return canApplyGainEffect
         case #selector(reapplyLastEffect(_:)):
             return canReapplyLastEffect
+        case #selector(splitAtPlayhead(_:)):
+            return canSplitAtPlayhead
         case #selector(toggleDebugTools(_:)):
             menuItem.state = isDebugToolsVisible ? .on : .off
             return true

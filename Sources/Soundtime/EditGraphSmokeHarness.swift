@@ -89,6 +89,7 @@ enum EditGraphSmokeHarness {
             String(format: "edit graph operations were too slow: %.2fms", elapsedMilliseconds)
         )
         try runFileClipPasteSmoke(fileInfo: fileInfo)
+        try runSplitPersistenceSmoke(fileInfo: fileInfo)
 
         print(
             String(
@@ -154,6 +155,30 @@ enum EditGraphSmokeHarness {
             restoredTimeline.frameCount == timeline.frameCount,
             "file clip smoke persisted the wrong frame count"
         )
+    }
+
+    private static func runSplitPersistenceSmoke(fileInfo: WAVFileInfo) throws {
+        var timeline = AudioFileEditTimeline(fileInfo: fileInfo)
+        try require(timeline.split(atProgress: 0.25), "split smoke did not create first clip boundary")
+        try require(timeline.split(atProgress: 0.50), "split smoke did not create second clip boundary")
+        try require(!timeline.split(atProgress: 0.50), "split smoke split the same boundary twice")
+
+        let state = try requireValue(timeline.persistentState, "split smoke did not persist")
+        try require(
+            state.segments.filter { $0.startsNewClip == true }.count == 2,
+            "split smoke persisted the wrong boundary count"
+        )
+
+        let restoredTimeline = try requireValue(
+            AudioFileEditTimeline(persistentState: state),
+            "split smoke could not restore persisted edit graph"
+        )
+        let restoredState = try requireValue(restoredTimeline.persistentState, "split smoke restore did not persist")
+        try require(
+            restoredState.segments.filter { $0.startsNewClip == true }.count == 2,
+            "split smoke lost clip boundaries after restore"
+        )
+        try require(restoredTimeline.frameCount == timeline.frameCount, "split smoke changed timeline length")
     }
 
     private static func require(_ condition: Bool, _ message: String) throws {

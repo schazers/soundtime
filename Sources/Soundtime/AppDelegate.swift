@@ -192,6 +192,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             action: #selector(TimelineView.pasteTimelineAudio(_:)),
             keyEquivalent: "v"
         ))
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(
+            title: "Split at Playhead",
+            action: #selector(TimelineView.splitAtPlayhead(_:)),
+            keyEquivalent: "b"
+        ))
 
         return menu
     }

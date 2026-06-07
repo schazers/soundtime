@@ -227,6 +227,7 @@ enum ProjectEditRoundTripSmokeHarness {
             try require(lhs.frameCount == rhs.frameCount, "segment \(index) frame count mismatch")
             try require(abs(lhs.gainStart - rhs.gainStart) < 0.000_001, "segment \(index) gain start mismatch")
             try require(abs(lhs.gainEnd - rhs.gainEnd) < 0.000_001, "segment \(index) gain end mismatch")
+            try require(lhs.startsNewClip == rhs.startsNewClip, "segment \(index) clip boundary mismatch")
         }
     }
 

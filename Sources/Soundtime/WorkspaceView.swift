@@ -443,6 +443,9 @@ final class WorkspaceView: NSView {
         timelineSurface.onPasteAudio = { [weak self] in
             self?.pasteAudio()
         }
+        timelineSurface.onSplitAtPlayhead = { [weak self] in
+            self?.splitAtPlayhead()
+        }
         timelineSurface.onUndo = { [weak self] in
             self?.undoLastEdit()
         }
@@ -911,6 +914,14 @@ final class WorkspaceView: NSView {
 
         if event.keyCode == 6, event.modifierFlags.contains(.command) {
             undoLastEdit()
+            return nil
+        }
+
+        if
+            event.charactersIgnoringModifiers?.lowercased() == "b",
+            event.modifierFlags.contains(.command)
+        {
+            splitAtPlayhead()
             return nil
         }
 
@@ -3473,6 +3484,12 @@ final class WorkspaceView: NSView {
             }
             pasteAudio()
             return AgentCommandResult(status: .accepted, message: "Agent: paste requested")
+        case .splitAtPlayhead:
+            guard canSplitAtPlayhead else {
+                return AgentCommandResult(status: .failed, message: "Agent: move the playhead inside a track")
+            }
+            splitAtPlayhead()
+            return AgentCommandResult(status: .accepted, message: "Agent: split requested")
         case .showGain:
             guard canApplyGainEffect else {
                 return AgentCommandResult(status: .failed, message: "Agent: select audio for gain")
@@ -3510,6 +3527,79 @@ final class WorkspaceView: NSView {
         } else {
             deleteSelection()
         }
+    }
+
+    private func splitAtPlayhead() {
+        guard
+            let trackIndex = activeProjectTrackIndex(),
+            projectTracks.indices.contains(trackIndex)
+        else {
+            updateStatus("select a track to split")
+            return
+        }
+
+        let snapshot = playbackController.snapshot()
+        let projectProgress = min(max(snapshot.progress, 0), 1)
+        let insertionSelection = editInsertionSelection(
+            forPlaybackProgress: projectProgress,
+            trackIndex: trackIndex
+        )
+        guard
+            insertionSelection.startProgress > 0,
+            insertionSelection.startProgress < 1
+        else {
+            updateStatus("move the playhead inside the track to split")
+            return
+        }
+
+        let undoSnapshot = ProjectTrackUndoSnapshot(
+            tracks: projectTracks,
+            activeTrackID: activeTrackID,
+            selectedTrackID: selectedTrackID,
+            selectedTimelineRange: selectedTimelineRange,
+            restoreProgress: projectProgress
+        )
+
+        let editedAudioTimeline: AudioEditTimeline?
+        let editedFileTimeline: AudioFileEditTimeline?
+        let editedDuration: TimeInterval
+
+        if let currentFileTimeline = try? preferredFileTimelineForEditing(trackIndex: trackIndex) {
+            var timeline = currentFileTimeline
+            guard timeline.split(atProgress: insertionSelection.startProgress) else {
+                updateStatus("already split at playhead")
+                return
+            }
+            editedAudioTimeline = nil
+            editedFileTimeline = timeline
+            editedDuration = timeline.duration
+        } else if let currentTimeline = projectTracks[trackIndex].audioTimeline {
+            var timeline = currentTimeline
+            guard timeline.split(atProgress: insertionSelection.startProgress) else {
+                updateStatus("already split at playhead")
+                return
+            }
+            editedAudioTimeline = timeline
+            editedFileTimeline = nil
+            editedDuration = timeline.duration
+        } else {
+            updateStatus("track is not ready to split")
+            return
+        }
+
+        editUndoStack.append(.projectTracks(undoSnapshot))
+        projectTracks[trackIndex].editRevision += 1
+        projectTracks[trackIndex].audioTimeline = editedAudioTimeline
+        projectTracks[trackIndex].fileTimeline = editedFileTimeline
+        projectTracks[trackIndex].decodedAudioBuffer = editedAudioTimeline?.sourceAudioBuffer
+        projectTracks[trackIndex].durationHint = editedDuration
+        refreshProjectTimelineDisplay(rebuildControls: false, animateWaveformTransition: false)
+        reloadPlaybackFromProjectTracks(
+            preserveProgress: true,
+            resumeIfPlaying: playbackController.isPlaying
+        )
+        updateEffectCommandState()
+        updateStatus("split at \(formatClockTime(Double(projectProgress) * displayedDuration))")
     }
 
     private func deleteSelectedTrack() {
@@ -5475,6 +5565,7 @@ final class WorkspaceView: NSView {
     ) {
         let snapshot = playbackController.snapshot()
         currentPlayheadFrame = snapshot.frameIndex
+        updateEffectCommandState()
         displayPlaybackVisuals(
             progress: snapshot.progress,
             isPlaying: snapshot.isPlaying,
@@ -5555,10 +5646,35 @@ final class WorkspaceView: NSView {
         return hasEditableTimeline && target.editSelection.durationProgress > 0
     }
 
+    private var canSplitAtPlayhead: Bool {
+        guard
+            let trackIndex = activeProjectTrackIndex(),
+            projectTracks.indices.contains(trackIndex)
+        else {
+            return false
+        }
+
+        let track = projectTracks[trackIndex]
+        let hasEditableTimeline =
+            track.audioTimeline != nil ||
+            track.fileTimeline != nil ||
+            WAVAudioDecoder.canDecode(track.sourceURL)
+        guard hasEditableTimeline else {
+            return false
+        }
+
+        let insertionSelection = editInsertionSelection(
+            forPlaybackProgress: playbackController.snapshot().progress,
+            trackIndex: trackIndex
+        )
+        return insertionSelection.startProgress > 0 && insertionSelection.startProgress < 1
+    }
+
     private func updateEffectCommandState() {
         timelineSurface.canApplyGainEffect = canApplyGainEffect
         timelineSurface.canApplyFadeEffect = canApplyGainEffect
         timelineSurface.canReapplyLastEffect = lastEffect != nil && canApplyGainEffect
+        timelineSurface.canSplitAtPlayhead = canSplitAtPlayhead
     }
 
     private func updateStatus(_ status: String) {
