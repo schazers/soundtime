@@ -1103,6 +1103,11 @@ final class WorkspaceView: NSView {
             return nil
         }
 
+        if event.keyCode == 53 {
+            dismissTimelineSelection()
+            return nil
+        }
+
         if event.keyCode == 51 || event.keyCode == 117 {
             if event.modifierFlags.contains(.command) {
                 clearSelection()
@@ -1922,6 +1927,16 @@ final class WorkspaceView: NSView {
         }
         publishSelectedTracksToTimeline()
         refreshTrackControls()
+    }
+
+    private func dismissTimelineSelection() {
+        clearDeadAirReview(publish: true)
+        selectedTimelineRange = nil
+        timelineSurface.displaySelection(nil)
+        timelineSurface.displayGainPreview(selection: nil, gain: 1)
+        clearSelectedTrack()
+        updateEffectCommandState()
+        updateStatus(currentPlaybackStatus)
     }
 
     private func publishSelectedTracksToTimeline() {
