@@ -299,6 +299,22 @@ enum EditGraphSmokeHarness {
             configuration: configuration
         )
         try require(deletionRanges == [520..<920], "silence analyzer padding range mismatch")
+
+        let roomToneConfiguration = AudioSilenceAnalyzer.Configuration(
+            thresholdDecibels: -44,
+            minimumSilenceDuration: 0.30,
+            paddingDuration: 0.05,
+            roomToneHandleDuration: 0.14
+        )
+        let roomToneDeletionRanges = AudioSilenceAnalyzer.deletionRanges(
+            for: regions,
+            sampleRate: sampleRate,
+            configuration: roomToneConfiguration
+        )
+        try require(
+            roomToneDeletionRanges == [560..<880],
+            "silence analyzer room tone handle range mismatch"
+        )
     }
 
     private static func runPodcastExportProcessorSmoke() throws {
