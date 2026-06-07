@@ -339,8 +339,12 @@ struct AudioFileEditTimeline: Sendable {
     }
 
     func waveformOverview(from sourceOverview: WaveformOverview) -> WaveformOverview {
-        guard sourceFrameCount > 0, !sourceOverview.bins.isEmpty else {
+        guard sourceFrameCount > 0, timelineFrameCount > 0, !sourceOverview.bins.isEmpty else {
             return WaveformOverview(duration: duration, bins: [])
+        }
+
+        if timelineFrameCount == sourceFrameCount, hasSourceFrameAlignment {
+            return equalDurationWaveformOverview(from: sourceOverview)
         }
 
         let sourceBinCount = sourceOverview.bins.count
@@ -384,6 +388,65 @@ struct AudioFileEditTimeline: Sendable {
         }
 
         return WaveformOverview(duration: duration, bins: editedBins)
+    }
+
+    private func equalDurationWaveformOverview(from sourceOverview: WaveformOverview) -> WaveformOverview {
+        let sourceBinCount = sourceOverview.bins.count
+        let sourceFramesPerBin = Double(sourceFrameCount) / Double(sourceBinCount)
+        var editedBins = sourceOverview.bins
+        var timelineFrame = 0
+
+        for segment in segments {
+            let segmentStartFrame = timelineFrame
+            let segmentEndFrame = timelineFrame + segment.frameCount
+            timelineFrame = segmentEndFrame
+
+            let startBin = min(
+                max(Int((Double(segmentStartFrame) / sourceFramesPerBin).rounded(.down)), 0),
+                sourceBinCount
+            )
+            let endBin = min(
+                max(Int((Double(segmentEndFrame) / sourceFramesPerBin).rounded(.up)), startBin),
+                sourceBinCount
+            )
+            guard startBin < endBin else {
+                continue
+            }
+
+            if segment.hasConstantGain {
+                let gain = segment.gainStart
+                guard abs(gain - 1) > Self.gainEpsilon else {
+                    continue
+                }
+                for outputBinIndex in startBin..<endBin {
+                    editedBins[outputBinIndex] = sourceOverview.bins[outputBinIndex].scaled(by: gain)
+                }
+                continue
+            }
+
+            for outputBinIndex in startBin..<endBin {
+                let binCenterFrame = min(
+                    max(Int((Double(outputBinIndex) + 0.5) * sourceFramesPerBin), segmentStartFrame),
+                    max(segmentEndFrame - 1, segmentStartFrame)
+                )
+                editedBins[outputBinIndex] = sourceOverview.bins[outputBinIndex].scaled(
+                    by: segment.gain(at: binCenterFrame - segmentStartFrame)
+                )
+            }
+        }
+
+        return WaveformOverview(duration: duration, bins: editedBins)
+    }
+
+    private var hasSourceFrameAlignment: Bool {
+        var timelineFrame = 0
+        for segment in segments {
+            guard segment.sourceStartFrame == timelineFrame else {
+                return false
+            }
+            timelineFrame += segment.frameCount
+        }
+        return timelineFrame == sourceFrameCount
     }
 
     mutating func delete(_ selection: TimelineSelection) -> Int {
