@@ -197,6 +197,8 @@ final class WorkspaceView: NSView {
     }
 
     private struct ProjectMixTrackSnapshot: Sendable {
+        let id: UUID
+        let name: String
         let volume: Float
         let source: ProjectMixTrackSource
         let zeroCrossingIndex: AudioZeroCrossingIndex?
@@ -623,6 +625,18 @@ final class WorkspaceView: NSView {
         }
         timelineSurface.onExportRequested = { [weak self] in
             self?.exportCurrentAudio()
+        }
+        timelineSurface.onExportWAVRequested = { [weak self] in
+            self?.exportWAVMixdown()
+        }
+        timelineSurface.onExportSelectedRegionRequested = { [weak self] in
+            self?.exportSelectedRegion()
+        }
+        timelineSurface.onExportMixdownAndStemsRequested = { [weak self] in
+            self?.exportMixdownAndStems()
+        }
+        timelineSurface.onExportStemsRequested = { [weak self] in
+            self?.exportStems()
         }
         timelineSurface.onOpenProjectRequested = { [weak self] in
             self?.openProject()
@@ -2692,26 +2706,34 @@ final class WorkspaceView: NSView {
     }
 
     private func projectMixTrackSnapshots() -> [ProjectMixTrackSnapshot] {
-        audibleProjectTracks.compactMap { track in
-            let source: ProjectMixTrackSource
-            if let fileTimeline = track.fileTimeline, WAVAudioDecoder.canDecode(track.sourceURL) {
-                source = .fileTimeline(track.sourceURL, fileTimeline)
-            } else if track.editRevision == 0, WAVAudioDecoder.canDecode(track.sourceURL) {
-                source = .file(track.sourceURL)
-            } else if let audioTimeline = track.audioTimeline {
-                source = .timeline(audioTimeline)
-            } else if let decodedAudioBuffer = track.decodedAudioBuffer {
-                source = .decoded(decodedAudioBuffer)
-            } else {
-                return nil
-            }
+        audibleProjectTracks.compactMap(projectMixTrackSnapshot)
+    }
 
-            return ProjectMixTrackSnapshot(
-                volume: track.volume,
-                source: source,
-                zeroCrossingIndex: track.zeroCrossingIndex
-            )
+    private func projectStemTrackSnapshots() -> [ProjectMixTrackSnapshot] {
+        projectTracks.compactMap(projectMixTrackSnapshot)
+    }
+
+    private func projectMixTrackSnapshot(for track: ProjectTrack) -> ProjectMixTrackSnapshot? {
+        let source: ProjectMixTrackSource
+        if let fileTimeline = track.fileTimeline, WAVAudioDecoder.canDecode(track.sourceURL) {
+            source = .fileTimeline(track.sourceURL, fileTimeline)
+        } else if track.editRevision == 0, WAVAudioDecoder.canDecode(track.sourceURL) {
+            source = .file(track.sourceURL)
+        } else if let audioTimeline = track.audioTimeline {
+            source = .timeline(audioTimeline)
+        } else if let decodedAudioBuffer = track.decodedAudioBuffer {
+            source = .decoded(decodedAudioBuffer)
+        } else {
+            return nil
         }
+
+        return ProjectMixTrackSnapshot(
+            id: track.id,
+            name: track.name,
+            volume: track.volume,
+            source: source,
+            zeroCrossingIndex: track.zeroCrossingIndex
+        )
     }
 
     private nonisolated static func decodedMixBuffer(
@@ -7293,6 +7315,131 @@ final class WorkspaceView: NSView {
         }
     }
 
+    private func exportWAVMixdown() {
+        let projectMixSnapshots = projectMixTrackSnapshots()
+        let fallbackDecodedAudioBuffer = decodedAudioBuffer
+        guard !projectMixSnapshots.isEmpty || (fallbackDecodedAudioBuffer?.frameCount ?? 0) > 0 else {
+            updateStatus("load audio before exporting")
+            return
+        }
+
+        let savePanel = NSSavePanel()
+        savePanel.title = "Export WAV"
+        savePanel.nameFieldStringValue = suggestedExportFilename()
+        savePanel.canCreateDirectories = true
+        savePanel.isExtensionHidden = false
+        savePanel.allowedContentTypes = [.wav]
+
+        let completion: (NSApplication.ModalResponse) -> Void = {
+            [weak self, projectMixSnapshots, fallbackDecodedAudioBuffer] response in
+            guard response == .OK, let destinationURL = savePanel.url else {
+                return
+            }
+
+            self?.prepareAndWriteWAVExport(
+                projectMixSnapshots: projectMixSnapshots,
+                fallbackDecodedAudioBuffer: fallbackDecodedAudioBuffer,
+                to: destinationURL,
+                selection: nil
+            )
+        }
+
+        if let window {
+            savePanel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(savePanel.runModal())
+        }
+    }
+
+    private func exportSelectedRegion() {
+        guard
+            let selectedTimelineRange,
+            selectedTimelineRange.durationProgress > 0
+        else {
+            updateStatus("select audio to export")
+            return
+        }
+
+        let projectMixSnapshots = projectMixTrackSnapshots()
+        let fallbackDecodedAudioBuffer = decodedAudioBuffer
+        guard !projectMixSnapshots.isEmpty || (fallbackDecodedAudioBuffer?.frameCount ?? 0) > 0 else {
+            updateStatus("load audio before exporting")
+            return
+        }
+
+        let savePanel = NSSavePanel()
+        savePanel.title = "Export Selected Region"
+        savePanel.nameFieldStringValue = suggestedSelectedRegionExportFilename()
+        savePanel.canCreateDirectories = true
+        savePanel.isExtensionHidden = false
+        savePanel.allowedContentTypes = [.wav]
+
+        let completion: (NSApplication.ModalResponse) -> Void = {
+            [weak self, projectMixSnapshots, fallbackDecodedAudioBuffer, selectedTimelineRange] response in
+            guard response == .OK, let destinationURL = savePanel.url else {
+                return
+            }
+
+            self?.prepareAndWriteWAVExport(
+                projectMixSnapshots: projectMixSnapshots,
+                fallbackDecodedAudioBuffer: fallbackDecodedAudioBuffer,
+                to: destinationURL,
+                selection: selectedTimelineRange
+            )
+        }
+
+        if let window {
+            savePanel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(savePanel.runModal())
+        }
+    }
+
+    private func exportMixdownAndStems() {
+        exportStemSet(includeMixdown: true)
+    }
+
+    private func exportStems() {
+        exportStemSet(includeMixdown: false)
+    }
+
+    private func exportStemSet(includeMixdown: Bool) {
+        let stemSnapshots = projectStemTrackSnapshots()
+        let mixSnapshots = projectMixTrackSnapshots()
+        guard !stemSnapshots.isEmpty else {
+            updateStatus("load tracks before exporting stems")
+            return
+        }
+
+        let openPanel = NSOpenPanel()
+        openPanel.title = includeMixdown ? "Export Mixdown Plus Stems" : "Export Stems"
+        openPanel.prompt = "Export"
+        openPanel.canChooseFiles = false
+        openPanel.canChooseDirectories = true
+        openPanel.canCreateDirectories = true
+        openPanel.allowsMultipleSelection = false
+
+        let completion: (NSApplication.ModalResponse) -> Void = {
+            [weak self, stemSnapshots, mixSnapshots, includeMixdown] response in
+            guard response == .OK, let folderURL = openPanel.url else {
+                return
+            }
+
+            self?.writeStemExports(
+                stemSnapshots: stemSnapshots,
+                mixSnapshots: includeMixdown ? mixSnapshots : [],
+                to: folderURL,
+                includeMixdown: includeMixdown
+            )
+        }
+
+        if let window {
+            openPanel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(openPanel.runModal())
+        }
+    }
+
     private func openProject() {
         let openPanel = NSOpenPanel()
         openPanel.title = "Open Soundtime Project"
@@ -7816,6 +7963,57 @@ final class WorkspaceView: NSView {
         }
     }
 
+    private func prepareAndWriteWAVExport(
+        projectMixSnapshots: [ProjectMixTrackSnapshot],
+        fallbackDecodedAudioBuffer: DecodedAudioBuffer?,
+        to destinationURL: URL,
+        selection: TimelineSelection?
+    ) {
+        updateStatus(selection == nil ? "preparing WAV export" : "preparing region export")
+        Task { [weak self, projectMixSnapshots, fallbackDecodedAudioBuffer, destinationURL, selection] in
+            let result: Result<DecodedAudioBuffer?, Error> = await Task.detached(priority: .userInitiated) {
+                let fullBuffer: DecodedAudioBuffer?
+                if !projectMixSnapshots.isEmpty {
+                    fullBuffer = try Self.makeProjectMix(
+                        from: projectMixSnapshots,
+                        outputURL: destinationURL
+                    )?.buffer
+                } else {
+                    fullBuffer = fallbackDecodedAudioBuffer
+                }
+
+                guard let fullBuffer else {
+                    return nil
+                }
+
+                if let selection {
+                    return Self.croppedBuffer(fullBuffer, to: selection)
+                }
+                return fullBuffer
+            }.result
+
+            guard let self else {
+                return
+            }
+
+            switch result {
+            case let .success(buffer):
+                guard let buffer, buffer.frameCount > 0 else {
+                    self.updateStatus("export failed: no audio to write")
+                    return
+                }
+
+                self.writeWAVBuffer(
+                    buffer,
+                    to: destinationURL,
+                    completionStatusPrefix: selection == nil ? "exported WAV" : "exported selection"
+                )
+            case let .failure(error):
+                self.updateStatus("export failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
     private func writeExport(_ decodedAudioBuffer: DecodedAudioBuffer, to destinationURL: URL) {
         updateStatus("exporting...")
         exportProgressOverlay.showExporting()
@@ -7870,8 +8068,225 @@ final class WorkspaceView: NSView {
         }
     }
 
+    private func writeWAVBuffer(
+        _ decodedAudioBuffer: DecodedAudioBuffer,
+        to destinationURL: URL,
+        completionStatusPrefix: String
+    ) {
+        updateStatus("exporting WAV...")
+        exportProgressOverlay.showExporting()
+        let exportProgressOverlay = exportProgressOverlay
+
+        Task { [weak self, decodedAudioBuffer, destinationURL, completionStatusPrefix] in
+            do {
+                let exportURL = try await Task.detached(priority: .userInitiated) {
+                    let exportURL = Self.normalizedWAVExportURL(destinationURL)
+                    try WAVFileWriter.write(decodedAudioBuffer, to: exportURL) { progress in
+                        Task { @MainActor in
+                            exportProgressOverlay.updateProgress(progress)
+                        }
+                    }
+                    return exportURL
+                }.value
+
+                guard let self else {
+                    return
+                }
+
+                self.exportProgressOverlay.showComplete()
+                self.updateStatus("\(completionStatusPrefix) \(exportURL.lastPathComponent)")
+            } catch {
+                guard let self else {
+                    return
+                }
+
+                self.exportProgressOverlay.showFailure("Export failed.")
+                self.updateStatus("export failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func writeStemExports(
+        stemSnapshots: [ProjectMixTrackSnapshot],
+        mixSnapshots: [ProjectMixTrackSnapshot],
+        to folderURL: URL,
+        includeMixdown: Bool
+    ) {
+        updateStatus(includeMixdown ? "exporting mixdown and stems..." : "exporting stems...")
+        exportProgressOverlay.showExporting()
+        let exportProgressOverlay = exportProgressOverlay
+        let projectName = suggestedProjectFilename()
+
+        Task { [weak self, stemSnapshots, mixSnapshots, folderURL, includeMixdown, projectName] in
+            do {
+                let writtenURLs = try await Task.detached(priority: .userInitiated) {
+                    var usedNames = Set<String>()
+                    var writtenURLs: [URL] = []
+                    let totalWriteCount = stemSnapshots.count + ((includeMixdown && !mixSnapshots.isEmpty) ? 1 : 0)
+                    var completedWriteCount = 0
+
+                    if includeMixdown, !mixSnapshots.isEmpty,
+                       let mixBuffer = try Self.makeProjectMix(
+                        from: mixSnapshots,
+                        outputURL: folderURL.appendingPathComponent("\(projectName)-mixdown.wav")
+                       )?.buffer
+                    {
+                        let mixURL = Self.uniqueWAVURL(
+                            in: folderURL,
+                            baseName: "\(projectName)-mixdown",
+                            usedNames: &usedNames
+                        )
+                        try WAVFileWriter.write(mixBuffer, to: mixURL)
+                        writtenURLs.append(mixURL)
+                        completedWriteCount += 1
+                        let progressValue = Double(completedWriteCount) / Double(max(totalWriteCount, 1))
+                        Task { @MainActor in
+                            exportProgressOverlay.updateProgress(progressValue)
+                        }
+                    }
+
+                    for stemSnapshot in stemSnapshots {
+                        let decodedBuffer = try Self.decodedMixBuffer(for: stemSnapshot)
+                        let stemBuffer = Self.bufferByApplyingVolume(
+                            stemSnapshot.volume,
+                            to: decodedBuffer,
+                            outputURL: folderURL
+                        )
+                        let stemURL = Self.uniqueWAVURL(
+                            in: folderURL,
+                            baseName: "\(projectName)-\(stemSnapshot.name)-stem",
+                            usedNames: &usedNames
+                        )
+                        try WAVFileWriter.write(stemBuffer, to: stemURL)
+                        writtenURLs.append(stemURL)
+                        completedWriteCount += 1
+                        let progressValue = Double(completedWriteCount) / Double(max(totalWriteCount, 1))
+                        Task { @MainActor in
+                            exportProgressOverlay.updateProgress(progressValue)
+                        }
+                    }
+
+                    return writtenURLs
+                }.value
+
+                guard let self else {
+                    return
+                }
+
+                self.exportProgressOverlay.showComplete()
+                self.updateStatus("exported \(writtenURLs.count) file\(writtenURLs.count == 1 ? "" : "s")")
+            } catch {
+                guard let self else {
+                    return
+                }
+
+                self.exportProgressOverlay.showFailure("Export failed.")
+                self.updateStatus("export failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
     private nonisolated static func normalizedAudioExportURL(_ destinationURL: URL) -> URL {
         destinationURL.pathExtension.isEmpty ? destinationURL.appendingPathExtension("wav") : destinationURL
+    }
+
+    private nonisolated static func normalizedWAVExportURL(_ destinationURL: URL) -> URL {
+        destinationURL.pathExtension.lowercased() == "wav" ?
+            destinationURL :
+            destinationURL.deletingPathExtension().appendingPathExtension("wav")
+    }
+
+    private nonisolated static func croppedBuffer(
+        _ buffer: DecodedAudioBuffer,
+        to selection: TimelineSelection
+    ) -> DecodedAudioBuffer? {
+        guard
+            buffer.frameCount > 0,
+            selection.durationProgress > 0
+        else {
+            return nil
+        }
+
+        let startFrame = min(
+            max(Int((selection.startProgress * Double(buffer.frameCount)).rounded(.down)), 0),
+            buffer.frameCount
+        )
+        let endFrame = min(
+            max(Int((selection.endProgress * Double(buffer.frameCount)).rounded(.up)), startFrame),
+            buffer.frameCount
+        )
+        guard startFrame < endFrame else {
+            return nil
+        }
+
+        let samplesByChannel = buffer.samplesByChannel.map { samples in
+            let channelEndFrame = min(endFrame, samples.count)
+            let channelStartFrame = min(startFrame, channelEndFrame)
+            return Array(samples[channelStartFrame..<channelEndFrame])
+        }
+        return DecodedAudioBuffer(
+            url: buffer.url,
+            sampleRate: buffer.sampleRate,
+            channelCount: buffer.channelCount,
+            frameCount: endFrame - startFrame,
+            samplesByChannel: samplesByChannel
+        )
+    }
+
+    private nonisolated static func bufferByApplyingVolume(
+        _ volume: Float,
+        to buffer: DecodedAudioBuffer,
+        outputURL: URL
+    ) -> DecodedAudioBuffer {
+        let gain = volume * volume
+        guard abs(gain - 1) > Float.ulpOfOne else {
+            return DecodedAudioBuffer(
+                url: outputURL,
+                sampleRate: buffer.sampleRate,
+                channelCount: buffer.channelCount,
+                frameCount: buffer.frameCount,
+                samplesByChannel: buffer.samplesByChannel
+            )
+        }
+
+        let samplesByChannel = buffer.samplesByChannel.map { samples in
+            samples.map { min(max($0 * gain, -1), 1) }
+        }
+        return DecodedAudioBuffer(
+            url: outputURL,
+            sampleRate: buffer.sampleRate,
+            channelCount: buffer.channelCount,
+            frameCount: buffer.frameCount,
+            samplesByChannel: samplesByChannel
+        )
+    }
+
+    private nonisolated static func uniqueWAVURL(
+        in folderURL: URL,
+        baseName: String,
+        usedNames: inout Set<String>
+    ) -> URL {
+        let sanitizedBaseName = sanitizedFilenameComponent(baseName)
+        var suffix = 0
+        while true {
+            let name = suffix == 0 ? sanitizedBaseName : "\(sanitizedBaseName)-\(suffix + 1)"
+            let filename = "\(name).wav"
+            if !usedNames.contains(filename) {
+                usedNames.insert(filename)
+                return folderURL.appendingPathComponent(filename)
+            }
+            suffix += 1
+        }
+    }
+
+    private nonisolated static func sanitizedFilenameComponent(_ value: String) -> String {
+        let invalidCharacters = CharacterSet(charactersIn: "/\\?%*|\"<>:")
+            .union(.newlines)
+            .union(.controlCharacters)
+        let components = value.components(separatedBy: invalidCharacters)
+        let sanitized = components.joined(separator: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return sanitized.isEmpty ? "Soundtime" : sanitized
     }
 
     private func startPlaybackTimer() {
@@ -8510,6 +8925,11 @@ final class WorkspaceView: NSView {
     private func suggestedExportFilename() -> String {
         let baseName = selectedAudioFile?.url.deletingPathExtension().lastPathComponent ?? "Soundtime Export"
         return "\(baseName)-edited.wav"
+    }
+
+    private func suggestedSelectedRegionExportFilename() -> String {
+        let baseName = selectedAudioFile?.url.deletingPathExtension().lastPathComponent ?? "Soundtime Export"
+        return "\(baseName)-selection.wav"
     }
 
     private func suggestedProjectFilename() -> String {
