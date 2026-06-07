@@ -390,6 +390,10 @@ struct AudioFileEditTimeline: Sendable {
         deleteFrames(in: frameRange(for: selection))
     }
 
+    mutating func delete(frameRange: Range<Int>) -> Int {
+        deleteFrames(in: frameRange)
+    }
+
     mutating func applyGain(_ gain: Float, to selection: TimelineSelection) -> Int {
         applyGain(gain, toFramesIn: frameRange(for: selection))
     }

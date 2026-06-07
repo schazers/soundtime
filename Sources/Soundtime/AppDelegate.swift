@@ -222,6 +222,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: ""
         ))
         menu.addItem(NSMenuItem(
+            title: "Delete Silence",
+            action: #selector(TimelineView.deleteSilence(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
             title: "Fade In",
             action: #selector(TimelineView.applyFadeInEffect(_:)),
             keyEquivalent: ""

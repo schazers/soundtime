@@ -106,6 +106,13 @@ final class WorkspaceView: NSView {
         let editSelection: TimelineSelection
     }
 
+    private struct SilenceCleanupResult: Sendable {
+        let frameRanges: [Range<Int>]
+        let detectedRegionCount: Int
+        let deletedFrameCount: Int
+        let deletedDuration: TimeInterval
+    }
+
     private enum ProjectMixTrackSource: Sendable {
         case decoded(DecodedAudioBuffer)
         case timeline(AudioEditTimeline)
@@ -475,6 +482,9 @@ final class WorkspaceView: NSView {
         }
         timelineSurface.onNormalizeRequested = { [weak self] in
             self?.applyNormalizeEffect()
+        }
+        timelineSurface.onDeleteSilenceRequested = { [weak self] in
+            self?.deleteDetectedSilence()
         }
         timelineSurface.onFadeInRequested = { [weak self] in
             self?.applyFadeEffect(.fadeIn)
@@ -3496,6 +3506,12 @@ final class WorkspaceView: NSView {
             }
             showGainEffect()
             return AgentCommandResult(status: .accepted, message: "Agent: gain opened")
+        case .deleteSilence:
+            guard canDeleteSilence else {
+                return AgentCommandResult(status: .failed, message: "Agent: select a track to clean")
+            }
+            deleteDetectedSilence()
+            return AgentCommandResult(status: .accepted, message: "Agent: silence cleanup started")
         case .normalizeSelection:
             guard canApplyGainEffect else {
                 return AgentCommandResult(status: .failed, message: "Agent: select audio to normalize")
@@ -3600,6 +3616,255 @@ final class WorkspaceView: NSView {
         )
         updateEffectCommandState()
         updateStatus("split at \(formatClockTime(Double(projectProgress) * displayedDuration))")
+    }
+
+    private func silenceCleanupTarget() -> EditableSelectionTarget? {
+        if let target = currentEditableSelectionTarget() {
+            return target
+        }
+
+        guard
+            let trackIndex = activeProjectTrackIndex(),
+            projectTracks.indices.contains(trackIndex)
+        else {
+            return nil
+        }
+
+        let trackID = projectTracks[trackIndex].id
+        return EditableSelectionTarget(
+            trackIndex: trackIndex,
+            displaySelection: fullTrackDisplaySelection(for: trackID),
+            editSelection: fullTrackEditSelection(for: trackID)
+        )
+    }
+
+    private func deleteDetectedSilence() {
+        guard
+            let target = silenceCleanupTarget(),
+            projectTracks.indices.contains(target.trackIndex)
+        else {
+            updateStatus("select a track to clean")
+            return
+        }
+
+        let trackIndex = target.trackIndex
+        let track = projectTracks[trackIndex]
+        let sourceURL = track.sourceURL
+        let trackID = track.id
+        let editRevision = track.editRevision
+        let audioTimeline = track.audioTimeline
+        let fileTimeline = try? preferredFileTimelineForEditing(trackIndex: trackIndex)
+        let editSelection = target.editSelection
+        let configuration = AudioSilenceAnalyzer.Configuration.podcastCleanup
+
+        updateStatus("detecting silence")
+        Task { [weak self, sourceURL, audioTimeline, fileTimeline, editSelection, trackID, editRevision, configuration] in
+            let result = await Task.detached(priority: .userInitiated) {
+                try Self.detectSilenceCleanupRanges(
+                    sourceURL: sourceURL,
+                    audioTimeline: audioTimeline,
+                    fileTimeline: fileTimeline,
+                    editSelection: editSelection,
+                    configuration: configuration
+                )
+            }.result
+
+            guard let self else {
+                return
+            }
+
+            switch result {
+            case let .success(cleanupResult):
+                self.applySilenceCleanupResult(
+                    cleanupResult,
+                    trackID: trackID,
+                    expectedEditRevision: editRevision
+                )
+            case let .failure(error):
+                self.updateStatus("silence cleanup failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private nonisolated static func detectSilenceCleanupRanges(
+        sourceURL: URL,
+        audioTimeline: AudioEditTimeline?,
+        fileTimeline: AudioFileEditTimeline?,
+        editSelection: TimelineSelection,
+        configuration: AudioSilenceAnalyzer.Configuration
+    ) throws -> SilenceCleanupResult {
+        let renderedBuffer: DecodedAudioBuffer
+        let timelineFrameCount: Int
+        let timelineSampleRate: Double
+
+        if let fileTimeline {
+            let sourceBuffer = try WAVAudioDecoder.decode(url: sourceURL)
+            renderedBuffer = fileTimeline.audioTimeline(sourceBuffer: sourceBuffer).render(selection: editSelection)
+            timelineFrameCount = fileTimeline.frameCount
+            timelineSampleRate = fileTimeline.sourceSampleRate
+        } else if let audioTimeline {
+            renderedBuffer = audioTimeline.render(selection: editSelection)
+            timelineFrameCount = audioTimeline.frameCount
+            timelineSampleRate = audioTimeline.sourceAudioBuffer.sampleRate
+        } else {
+            let sourceBuffer = try WAVAudioDecoder.decode(url: sourceURL)
+            let timeline = AudioEditTimeline(sourceBuffer: sourceBuffer)
+            renderedBuffer = timeline.render(selection: editSelection)
+            timelineFrameCount = timeline.frameCount
+            timelineSampleRate = sourceBuffer.sampleRate
+        }
+
+        let detectedRegions = AudioSilenceAnalyzer.detectSilence(
+            in: renderedBuffer,
+            configuration: configuration
+        )
+        let localDeletionRanges = AudioSilenceAnalyzer.deletionRanges(
+            for: detectedRegions,
+            sampleRate: renderedBuffer.sampleRate,
+            configuration: configuration
+        )
+        let selectionStartFrame = min(
+            max(Int((editSelection.startProgress * Double(timelineFrameCount)).rounded(.down)), 0),
+            timelineFrameCount
+        )
+        let frameRanges = localDeletionRanges.compactMap { localRange -> Range<Int>? in
+            let lowerBound = min(max(selectionStartFrame + localRange.lowerBound, 0), timelineFrameCount)
+            let upperBound = min(max(selectionStartFrame + localRange.upperBound, lowerBound), timelineFrameCount)
+            guard lowerBound < upperBound else {
+                return nil
+            }
+            return lowerBound..<upperBound
+        }
+        let deletedFrameCount = frameRanges.reduce(0) { total, range in
+            total + range.count
+        }
+        let deletedDuration = timelineSampleRate > 0 ?
+            Double(deletedFrameCount) / timelineSampleRate :
+            0
+
+        return SilenceCleanupResult(
+            frameRanges: frameRanges,
+            detectedRegionCount: detectedRegions.count,
+            deletedFrameCount: deletedFrameCount,
+            deletedDuration: deletedDuration
+        )
+    }
+
+    private func applySilenceCleanupResult(
+        _ result: SilenceCleanupResult,
+        trackID: UUID,
+        expectedEditRevision: Int
+    ) {
+        guard !result.frameRanges.isEmpty, result.deletedFrameCount > 0 else {
+            updateStatus("no removable silence found")
+            return
+        }
+        guard
+            let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }),
+            projectTracks[trackIndex].editRevision == expectedEditRevision
+        else {
+            updateStatus("silence cleanup skipped: track changed")
+            return
+        }
+
+        let snapshot = playbackController.snapshot()
+        let undoSnapshot = ProjectTrackUndoSnapshot(
+            tracks: projectTracks,
+            activeTrackID: activeTrackID,
+            selectedTrackID: selectedTrackID,
+            selectedTimelineRange: selectedTimelineRange,
+            restoreProgress: snapshot.progress
+        )
+
+        let editedAudioTimeline: AudioEditTimeline?
+        let editedFileTimeline: AudioFileEditTimeline?
+        let editedDuration: TimeInterval
+        var removedFrameCount = 0
+
+        if let currentFileTimeline = try? preferredFileTimelineForEditing(trackIndex: trackIndex) {
+            var timeline = currentFileTimeline
+            for frameRange in result.frameRanges.sorted(by: { $0.lowerBound > $1.lowerBound }) {
+                removedFrameCount += timeline.delete(frameRange: frameRange)
+            }
+            editedAudioTimeline = nil
+            editedFileTimeline = timeline
+            editedDuration = timeline.duration
+        } else if let currentTimeline = projectTracks[trackIndex].audioTimeline {
+            var timeline = currentTimeline
+            for frameRange in result.frameRanges.sorted(by: { $0.lowerBound > $1.lowerBound }) {
+                removedFrameCount += timeline.delete(frameRange: frameRange)
+            }
+            editedAudioTimeline = timeline
+            editedFileTimeline = nil
+            editedDuration = timeline.duration
+        } else {
+            updateStatus("track is not ready to clean")
+            return
+        }
+
+        guard removedFrameCount > 0 else {
+            updateStatus("no removable silence found")
+            return
+        }
+
+        editUndoStack.append(.projectTracks(undoSnapshot))
+        cancelEditMaterialization(for: trackID)
+        projectTracks[trackIndex].editRevision += 1
+        let editRevision = projectTracks[trackIndex].editRevision
+        projectTracks[trackIndex].audioTimeline = editedAudioTimeline
+        projectTracks[trackIndex].fileTimeline = editedFileTimeline
+        projectTracks[trackIndex].decodedAudioBuffer = editedAudioTimeline?.sourceAudioBuffer
+        projectTracks[trackIndex].durationHint = editedDuration
+
+        let currentOverview = projectTracks[trackIndex].waveformOverview
+        if let editedFileTimeline {
+            projectTracks[trackIndex].waveformOverview =
+                optimisticWaveformOverview(
+                    for: editedFileTimeline,
+                    sourceOverview: projectTracks[trackIndex].sourceWaveformOverview,
+                    fallbackOverview: currentOverview
+                )
+            scheduleFileTimelineWaveformRefinement(
+                trackID: trackID,
+                fileTimeline: editedFileTimeline,
+                sourceOverview: projectTracks[trackIndex].sourceWaveformOverview ?? currentOverview,
+                editRevision: editRevision,
+                delay: editMaterializationDelay
+            )
+        } else if let currentOverview {
+            projectTracks[trackIndex].waveformOverview = WaveformOverview(
+                duration: editedDuration,
+                bins: currentOverview.bins
+            )
+        }
+
+        selectedTimelineRange = nil
+        timelineSurface.displaySelection(nil)
+        timelineSurface.displayGainPreview(selection: nil, gain: 1)
+        refreshProjectTimelineDisplay(rebuildControls: false, animateWaveformTransition: false)
+        updateProjectDisplayTiming()
+        reloadPlaybackFromProjectTracks(
+            preserveProgress: true,
+            resumeIfPlaying: playbackController.isPlaying
+        )
+        updateEffectCommandState()
+        let statusDuration = formatDuration(Double(removedFrameCount) / max(projectTracks[trackIndex].fileTimeline?.sourceSampleRate ?? projectTracks[trackIndex].audioTimeline?.sourceAudioBuffer.sampleRate ?? 1, 1))
+        updateStatus(
+            "deleted \(statusDuration) silence in \(result.detectedRegionCount) " +
+                "\(result.detectedRegionCount == 1 ? "gap" : "gaps")"
+        )
+
+        if let editedAudioTimeline {
+            materializeEditedTimeline(
+                trackID: trackID,
+                timeline: editedAudioTimeline,
+                editRevision: editRevision,
+                status: "deleted silence",
+                preservePlaybackProgress: true,
+                startDelay: editMaterializationDelay,
+                animateWaveformTransition: false
+            )
+        }
     }
 
     private func deleteSelectedTrack() {
@@ -5670,11 +5935,26 @@ final class WorkspaceView: NSView {
         return insertionSelection.startProgress > 0 && insertionSelection.startProgress < 1
     }
 
+    private var canDeleteSilence: Bool {
+        guard
+            let target = silenceCleanupTarget(),
+            projectTracks.indices.contains(target.trackIndex)
+        else {
+            return false
+        }
+
+        let track = projectTracks[target.trackIndex]
+        return track.audioTimeline != nil ||
+            track.fileTimeline != nil ||
+            WAVAudioDecoder.canDecode(track.sourceURL)
+    }
+
     private func updateEffectCommandState() {
         timelineSurface.canApplyGainEffect = canApplyGainEffect
         timelineSurface.canApplyFadeEffect = canApplyGainEffect
         timelineSurface.canReapplyLastEffect = lastEffect != nil && canApplyGainEffect
         timelineSurface.canSplitAtPlayhead = canSplitAtPlayhead
+        timelineSurface.canDeleteSilence = canDeleteSilence
     }
 
     private func updateStatus(_ status: String) {

@@ -33,6 +33,7 @@ enum AgentResolvedCommand: Sendable, Equatable {
     case pasteAudio
     case splitAtPlayhead
     case showGain
+    case deleteSilence
     case normalizeSelection
     case fadeInSelection
     case fadeOutSelection
@@ -109,6 +110,13 @@ final class AgentCommandRegistry {
                 identifier: "timeline.normalize",
                 title: "Normalize Selection",
                 summary: "Normalize the active selection through the edit graph without blocking playback or rendering."
+            )
+        )
+        register(
+            AgentCommandCapability(
+                identifier: "timeline.deleteSilence",
+                title: "Delete Silence",
+                summary: "Detect and remove long silent regions from the active track or selected region."
             )
         )
         register(
@@ -243,6 +251,11 @@ final class AgentCommandController {
         }
         if normalized.contains("split") || normalized.contains("blade") {
             return .splitAtPlayhead
+        }
+        if normalized.contains("silence") &&
+            (normalized.contains("delete") || normalized.contains("remove") || normalized.contains("clean"))
+        {
+            return .deleteSilence
         }
         if normalized.contains("normalize") {
             return .normalizeSelection
