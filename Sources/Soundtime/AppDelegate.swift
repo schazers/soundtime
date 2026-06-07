@@ -245,6 +245,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: ""
         ))
         menu.addItem(NSMenuItem(
+            title: "Select Time Across Linked Tracks",
+            action: #selector(TimelineView.selectTimeAcrossLinkedTracks(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
             title: "Zoom to Selection",
             action: #selector(TimelineView.zoomToSelection(_:)),
             keyEquivalent: "j"

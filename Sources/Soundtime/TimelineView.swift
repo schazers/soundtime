@@ -40,6 +40,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onHealAdjacentClipsRequested: (() -> Void)?
     var onNudgeSelectionRequested: ((Int) -> Void)?
     var onSnapSelectionRequested: (() -> Void)?
+    var onSelectTimeAcrossLinkedTracksRequested: (() -> Void)?
     var onUndo: (() -> Void)?
     var onExportRequested: (() -> Void)?
     var onOpenProjectRequested: (() -> Void)?
@@ -1069,6 +1070,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onSnapSelectionRequested?()
     }
 
+    @objc func selectTimeAcrossLinkedTracks(_ sender: Any?) {
+        onSelectTimeAcrossLinkedTracksRequested?()
+    }
+
     @objc func zoomToSelection(_ sender: Any?) {
         zoomToSelection()
     }
@@ -1143,6 +1148,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return currentSelection?.durationProgress ?? 0 > 0
         case #selector(snapSelectionToPlayheadEdgesOrSilence(_:)):
             return currentSelection?.durationProgress ?? 0 > 0 || canUseDeadAirCandidate
+        case #selector(selectTimeAcrossLinkedTracks(_:)):
+            return currentSelection?.durationProgress ?? 0 > 0
         case #selector(reapplyLastEffect(_:)):
             return canReapplyLastEffect
         case #selector(deleteTimelineSelection(_:)):
