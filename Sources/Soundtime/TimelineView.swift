@@ -30,6 +30,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onAudioFileDropped: ((URL) -> Void)?
     var onTogglePlayback: (() -> Void)?
     var onDeleteSelection: (() -> Void)?
+    var onRemoveTimeRangeRequested: (() -> Void)?
     var onClearSelection: (() -> Void)?
     var onCutSelection: (() -> Void)?
     var onCopySelection: (() -> Void)?
@@ -1023,6 +1024,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onDeleteSelection?()
     }
 
+    @objc func removeTimeRangeAcrossScope(_ sender: Any?) {
+        onRemoveTimeRangeRequested?()
+    }
+
     @objc func clearTimelineSelection(_ sender: Any?) {
         onClearSelection?()
     }
@@ -1107,6 +1112,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         case #selector(reapplyLastEffect(_:)):
             return canReapplyLastEffect
         case #selector(deleteTimelineSelection(_:)):
+            return canDeleteSelection
+        case #selector(removeTimeRangeAcrossScope(_:)):
             return canDeleteSelection
         case #selector(clearTimelineSelection(_:)):
             return canClearSelection
