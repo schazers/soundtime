@@ -14,6 +14,9 @@ swift test
 echo "== Soundtime recording smoke =="
 swift run Soundtime --recording-smoke
 
+echo "== Soundtime diagnostics smoke =="
+swift run Soundtime --diagnostics-smoke
+
 echo "== Soundtime project edit round-trip smoke =="
 swift run Soundtime --project-edit-roundtrip-smoke
 
