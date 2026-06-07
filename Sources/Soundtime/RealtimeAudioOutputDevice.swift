@@ -4,6 +4,7 @@ import SoundtimeAudioCore
 
 protocol RealtimeAudioOutputDevice: AnyObject {
     func configure(corePointer: OpaquePointer, sampleRate: Double) throws
+    func invalidateConfiguration()
     func start() throws
     func stop()
 }
@@ -83,5 +84,13 @@ final class AVAudioSourceNodeOutputDevice: RealtimeAudioOutputDevice {
 
     func stop() {
         engine.stop()
+    }
+
+    func invalidateConfiguration() {
+        engine.stop()
+        if let sourceNode {
+            engine.disconnectNodeOutput(sourceNode)
+        }
+        configuredSampleRate = nil
     }
 }
