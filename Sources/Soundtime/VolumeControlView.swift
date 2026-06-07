@@ -36,8 +36,8 @@ final class VolumeControlView: NSView {
         iconView.image = NSImage(
             systemSymbolName: "speaker.wave.2.fill",
             accessibilityDescription: "Volume"
-        )?.withSymbolConfiguration(.init(pointSize: 17, weight: .medium))
-        iconView.contentTintColor = NSColor(white: 0.78, alpha: 1)
+        )?.withSymbolConfiguration(.init(pointSize: 18, weight: .medium))
+        iconView.contentTintColor = NSColor(white: 0.86, alpha: 1)
         iconView.translatesAutoresizingMaskIntoConstraints = false
 
         sliderView.translatesAutoresizingMaskIntoConstraints = false
@@ -54,10 +54,10 @@ final class VolumeControlView: NSView {
         NSLayoutConstraint.activate([
             iconView.leadingAnchor.constraint(equalTo: leadingAnchor),
             iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
-            iconView.widthAnchor.constraint(equalToConstant: 24),
+            iconView.widthAnchor.constraint(equalToConstant: 22),
             iconView.heightAnchor.constraint(equalToConstant: 24),
 
-            sliderView.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 5),
+            sliderView.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 2),
             sliderView.trailingAnchor.constraint(equalTo: trailingAnchor),
             sliderView.centerYAnchor.constraint(equalTo: centerYAnchor),
             sliderView.heightAnchor.constraint(equalToConstant: 30),
