@@ -2093,45 +2093,61 @@ final class WorkspaceView: NSView {
         }
 
         let existingFileTimeline = projectTracks[trackIndex].fileTimeline
-        let existingEditedOverview = projectTracks[trackIndex].editRevision > 0 ?
-            projectTracks[trackIndex].waveformOverview :
-            nil
-        let decodedTimeline = existingFileTimeline?.audioTimeline(sourceBuffer: decodedAudioBuffer) ??
-            AudioEditTimeline(sourceBuffer: decodedAudioBuffer)
+        if let existingFileTimeline {
+            let existingEditedOverview = projectTracks[trackIndex].editRevision > 0 ?
+                projectTracks[trackIndex].waveformOverview :
+                nil
+            let editRevision = projectTracks[trackIndex].editRevision
 
+            projectTracks[trackIndex].decodedAudioBuffer = nil
+            projectTracks[trackIndex].sourceWaveformOverview = waveformOverview
+            projectTracks[trackIndex].waveformOverview = existingEditedOverview ?? waveformOverview
+            projectTracks[trackIndex].durationHint = existingFileTimeline.duration
+            projectTracks[trackIndex].zeroCrossingIndex = zeroCrossingIndex
+            projectTracks[trackIndex].audioTimeline = nil
+            projectTracks[trackIndex].fileTimeline = existingFileTimeline
+            activeTrackID = trackID
+            syncActiveTrackFields()
+            refreshProjectTimelineDisplay(rebuildControls: false)
+            updateProjectDisplayTiming(sampleRateHint: decodedAudioBuffer.sampleRate)
+            if !playbackController.hasSource {
+                reloadPlaybackFromProjectTracks(preserveProgress: true)
+            } else {
+                updateProjectPlaybackTrackMix()
+            }
+            updateEffectCommandState()
+            updateStatus("track ready")
+
+            if existingFileTimeline.hasEdits {
+                scheduleFileTimelineWaveformRefinement(
+                    trackID: trackID,
+                    fileTimeline: existingFileTimeline,
+                    sourceOverview: waveformOverview,
+                    editRevision: editRevision
+                )
+            }
+            return
+        }
+
+        let decodedTimeline = AudioEditTimeline(sourceBuffer: decodedAudioBuffer)
         projectTracks[trackIndex].decodedAudioBuffer = decodedAudioBuffer
         projectTracks[trackIndex].sourceWaveformOverview = waveformOverview
-        projectTracks[trackIndex].waveformOverview =
-            existingFileTimeline?.waveformOverview(from: waveformOverview) ??
-            existingEditedOverview ??
-            waveformOverview
+        projectTracks[trackIndex].waveformOverview = waveformOverview
         projectTracks[trackIndex].durationHint = decodedTimeline.duration
         projectTracks[trackIndex].zeroCrossingIndex = zeroCrossingIndex
         projectTracks[trackIndex].audioTimeline = decodedTimeline
         projectTracks[trackIndex].fileTimeline = nil
-        let shouldReloadPlayback = projectTracks[trackIndex].editRevision != 0 || !playbackController.hasSource
         activeTrackID = trackID
         syncActiveTrackFields()
         refreshProjectTimelineDisplay(rebuildControls: false)
         updateProjectDisplayTiming(sampleRateHint: decodedAudioBuffer.sampleRate)
-        if shouldReloadPlayback {
+        if !playbackController.hasSource {
             reloadPlaybackFromProjectTracks(preserveProgress: true)
         } else {
             updateProjectPlaybackTrackMix()
         }
         updateEffectCommandState()
         updateStatus("track ready")
-
-        if existingFileTimeline?.hasEdits == true {
-            let editRevision = projectTracks[trackIndex].editRevision
-            materializeEditedTimeline(
-                trackID: trackID,
-                timeline: decodedTimeline,
-                editRevision: editRevision,
-                status: "track ready",
-                preservePlaybackProgress: true
-            )
-        }
     }
 
     private func syncActiveTrackFields() {
@@ -2142,7 +2158,7 @@ final class WorkspaceView: NSView {
             return
         }
 
-        decodedAudioBuffer = activeTrack.decodedAudioBuffer ?? decodedAudioBuffer
+        decodedAudioBuffer = activeTrack.decodedAudioBuffer
         audioTimeline = activeTrack.audioTimeline
         let duration = trackDuration(for: activeTrack)
         if duration > 0 {
