@@ -37,6 +37,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onPasteAudio: (() -> Void)?
     var onSplitAtPlayhead: (() -> Void)?
     var onInsertSilenceRequested: (() -> Void)?
+    var onHealAdjacentClipsRequested: (() -> Void)?
     var onUndo: (() -> Void)?
     var onExportRequested: (() -> Void)?
     var onOpenProjectRequested: (() -> Void)?
@@ -1040,6 +1041,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onInsertSilenceRequested?()
     }
 
+    @objc func healAdjacentClips(_ sender: Any?) {
+        onHealAdjacentClipsRequested?()
+    }
+
     @objc func zoomToSelection(_ sender: Any?) {
         zoomToSelection()
     }
@@ -1126,6 +1131,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         case #selector(splitAtPlayhead(_:)):
             return canSplitAtPlayhead
         case #selector(insertSilenceAtPlayhead(_:)):
+            return canSplitAtPlayhead
+        case #selector(healAdjacentClips(_:)):
             return canSplitAtPlayhead
         case #selector(zoomToSelection(_:)):
             return currentSelection?.durationProgress ?? 0 > 0

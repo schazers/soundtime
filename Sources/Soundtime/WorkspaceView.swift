@@ -597,6 +597,9 @@ final class WorkspaceView: NSView {
         timelineSurface.onInsertSilenceRequested = { [weak self] in
             self?.insertSilenceOrTime()
         }
+        timelineSurface.onHealAdjacentClipsRequested = { [weak self] in
+            self?.healAdjacentClips()
+        }
         timelineSurface.onUndo = { [weak self] in
             self?.undoLastEdit()
         }
@@ -4251,6 +4254,115 @@ final class WorkspaceView: NSView {
                 timeline: edit.timeline,
                 editRevision: edit.editRevision,
                 status: status,
+                preservePlaybackProgress: true,
+                startDelay: editMaterializationDelay,
+                animateWaveformTransition: false
+            )
+        }
+    }
+
+    private func healAdjacentClips() {
+        guard
+            let trackIndex = activeProjectTrackIndex(),
+            projectTracks.indices.contains(trackIndex)
+        else {
+            updateStatus("select a track to heal")
+            return
+        }
+
+        let projectDuration = projectSelectionDuration
+        let track = projectTracks[trackIndex]
+        let trackDuration = trackDuration(for: track)
+        guard projectDuration > 0, trackDuration > 0 else {
+            updateStatus("cannot heal clips without audio")
+            return
+        }
+
+        let projectProgress = selectedTimelineRange?.startProgressFloat ?? playbackController.snapshot().progress
+        let projectTime = Double(min(max(projectProgress, 0), 1)) * projectDuration
+        let localProgress = min(max(projectTime / trackDuration, 0), 1)
+
+        let editedAudioTimeline: AudioEditTimeline?
+        let editedFileTimeline: AudioFileEditTimeline?
+        let editedDuration: TimeInterval
+        if let currentFileTimeline = try? preferredFileTimelineForEditing(trackIndex: trackIndex) {
+            var timeline = currentFileTimeline
+            guard timeline.healNearestClipBoundary(atProgress: localProgress) else {
+                updateStatus("no clip boundary to heal")
+                return
+            }
+            editedAudioTimeline = nil
+            editedFileTimeline = timeline
+            editedDuration = timeline.duration
+        } else if let currentTimeline = projectTracks[trackIndex].audioTimeline {
+            var timeline = currentTimeline
+            guard timeline.healNearestClipBoundary(atProgress: localProgress) else {
+                updateStatus("no clip boundary to heal")
+                return
+            }
+            editedAudioTimeline = timeline
+            editedFileTimeline = nil
+            editedDuration = timeline.duration
+        } else {
+            updateStatus("track is not ready to heal")
+            return
+        }
+
+        let undoSnapshot = ProjectTrackUndoSnapshot(
+            tracks: projectTracks,
+            activeTrackID: activeTrackID,
+            selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
+            selectedTimelineRange: selectedTimelineRange,
+            restoreProgress: projectProgress
+        )
+        editUndoStack.append(.projectTracks(undoSnapshot))
+
+        let trackID = projectTracks[trackIndex].id
+        cancelEditMaterialization(for: trackID)
+        projectTracks[trackIndex].editRevision += 1
+        let editRevision = projectTracks[trackIndex].editRevision
+        projectTracks[trackIndex].audioTimeline = editedAudioTimeline
+        projectTracks[trackIndex].fileTimeline = editedFileTimeline
+        projectTracks[trackIndex].decodedAudioBuffer = editedAudioTimeline?.sourceAudioBuffer
+        projectTracks[trackIndex].durationHint = editedDuration
+
+        let currentOverview = projectTracks[trackIndex].waveformOverview
+        if let editedFileTimeline {
+            projectTracks[trackIndex].waveformOverview =
+                optimisticWaveformOverview(
+                    for: editedFileTimeline,
+                    sourceOverview: projectTracks[trackIndex].sourceWaveformOverview,
+                    fallbackOverview: currentOverview
+                )
+            scheduleFileTimelineWaveformRefinement(
+                trackID: trackID,
+                fileTimeline: editedFileTimeline,
+                sourceOverview: projectTracks[trackIndex].sourceWaveformOverview ?? currentOverview,
+                editRevision: editRevision,
+                delay: editMaterializationDelay
+            )
+        } else if let currentOverview {
+            projectTracks[trackIndex].waveformOverview = WaveformOverview(
+                duration: editedDuration,
+                bins: currentOverview.bins
+            )
+        }
+
+        refreshProjectTimelineDisplay(rebuildControls: false, animateWaveformTransition: false)
+        reloadPlaybackFromProjectTracks(
+            preserveProgress: true,
+            resumeIfPlaying: playbackController.isPlaying
+        )
+        updateEffectCommandState()
+        updateStatus("healed adjacent clips")
+
+        if let editedAudioTimeline {
+            materializeEditedTimeline(
+                trackID: trackID,
+                timeline: editedAudioTimeline,
+                editRevision: editRevision,
+                status: "healed adjacent clips",
                 preservePlaybackProgress: true,
                 startDelay: editMaterializationDelay,
                 animateWaveformTransition: false
