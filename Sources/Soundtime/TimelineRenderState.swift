@@ -37,6 +37,18 @@ struct TimelineRenderState: Sendable {
         let gain: Float
     }
 
+    struct CandidateRegion: Sendable {
+        let id: UUID
+        let selection: TimelineSelection
+        let isActive: Bool
+
+        init(id: UUID, selection: TimelineSelection, isActive: Bool = false) {
+            self.id = id
+            self.selection = selection
+            self.isActive = isActive
+        }
+    }
+
     static let empty = TimelineRenderState(
         tracks: [],
         viewport: .full,
@@ -49,6 +61,7 @@ struct TimelineRenderState: Sendable {
         isHoverGuideArmed: false,
         selection: nil,
         selectedTrackID: nil,
+        candidateRegions: [],
         trimPreview: nil,
         gainPreview: nil
     )
@@ -68,6 +81,7 @@ struct TimelineRenderState: Sendable {
     let selection: TimelineSelection?
     let selectedTrackID: UUID?
     let selectedTrackIDs: Set<UUID>
+    let candidateRegions: [CandidateRegion]
     let trimPreview: TimelineTrimRange?
     let gainPreview: GainPreview?
 
@@ -84,6 +98,7 @@ struct TimelineRenderState: Sendable {
         selection: TimelineSelection?,
         selectedTrackID: UUID?,
         selectedTrackIDs: Set<UUID>? = nil,
+        candidateRegions: [CandidateRegion] = [],
         trimPreview: TimelineTrimRange?,
         gainPreview: GainPreview?,
         duration: TimeInterval? = nil,
@@ -105,6 +120,7 @@ struct TimelineRenderState: Sendable {
         self.selection = selection
         self.selectedTrackID = selectedTrackID
         self.selectedTrackIDs = selectedTrackIDs ?? selectedTrackID.map { [$0] } ?? []
+        self.candidateRegions = candidateRegions
         self.trimPreview = trimPreview
         self.gainPreview = gainPreview
     }
@@ -149,6 +165,7 @@ struct TimelineRenderState: Sendable {
             selection: selection,
             selectedTrackID: selectedTrackID,
             selectedTrackIDs: selectedTrackIDs,
+            candidateRegions: candidateRegions,
             trimPreview: trimPreview,
             gainPreview: nil
         )
@@ -168,6 +185,7 @@ struct TimelineRenderState: Sendable {
             selection: selection,
             selectedTrackID: selectedTrackID,
             selectedTrackIDs: selectedTrackIDs,
+            candidateRegions: candidateRegions,
             trimPreview: trimPreview,
             gainPreview: gainPreview
         )
@@ -187,6 +205,7 @@ struct TimelineRenderState: Sendable {
             selection: selection,
             selectedTrackID: selectedTrackID,
             selectedTrackIDs: selectedTrackIDs,
+            candidateRegions: candidateRegions,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
             duration: duration,
@@ -209,6 +228,7 @@ struct TimelineRenderState: Sendable {
             selection: selection,
             selectedTrackID: selectedTrackID,
             selectedTrackIDs: selectedTrackIDs,
+            candidateRegions: candidateRegions,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
             duration: duration,
@@ -234,6 +254,7 @@ struct TimelineRenderState: Sendable {
             selection: selection,
             selectedTrackID: selectedTrackID,
             selectedTrackIDs: selectedTrackIDs,
+            candidateRegions: candidateRegions,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
             duration: duration,
@@ -256,6 +277,7 @@ struct TimelineRenderState: Sendable {
             selection: selection,
             selectedTrackID: selectedTrackID,
             selectedTrackIDs: selectedTrackIDs,
+            candidateRegions: candidateRegions,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
             duration: duration,
@@ -278,6 +300,7 @@ struct TimelineRenderState: Sendable {
             selection: selection,
             selectedTrackID: selectedTrackID,
             selectedTrackIDs: selectedTrackIDs,
+            candidateRegions: candidateRegions,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
             duration: duration,
@@ -301,6 +324,7 @@ struct TimelineRenderState: Sendable {
             selection: selection,
             selectedTrackID: selectedTrackID,
             selectedTrackIDs: selectedTrackIDs,
+            candidateRegions: candidateRegions,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
             duration: duration,
@@ -323,6 +347,7 @@ struct TimelineRenderState: Sendable {
             selection: selection,
             selectedTrackID: selectedTrackID,
             selectedTrackIDs: selectedTrackIDs,
+            candidateRegions: candidateRegions,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
             duration: duration,
@@ -345,6 +370,7 @@ struct TimelineRenderState: Sendable {
             selection: selection,
             selectedTrackID: selectedTrackID,
             selectedTrackIDs: selectedTrackID.map { [$0] } ?? [],
+            candidateRegions: candidateRegions,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
             duration: duration,
@@ -367,6 +393,7 @@ struct TimelineRenderState: Sendable {
             selection: selection,
             selectedTrackID: primaryTrackID,
             selectedTrackIDs: selectedTrackIDs,
+            candidateRegions: candidateRegions,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
             duration: duration,
@@ -389,6 +416,7 @@ struct TimelineRenderState: Sendable {
             selection: selection,
             selectedTrackID: selectedTrackID,
             selectedTrackIDs: selectedTrackIDs,
+            candidateRegions: candidateRegions,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
             duration: duration,
@@ -411,6 +439,30 @@ struct TimelineRenderState: Sendable {
             selection: selection,
             selectedTrackID: selectedTrackID,
             selectedTrackIDs: selectedTrackIDs,
+            candidateRegions: candidateRegions,
+            trimPreview: trimPreview,
+            gainPreview: gainPreview,
+            duration: duration,
+            hasWaveforms: hasWaveforms,
+            hasSoloedTrack: hasSoloedTrack
+        )
+    }
+
+    func withCandidateRegions(_ candidateRegions: [CandidateRegion]) -> TimelineRenderState {
+        TimelineRenderState(
+            tracks: tracks,
+            viewport: viewport,
+            trackLayout: trackLayout,
+            playheadProgress: playheadProgress,
+            playheadAnchorTimestamp: playheadAnchorTimestamp,
+            isPlaybackActive: isPlaybackActive,
+            isRecordingActive: isRecordingActive,
+            hoverProgress: hoverProgress,
+            isHoverGuideArmed: isHoverGuideArmed,
+            selection: selection,
+            selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
+            candidateRegions: candidateRegions,
             trimPreview: trimPreview,
             gainPreview: gainPreview,
             duration: duration,
