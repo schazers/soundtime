@@ -300,7 +300,7 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
             throw MetalPixelSmokeError.commandBufferUnavailable
         }
 
-        var vertices = [
+        let vertices = [
             HistoryVertex(position: SIMD2<Float>(0, 0)),
             HistoryVertex(position: SIMD2<Float>(1, 0)),
             HistoryVertex(position: SIMD2<Float>(0, 1)),
