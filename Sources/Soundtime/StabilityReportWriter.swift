@@ -24,6 +24,25 @@ enum StabilityReportWriter {
         metadata: [String: String] = [:],
         arguments: [String]
     ) -> URL? {
+        writeSuite(
+            name: name,
+            status: "passed",
+            startedAtNanoseconds: startedAtNanoseconds,
+            checks: checks.map { StabilityCheckReport(name: $0, status: "passed", detail: nil) },
+            metadata: metadata,
+            arguments: arguments
+        )
+    }
+
+    @discardableResult
+    static func writeSuite(
+        name: String,
+        status: String,
+        startedAtNanoseconds: UInt64,
+        checks: [StabilityCheckReport],
+        metadata: [String: String] = [:],
+        arguments: [String]
+    ) -> URL? {
         guard let directory = reportDirectory(arguments: arguments) else {
             return nil
         }
@@ -31,10 +50,10 @@ enum StabilityReportWriter {
         let endedAtNanoseconds = DispatchTime.now().uptimeNanoseconds
         let report = StabilitySuiteReport(
             suiteName: name,
-            status: "passed",
+            status: status,
             generatedAt: Date(),
             durationMilliseconds: Double(endedAtNanoseconds - startedAtNanoseconds) / 1_000_000,
-            checks: checks.map { StabilityCheckReport(name: $0, status: "passed", detail: nil) },
+            checks: checks,
             metadata: metadata
         )
         let fileName = sanitizedFileName(name) + ".json"

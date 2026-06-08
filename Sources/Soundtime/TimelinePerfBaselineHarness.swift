@@ -149,6 +149,7 @@ enum TimelinePerfBaselineHarness {
     }
 
     static func runFromCommandLine(arguments: [String]) throws {
+        let startedAtNanoseconds = DispatchTime.now().uptimeNanoseconds
         let isQuick = arguments.contains("--quick") || arguments.contains("--timeline-perf-baseline-quick")
         let enforcesBudgets = arguments.contains("--ci") || arguments.contains("--timeline-perf-baseline-ci")
         let pixelFormat: MTLPixelFormat = .bgra8Unorm
@@ -194,6 +195,7 @@ enum TimelinePerfBaselineHarness {
 
         var trackCache: [TrackCacheKey: [TimelineRenderState.Track]] = [:]
         var budgetFailures: [String] = []
+        var reportChecks: [StabilityCheckReport] = []
         for scenario in scenarios {
             let scenarioBinCount = scenario.waveformBinCount ?? syntheticBinCount
             let cacheKey = TrackCacheKey(
@@ -222,10 +224,39 @@ enum TimelinePerfBaselineHarness {
                 rendererStats: { renderer.currentFrameStatsSnapshot() },
                 enforcesBudgets: enforcesBudgets
             )
-            print(jsonLine(for: result, deviceName: device.name))
+            let resultBudgetFailures = budgetFailuresFor(result)
+            let resultJSONLine = jsonLine(for: result, deviceName: device.name)
+            print(resultJSONLine)
+            reportChecks.append(StabilityCheckReport(
+                name: "\(scenario.name) / \(scenario.trackCount) tracks",
+                status: resultBudgetFailures.isEmpty ? "passed" : "failed",
+                detail: resultBudgetFailures.isEmpty ?
+                    resultJSONLine :
+                    resultJSONLine + "\n" + resultBudgetFailures.joined(separator: "\n")
+            ))
             if enforcesBudgets {
-                budgetFailures.append(contentsOf: budgetFailuresFor(result))
+                budgetFailures.append(contentsOf: resultBudgetFailures)
             }
+        }
+
+        if let reportURL = StabilityReportWriter.writeSuite(
+            name: "timeline-perf-baseline",
+            status: budgetFailures.isEmpty ? "passed" : "failed",
+            startedAtNanoseconds: startedAtNanoseconds,
+            checks: reportChecks,
+            metadata: [
+                "device": device.name,
+                "mode": isQuick ? "quick" : "full",
+                "enforcesBudgets": enforcesBudgets ? "true" : "false",
+                "viewportWidth": "\(textureWidth)",
+                "viewportHeight": "\(textureHeight)",
+                "backingScale": "\(backingScale)",
+                "syntheticBinCount": "\(syntheticBinCount)",
+                "scenarioCount": "\(scenarios.count)",
+            ],
+            arguments: arguments
+        ) {
+            print("wrote stability report: \(reportURL.path)")
         }
 
         if !budgetFailures.isEmpty {
