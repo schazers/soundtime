@@ -16,6 +16,7 @@ enum RealtimeGraphPublishSmokeHarness {
     }
 
     static func runFromCommandLine(arguments: [String]) throws {
+        let startedAtNanoseconds = DispatchTime.now().uptimeNanoseconds
         let isFull = arguments.contains("--realtime-graph-publish-full")
         let trackCount = isFull ? 256 : 128
         let updateCount = isFull ? 220 : 96
@@ -187,6 +188,38 @@ enum RealtimeGraphPublishSmokeHarness {
             )
         )
         print(fileBackedPublishSummary)
+
+        if let reportURL = StabilityReportWriter.writePassedSuite(
+            name: "realtime-graph-publish-smoke",
+            startedAtNanoseconds: startedAtNanoseconds,
+            checks: [
+                "duplicate memory-backed tracks render sample-synchronously",
+                "duplicate file-backed tracks render sample-synchronously",
+                "visual clock snapshots stay synchronized with realtime render",
+                "lazy file output refresh reconfigures the output device",
+                "graph publishing overlaps render blocks without dropped commands",
+                "file-backed graph edits overlap render blocks within budget",
+            ],
+            metadata: [
+                "mode": isFull ? "full" : "quick",
+                "trackCount": "\(trackCount)",
+                "updateCount": "\(updateCount)",
+                "renderBlockCount": "\(renderBlockCount)",
+                "renderBlockFrameCount": "\(renderBlockFrameCount)",
+                "publishP95Milliseconds": String(format: "%.3f", publishP95),
+                "publishMaxMilliseconds": String(format: "%.3f", publishMax),
+                "mixP95Milliseconds": String(format: "%.3f", mixP95),
+                "mixMaxMilliseconds": String(format: "%.3f", mixMax),
+                "seekP95Milliseconds": String(format: "%.3f", seekP95),
+                "elapsedMilliseconds": String(format: "%.3f", elapsedMilliseconds),
+                "duplicateTrackPhaseMaxError": String(format: "%.8f", duplicateTrackPhaseMaxError),
+                "fileBackedDuplicateTrackPhaseMaxError": String(format: "%.8f", fileBackedDuplicateTrackPhaseMaxError),
+                "droppedCommandCount": "\(snapshot.droppedCommandCount)",
+            ],
+            arguments: arguments
+        ) {
+            print("wrote stability report: \(reportURL.path)")
+        }
     }
 
     private static func runDuplicateTrackPhaseSmoke(
