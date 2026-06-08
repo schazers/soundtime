@@ -38,3 +38,24 @@ swift run Soundtime --timeline-ux-smoke
 
 echo "== Soundtime timeline perf baseline =="
 swift run Soundtime --timeline-perf-baseline "${mode_args[@]}"
+
+if [[ -n "${SOUNDTIME_STABILITY_REPORT_DIR:-}" ]]; then
+  expected_reports=(
+    "recording-smoke.json"
+    "diagnostics-smoke.json"
+    "project-edit-roundtrip-smoke.json"
+    "edit-graph-smoke.json"
+    "edit-preview-smoke.json"
+    "realtime-graph-publish-smoke.json"
+    "timeline-ux-smoke.json"
+    "timeline-perf-baseline.json"
+  )
+
+  for report_name in "${expected_reports[@]}"; do
+    report_path="$SOUNDTIME_STABILITY_REPORT_DIR/$report_name"
+    if [[ ! -s "$report_path" ]]; then
+      echo "missing stability report: $report_path" >&2
+      exit 1
+    fi
+  done
+fi
