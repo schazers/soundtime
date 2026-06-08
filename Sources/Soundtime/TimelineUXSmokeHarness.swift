@@ -170,6 +170,15 @@ enum TimelineUXSmokeHarness {
         )
         complete("scrolled multi-track render keeps visible lanes alive")
 
+        try verifySelectionDragUpdatesStayResponsive(
+            renderer: renderer,
+            track: track,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        complete("rapid selection drag updates stay responsive and visible")
+
         try verifyDeletionEffectLifecycle(
             renderer: renderer,
             track: track,
@@ -546,6 +555,109 @@ enum TimelineUXSmokeHarness {
         }
     }
 
+    private static func verifySelectionDragUpdatesStayResponsive(
+        renderer: TimelineRenderer,
+        track: TimelineRenderState.Track,
+        texture: MTLTexture,
+        viewportSize: CGSize,
+        backingScale: Float
+    ) throws {
+        var frameDurations: [Double] = []
+        frameDurations.reserveCapacity(54)
+        let baseTimestamp = CACurrentMediaTime()
+
+        renderer.displayTracks([track], animateWaveformTransition: false)
+        renderer.displayTrackLayout(.default)
+        renderer.displayViewport(.full)
+        renderer.displayPlaybackActive(false)
+        renderer.displayPlayheadProgress(
+            0.04,
+            force: true,
+            anchorTimestamp: baseTimestamp,
+            resetsTouchStart: true
+        )
+
+        let firstSelection = TimelineSelection(startProgress: 0.10, endProgress: 0.12, trackID: track.id)
+        renderer.displaySelection(firstSelection)
+        let firstFrame = try renderTimeline(
+            renderer: renderer,
+            tracks: [track],
+            viewport: .full,
+            playheadProgress: 0.04,
+            isPlaybackActive: false,
+            displayTimestamp: baseTimestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+
+        for warmupIndex in 0..<8 {
+            renderer.displaySelection(TimelineSelection(
+                startProgress: 0.10,
+                endProgress: 0.14 + Double(warmupIndex) * 0.01,
+                trackID: track.id
+            ))
+            let renderPassDescriptor = makeRenderPassDescriptor(texture: texture)
+            _ = renderer.renderOffscreen(
+                renderPassDescriptor: renderPassDescriptor,
+                viewportSize: viewportSize,
+                backingScale: backingScale,
+                displayTimestamp: baseTimestamp + Double(warmupIndex + 1) / 144.0,
+                waitUntilCompleted: true
+            )
+        }
+
+        for frameIndex in 0..<54 {
+            let t = Double(frameIndex) / 53.0
+            let selection = TimelineSelection(
+                startProgress: 0.10,
+                endProgress: 0.12 + t * 0.68,
+                trackID: track.id
+            )
+            renderer.displaySelection(selection)
+
+            let renderPassDescriptor = makeRenderPassDescriptor(texture: texture)
+            let startTime = CACurrentMediaTime()
+            let commandBuffer = renderer.renderOffscreen(
+                renderPassDescriptor: renderPassDescriptor,
+                viewportSize: viewportSize,
+                backingScale: backingScale,
+                displayTimestamp: baseTimestamp + Double(frameIndex + 10) / 144.0,
+                waitUntilCompleted: false
+            )
+            frameDurations.append((CACurrentMediaTime() - startTime) * 1_000)
+            commandBuffer?.waitUntilCompleted()
+        }
+
+        renderer.displaySelection(TimelineSelection(startProgress: 0.10, endProgress: 0.80, trackID: track.id))
+        let lastFrame = try renderTimeline(
+            renderer: renderer,
+            tracks: [track],
+            viewport: .full,
+            playheadProgress: 0.04,
+            isPlaybackActive: false,
+            displayTimestamp: baseTimestamp + 1,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+
+        let p95Milliseconds = percentile(frameDurations, percentile: 0.95)
+        let maxMilliseconds = frameDurations.max() ?? 0
+        try require(
+            p95Milliseconds < 2.5,
+            String(format: "selection drag render p95 was too slow: %.2fms", p95Milliseconds)
+        )
+        try require(
+            maxMilliseconds < 8,
+            String(format: "selection drag render outlier was too slow: %.2fms", maxMilliseconds)
+        )
+
+        let changedPixels = pixelDifferenceCount(firstFrame.bytes, lastFrame.bytes, threshold: 8)
+        renderer.displaySelection(nil)
+        try require(changedPixels > 8_000, "selection drag did not visibly update final selection: \(changedPixels)")
+    }
+
     private static func verifyDeletionEffectLifecycle(
         renderer: TimelineRenderer,
         track: TimelineRenderState.Track,
@@ -859,6 +971,20 @@ enum TimelineUXSmokeHarness {
             }
         }
         return count
+    }
+
+    private static func percentile(_ values: [Double], percentile: Double) -> Double {
+        guard !values.isEmpty else {
+            return 0
+        }
+
+        let sortedValues = values.sorted()
+        let clampedPercentile = min(max(percentile, 0), 1)
+        let index = min(
+            max(Int((Double(sortedValues.count - 1) * clampedPercentile).rounded()), 0),
+            sortedValues.count - 1
+        )
+        return sortedValues[index]
     }
 
     private static func requireCyanX(
