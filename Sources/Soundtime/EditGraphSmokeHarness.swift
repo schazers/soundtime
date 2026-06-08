@@ -13,6 +13,7 @@ enum EditGraphSmokeHarness {
     }
 
     static func runFromCommandLine(arguments: [String]) throws {
+        let startedAtNanoseconds = DispatchTime.now().uptimeNanoseconds
         let sampleRate = 48_000.0
         let sourceFrameCount = Int(sampleRate) * 60 * 60 * 2
         let sourceURL = URL(fileURLWithPath: "/tmp/SoundtimeEditGraphSmoke.wav")
@@ -113,6 +114,31 @@ enum EditGraphSmokeHarness {
         try runSplitPersistenceSmoke(fileInfo: fileInfo)
         try runSilenceAnalyzerSmoke()
         try runPodcastExportProcessorSmoke()
+
+        if let reportURL = StabilityReportWriter.writePassedSuite(
+            name: "edit-graph-smoke",
+            startedAtNanoseconds: startedAtNanoseconds,
+            checks: [
+                "mixed edit operations stay below latency budget",
+                "edit graph segment count stays bounded",
+                "file clip paste preserves edit timelines",
+                "linked ripple delete preserves grouped track timing",
+                "split persistence survives project state round-trip",
+                "silence analyzer and podcast export processors smoke-test",
+            ],
+            metadata: [
+                "operationCount": "\(operationCount)",
+                "segmentCount": "\(state.segments.count)",
+                "touchedFrameCount": "\(touchedFrameCount)",
+                "deletedFrameCount": "\(deletedFrameCount)",
+                "operationP95Milliseconds": String(format: "%.3f", p95OperationMilliseconds),
+                "operationMaxMilliseconds": String(format: "%.3f", maximumOperationMilliseconds),
+                "elapsedMilliseconds": String(format: "%.3f", elapsedMilliseconds),
+            ],
+            arguments: arguments
+        ) {
+            print("wrote stability report: \(reportURL.path)")
+        }
 
         print(
             String(
@@ -389,6 +415,7 @@ enum EditPreviewSmokeHarness {
     }
 
     static func runFromCommandLine(arguments: [String]) throws {
+        let startedAtNanoseconds = DispatchTime.now().uptimeNanoseconds
         let sampleRate = 48_000.0
         let sourceFrameCount = Int(sampleRate) * 60 * 60 * 2
         let sourceURL = URL(fileURLWithPath: "/tmp/SoundtimeEditPreviewSmoke.wav")
@@ -469,6 +496,28 @@ enum EditPreviewSmokeHarness {
             String(format: "edit previews were too slow: %.2fms", elapsedMilliseconds)
         )
         try runDeletePrefixStabilitySmoke()
+
+        if let reportURL = StabilityReportWriter.writePassedSuite(
+            name: "edit-preview-smoke",
+            startedAtNanoseconds: startedAtNanoseconds,
+            checks: [
+                "optimistic waveform previews stay nonempty",
+                "preview regeneration stays below latency budget",
+                "edit preview segment count stays bounded",
+                "delete prefix stability preserves left-side rendering assumptions",
+            ],
+            metadata: [
+                "operationCount": "\(operationCount)",
+                "previewBinCount": "\(previewBinCount)",
+                "segmentCount": "\(state.segments.count)",
+                "previewP95Milliseconds": String(format: "%.3f", p95PreviewMilliseconds),
+                "previewMaxMilliseconds": String(format: "%.3f", maximumPreviewMilliseconds),
+                "elapsedMilliseconds": String(format: "%.3f", elapsedMilliseconds),
+            ],
+            arguments: arguments
+        ) {
+            print("wrote stability report: \(reportURL.path)")
+        }
 
         print(
             String(

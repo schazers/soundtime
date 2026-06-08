@@ -13,6 +13,7 @@ enum ProjectEditRoundTripSmokeHarness {
     }
 
     static func runFromCommandLine(arguments: [String]) throws {
+        let startedAtNanoseconds = DispatchTime.now().uptimeNanoseconds
         let sourceFrameCount = 12_000
         let sampleRate = 48_000.0
         let trackID = UUID(uuidString: "11111111-2222-3333-4444-555555555555") ?? UUID()
@@ -137,6 +138,28 @@ enum ProjectEditRoundTripSmokeHarness {
             sampleRate: sampleRate,
             expectedFrameCount: sourceFrameCount - deletedFrames + pastedFrames
         )
+
+        if let reportURL = StabilityReportWriter.writePassedSuite(
+            name: "project-edit-roundtrip-smoke",
+            startedAtNanoseconds: startedAtNanoseconds,
+            checks: [
+                "project preserves track and mixer state",
+                "project preserves edit timeline state",
+                "restored timeline renders audio identical to original edits",
+                "legacy projects migrate and decode",
+                "multi-track edit graph stress round-trips",
+            ],
+            metadata: [
+                "sourceFrameCount": "\(sourceFrameCount)",
+                "restoredFrameCount": "\(restoredTimeline.frameCount)",
+                "segmentCount": "\(decodedState.segments.count)",
+                "deletedFrames": "\(deletedFrames)",
+                "pastedFrames": "\(pastedFrames)",
+            ],
+            arguments: arguments
+        ) {
+            print("wrote stability report: \(reportURL.path)")
+        }
 
         print(
             "Soundtime project edit round-trip smoke passed: " +

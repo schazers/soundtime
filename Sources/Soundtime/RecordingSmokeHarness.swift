@@ -13,6 +13,7 @@ enum RecordingSmokeHarness {
     }
 
     static func runFromCommandLine(arguments: [String]) throws {
+        let startedAtNanoseconds = DispatchTime.now().uptimeNanoseconds
         let tempURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("SoundtimeRecordingSmoke-\(UUID().uuidString)")
             .appendingPathExtension("wav")
@@ -70,6 +71,25 @@ enum RecordingSmokeHarness {
         try require(decoded.frameCount == expectedFrameCount, "decoded recording frame count mismatch")
         try require(decoded.samplesByChannel.count == channelCount, "decoded recording channel count mismatch")
         try require(decoded.samplesByChannel.allSatisfy { $0.count == expectedFrameCount }, "decoded channel lengths mismatch")
+
+        if let reportURL = StabilityReportWriter.writePassedSuite(
+            name: "recording-smoke",
+            startedAtNanoseconds: startedAtNanoseconds,
+            checks: [
+                "streaming WAV writer preserves frame/channel/sample-rate metadata",
+                "recording preview and live preview produce waveform bins",
+                "decoded recording round-trips channel samples",
+            ],
+            metadata: [
+                "frameCount": "\(expectedFrameCount)",
+                "channelCount": "\(channelCount)",
+                "sampleRate": "\(Int(sampleRate))",
+                "chunkCount": "\(chunkCount)",
+            ],
+            arguments: arguments
+        ) {
+            print("wrote stability report: \(reportURL.path)")
+        }
 
         print(
             "Soundtime recording smoke passed: \(expectedFrameCount) frames, " +
