@@ -158,6 +158,18 @@ enum TimelineUXSmokeHarness {
         )
         complete("multi-track lane render keeps every visible lane alive")
 
+        try verifyTrackLayoutGeometry()
+        complete("track layout geometry keeps lanes aligned and hit-testable")
+
+        try verifyScrolledTrackLanesRender(
+            renderer: renderer,
+            track: track,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        complete("scrolled multi-track render keeps visible lanes alive")
+
         try verifyDeletionEffectLifecycle(
             renderer: renderer,
             track: track,
@@ -456,6 +468,84 @@ enum TimelineUXSmokeHarness {
         }
     }
 
+    private static func verifyTrackLayoutGeometry() throws {
+        let threeTrackLayout = TimelineTrackLayout.default.resolved(totalTrackCount: 3, viewportHeight: 360)
+        try require(abs(threeTrackLayout.trackHeight - 120) < 0.000_1, "3-track layout did not fill viewport equally")
+        try require(abs(threeTrackLayout.contentHeight - 360) < 0.000_1, "3-track content height did not match viewport")
+        try require(threeTrackLayout.maximumScrollOffset == 0, "3-track layout should not scroll")
+        try require(threeTrackLayout.visibleRange(overscan: 0) == 0..<3, "3-track visible range was wrong")
+        try require(threeTrackLayout.trackIndex(atYFromTop: 1) == 0, "top y did not hit first track")
+        try require(threeTrackLayout.trackIndex(atYFromTop: 180) == 1, "middle y did not hit second track")
+        try require(threeTrackLayout.trackIndex(atYFromTop: 359) == 2, "bottom y did not hit third track")
+
+        let fiveTrackLayout = TimelineTrackLayout.default.resolved(totalTrackCount: 5, viewportHeight: 360)
+        try require(
+            abs(fiveTrackLayout.trackHeight - TimelineTrackLayout.defaultPreferredTrackHeight) < 0.000_1,
+            "5-track layout did not use preferred track height"
+        )
+        try require(fiveTrackLayout.isScrollable, "5-track layout should scroll")
+        try require(fiveTrackLayout.visibleRange(overscan: 0) == 0..<3, "5-track initial visible range was wrong")
+
+        let scrolled = TimelineTrackLayout(scrollOffset: 260).resolved(totalTrackCount: 5, viewportHeight: 360)
+        try require(scrolled.visibleRange(overscan: 0) == 1..<5, "scrolled visible range was wrong")
+        try require(scrolled.trackIndex(atYFromTop: 1) == 1, "scrolled top y did not hit expected track")
+        try require(scrolled.trackIndex(atYFromTop: 359) == 4, "scrolled bottom y did not hit expected track")
+
+        for trackIndex in 0..<5 {
+            guard let laneFrame = scrolled.laneFrame(forTrackIndex: trackIndex) else {
+                throw SmokeError.checkFailed("missing lane frame for track \(trackIndex)")
+            }
+            try require(laneFrame.bottom > laneFrame.top, "lane \(trackIndex) had inverted geometry")
+        }
+    }
+
+    private static func verifyScrolledTrackLanesRender(
+        renderer: TimelineRenderer,
+        track: TimelineRenderState.Track,
+        texture: MTLTexture,
+        viewportSize: CGSize,
+        backingScale: Float
+    ) throws {
+        let tracks = (0..<6).map { index in
+            renderTrack(
+                from: track,
+                id: UUID(uuidString: String(format: "AAAAAAAA-BBBB-CCCC-DDDD-%012d", index + 10)) ?? UUID(),
+                volume: 0.42 + Float(index) * 0.08
+            )
+        }
+        let trackLayout = TimelineTrackLayout(scrollOffset: 222)
+        let frame = try renderTimeline(
+            renderer: renderer,
+            tracks: tracks,
+            viewport: .full,
+            playheadProgress: 0.40,
+            isPlaybackActive: false,
+            trackLayout: trackLayout,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+
+        let resolvedLayout = trackLayout.resolved(
+            totalTrackCount: tracks.count,
+            viewportHeight: Float(frame.summary.height)
+        )
+        for trackIndex in resolvedLayout.visibleRange(overscan: 0) {
+            guard let laneFrame = resolvedLayout.laneFrame(forTrackIndex: trackIndex), laneFrame.isVisible else {
+                throw SmokeError.checkFailed("visible lane \(trackIndex) did not produce a visible lane frame")
+            }
+
+            let startRow = max(Int(floor(Float(frame.summary.height) * max(laneFrame.top, 0))), 0)
+            let endRow = min(Int(ceil(Float(frame.summary.height) * min(laneFrame.bottom, 1))), frame.summary.height)
+            let count = nonBackgroundPixelCount(
+                inRows: startRow..<endRow,
+                bytes: frame.bytes,
+                width: frame.summary.width
+            )
+            try require(count > 1_800, "scrolled visible lane \(trackIndex) rendered too few pixels: \(count)")
+        }
+    }
+
     private static func verifyDeletionEffectLifecycle(
         renderer: TimelineRenderer,
         track: TimelineRenderState.Track,
@@ -604,12 +694,13 @@ enum TimelineUXSmokeHarness {
         isPlaybackActive: Bool,
         displayTimestamp: CFTimeInterval = CACurrentMediaTime(),
         playheadAnchorTimestamp: CFTimeInterval? = nil,
+        trackLayout: TimelineTrackLayout = .default,
         texture: MTLTexture,
         viewportSize: CGSize,
         backingScale: Float
     ) throws -> RenderedFrame {
         renderer.displayTracks(tracks, animateWaveformTransition: false)
-        renderer.displayTrackLayout(.default)
+        renderer.displayTrackLayout(trackLayout)
         renderer.displayViewport(viewport)
         renderer.displayPlaybackActive(isPlaybackActive)
         renderer.displayPlayheadProgress(
