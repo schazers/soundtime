@@ -179,6 +179,15 @@ enum TimelineUXSmokeHarness {
         )
         complete("rapid selection drag updates stay responsive and visible")
 
+        try verifyHoverGuideUpdatesStayResponsive(
+            renderer: renderer,
+            track: track,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        complete("rapid hover guide updates stay responsive and visible")
+
         try verifyDeletionEffectLifecycle(
             renderer: renderer,
             track: track,
@@ -656,6 +665,99 @@ enum TimelineUXSmokeHarness {
         let changedPixels = pixelDifferenceCount(firstFrame.bytes, lastFrame.bytes, threshold: 8)
         renderer.displaySelection(nil)
         try require(changedPixels > 8_000, "selection drag did not visibly update final selection: \(changedPixels)")
+    }
+
+    private static func verifyHoverGuideUpdatesStayResponsive(
+        renderer: TimelineRenderer,
+        track: TimelineRenderState.Track,
+        texture: MTLTexture,
+        viewportSize: CGSize,
+        backingScale: Float
+    ) throws {
+        var frameDurations: [Double] = []
+        frameDurations.reserveCapacity(54)
+        let baseTimestamp = CACurrentMediaTime()
+
+        renderer.displayTracks([track], animateWaveformTransition: false)
+        renderer.displayTrackLayout(.default)
+        renderer.displayViewport(.full)
+        renderer.displayPlaybackActive(false)
+        renderer.displayPlayheadProgress(
+            0.04,
+            force: true,
+            anchorTimestamp: baseTimestamp,
+            resetsTouchStart: true
+        )
+
+        renderer.displayHoverProgress(0.15, isArmed: true)
+        let firstFrame = try renderTimeline(
+            renderer: renderer,
+            tracks: [track],
+            viewport: .full,
+            playheadProgress: 0.04,
+            isPlaybackActive: false,
+            displayTimestamp: baseTimestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+
+        for warmupIndex in 0..<8 {
+            renderer.displayHoverProgress(0.16 + Float(warmupIndex) * 0.01, isArmed: true)
+            let renderPassDescriptor = makeRenderPassDescriptor(texture: texture)
+            _ = renderer.renderOffscreen(
+                renderPassDescriptor: renderPassDescriptor,
+                viewportSize: viewportSize,
+                backingScale: backingScale,
+                displayTimestamp: baseTimestamp + Double(warmupIndex + 1) / 144.0,
+                waitUntilCompleted: true
+            )
+        }
+
+        for frameIndex in 0..<54 {
+            let t = Float(frameIndex) / 53.0
+            renderer.displayHoverProgress(0.15 + t * 0.70, isArmed: true)
+
+            let renderPassDescriptor = makeRenderPassDescriptor(texture: texture)
+            let startTime = CACurrentMediaTime()
+            let commandBuffer = renderer.renderOffscreen(
+                renderPassDescriptor: renderPassDescriptor,
+                viewportSize: viewportSize,
+                backingScale: backingScale,
+                displayTimestamp: baseTimestamp + Double(frameIndex + 10) / 144.0,
+                waitUntilCompleted: false
+            )
+            frameDurations.append((CACurrentMediaTime() - startTime) * 1_000)
+            commandBuffer?.waitUntilCompleted()
+        }
+
+        renderer.displayHoverProgress(0.85, isArmed: true)
+        let lastFrame = try renderTimeline(
+            renderer: renderer,
+            tracks: [track],
+            viewport: .full,
+            playheadProgress: 0.04,
+            isPlaybackActive: false,
+            displayTimestamp: baseTimestamp + 1,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+
+        let p95Milliseconds = percentile(frameDurations, percentile: 0.95)
+        let maxMilliseconds = frameDurations.max() ?? 0
+        try require(
+            p95Milliseconds < 2.5,
+            String(format: "hover guide render p95 was too slow: %.2fms", p95Milliseconds)
+        )
+        try require(
+            maxMilliseconds < 8,
+            String(format: "hover guide render outlier was too slow: %.2fms", maxMilliseconds)
+        )
+
+        let changedPixels = pixelDifferenceCount(firstFrame.bytes, lastFrame.bytes, threshold: 8)
+        renderer.displayHoverProgress(nil, isArmed: false)
+        try require(changedPixels > 600, "hover guide did not visibly update final position: \(changedPixels)")
     }
 
     private static func verifyDeletionEffectLifecycle(
