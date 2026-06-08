@@ -832,7 +832,7 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
             throw MetalPixelSmokeError.commandBufferUnavailable
         }
 
-        var vertices = [
+        let vertices = [
             SparkVertex(position: SIMD2<Float>(0, 0)),
             SparkVertex(position: SIMD2<Float>(1, 0)),
             SparkVertex(position: SIMD2<Float>(0, 1)),
@@ -842,7 +842,7 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
         ]
         let clampedValues = values.isEmpty ? [Float(0)] : Array(values.prefix(192))
         let spacing = 15 / Float(max(clampedValues.count - 1, 1))
-        var samples = clampedValues.enumerated().map { index, value in
+        let samples = clampedValues.enumerated().map { index, value in
             SparkSample(timestamp: now - 15 + Float(index) * spacing, value: max(value, 0))
         }
         var uniforms = SparkUniforms(

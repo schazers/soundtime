@@ -1688,6 +1688,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         deletionEffectLock.unlock()
     }
 
+    func activeDeletionEffectCountForPerformanceTest() -> Int {
+        deletionEffectLock.lock()
+        let count = deletionEffects.count
+        deletionEffectLock.unlock()
+        return count
+    }
+
     func triggerTransientParticlesForPerformanceTest(
         originProgress: Float,
         displayTimestamp: CFTimeInterval
@@ -2482,6 +2489,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let tracks = renderState.tracks
         let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
         var checkedRenderableTrack = false
+        var drawableTrackCount = 0
         for trackIndex in trackLayout.visibleRange(overscan: 1) {
             guard tracks.indices.contains(trackIndex) else {
                 continue
@@ -2515,11 +2523,18 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 renderState: renderState,
                 fallbackPolicy: fallbackPolicy
             ) != nil else {
-                return false
+                if fallbackPolicy == .preferredOnly {
+                    return false
+                }
+                continue
             }
+            drawableTrackCount += 1
         }
 
-        return checkedRenderableTrack
+        if fallbackPolicy == .preferredOnly {
+            return checkedRenderableTrack
+        }
+        return checkedRenderableTrack && drawableTrackCount > 0
     }
 
     private func waveformSampleSmoothingAmount(

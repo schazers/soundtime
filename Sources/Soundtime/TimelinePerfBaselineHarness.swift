@@ -38,6 +38,7 @@ enum TimelinePerfBaselineHarness {
         let gpuFrameMilliseconds: [Double]
         let rendererStats: TimelineFrameStats
         let rendererStatsSamples: [TimelineFrameStats]
+        let deletionEffectCounts: [Int]
         let visibleLaneCounts: [Int]
         let visibleLaneBudget: Int
 
@@ -91,7 +92,10 @@ enum TimelinePerfBaselineHarness {
         }
 
         var maximumDeletionEffectCount: Int {
-            rendererStatsSamples.map(\.deletionEffectCount).max() ?? rendererStats.deletionEffectCount
+            max(
+                rendererStatsSamples.map(\.deletionEffectCount).max() ?? rendererStats.deletionEffectCount,
+                deletionEffectCounts.max() ?? 0
+            )
         }
 
         var maximumPlayheadContactEventCount: Int {
@@ -551,11 +555,13 @@ enum TimelinePerfBaselineHarness {
         var cpuMilliseconds: [Double] = []
         var gpuMilliseconds: [Double] = []
         var rendererStatsSamples: [TimelineFrameStats] = []
+        var deletionEffectCounts: [Int] = []
         var visibleLaneCounts: [Int] = []
         var activeTracks = tracks
         cpuMilliseconds.reserveCapacity(scenario.frames)
         gpuMilliseconds.reserveCapacity(scenario.frames)
         rendererStatsSamples.reserveCapacity(scenario.frames)
+        deletionEffectCounts.reserveCapacity(scenario.frames)
         visibleLaneCounts.reserveCapacity(scenario.frames)
         renderer.displayTracks(activeTracks)
 
@@ -658,6 +664,7 @@ enum TimelinePerfBaselineHarness {
                         gpuMilliseconds.append(gpuMillisecondsForFrame)
                     }
                     rendererStatsSamples.append(statsAfterFrame)
+                    deletionEffectCounts.append(renderer.activeDeletionEffectCountForPerformanceTest())
                     visibleLaneCounts.append(visibleLaneCount(
                         trackLayout: trackLayout,
                         trackCount: scenario.trackCount,
@@ -674,6 +681,7 @@ enum TimelinePerfBaselineHarness {
             gpuFrameMilliseconds: gpuMilliseconds,
             rendererStats: rendererStats(),
             rendererStatsSamples: rendererStatsSamples,
+            deletionEffectCounts: deletionEffectCounts,
             visibleLaneCounts: visibleLaneCounts,
             visibleLaneBudget: visibleLaneBudget(
                 trackCount: scenario.trackCount,
