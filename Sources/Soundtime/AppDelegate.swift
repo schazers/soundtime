@@ -45,6 +45,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         windowControllers.append(controller)
         controller.showWindow(nil)
+        if restoresLastProject {
+            controller.restoreLastProjectIfNeeded()
+        }
         return controller
     }
 

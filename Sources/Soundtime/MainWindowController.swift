@@ -42,6 +42,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         (window?.contentViewController?.view as? WorkspaceView)?.persistCurrentProjectWindowLayout()
     }
 
+    func restoreLastProjectIfNeeded() {
+        (window?.contentViewController?.view as? WorkspaceView)?.restoreLastProjectIfNeeded()
+    }
+
     func windowWillClose(_ notification: Notification) {
         persistOpenProjectWindowLayout()
         onWindowWillClose?(self)
