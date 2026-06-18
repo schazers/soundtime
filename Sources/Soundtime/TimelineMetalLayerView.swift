@@ -5,6 +5,11 @@ import QuartzCore
 class TimelineMetalLayerView: NSView {
     let metalDevice: MTLDevice?
     var preferredFramesPerSecond = 60
+    var drawableBackingScaleOverride: CGFloat? {
+        didSet {
+            updateDrawableSize()
+        }
+    }
     var colorPixelFormat: MTLPixelFormat = .bgra8Unorm {
         didSet {
             timelineMetalLayer?.pixelFormat = colorPixelFormat
@@ -21,6 +26,10 @@ class TimelineMetalLayerView: NSView {
     private var cachedDrawableBackingScale: CGFloat = 1
 
     private var backingScale: CGFloat {
+        if let drawableBackingScaleOverride, drawableBackingScaleOverride > 0 {
+            return drawableBackingScaleOverride
+        }
+
         if let windowScale = window?.backingScaleFactor, windowScale > 0 {
             return windowScale
         }
@@ -142,7 +151,8 @@ class TimelineMetalLayerView: NSView {
             drawable: drawable,
             viewportSize: drawableState.viewportSize,
             backingScale: Float(drawableState.backingScale),
-            displayTimestamp: displayTimestamp
+            displayTimestamp: displayTimestamp,
+            publishesFrameStats: true
         )
     }
 

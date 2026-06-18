@@ -27,6 +27,7 @@ struct TimelineRenderState: Sendable {
         let isMuted: Bool
         let isSoloed: Bool
         let clipRanges: [ClipRange]
+        let waveformTileSource: WaveformTileBuildSource?
 
         init(
             id: UUID,
@@ -37,7 +38,8 @@ struct TimelineRenderState: Sendable {
             isMuted: Bool,
             isSoloed: Bool,
             hasWaveform: Bool? = nil,
-            clipRanges: [ClipRange] = []
+            clipRanges: [ClipRange] = [],
+            waveformTileSource: WaveformTileBuildSource? = nil
         ) {
             self.id = id
             self.waveformVersion = waveformVersion
@@ -48,6 +50,7 @@ struct TimelineRenderState: Sendable {
             self.isSoloed = isSoloed
             self.hasWaveform = hasWaveform ?? (waveformOverview?.isEmpty == false)
             self.clipRanges = clipRanges.filter { $0.durationProgress > 0 }
+            self.waveformTileSource = waveformTileSource
         }
     }
 
