@@ -36,7 +36,7 @@ final class AddTrackButton: NSControl {
 
         let nextTrackingArea = NSTrackingArea(
             rect: bounds,
-            options: [.activeInKeyWindow, .mouseEnteredAndExited, .inVisibleRect],
+            options: [.activeInKeyWindow, .mouseEnteredAndExited, .mouseMoved, .cursorUpdate, .inVisibleRect],
             owner: self,
             userInfo: nil
         )
@@ -51,6 +51,16 @@ final class AddTrackButton: NSControl {
 
     override func mouseEntered(with event: NSEvent) {
         isHovered = true
+        NSCursor.pointingHand.set()
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        isHovered = true
+        NSCursor.pointingHand.set()
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        NSCursor.pointingHand.set()
     }
 
     override func mouseExited(with event: NSEvent) {

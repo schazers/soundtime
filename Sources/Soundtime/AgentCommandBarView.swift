@@ -1,5 +1,22 @@
 import AppKit
 
+private enum AgentCommandBarMetrics {
+    static let horizontalTextInset: CGFloat = 20
+    static let minimumVerticalTextInset: CGFloat = 12
+    static let textHeightPadding: CGFloat = 34
+    static let minimumTextHeight: CGFloat = 54
+    static let maximumTextHeight: CGFloat = 168
+    static let outerVerticalInset: CGFloat = 10
+    static let sendButtonDiameter: CGFloat = 52
+
+    static func verticalTextInset(forContentHeight contentHeight: CGFloat, viewHeight: CGFloat) -> CGFloat {
+        max(
+            minimumVerticalTextInset,
+            floor((viewHeight - contentHeight) * 0.5)
+        )
+    }
+}
+
 @MainActor
 final class AgentCommandBarView: NSView, NSTextViewDelegate {
     var onSubmit: ((String) -> Void)?
@@ -7,14 +24,10 @@ final class AgentCommandBarView: NSView, NSTextViewDelegate {
 
     var presentationState: AgentCommandController.PresentationState = .idle {
         didSet {
-            panelView.presentationState = presentationState
             updatePlaceholder()
         }
     }
 
-    private let panelView = AgentCommandPanelView()
-    private let textBackgroundView = AgentTextFieldBackgroundView()
-    private let scrollView = NSScrollView()
     private let textView = AgentPromptTextView()
     private let placeholderLabel = AgentPlaceholderLabel(labelWithString: "How can I help you?")
     private let sendButton = AgentSendButton()
@@ -22,8 +35,7 @@ final class AgentCommandBarView: NSView, NSTextViewDelegate {
     private var outsideClickMonitor: Any?
     private var isTextFocused = false {
         didSet {
-            panelView.isFocused = isTextFocused
-            textBackgroundView.isFocused = isTextFocused
+            textView.isPromptFocused = isTextFocused
             updatePlaceholder()
         }
     }
@@ -34,7 +46,10 @@ final class AgentCommandBarView: NSView, NSTextViewDelegate {
 
     override var intrinsicContentSize: NSSize {
         let textHeight = textHeightConstraint?.constant ?? 46
-        return NSSize(width: NSView.noIntrinsicMetric, height: textHeight + 22)
+        return NSSize(
+            width: NSView.noIntrinsicMetric,
+            height: textHeight + AgentCommandBarMetrics.outerVerticalInset * 2
+        )
     }
 
     override init(frame frameRect: NSRect) {
@@ -59,7 +74,12 @@ final class AgentCommandBarView: NSView, NSTextViewDelegate {
     override func layout() {
         super.layout()
         updateTextHeight()
-        syncTextViewFrame()
+        window?.invalidateCursorRects(for: self)
+        window?.invalidateCursorRects(for: textView)
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
@@ -67,20 +87,22 @@ final class AgentCommandBarView: NSView, NSTextViewDelegate {
             return nil
         }
 
-        let textRect = convert(textBackgroundView.bounds, from: textBackgroundView).insetBy(dx: -2, dy: -2)
-        let sendRect = convert(sendButton.bounds, from: sendButton).insetBy(dx: -2, dy: -2)
-        guard textRect.contains(point) || sendRect.contains(point) else {
-            return nil
+        if sendHitRect().contains(point) {
+            let sendPoint = sendButton.convert(point, from: self)
+            return sendButton.hitTest(sendPoint) ?? sendButton
         }
 
-        return super.hitTest(point)
+        if promptHitRect().contains(point) {
+            let textPoint = textView.convert(point, from: self)
+            return textView.hitTest(textPoint) ?? textView
+        }
+
+        return nil
     }
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        let textRect = convert(textBackgroundView.bounds, from: textBackgroundView).insetBy(dx: -2, dy: -2)
-        let scrollRect = convert(scrollView.bounds, from: scrollView)
-        if textRect.contains(point), scrollRect.contains(point) == false {
+        if promptHitRect().contains(point) {
             focusPrompt()
             return
         }
@@ -89,7 +111,15 @@ final class AgentCommandBarView: NSView, NSTextViewDelegate {
     }
 
     func focusPrompt() {
-        window?.makeFirstResponder(textView)
+        guard let window else {
+            return
+        }
+
+        let didFocus = window.makeFirstResponder(textView)
+        isTextFocused = didFocus || window.firstResponder === textView
+        if didFocus, textView.selectedRange().location == NSNotFound {
+            textView.setSelectedRange(NSRange(location: textView.string.utf16.count, length: 0))
+        }
     }
 
     private func blurPrompt() {
@@ -109,25 +139,16 @@ final class AgentCommandBarView: NSView, NSTextViewDelegate {
         wantsLayer = true
         layer?.masksToBounds = false
 
-        panelView.translatesAutoresizingMaskIntoConstraints = false
-        textBackgroundView.translatesAutoresizingMaskIntoConstraints = false
-
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.drawsBackground = false
-        scrollView.borderType = .noBorder
-        scrollView.hasHorizontalScroller = false
-        scrollView.hasVerticalScroller = false
-        scrollView.autohidesScrollers = true
-        scrollView.documentView = textView
-        textView.frame = NSRect(x: 0, y: 0, width: 1, height: 46)
-        textView.autoresizingMask = [.width]
-
+        textView.translatesAutoresizingMaskIntoConstraints = false
         textView.delegate = self
         textView.onSubmitShortcut = { [weak self] in
             self?.submit()
         }
         textView.onCancelShortcut = { [weak self] in
             self?.blurPrompt()
+        }
+        textView.onHoverChanged = { [weak self] isHovered in
+            self?.textView.isPromptHovered = isHovered
         }
 
         placeholderLabel.font = .systemFont(ofSize: 15, weight: .regular)
@@ -140,58 +161,46 @@ final class AgentCommandBarView: NSView, NSTextViewDelegate {
         }
         sendButton.translatesAutoresizingMaskIntoConstraints = false
         sendButton.isEnabled = false
-        panelView.onMouseDown = { [weak self] event in
-            guard let self else {
-                return false
-            }
 
-            let point = self.convert(event.locationInWindow, from: nil)
-            let textRect = self.convert(self.textBackgroundView.bounds, from: self.textBackgroundView).insetBy(dx: -2, dy: -2)
-            guard textRect.contains(point) else {
-                return false
-            }
+        addSubview(textView)
+        addSubview(placeholderLabel)
+        addSubview(sendButton)
 
-            self.focusPrompt()
-            return true
-        }
-
-        addSubview(panelView)
-        panelView.addSubview(textBackgroundView)
-        panelView.addSubview(scrollView)
-        panelView.addSubview(placeholderLabel)
-        panelView.addSubview(sendButton)
-
-        let textHeightConstraint = scrollView.heightAnchor.constraint(equalToConstant: 46)
+        let textHeightConstraint = textView.heightAnchor.constraint(equalToConstant: AgentCommandBarMetrics.minimumTextHeight)
         self.textHeightConstraint = textHeightConstraint
 
         NSLayoutConstraint.activate([
-            panelView.topAnchor.constraint(equalTo: topAnchor),
-            panelView.leadingAnchor.constraint(equalTo: leadingAnchor),
-            panelView.trailingAnchor.constraint(equalTo: trailingAnchor),
-            panelView.bottomAnchor.constraint(equalTo: bottomAnchor),
-
-            scrollView.topAnchor.constraint(equalTo: panelView.topAnchor, constant: 11),
-            scrollView.leadingAnchor.constraint(equalTo: textBackgroundView.leadingAnchor, constant: 18),
-            scrollView.trailingAnchor.constraint(equalTo: textBackgroundView.trailingAnchor, constant: -16),
-            scrollView.bottomAnchor.constraint(equalTo: panelView.bottomAnchor, constant: -11),
+            textView.topAnchor.constraint(equalTo: topAnchor, constant: AgentCommandBarMetrics.outerVerticalInset),
+            textView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            textView.trailingAnchor.constraint(equalTo: sendButton.leadingAnchor, constant: -12),
+            textView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -AgentCommandBarMetrics.outerVerticalInset),
             textHeightConstraint,
 
-            textBackgroundView.topAnchor.constraint(equalTo: scrollView.topAnchor, constant: -2),
-            textBackgroundView.leadingAnchor.constraint(equalTo: panelView.leadingAnchor, constant: 10),
-            textBackgroundView.trailingAnchor.constraint(equalTo: sendButton.leadingAnchor, constant: -12),
-            textBackgroundView.bottomAnchor.constraint(equalTo: scrollView.bottomAnchor, constant: 2),
+            placeholderLabel.leadingAnchor.constraint(
+                equalTo: textView.leadingAnchor,
+                constant: AgentCommandBarMetrics.horizontalTextInset
+            ),
+            placeholderLabel.trailingAnchor.constraint(
+                lessThanOrEqualTo: textView.trailingAnchor,
+                constant: -AgentCommandBarMetrics.horizontalTextInset
+            ),
+            placeholderLabel.centerYAnchor.constraint(equalTo: textView.centerYAnchor),
 
-            placeholderLabel.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor),
-            placeholderLabel.trailingAnchor.constraint(lessThanOrEqualTo: scrollView.trailingAnchor),
-            placeholderLabel.centerYAnchor.constraint(equalTo: textBackgroundView.centerYAnchor),
-
-            sendButton.trailingAnchor.constraint(equalTo: panelView.trailingAnchor, constant: -10),
-            sendButton.topAnchor.constraint(equalTo: textBackgroundView.topAnchor),
-            sendButton.bottomAnchor.constraint(equalTo: textBackgroundView.bottomAnchor),
-            sendButton.widthAnchor.constraint(equalTo: sendButton.heightAnchor),
+            sendButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            sendButton.bottomAnchor.constraint(equalTo: textView.bottomAnchor),
+            sendButton.widthAnchor.constraint(equalToConstant: AgentCommandBarMetrics.sendButtonDiameter),
+            sendButton.heightAnchor.constraint(equalToConstant: AgentCommandBarMetrics.sendButtonDiameter),
         ])
 
         updatePlaceholder()
+    }
+
+    private func promptHitRect() -> NSRect {
+        convert(textView.bounds, from: textView).insetBy(dx: -2, dy: -2)
+    }
+
+    private func sendHitRect() -> NSRect {
+        convert(sendButton.bounds, from: sendButton).insetBy(dx: -2, dy: -2)
     }
 
     private func submit() {
@@ -219,42 +228,32 @@ final class AgentCommandBarView: NSView, NSTextViewDelegate {
     }
 
     private func updateTextHeight() {
-        guard let textContainer = textView.textContainer, scrollView.bounds.width > 0 else {
+        guard let textContainer = textView.textContainer, textView.bounds.width > 0 else {
             return
         }
 
+        let containerWidth = max(
+            textView.bounds.width - AgentCommandBarMetrics.horizontalTextInset * 2,
+            1
+        )
         textContainer.containerSize = NSSize(
-            width: scrollView.contentSize.width,
+            width: containerWidth,
             height: CGFloat.greatestFiniteMagnitude
         )
         textView.layoutManager?.ensureLayout(for: textContainer)
-        let usedHeight = textView.layoutManager?.usedRect(for: textContainer).height ?? 22
-        let nextHeight = min(max(ceil(usedHeight) + 20, 46), 148)
+        let usedHeight = textView.normalizedContentHeight(
+            textView.layoutManager?.usedRect(for: textContainer).height ?? 0
+        )
+        let nextHeight = min(
+            max(ceil(usedHeight) + AgentCommandBarMetrics.textHeightPadding, AgentCommandBarMetrics.minimumTextHeight),
+            AgentCommandBarMetrics.maximumTextHeight
+        )
         if abs((textHeightConstraint?.constant ?? 0) - nextHeight) > 0.5 {
             textHeightConstraint?.constant = nextHeight
-            scrollView.hasVerticalScroller = nextHeight >= 148
             invalidateIntrinsicContentSize()
             superview?.needsLayout = true
         }
-        syncTextViewFrame(height: nextHeight)
-    }
-
-    private func syncTextViewFrame(height: CGFloat? = nil) {
-        let contentSize = scrollView.contentSize
-        guard contentSize.width > 0 else {
-            return
-        }
-
-        let nextHeight = max(height ?? textHeightConstraint?.constant ?? contentSize.height, contentSize.height)
-        let nextFrame = NSRect(
-            x: 0,
-            y: 0,
-            width: contentSize.width,
-            height: nextHeight
-        )
-        if textView.frame != nextFrame {
-            textView.frame = nextFrame
-        }
+        textView.updateVerticalInset(forContentHeight: usedHeight, viewHeight: nextHeight)
     }
 
     private func installOutsideClickMonitorIfNeeded() {
@@ -293,13 +292,27 @@ final class AgentCommandBarView: NSView, NSTextViewDelegate {
             return
         }
 
-        let point = convert(event.locationInWindow, from: nil)
-        let promptRect = convert(textBackgroundView.bounds, from: textBackgroundView).insetBy(dx: -2, dy: -2)
-        if promptRect.contains(point) {
+        if
+            let point = pointInsideAgentBar(for: event),
+            promptHitRect().contains(point)
+        {
             return
         }
 
         blurPrompt()
+    }
+
+    private func pointInsideAgentBar(for event: NSEvent) -> NSPoint? {
+        guard event.window === window, !isHidden, alphaValue > 0.01 else {
+            return nil
+        }
+
+        let point = convert(event.locationInWindow, from: nil)
+        guard bounds.contains(point) else {
+            return nil
+        }
+
+        return point
     }
 
     func textDidBeginEditing(_ notification: Notification) {
@@ -325,10 +338,28 @@ private final class AgentPlaceholderLabel: NSTextField {
     }
 }
 
-@MainActor
 private final class AgentPromptTextView: NSTextView {
     var onSubmitShortcut: (() -> Void)?
     var onCancelShortcut: (() -> Void)?
+    var onHoverChanged: ((Bool) -> Void)?
+
+    var isPromptFocused = false {
+        didSet {
+            needsDisplay = true
+        }
+    }
+
+    var isPromptHovered = false {
+        didSet {
+            guard oldValue != isPromptHovered else {
+                return
+            }
+            needsDisplay = true
+            onHoverChanged?(isPromptHovered)
+        }
+    }
+
+    private var trackingArea: NSTrackingArea?
 
     override var acceptsFirstResponder: Bool {
         true
@@ -336,6 +367,80 @@ private final class AgentPromptTextView: NSTextView {
 
     override var mouseDownCanMoveWindow: Bool {
         false
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden, alphaValue > 0.01, bounds.contains(point) else {
+            return nil
+        }
+
+        return self
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+
+        let nextTrackingArea = NSTrackingArea(
+            rect: bounds,
+            options: [.activeInKeyWindow, .inVisibleRect, .mouseEnteredAndExited, .mouseMoved, .cursorUpdate],
+            owner: self,
+            userInfo: nil
+        )
+        trackingArea = nextTrackingArea
+        addTrackingArea(nextTrackingArea)
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        updateHoverAndCursor(for: event)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        updateHoverAndCursor(for: event)
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        updateHoverAndCursor(for: event)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isPromptHovered = false
+    }
+
+    private func updateHoverAndCursor(for event: NSEvent) {
+        let eventPoint = convert(event.locationInWindow, from: nil)
+        let isInside = bounds.contains(eventPoint)
+        isPromptHovered = isInside
+        if isInside {
+            NSCursor.iBeam.set()
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        super.mouseDown(with: event)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let radius = min(rect.height * 0.5, 30)
+        let path = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
+        let fillWhite: CGFloat = isPromptHovered ? 0.205 : 0.16
+        let fillAlpha: CGFloat = isPromptHovered || isPromptFocused ? 0.96 : 0.92
+        NSColor(white: fillWhite, alpha: fillAlpha).setFill()
+        path.fill()
+
+        super.draw(dirtyRect)
     }
 
     override init(frame frameRect: NSRect = .zero, textContainer container: NSTextContainer? = nil) {
@@ -373,6 +478,12 @@ private final class AgentPromptTextView: NSTextView {
     }
 
     private func configure() {
+        let promptFont = NSFont.systemFont(ofSize: 15.5, weight: .regular)
+        let initialTextInset = AgentCommandBarMetrics.verticalTextInset(
+            forContentHeight: singleLineContentHeight(for: promptFont),
+            viewHeight: AgentCommandBarMetrics.minimumTextHeight
+        )
+
         drawsBackground = false
         isEditable = true
         isSelectable = true
@@ -386,129 +497,49 @@ private final class AgentPromptTextView: NSTextView {
         isVerticallyResizable = true
         minSize = NSSize(width: 0, height: 40)
         maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        textContainerInset = NSSize(width: 0, height: 15)
-        font = .systemFont(ofSize: 15.5, weight: .regular)
+        textContainerInset = NSSize(
+            width: AgentCommandBarMetrics.horizontalTextInset,
+            height: initialTextInset
+        )
+        font = promptFont
         let paragraphStyle = NSMutableParagraphStyle()
         paragraphStyle.lineSpacing = 5
         paragraphStyle.paragraphSpacing = 0
         defaultParagraphStyle = paragraphStyle
         typingAttributes = [
-            .font: NSFont.systemFont(ofSize: 15.5, weight: .regular),
+            .font: promptFont,
             .foregroundColor: NSColor(white: 0.94, alpha: 1),
             .paragraphStyle: paragraphStyle,
         ]
         textColor = NSColor(white: 0.94, alpha: 1)
-        insertionPointColor = NSColor(calibratedRed: 0.42, green: 0.98, blue: 1.0, alpha: 1)
+        insertionPointColor = NSColor(white: 1, alpha: 1)
+    }
+
+    func updateVerticalInset(forContentHeight contentHeight: CGFloat, viewHeight: CGFloat) {
+        let nextInset = AgentCommandBarMetrics.verticalTextInset(
+            forContentHeight: normalizedContentHeight(contentHeight),
+            viewHeight: viewHeight
+        )
+        let nextSize = NSSize(width: AgentCommandBarMetrics.horizontalTextInset, height: nextInset)
+        if textContainerInset != nextSize {
+            textContainerInset = nextSize
+        }
+    }
+
+    func normalizedContentHeight(_ measuredHeight: CGFloat) -> CGFloat {
+        guard measuredHeight > 0.5 else {
+            return singleLineContentHeight(for: font)
+        }
+
+        return measuredHeight
+    }
+
+    private func singleLineContentHeight(for font: NSFont?) -> CGFloat {
+        let font = font ?? NSFont.systemFont(ofSize: 15.5, weight: .regular)
+        return ceil(layoutManager?.defaultLineHeight(for: font) ?? (font.ascender - font.descender + font.leading))
     }
 }
 
-@MainActor
-private final class AgentCommandPanelView: NSView {
-    var onMouseDown: ((NSEvent) -> Bool)?
-
-    var isFocused = false {
-        didSet {
-            needsDisplay = true
-        }
-    }
-
-    var presentationState: AgentCommandController.PresentationState = .idle {
-        didSet {
-            needsDisplay = true
-        }
-    }
-
-    var animationTime = CACurrentMediaTime() {
-        didSet {
-            needsDisplay = true
-        }
-    }
-
-    override var mouseDownCanMoveWindow: Bool {
-        false
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        if onMouseDown?(event) == true {
-            return
-        }
-
-        super.mouseDown(with: event)
-    }
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        configure()
-    }
-
-    required init?(coder: NSCoder) {
-        super.init(coder: coder)
-        configure()
-    }
-
-    private func configure() {
-        wantsLayer = true
-        layer?.masksToBounds = false
-        translatesAutoresizingMaskIntoConstraints = false
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-    }
-}
-
-@MainActor
-private final class AgentTextFieldBackgroundView: NSView {
-    var isFocused = false {
-        didSet {
-            needsDisplay = true
-        }
-    }
-
-    override var mouseDownCanMoveWindow: Bool {
-        false
-    }
-
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        nil
-    }
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        configure()
-    }
-
-    required init?(coder: NSCoder) {
-        super.init(coder: coder)
-        configure()
-    }
-
-    private func configure() {
-        wantsLayer = true
-        layer?.masksToBounds = false
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-
-        let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
-        let radius: CGFloat = 25
-        let path = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
-
-        NSColor(white: 0.16, alpha: 0.92).setFill()
-        path.fill()
-
-        guard isFocused else {
-            return
-        }
-
-        NSColor(white: 1, alpha: 0.70).setStroke()
-        path.lineWidth = 1.4
-        path.stroke()
-    }
-}
-
-@MainActor
 private final class AgentSendButton: NSControl {
     var onPressed: (() -> Void)?
 
@@ -614,10 +645,10 @@ private final class AgentSendButton: NSControl {
 
         let center = CGPoint(x: bounds.midX, y: bounds.midY)
         let arrow = NSBezierPath()
-        arrow.move(to: CGPoint(x: center.x - 5.2, y: center.y - 6.4))
-        arrow.line(to: CGPoint(x: center.x + 6.0, y: center.y))
-        arrow.line(to: CGPoint(x: center.x - 5.2, y: center.y + 6.4))
-        arrow.line(to: CGPoint(x: center.x - 2.3, y: center.y))
+        arrow.move(to: CGPoint(x: center.x - 5.8, y: center.y - 7.2))
+        arrow.line(to: CGPoint(x: center.x + 6.8, y: center.y))
+        arrow.line(to: CGPoint(x: center.x - 5.8, y: center.y + 7.2))
+        arrow.line(to: CGPoint(x: center.x - 2.5, y: center.y))
         arrow.close()
 
         NSColor(white: isEnabled ? 0.10 : 0.64, alpha: isEnabled ? 0.92 : 0.70).setFill()
