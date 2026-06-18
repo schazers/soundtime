@@ -1,0 +1,1268 @@
+Soundtime Codebase Documentation
+================================
+
+Summary
+-------
+
+Soundtime is a native macOS audio editor built as a Swift Package. The app is
+mostly AppKit for UI, Metal for timeline and specialized meters, and a C++ audio
+core for realtime playback/recording primitives. The current product direction
+is a very responsive editor for podcast-style audio work: drag in audio, edit
+immediately, keep the UI fluid during long waveform/import/edit work, and export
+mixdowns or stems.
+
+The system has four major layers:
+
+1. App and workspace orchestration
+   AppDelegate creates menus and windows. MainWindowController owns each
+   document window. WorkspaceView is the main coordinator for project state,
+   imported tracks, editing, playback, recording, export, diagnostics, and the
+   layout of the visible UI around the timeline.
+
+2. Timeline interaction and rendering
+   TimelineView is a Metal-backed NSView. It owns mouse/keyboard/drag gestures,
+   viewport panning and zooming, selection state, display-link scheduling, and
+   the bridge into TimelineRenderer. TimelineRenderer consumes immutable
+   TimelineRenderState snapshots and draws the grid, ruler ticks, waveforms,
+   playhead, selection, clip boundaries, visual effects, particles, and delete
+   animations through Metal.
+
+3. Audio and edit engine
+   PlaybackEngine is the Swift protocol used by WorkspaceView. The current
+   default path goes through HybridPlaybackEngine and RealtimeCorePlaybackEngine,
+   which prepare ProjectPlaybackTrack data and publish it to SoundtimeAudioCore,
+   the C++ realtime render engine. Editing is represented as segment graphs in
+   AudioEditTimeline and AudioFileEditTimeline, so operations like ripple delete,
+   clear, gain, fade, split, trim, duplicate, slip, and nudge can update metadata
+   first and let expensive materialization/refinement happen in the background.
+
+4. Supporting systems
+   These include progressive WAV import and waveform previews, project save/load
+   and autosave, audio device preferences, recording, export, podcast loudness
+   processing, silence/dead-air review, an AppKit agent command bar, performance
+   dashboards, smoke harnesses, and realtime audio tests.
+
+At a high level, the intended data flow is:
+
+    User gesture / menu / agent command
+        -> TimelineView or AppKit control callback
+        -> WorkspaceView command method
+        -> ProjectTrack / edit timeline mutation
+        -> playback graph refresh and render-state publish
+        -> TimelineRenderer draws from immutable render data
+        -> C++ audio core renders from immutable realtime graph
+
+The most important architectural idea is that audio rendering, timeline drawing,
+and background work should not block each other. The UI should publish compact
+state to the renderer; the renderer should reuse GPU-resident waveform data; the
+audio callback should never allocate, lock, retain Swift/Obj-C objects, or cross
+into AppKit; and expensive work should run progressively in the background with
+clear budgets.
+
+
+How To Build, Run, And Test
+---------------------------
+
+The project is a Swift Package.
+
+Common commands:
+
+    swift run Soundtime
+    swift build
+    swift test
+    scripts/perf-gate.sh
+
+The main executable also exposes command-line smoke/performance modes from
+main.swift:
+
+    swift run Soundtime --recording-smoke
+    swift run Soundtime --diagnostics-smoke
+    swift run Soundtime --project-edit-roundtrip-smoke
+    swift run Soundtime --edit-graph-smoke
+    swift run Soundtime --edit-preview-smoke
+    swift run Soundtime --realtime-graph-publish-smoke
+    swift run Soundtime --timeline-ux-smoke
+    swift run Soundtime --timeline-perf-baseline --quick --ci
+
+scripts/perf-gate.sh runs the core unit tests and all smoke/perf harnesses. If
+SOUNDTIME_STABILITY_REPORT_DIR is set, the harnesses must also write JSON
+reports.
+
+Useful environment flags:
+
+    SOUNDTIME_LEGACY_PLAYBACK=1
+        Forces the older AVAudioPlayerNode-oriented playback controller.
+
+    SOUNDTIME_REALTIME_PLAYBACK=1
+        Forces RealtimeCorePlaybackEngine when available.
+
+    SOUNDTIME_AUDIO_UNIT_OUTPUT=1
+        Forces AudioUnitOutputDevice instead of the AVAudioSourceNode-backed
+        output device path inside RealtimeCorePlaybackEngine.
+
+
+Repository Layout
+-----------------
+
+Package.swift
+    Defines one executable target, Soundtime, one C++ target,
+    SoundtimeAudioCore, and one XCTest target, SoundtimeAudioCoreTests.
+
+Sources/Soundtime
+    The macOS app, UI, renderer, playback bridge, import/export/edit logic,
+    diagnostics, and smoke harnesses.
+
+Sources/SoundtimeAudioCore
+    C++ realtime audio core plus public C header and the vendored ez headers.
+
+Tests/SoundtimeAudioCoreTests
+    Unit tests for realtime transport, graph publication, sample sync, ramps,
+    segmented edit playback, recording ring behavior, and callback-safety
+    regressions.
+
+scripts
+    Local CI/perf-gate shell scripts.
+
+docs
+    Additional project docs, currently separate from this generated onboarding
+    document.
+
+The root currently also contains local sample WAV and .soundtime fixture files.
+Those are working/project data, not source architecture.
+
+
+App Lifecycle And Windowing
+---------------------------
+
+main.swift
+    main.swift first checks for command-line smoke/perf flags. If no harness flag
+    is present, it starts NSApplication, installs AppDelegate, sets regular app
+    activation policy, and enters the AppKit run loop.
+
+AppDelegate.swift
+    AppDelegate owns top-level app behavior:
+
+    - Builds the Soundtime, Edit, and Effects menus.
+    - Creates new project windows.
+    - Opens projects and recent projects.
+    - Shows Preferences.
+    - Routes menu actions to the active TimelineView/WorkspaceView.
+    - Restores the last project on launch.
+    - Allows multiple project windows.
+    - Terminates when the final project window closes.
+
+    Menu actions are intentionally connected to TimelineView selectors where
+    possible. TimelineView then calls closure callbacks into WorkspaceView, which
+    keeps UI event handling separate from project mutation.
+
+MainWindowController.swift
+    Creates each main NSWindow, installs WorkspaceViewController, sets a very
+    small minimum size, and persists window layout when closing. The window
+    itself is conventional AppKit; the timeline inside it is Metal-backed.
+
+WorkspaceViewController.swift
+    A thin NSViewController wrapper. It creates WorkspaceView and asks it to
+    restore the previous project once the view is visible.
+
+
+WorkspaceView: The Main Coordinator
+-----------------------------------
+
+WorkspaceView.swift is the central application object. It is large because it
+currently coordinates many systems that should eventually be split into smaller
+controllers. When learning this codebase, treat WorkspaceView as the place where
+product behavior is assembled.
+
+Major responsibilities:
+
+    - Overall AppKit layout.
+    - The TimelineView and track control list.
+    - The top transport/time/volume/loudness/FPS/debug controls.
+    - The bottom add-track button and agent command bar.
+    - ProjectTrack storage and active project metadata.
+    - Drag/drop import.
+    - Progressive waveform preview/refinement.
+    - Playback controller loading, seeking, play/pause, and visual sync.
+    - Track mute/solo/gain/record state.
+    - Recording into empty or existing tracks.
+    - Selection, whole-track selection, and edit scopes.
+    - Edit commands and undo stacks.
+    - Export commands.
+    - Project save/load/autosave/recent files.
+    - Dead-air/silence review.
+    - Diagnostics and performance-dashboard publishing.
+
+ProjectTrack
+    ProjectTrack is WorkspaceView's in-memory model for one track. It contains:
+
+    - id and editGroupID.
+    - display name and sourceURL.
+    - source ownership flags for recordings/materialized edits.
+    - waveformOverview and progressive preview state.
+    - decodedAudioBuffer when a full decode is available.
+    - zero-crossing data/probes.
+    - AudioEditTimeline for decoded/in-memory edits.
+    - AudioFileEditTimeline for file-backed persistent edits.
+    - volume, mute, solo.
+    - importID and editRevision counters used to reject stale async work.
+
+The same ProjectTrack is used to build render tracks, playback tracks, save-file
+tracks, export snapshots, and edit targets. That makes the type important but
+also makes WorkspaceView a coupling hotspot.
+
+Render publication
+    WorkspaceView turns ProjectTrack values into TimelineRenderState.Track
+    values in timelineRenderTracks() and related helpers. The render track is
+    intentionally lighter than ProjectTrack: the renderer gets waveform refs,
+    duration, mix state, clip ranges, and a waveformVersion, not arbitrary app
+    state.
+
+Playback publication
+    WorkspaceView turns ProjectTrack values into ProjectPlaybackTrack values in
+    projectPlaybackTracks(). Those are passed to PlaybackEngine. For
+    file-backed tracks, the playback source can be a URL plus
+    AudioFileEditTimeline, allowing the realtime core to render timeline edits
+    without necessarily materializing a new decoded buffer first.
+
+Edits and optimism
+    Most edit methods follow this shape:
+
+    1. Find the active EditableSelectionTarget.
+    2. Create an undo snapshot.
+    3. Mutate AudioFileEditTimeline or AudioEditTimeline immediately.
+    4. Publish an optimistic waveform overview for the UI.
+    5. Refresh playback graph/mix.
+    6. Schedule waveform refinement or materialization in the background.
+
+The intended user experience is that delete, cut, gain, fade, normalize, paste,
+and similar commands never freeze the timeline. If a command currently blocks,
+look for work that is happening synchronously in WorkspaceView after the edit
+graph is mutated.
+
+Undo
+    Undo uses ProjectTrackUndoSnapshot and UndoAction values. The snapshots need
+    to preserve enough track, edit, selection, and playback state to restore
+    without corrupting the timeline viewport or playhead. Because source files
+    may be owned by the app after recording/materialization, undo cleanup also
+    has to avoid deleting still-referenced owned files.
+
+
+Timeline Interaction
+--------------------
+
+TimelineView.swift is the interactive Metal view. It should be understood as the
+timeline's input and scheduling layer, not the product-state owner.
+
+Key concepts:
+
+TimelineViewport
+    Represents the visible horizontal range in normalized project progress. It
+    provides progress conversion, panning, and zooming. durationProgress has a
+    very small minimum so the app can zoom deeply without hitting division by
+    zero.
+
+TimelineTrackLayout
+    Converts track counts and viewport height into per-lane frames. For up to
+    four tracks it auto-fits lanes to the visible height. For more tracks it uses
+    a preferred track height and vertical scroll offset. Both the timeline and
+    the left track controls must use the same resolved layout to stay aligned.
+
+TimelineSelection
+    A normalized start/end selection plus optional trackID. Track-specific
+    selection is the common case for audio edits. A nil trackID represents
+    timeline/time-level selection when commands support broader scopes.
+
+Gesture handling
+    TimelineView handles:
+
+    - Click to seek.
+    - Double-click to play from a point.
+    - Drag to select.
+    - Trim handle drags.
+    - Clip boundary drags.
+    - Right-drag panning with momentum.
+    - Mouse-wheel/trackpad zoom with momentum.
+    - Gesture locking so a gesture is pan or zoom, not both.
+    - Drag/drop of audio files.
+    - Keyboard shortcuts for transport, editing, effects, navigation, and export.
+
+TimelineView does not directly mutate audio. It calls closures such as
+onDeleteSelection, onSelectionChanged, onSeekRequested, onPlayFromProgress, and
+onTrimRequested. WorkspaceView wires those closures to actual project commands.
+
+Rendering schedule
+    TimelineView uses TimelineDisplayLink and a private serial render queue. A
+    RenderFlightGate prevents overlapping render submissions. During interaction,
+    TimelineView can kick immediate renders at up to a high rate so selection
+    and hover feedback stay attached to the pointer. During playback, the
+    display link keeps rendering so the playhead and visual effects animate.
+
+Important separation
+    TimelineView owns interaction state that needs to be responsive, but
+    TimelineRenderer owns actual Metal encoding. Render state changes should be
+    published as compact data rather than causing large CPU mesh rebuilds during
+    pointer movement or playback.
+
+
+Timeline Rendering
+------------------
+
+TimelineRenderState.swift
+    TimelineRenderState is the immutable snapshot passed to the renderer. It
+    contains only render-needed data:
+
+    - tracks, waveform refs, durations, waveform versions, clip ranges.
+    - project duration and solo summary.
+    - viewport and track layout.
+    - playhead progress, playback/recording flags, and anchor timestamp.
+    - hover and selection.
+    - selected track IDs.
+    - trim preview, gain preview, and dead-air candidate regions.
+
+The with... methods construct new snapshots instead of mutating old ones. This
+keeps the renderer from reaching into mutable WorkspaceView state and makes it
+easier to reason about threaded render submission.
+
+TimelineRenderer.swift
+    TimelineRenderer is the Metal renderer. It owns:
+
+    - Metal device command queue and pipeline states.
+    - Inline shader library source.
+    - Dynamic vertex buffer ring.
+    - Grid/ruler/waveform/effect caches.
+    - Waveform mip pyramid cache.
+    - Persistent waveform shader buffer store.
+    - Frame stats.
+    - Playhead touch/glow/kick/contact events.
+    - Transient particles.
+    - Deletion effects.
+    - Fisheye code, currently controlled by SoundtimeFeatureFlags.waveformFisheye.
+
+Render path
+    render(to:) creates a command buffer and encoder, begins the dynamic vertex
+    ring frame, then calls encodeTimeline(...). encodeTimeline snapshots the
+    published TimelineRenderState plus interaction overrides, resolves current
+    playhead progress, selects waveform mips, prepares effect vertices/uniforms,
+    and encodes draws in layers.
+
+Waveform rendering
+    The modern path is shader-based. Each waveform bin is represented by
+    WaveformShaderBin data:
+
+    - min/max sample.
+    - RMS.
+    - approximate low/mid/high energy.
+    - peak magnitude.
+
+The renderer uploads/prewarms waveform mip data into GPU buffers. At frame time,
+visible tracks are batched by MTLBuffer and drawn as quads with per-track
+uniforms. The shader uses viewport, lane, gain, mute/solo alpha, selected state,
+touch glow, and visual style to draw the waveform. CPU-generated vertex fallback
+still exists for some conditions, but the desired architecture is persistent
+GPU-resident waveform data with batched visible-track draws.
+
+Mips and progressive display
+    WaveformOverviewBuilder can create very large overviews, currently with a
+    default target of 4,194,304 bins. TimelineRenderer builds additional mip
+    levels and chooses an appropriate level for the current zoom. Progressive
+    import and edit refinement mean a track may start with a coarse overview and
+    later receive better data. The renderer tries to transition between old and
+    new states without flashing or dropping to coarse data.
+
+Visual effects
+    The renderer contains several expressive effects:
+
+    - Playhead line and play/pause ghost trail.
+    - Waveform touch glow and vertical size influence near the playhead.
+    - Zoomed-out glow extension.
+    - Playhead contact light along the song line.
+    - Transient particle bursts.
+    - Deletion shards/ripple/conjoin animation.
+    - Selection overlays and clip boundaries.
+    - Timeline ruler ticks.
+
+These effects are performance-sensitive. Prefer shader uniforms, compact event
+buffers, capped particle counts, and persistent buffers over per-frame CPU
+geometry. Any visual effect should have a bounded worst case and should show up
+in TimelineFrameStats.
+
+Frame stats
+    TimelineFrameStats includes FPS, average/jitter/worst frame times, renderer
+    mode, CPU vertex counts, GPU draw counts, buffer upload counts/bytes,
+    transient/deletion/effect counts, mip cache counts, and playhead contact
+    counts. WorkspaceView forwards these to the top FPS display, diagnostics,
+    and the performance dashboard.
+
+
+Audio Playback Architecture
+---------------------------
+
+PlaybackEngine.swift
+    PlaybackEngine is the app-facing abstraction. WorkspaceView does not need to
+    know whether playback is old AVAudioPlayerNode playback, hybrid playback, or
+    the realtime C++ core. Important API groups:
+
+    - load/loadFile/loadProjectTracks/updateProjectTracks.
+    - refreshOutputDevice.
+    - setPerceptualVolume and updateProjectTrackMix.
+    - play/pause/pause(atProgress)/seek/seekExactly/togglePlayback.
+    - snapshot and drainMeterSamples.
+
+PlaybackEngineFactory.swift
+    Creates the default engine. The normal path prefers the realtime engine
+    through HybridPlaybackEngine. Environment flags can force legacy or realtime
+    variants.
+
+RealtimeCorePlaybackEngine.swift
+    This is the main Swift bridge from ProjectPlaybackTrack to the C++ audio
+    core. It prepares sources, segment graphs, track gains, mute/solo state,
+    zero-crossing seek behavior, output device configuration, and snapshots.
+
+    For each ProjectPlaybackTrack, it chooses a prepared source:
+
+    - decoded buffer source.
+    - mapped WAV byte source.
+    - file-backed edit timeline source.
+    - in-memory AudioEditTimeline source.
+
+    It then turns edit timeline segments into PreparedRealtimeAudioSegment
+    values. The C++ engine receives only prepared source pointers, segment
+    arrays, gain values, and transport commands.
+
+RealtimeAudioCore.swift
+    Swift wrapper around the C API in SoundtimeAudioCore.h. It owns the opaque
+    C++ engine pointer and PreparedRealtimeAudioSource handles. For WAV files it
+    can memory-map file bytes and pass a stable pointer to the core, avoiding
+    full float materialization for file-backed playback.
+
+RealtimeAudioOutputDevice.swift and AudioUnitOutputDevice.swift
+    RealtimeAudioOutputDevice abstracts the output callback host. There is an
+    AVAudioSourceNode implementation and an AudioUnitOutputDevice implementation.
+    Both eventually call soundtime_audio_core_render_at_host_time(...) with
+    planar float output pointers. AudioUnitOutputDevice supports explicit Core
+    Audio output device selection.
+
+AudioDevicePreferences.swift and AudioDevicePreferencesWindowController.swift
+    AudioDeviceRegistry enumerates Core Audio devices and default input/output
+    devices. AudioDevicePreferences stores explicit input/output IDs in
+    UserDefaults and posts a notification when changed. WorkspaceView observes
+    that notification and calls playbackController.refreshOutputDevice() for
+    output changes.
+
+Realtime constraints
+    The audio callback must remain strict:
+
+    - No AppKit.
+    - No Swift object graph traversal.
+    - No Obj-C/Swift ARC traffic.
+    - No dynamic allocation.
+    - No locks.
+    - No file I/O.
+    - No waiting on background jobs.
+
+The current C++ core still uses shared_ptr ownership outside the callback to
+manage sources/graphs, but the callback observes raw immutable RenderGraph
+pointers with a small hazard-pointer style handoff. That is the important
+boundary: non-realtime code owns lifetime; realtime code renders through stable
+pointers for the block.
+
+
+SoundtimeAudioCore C++ Core
+---------------------------
+
+SoundtimeAudioCore.h
+    Public C ABI used by Swift. It exposes:
+
+    - Engine create/destroy/reset.
+    - Source creation from planar float buffers or WAV bytes.
+    - Prepared track and segmented track publication.
+    - Play/pause/pause-at/seek/gain/ramp commands.
+    - Snapshot, clock samples, and meter samples.
+    - Realtime render entrypoints.
+    - Recording ring create/push/pop/reset/metrics.
+
+SoundtimeAudioCore.cpp
+    The core's internal model:
+
+    AudioSource
+        Owns either interleaved float samples or borrowed WAV byte metadata.
+
+    RenderSegment
+        Describes where a source segment appears in project output time, how
+        source frames map to output frames, and gain/fade values.
+
+    RenderTrack
+        A source plus segments and track gain.
+
+    RenderGraph
+        Immutable graph of project duration, channel count, sample rate, and
+        tracks.
+
+    SoundtimeAudioCoreEngine
+        Realtime state: atomics for frame index/playing/snapshot counters,
+        currentGraph raw pointer, lifetime ownership on the control side,
+        retired graph storage, SPSC command/clock/meter queues, transport ramps,
+        and per-track gain ramps.
+
+Command model
+    Non-realtime code pushes EngineCommand values into an SPSC queue. The render
+    callback drains commands at block boundaries. Commands are play, pause,
+    pauseAt, and seek.
+
+Graph publication
+    Non-realtime code builds a shared_ptr<RenderGraph>, then publish_graph swaps
+    it into currentGraphOwner/currentGraph under graphLifetimeMutex. Old graphs
+    move to retiredGraphs. The audio callback calls acquire_render_graph(),
+    stores renderGraphInUse, renders a block, then release_render_graph(). GC
+    can drop retired graphs that are no longer in use.
+
+Rendering
+    soundtime_audio_core_render_at_host_time clears outputs, processes commands,
+    renders each output frame by summing each track/segment, applies master
+    gain, transport gain, track gain ramps, segment gain, and splice fades, then
+    publishes meter/clock/timing samples. It updates frameIndex atomically and
+    stops at end of project.
+
+Recording ring
+    SoundtimeAudioCoreRecordingRing is a lock-free-ish planar ring used by
+    AudioInputRecorder. Input pushes into the ring; a non-realtime timer drains
+    chunks to Swift for waveform preview and file writing. Overflow increments a
+    dropped-frame counter instead of blocking.
+
+
+Editing Model
+-------------
+
+There are two related timeline edit types:
+
+AudioEditTimeline.swift
+    In-memory edit graph backed by a DecodedAudioBuffer. Useful when a track is
+    fully decoded or when an edit must render to a new DecodedAudioBuffer.
+
+AudioFileEditTimeline.swift
+    File-backed persistent edit graph. It stores source frame count, sample rate,
+    and segments that reference source frame ranges. It can be saved in
+    .soundtime projects and converted into playback segments for the realtime
+    engine.
+
+Segments
+    Both edit timelines model edited audio as ordered segments:
+
+    - sourceStartFrame.
+    - frameCount.
+    - gainStart/gainEnd.
+    - startsNewClip.
+
+This is the core non-destructive representation. Ripple delete removes segment
+ranges and shortens timelineFrameCount. Clear replaces a range with silence-like
+segments while preserving duration. Gain/fades split affected ranges and adjust
+segment gain endpoints. Split creates clip boundaries. Slip shifts source frame
+references while keeping output timing.
+
+Clip ranges
+    Clip ranges are derived from startsNewClip markers and normalized to the
+    current edited timeline length. Renderer clip boundaries and clip selection
+    use these ranges.
+
+File-backed waveform overview
+    AudioFileEditTimeline.waveformOverview(from:) projects source overviews
+    through the edit graph. If the timeline still aligns with the source, it can
+    update bins in place. If edits changed duration/order, it builds an edited
+    bin sequence from the segment list.
+
+Materialization
+    Some operations eventually need an actual DecodedAudioBuffer, for export,
+    clipboard, or compatibility. WorkspaceView schedules materialization and
+    refinement tasks, but the edit graph mutation should already be visible and
+    playable before those tasks finish.
+
+Delete vs clear
+    In current app behavior, pressing Delete/Backspace is intended to perform
+    ripple delete by default. Command-Delete clears/leaves a gap. That behavior
+    lives at the WorkspaceView command level and maps down to AudioFileEditTimeline
+    or AudioEditTimeline operations.
+
+
+Import And Waveform Generation
+------------------------------
+
+AudioImportPipeline.swift
+    High-level async import helpers for dropped files. WAV files can be previewed
+    quickly and fully decoded/refined later.
+
+WAVAudioDecoder.swift
+    Low-level WAV parser/decoder. It can:
+
+    - Inspect RIFF/WAVE headers.
+    - Build sparse previews directly from mapped file data.
+    - Decode PCM/float samples into DecodedAudioBuffer.
+    - Create WAVZeroCrossingProbe values for seek/edit snapping.
+
+WaveformOverview.swift
+    WaveformOverview is an array of bins. Each bin contains min, max, RMS, and
+    approximate low/mid/high energy. The renderer uses these for amplitude,
+    center density, spectral-ish styling, transient scoring, and glow.
+
+WaveformOverviewBuilder.swift
+    Builds high-resolution overviews from decoded buffers. The default target is
+    4,194,304 bins, clamped to the source frame count. It periodically yields
+    through ImportWorkBudget so playback can remain responsive.
+
+ImportWorkBudget.swift
+    Global scheduling/backoff helper for heavy import/refinement work. It tracks
+    whether playback is active, serializes exclusive heavy work, and adds small
+    per-work-class sleeps while audio is playing. This is a pragmatic guard
+    against background work stealing enough CPU to cause UI/audio glitches.
+
+Progressive import strategy
+    A dropped WAV should:
+
+    1. Show a sparse preview quickly.
+    2. Add/enable the track and playback graph early.
+    3. Continue preview refinement and full decode/mip building in the
+       background.
+    4. Publish new waveform versions without flicker.
+    5. Avoid stopping refinement merely because playback starts.
+
+
+Multi-Track Model
+-----------------
+
+Tracks are horizontal lanes. The left side is TrackControlView; the timeline lane
+is drawn in Metal. The track header contains:
+
+    - title.
+    - horizontal volume slider.
+    - solo button.
+    - mute button.
+    - record/microphone button.
+    - selected-track background/accent state.
+
+Solo/mute behavior
+    WorkspaceView computes effective audibility for both rendering and playback.
+    Solo should override mute for the soloed track's effective playback/visual
+    state while preserving the stored mute flag if solo is later turned off.
+    RealtimeCorePlaybackEngine updates track gains/mute/solo through immutable
+    graph/mix updates and short gain ramps to prevent clicks.
+
+Track layout synchronization
+    TimelineView publishes ResolvedTimelineTrackLayout to WorkspaceView so
+    WorkspaceView can lay out the left track controls with the same lane heights
+    and vertical scroll offset. Bugs in this boundary show up as waveform lanes
+    not matching track headers.
+
+
+Recording
+---------
+
+AudioInputRecorder.swift
+    Uses a HAL input AudioUnit. The input callback writes planar samples into
+    SoundtimeAudioCoreRecordingRing. A timer drains the ring into
+    AudioRecordingChunk values on the non-realtime side.
+
+StreamingWAVTakeWriter.swift
+    Streams recorded chunks to a WAV file.
+
+LiveRecordingWaveformAccumulator.swift
+    Builds a live waveform overview while recording.
+
+WorkspaceView recording flow
+    Clicking a track's mic button starts/stops recording for that track. While
+    recording:
+
+    - The mic button blinks.
+    - The playhead base color changes toward red.
+    - Incoming samples update waveform preview in real time.
+    - The same kind of playhead touch/glow visual language is reused for
+      incoming samples.
+    - Pressing Space or clicking the mic button stops recording.
+
+Recorded takes are owned source files under Application Support/Soundtime and
+must be tracked carefully for save, undo, and cleanup.
+
+
+Project Persistence
+-------------------
+
+SoundtimeProject.swift
+    JSON Codable project format. Current schema version is 3. It stores:
+
+    - tracks.
+    - window layout.
+    - master volume.
+    - timeline viewport.
+    - silence review state.
+    - schemaVersion.
+
+SoundtimeProject.Track stores:
+
+    - id.
+    - editGroupID.
+    - name.
+    - filePath.
+    - volume/mute/solo.
+    - AudioFileEditTimeline.PersistentState.
+
+SoundtimeProjectStore
+    Provides load, loadRecoveringAutosave, save, autosave, recent projects, last
+    project, and schema migration hooks. Autosaves live under:
+
+    ~/Library/Application Support/Soundtime/Autosaves
+
+Paths
+    Project track filePath values are stored as strings. WorkspaceView contains
+    recovery logic for owned recordings/materialized files and for resolving
+    source files near a project URL.
+
+Window restoration
+    Window layout is saved into the project and applied on load. Main window
+    close also asks WorkspaceView to persist current layout.
+
+
+Export And Podcast Processing
+-----------------------------
+
+WAVFileWriter.swift
+    Writes 16-bit PCM WAV in chunks with optional progress callbacks.
+
+CompressedAudioFileWriter.swift
+    Uses AVFoundation to export m4a/aac/mp3 from DecodedAudioBuffer.
+
+PodcastExportProcessor.swift
+    Provides simple podcast-oriented mastering helpers:
+
+    - approximate integrated loudness.
+    - approximate true peak.
+    - gain toward target LUFS.
+    - true-peak limiting by amplitude clamp.
+
+WorkspaceView export commands
+    Current commands include general export, WAV mixdown, selected region export,
+    mixdown plus stems, and stems. Export snapshots are built from ProjectTrack
+    state and then rendered/written outside the realtime callback.
+
+
+Silence And Dead-Air Review
+---------------------------
+
+AudioSilenceAnalyzer.swift
+    Detects silence using peak amplitude threshold, minimum duration, padding,
+    and room-tone handle duration. The default podcast cleanup config uses:
+
+    - threshold: -44 dB.
+    - minimum silence: 0.45 s.
+    - padding: 0.09 s.
+    - room-tone handle: 0.12 s.
+
+WorkspaceView dead-air flow
+    WorkspaceView can build DeadAirReviewCandidate values, publish candidate
+    regions to the renderer, step through candidates, audition, accept/reject,
+    accept all high-confidence candidates, and save review state in the project.
+
+This is still heuristic, not a speech-aware editor. A future podcast-grade
+version should combine signal analysis, transcript boundaries, speaker context,
+and user-adjustable review confidence.
+
+
+Agent Command Bar
+-----------------
+
+AgentCommandBarView.swift
+    AppKit text-entry overlay at the bottom of the app. AppKit is the right tool
+    for text input, focus, selection, IME, copy/paste, accessibility, and text
+    layout. Metal should not own normal text editing.
+
+AgentCommandController.swift
+    Early command-controller and registry. It exposes typed capabilities such as
+    delete selection, clear selection, gain, fade, split, normalize, delete
+    silence, zoom to region, and playback. The current resolver is simple string
+    matching. The important architectural boundary is that future agents should
+    call typed app commands, not simulate fragile mouse clicks as the source of
+    truth.
+
+Agent command flow:
+
+    User prompt
+        -> AgentCommandBarView.submit
+        -> AgentCommandController.submit
+        -> optional AgentResolvedCommand
+        -> WorkspaceView.performAgentCommand
+        -> normal app command path
+
+Future agent work should extend the command registry into a real capability
+schema with arguments, validation, previews, undo grouping, and explainability.
+
+
+Diagnostics And Performance Instrumentation
+-------------------------------------------
+
+SoundtimeDiagnostics.swift
+    Central event/trace collector. It records warnings/errors/info across
+    categories:
+
+    - audio.
+    - renderer.
+    - import/export.
+    - project.
+    - interaction.
+    - diagnostics.
+
+It records frame stats, audio core snapshots, and main-thread stalls. It can
+write traces when significant events occur.
+
+SoundtimeMainThreadStallMonitor.swift
+    Periodically pings the main thread and records stalls.
+
+FrameRateHistoryView.swift
+    Small Metal FPS sparkline in the main window. It uses glowing line rendering
+    and danger coloring for low FPS.
+
+PerformanceDashboardWindowController.swift
+    Separate performance dashboard window. It displays larger FPS/CPU graphs,
+    counters, recent diagnostics, and trace export controls. Only one dashboard
+    should be shown per project window.
+
+LoudnessMeterView.swift
+    GPU-rendered output loudness meter with left/right or mono display, smoothing,
+    peak values, and red clipping region.
+
+TimelineFrameStats
+    The renderer's per-frame metrics are the connective tissue between rendering
+    code, the debug UI, diagnostics, and perf gates.
+
+StabilityReportWriter.swift
+    Writes JSON reports for smoke/perf harnesses. perf-gate.sh checks for these
+    when SOUNDTIME_STABILITY_REPORT_DIR is set.
+
+
+Tests And Stability Harnesses
+-----------------------------
+
+Unit tests
+    Tests/SoundtimeAudioCoreTests/SoundtimeAudioCoreTests.swift is focused on
+    the realtime C++ audio core. It covers:
+
+    - Transport commands.
+    - Interleaved and planar rendering.
+    - Meter samples.
+    - Prepared source publication.
+    - WAV byte source rendering.
+    - Transport ramp sample accuracy.
+    - Sample-synchronous prepared tracks.
+    - Duplicate source phase correctness.
+    - Segmented edit graph playback.
+    - Splice fades.
+    - Mixed sample rates.
+    - Track updates without transport reset.
+    - Gain ramps and many gain ramps.
+    - Graph/source lifetime during overlapping render blocks.
+    - Pause-at-frame behavior.
+    - Clock samples.
+    - Recording ring behavior and overflow.
+
+Smoke harnesses
+    The app target contains smoke harnesses for recording, diagnostics, project
+    edit round trip, edit graph, edit preview, realtime graph publication,
+    timeline UX, and timeline performance.
+
+What this gives us
+    These tests are unusually valuable for a young audio app because they guard
+    sample sync, callback graph lifetime, and UI/performance regressions.
+
+Remaining blind spots
+    Important future tests include:
+
+    - AppKit UI automation for drag selection, seek, play/pause, track controls,
+      text entry, and project window behavior.
+    - Golden-image or pixel-summary tests for timeline rendering states.
+    - Stress tests with hundreds of tracks and long sources.
+    - Explicit no-allocation/no-lock guards in the audio callback.
+    - Thread sanitizer runs for non-realtime shared state.
+    - Audio glitch detectors around callback deadline misses and underruns.
+    - Project corpus round trips over real user projects.
+
+
+Important Design Rationale
+--------------------------
+
+Why AppKit plus Metal?
+    AppKit is good for windows, menus, text input, controls, accessibility, and
+    native focus behavior. Metal is good for drawing many waveform bins and
+    expressive visual effects at high frame rates. Soundtime uses both: normal
+    controls are AppKit, timeline visuals and custom graphs/meters are Metal.
+
+Why immutable render state?
+    The renderer should not depend on mutable WorkspaceView state. A render can
+    happen on a queue after the main thread has moved on. Immutable snapshots
+    reduce race conditions and make it clearer what data the renderer is allowed
+    to use.
+
+Why segment edit graphs?
+    Large audio edits should not require immediately reassembling a huge buffer.
+    Segment graphs let the app represent edits cheaply, play them through the
+    realtime engine, and update the UI optimistically. Materialized files/buffers
+    can be produced later for export or compatibility.
+
+Why a C++ realtime core?
+    Swift/AppKit are not appropriate inside a hard realtime audio callback.
+    C++ lets the core use atomics, fixed queues, stable raw pointers, and simple
+    memory ownership rules. Swift prepares data around the callback; C++ renders
+    the callback.
+
+Why progressive waveform generation?
+    Large files should appear quickly. Sparse previews give immediate feedback,
+    while high-resolution overviews and GPU mip buffers are built in background
+    steps. The hard part is making transitions visually smooth and ensuring
+    playback/interaction remain responsive while refinement continues.
+
+
+High-Risk Areas For New Engineers
+---------------------------------
+
+Realtime audio callback
+    Never add Swift closures, AppKit calls, locks, allocation, file I/O, logging,
+    or shared_ptr copies in the render callback path. If a change touches
+    SoundtimeAudioCore.cpp around render_at_host_time, graph acquisition,
+    command queues, or source lifetime, run swift test and the realtime graph
+    smoke harness at minimum.
+
+WorkspaceView size and coupling
+    WorkspaceView is powerful but too large. Many bugs come from state updates
+    being duplicated across project tracks, render tracks, playback tracks,
+    selection state, undo snapshots, and project persistence. When changing edit
+    behavior, trace all of those flows.
+
+Timeline lane layout
+    The left track controls and Metal timeline must share the same resolved
+    TimelineTrackLayout. If one side uses stale bounds or track counts, the UI
+    appears misaligned and interaction can target the wrong track.
+
+Selection coordinate conversion
+    Selection uses normalized progress, but edit operations often need track
+    local duration/frame counts. After ripple deletes, per-track durations can
+    change. Always be explicit about whether a selection is display/project
+    progress or edit/track-local progress.
+
+Waveform versioning
+    Async import/edit refinement can publish stale waveform results. Track import
+    IDs, edit revisions, and waveformVersion values exist to reject stale work
+    and force renderer cache invalidation. Bugs here show up as coarse flashes,
+    missing waveforms, or edits drawing the wrong waveform.
+
+Audio device changes
+    Changing output devices should invalidate and reconfigure the output device
+    while preserving the engine graph and transport state. This touches
+    AudioDevicePreferences, WorkspaceView notification handling,
+    RealtimeCorePlaybackEngine.refreshOutputDevice, and AudioUnitOutputDevice.
+
+Owned source file cleanup
+    Recordings and materialized edits can be app-owned files. Undo, save-as,
+    project close, and replacement cleanup must not delete files still referenced
+    by current tracks or undo history.
+
+
+Suggested Refactors And Improvements
+------------------------------------
+
+1. Split WorkspaceView into controllers
+   Candidate controllers:
+
+   - ProjectDocumentController for save/load/autosave/recent files.
+   - TrackListController for track controls and selection.
+   - EditCommandController for cut/copy/paste/delete/gain/fade/split.
+   - PlaybackCoordinator for playback graph publication and visual sync.
+   - ImportCoordinator for progressive import/refinement.
+   - ExportCoordinator.
+   - RecordingCoordinator.
+   - DeadAirReviewController.
+   - DiagnosticsCoordinator.
+
+2. Split TimelineRenderer into passes
+   Candidate files:
+
+   - TimelineRendererCore.
+   - WaveformRenderer.
+   - WaveformMipCache.
+   - WaveformShaderBufferStore.
+   - SelectionRenderer.
+   - PlayheadRenderer.
+   - DeletionEffectRenderer.
+   - TransientParticleRenderer.
+   - TimelineRulerRenderer.
+
+3. Make edit scopes explicit command objects
+   Many commands share logic for track scope, edit group scope, time scope, and
+   active selection target. A typed EditCommand with validation, preview, apply,
+   and undo payload would reduce accidental behavior drift.
+
+4. Formalize agent capabilities
+   Replace simple string matching with typed commands that include arguments,
+   validation, preview, execution, undo grouping, and user-visible explanations.
+
+5. Finish performance architecture toward hundreds of tracks
+   Continue pushing waveform data into long-lived GPU buffers/textures, batching
+   visible tracks, limiting upload budgets, virtualizing AppKit track controls,
+   and adding perf gates that fail on frame-time regressions.
+
+6. Build a project corpus
+   Keep real .soundtime fixtures with multi-track, long-file, edited, muted,
+   soloed, recorded, and dead-air-review states. Round-trip and smoke-test them.
+
+7. Add visual regression tests
+   Metal rendering can regress silently. Pixel summaries are a start; golden
+   screenshots for canonical timeline states would catch missing waveforms,
+   wrong lane heights, broken FPS graphs, and selection lag.
+
+8. Harden audio callback instrumentation
+   Add callback allocation/lock detection in debug builds if possible. Surface
+   underruns, deadline misses, dropped commands, render max time, and meter queue
+   drops prominently in diagnostics.
+
+9. Expand import format support
+   Timeline drag/drop recognizes several audio extensions, but the robust decode
+   path is currently WAV-centric. Non-WAV import should use AVFoundation or a
+   dedicated decoder and still produce the same ProjectTrack/source abstractions.
+
+10. Document invariants in code
+    The most important invariants should be written near the code:
+
+    - Selection progress coordinate space.
+    - AudioFileEditTimeline segment coalescing rules.
+    - Realtime graph publication lifetime rules.
+    - Waveform version/cache invalidation rules.
+    - Owned source file cleanup rules.
+
+
+Practical Debugging Map
+-----------------------
+
+Waveform not visible
+    Check:
+
+    - WorkspaceView.timelineRenderTracks().
+    - TimelineRenderState.hasWaveforms and duration.
+    - Track waveformVersion and waveformOverview presence.
+    - TimelineView currentRenderTracks and trackLayout.
+    - TimelineRenderer.shouldRenderShaderWaveforms().
+    - shaderWaveformsAreDrawable() and waveform mip residency.
+    - Frame stats: renderer mode, GPU draw count, buffer counts.
+
+Seek/click position wrong
+    Check:
+
+    - TimelineView.progress(for:) and preciseProgress(for:).
+    - Viewport start/duration.
+    - Fisheye inverse mapping if the feature is enabled.
+    - TimelineSelection.trackID and active track index.
+    - WorkspaceView.seek(to:) and playbackController.seek.
+    - Track duration vs project duration conversions.
+
+Playback silent or out of sync
+    Check:
+
+    - projectPlaybackTracks().
+    - RealtimeCorePlaybackEngine.prepareProjectTracks().
+    - Project duration/sample-rate calculation.
+    - Mute/solo effective gain.
+    - Prepared source creation and mapped WAV compatibility.
+    - C++ RenderGraph track/segment outputStartFrame values.
+    - SoundtimeAudioCoreTests for duplicate phase and mixed sample rate.
+
+UI freezes during edit
+    Check:
+
+    - Synchronous calls after edit graph mutation in WorkspaceView.
+    - Materialization/refinement accidentally running on main thread.
+    - WaveformOverviewBuilder loops without ImportWorkBudget yields.
+    - Renderer cache rebuild/upload on the render path.
+    - Diagnostics main-thread stall events.
+
+Track headers out of sync with waveform lanes
+    Check:
+
+    - TimelineTrackLayout.resolved().
+    - TimelineView.updateTrackLayoutForCurrentBounds().
+    - onTrackLaneLayoutChanged callback.
+    - WorkspaceView.updateTrackLaneLayout/layoutTrackControlViews.
+    - Track count differences between controls and render state.
+
+Audio output device preference ignored
+    Check:
+
+    - AudioDevicePreferences notification fires.
+    - WorkspaceView.handleAudioDevicePreferencesChanged sees "output".
+    - PlaybackEngine.refreshOutputDevice implementation is active.
+    - RealtimeCorePlaybackEngine.configureOutputDevice.
+    - AudioUnitOutputDevice configuredOutputDeviceID and reset path.
+
+
+Glossary
+--------
+
+Project progress
+    A normalized 0...1 position across the whole project duration.
+
+Track-local progress
+    A normalized 0...1 position across one edited track's current duration.
+
+Viewport progress
+    A normalized 0...1 position across the visible timeline rectangle.
+
+WaveformOverview
+    Display-oriented summary of audio samples as min/max/RMS/energy bins.
+
+Mip level
+    Downsampled waveform overview used for a particular zoom level.
+
+Render graph
+    Immutable C++ data structure used by the audio callback to render tracks.
+
+Edit graph
+    Segment list describing how source audio maps to edited timeline audio.
+
+Ripple delete
+    Delete selected audio/time and close the gap by moving later audio earlier.
+
+Clear / leave gap
+    Remove the sound in a range while keeping the timeline duration unchanged.
+
+Materialization
+    Rendering an edit graph into a concrete audio file or DecodedAudioBuffer.
+
+Transient particle
+    Visual particle burst spawned near high-energy transients during playback.
+
+Playhead touch effect
+    The glow/height/light response when the playhead passes waveform samples.
+
+
+File Guide
+----------
+
+Core app/window files:
+
+    Sources/Soundtime/main.swift
+    Sources/Soundtime/AppDelegate.swift
+    Sources/Soundtime/MainWindowController.swift
+    Sources/Soundtime/WorkspaceViewController.swift
+    Sources/Soundtime/WorkspaceView.swift
+
+Timeline/rendering:
+
+    Sources/Soundtime/TimelineView.swift
+    Sources/Soundtime/TimelineRenderer.swift
+    Sources/Soundtime/TimelineRenderState.swift
+    Sources/Soundtime/TimelineViewport.swift
+    Sources/Soundtime/TimelineSelection.swift
+    Sources/Soundtime/TimelineTrackLayout.swift
+    Sources/Soundtime/TimelineTrimRange.swift
+    Sources/Soundtime/TimelineClipBoundaryTrim.swift
+    Sources/Soundtime/TimelineDisplayLink.swift
+    Sources/Soundtime/TimelineMetalLayerView.swift
+
+Audio/playback:
+
+    Sources/Soundtime/PlaybackEngine.swift
+    Sources/Soundtime/PlaybackEngineFactory.swift
+    Sources/Soundtime/RealtimeCorePlaybackEngine.swift
+    Sources/Soundtime/RealtimeAudioCore.swift
+    Sources/Soundtime/RealtimeAudioOutputDevice.swift
+    Sources/Soundtime/AudioUnitOutputDevice.swift
+    Sources/Soundtime/HybridPlaybackEngine.swift
+    Sources/Soundtime/AudioPlaybackController.swift
+    Sources/Soundtime/MultitrackPlaybackController.swift
+    Sources/SoundtimeAudioCore/SoundtimeAudioCore.cpp
+    Sources/SoundtimeAudioCore/include/SoundtimeAudioCore.h
+
+Editing:
+
+    Sources/Soundtime/AudioEditTimeline.swift
+    Sources/Soundtime/AudioFileEditTimeline.swift
+    Sources/Soundtime/AudioSilenceAnalyzer.swift
+    Sources/Soundtime/AudioZeroCrossingIndex.swift
+    Sources/Soundtime/WAVZeroCrossingProbe.swift
+
+Import/waveforms:
+
+    Sources/Soundtime/AudioImportPipeline.swift
+    Sources/Soundtime/WAVAudioDecoder.swift
+    Sources/Soundtime/WAVFileInfo.swift
+    Sources/Soundtime/DecodedAudioBuffer.swift
+    Sources/Soundtime/WaveformOverview.swift
+    Sources/Soundtime/WaveformOverviewBuilder.swift
+    Sources/Soundtime/ImportWorkBudget.swift
+
+Recording:
+
+    Sources/Soundtime/AudioInputRecorder.swift
+    Sources/Soundtime/StreamingWAVTakeWriter.swift
+    Sources/Soundtime/LiveRecordingWaveformAccumulator.swift
+
+Project/export:
+
+    Sources/Soundtime/SoundtimeProject.swift
+    Sources/Soundtime/WAVFileWriter.swift
+    Sources/Soundtime/CompressedAudioFileWriter.swift
+    Sources/Soundtime/PodcastExportProcessor.swift
+    Sources/Soundtime/ExportProgressOverlayView.swift
+
+Controls/UI:
+
+    Sources/Soundtime/TrackControlView.swift
+    Sources/Soundtime/TrackControlsViewportView.swift
+    Sources/Soundtime/AddTrackButton.swift
+    Sources/Soundtime/TransportControlPanelView.swift
+    Sources/Soundtime/VolumeControlView.swift
+    Sources/Soundtime/LoudnessMeterView.swift
+    Sources/Soundtime/FrameRateHistoryView.swift
+    Sources/Soundtime/GainEffectOverlayView.swift
+    Sources/Soundtime/AudioDevicePreferences.swift
+    Sources/Soundtime/AudioDevicePreferencesWindowController.swift
+
+Agent:
+
+    Sources/Soundtime/AgentCommandBarView.swift
+    Sources/Soundtime/AgentCommandController.swift
+
+Diagnostics/perf:
+
+    Sources/Soundtime/SoundtimeDiagnostics.swift
+    Sources/Soundtime/SoundtimeMainThreadStallMonitor.swift
+    Sources/Soundtime/PerformanceDashboardButton.swift
+    Sources/Soundtime/PerformanceDashboardWindowController.swift
+    Sources/Soundtime/MetalPixelSmokeSummary.swift
+    Sources/Soundtime/StabilityReportWriter.swift
+    Sources/Soundtime/TimelinePerfBaselineHarness.swift
+    Sources/Soundtime/TimelineUXSmokeHarness.swift
+    Sources/Soundtime/RealtimeGraphPublishSmokeHarness.swift
+    Sources/Soundtime/DiagnosticsSmokeHarness.swift
+    Sources/Soundtime/RecordingSmokeHarness.swift
+    Sources/Soundtime/EditGraphSmokeHarness.swift
+    Sources/Soundtime/ProjectEditRoundTripSmokeHarness.swift
+
+
+Onboarding Path For A New Engineer
+----------------------------------
+
+1. Read README.md and Package.swift.
+2. Read main.swift, AppDelegate.swift, MainWindowController.swift.
+3. Skim WorkspaceView.swift using the function list, then read the areas for the
+   feature you are changing.
+4. Read TimelineView.swift for input/render scheduling.
+5. Read TimelineRenderState.swift and TimelineRenderer.swift around render(to:),
+   encodeTimeline, and drawShaderWaveforms.
+6. Read PlaybackEngine.swift, RealtimeCorePlaybackEngine.swift, and
+   RealtimeAudioCore.swift.
+7. Read SoundtimeAudioCore.h and SoundtimeAudioCore.cpp around graph
+   publication and render_at_host_time.
+8. Read AudioFileEditTimeline.swift and AudioEditTimeline.swift before touching
+   edits.
+9. Run swift test and scripts/perf-gate.sh before/after high-risk changes.
+10. Use the performance dashboard and diagnostics trace when investigating frame
+    drops, stalls, underruns, or missing render output.
+
+The codebase is already unusually ambitious for a young editor. The main thing
+to preserve is the separation between realtime audio, GPU rendering, and
+background work. Most regressions happen when one layer reaches too far into
+another or when an expensive operation sneaks back onto the interaction/render
+path.
