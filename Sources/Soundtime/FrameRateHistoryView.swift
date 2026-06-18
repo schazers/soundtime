@@ -3,23 +3,30 @@ import Metal
 import QuartzCore
 
 final class FrameRateHistoryView: TimelineMetalLayerView {
+    enum Metric {
+        case framesPerSecond
+        case cpuUsage
+    }
+
     private struct HistoryVertex {
         var position: SIMD2<Float>
     }
 
     private struct HistorySample {
         var timestamp: Float
-        var framesPerSecond: Float
+        var value: Float
     }
 
     private struct HistoryUniforms {
         var viewport: SIMD4<Float>
         var timing: SIMD4<Float>
         var colors: SIMD4<Float>
+        var danger: SIMD4<Float>
     }
 
     private let historyDuration: CFTimeInterval = 15
     private let historyExitDuration: CFTimeInterval = 1.25
+    private let staleSampleHoldDuration: Float = 0.75
     private let maximumSampleCount = 192
     private let renderRefreshRate: TimeInterval = 30
     private let sampleLock = NSLock()
@@ -28,6 +35,8 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
     private var displayTimer: Timer?
     private var commandQueue: MTLCommandQueue?
     private var pipelineState: MTLRenderPipelineState?
+    private let metric: Metric
+    private var isLiveResizePaused = false
     private var vertices: [HistoryVertex] = [
         HistoryVertex(position: SIMD2<Float>(0, 0)),
         HistoryVertex(position: SIMD2<Float>(1, 0)),
@@ -42,11 +51,19 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
     }
 
     override init(frame frameRect: NSRect = .zero, device: MTLDevice? = MTLCreateSystemDefaultDevice()) {
+        metric = .framesPerSecond
+        super.init(frame: frameRect, device: device)
+        configureHistoryRenderer()
+    }
+
+    init(metric: Metric, frame frameRect: NSRect = .zero, device: MTLDevice? = MTLCreateSystemDefaultDevice()) {
+        self.metric = metric
         super.init(frame: frameRect, device: device)
         configureHistoryRenderer()
     }
 
     required init?(coder: NSCoder) {
+        metric = .framesPerSecond
         super.init(coder: coder)
         configureHistoryRenderer()
     }
@@ -55,12 +72,35 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
         super.viewDidMoveToWindow()
 
         if window == nil {
-            displayTimer?.invalidate()
-            displayTimer = nil
+            stopDisplayTimer()
         } else {
             startDisplayTimerIfNeeded()
             render()
         }
+    }
+
+    override var isHidden: Bool {
+        didSet {
+            if isHidden {
+                stopDisplayTimer()
+            } else {
+                startDisplayTimerIfNeeded()
+                render()
+            }
+        }
+    }
+
+    override func viewWillStartLiveResize() {
+        super.viewWillStartLiveResize()
+        isLiveResizePaused = true
+        stopDisplayTimer()
+    }
+
+    override func viewDidEndLiveResize() {
+        super.viewDidEndLiveResize()
+        isLiveResizePaused = false
+        startDisplayTimerIfNeeded()
+        render()
     }
 
     override func layout() {
@@ -69,10 +109,18 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
     }
 
     func display(frameStats: TimelineFrameStats) {
+        display(value: Float(max(frameStats.framesPerSecond, 0)))
+    }
+
+    func display(cpuPercent: Double) {
+        display(value: Float(max(cpuPercent, 0)))
+    }
+
+    private func display(value: Float) {
         let now = relativeTimestamp()
         let sample = HistorySample(
             timestamp: now,
-            framesPerSecond: Float(max(frameStats.framesPerSecond, 0))
+            value: value
         )
 
         sampleLock.lock()
@@ -80,11 +128,17 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
         trimSamples(now: now)
         sampleLock.unlock()
 
+        startDisplayTimerIfNeeded()
         render()
     }
 
     private func startDisplayTimerIfNeeded() {
-        guard displayTimer == nil else {
+        guard
+            displayTimer == nil,
+            window != nil,
+            !isLiveResizePaused,
+            !isHiddenOrHasHiddenAncestor
+        else {
             return
         }
 
@@ -98,6 +152,11 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
         }
         displayTimer = timer
         RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stopDisplayTimer() {
+        displayTimer?.invalidate()
+        displayTimer = nil
     }
 
     private func configureHistoryRenderer() {
@@ -142,6 +201,8 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
 
     private func render() {
         guard
+            !isLiveResizePaused,
+            !isHiddenOrHasHiddenAncestor,
             let renderTarget = makeTimelineRenderTarget(),
             let commandQueue,
             let pipelineState,
@@ -158,15 +219,16 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
                 Float(renderTarget.viewportSize.width),
                 Float(renderTarget.viewportSize.height),
                 renderTarget.backingScale,
-                maximumFramesPerSecond(for: renderSamples)
+                maximumValue(for: renderSamples)
             ),
             timing: SIMD4<Float>(
                 now,
                 Float(historyDuration),
                 Float(renderSamples.count),
-                renderSamples.last?.framesPerSecond ?? 0
+                renderSamples.last?.value ?? 0
             ),
-            colors: SIMD4<Float>(0.0, 0.78, 0.84, 1.0)
+            colors: baseColor,
+            danger: dangerUniform(for: renderSamples)
         )
 
         encoder.setRenderPipelineState(pipelineState)
@@ -181,7 +243,7 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
             if let baseAddress = bytes.baseAddress, !bytes.isEmpty {
                 encoder.setFragmentBytes(baseAddress, length: bytes.count, index: 0)
             } else {
-                var emptySample = HistorySample(timestamp: now, framesPerSecond: 0)
+                var emptySample = HistorySample(timestamp: now, value: 0)
                 encoder.setFragmentBytes(&emptySample, length: MemoryLayout<HistorySample>.stride, index: 0)
             }
         }
@@ -203,15 +265,19 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
                 if renderSamples.count == 1 {
                     renderSamples.insert(HistorySample(
                         timestamp: now - Float(historyDuration),
-                        framesPerSecond: latestSample.framesPerSecond
+                        value: latestSample.value
                     ), at: 0)
                 }
-                let staleAge = now - latestSample.timestamp
-                let displayedFramesPerSecond = staleAge > 0.75 ? 0 : latestSample.framesPerSecond
-                renderSamples.append(HistorySample(
-                    timestamp: now,
-                    framesPerSecond: displayedFramesPerSecond
-                ))
+                // The timeline display link intentionally sleeps while idle. Hold
+                // the most recent active value briefly so the graph does not snap
+                // to zero, then let it age out as historical data instead of
+                // pretending stale FPS is the current frame rate forever.
+                if now - latestSample.timestamp <= staleSampleHoldDuration {
+                    renderSamples.append(HistorySample(
+                        timestamp: now,
+                        value: latestSample.value
+                    ))
+                }
             }
         }
 
@@ -230,12 +296,38 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
         }
     }
 
-    private func maximumFramesPerSecond(for samples: [HistorySample]) -> Float {
-        let maximumObservedFPS = samples.reduce(Float(0)) { result, sample in
-            max(result, sample.framesPerSecond)
+    private func maximumValue(for samples: [HistorySample]) -> Float {
+        let maximumObservedValue = samples.reduce(Float(0)) { result, sample in
+            max(result, sample.value)
         }
-        let paddedMaximum = ceil(max(maximumObservedFPS, 144) / 30) * 30
-        return min(max(paddedMaximum, 144), 240)
+
+        switch metric {
+        case .framesPerSecond:
+            let paddedMaximum = ceil(max(maximumObservedValue, 144) / 30) * 30
+            return min(max(paddedMaximum, 144), 240)
+        case .cpuUsage:
+            let paddedMaximum = ceil(max(maximumObservedValue, 100) / 50) * 50
+            return min(max(paddedMaximum, 100), 1_000)
+        }
+    }
+
+    private var baseColor: SIMD4<Float> {
+        switch metric {
+        case .framesPerSecond:
+            return SIMD4<Float>(0.0, 0.78, 0.84, 1.0)
+        case .cpuUsage:
+            return SIMD4<Float>(0.88, 0.91, 0.93, 1.0)
+        }
+    }
+
+    private func dangerUniform(for samples: [HistorySample]) -> SIMD4<Float> {
+        let maximumRenderedValue = maximumValue(for: samples)
+        switch metric {
+        case .framesPerSecond:
+            return SIMD4<Float>(1, 60, 80, 60)
+        case .cpuUsage:
+            return SIMD4<Float>(0, 0, 1, max(maximumRenderedValue / 4, 25))
+        }
     }
 
     private func relativeTimestamp() -> Float {
@@ -310,15 +402,16 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
         ]
         var samples = inputSamples
             .prefix(192)
-            .map { HistorySample(timestamp: $0.timestamp, framesPerSecond: $0.framesPerSecond) }
+            .map { HistorySample(timestamp: $0.timestamp, value: $0.framesPerSecond) }
         if samples.isEmpty {
-            samples.append(HistorySample(timestamp: now, framesPerSecond: 0))
+            samples.append(HistorySample(timestamp: now, value: 0))
         }
-        let maxFPS = samples.reduce(Float(144)) { max($0, $1.framesPerSecond) }
+        let maxFPS = samples.reduce(Float(144)) { max($0, $1.value) }
         var uniforms = HistoryUniforms(
             viewport: SIMD4<Float>(Float(width), Float(height), 1, min(max(ceil(maxFPS / 30) * 30, 144), 240)),
-            timing: SIMD4<Float>(now, 15, Float(samples.count), samples.last?.framesPerSecond ?? 0),
-            colors: SIMD4<Float>(0.0, 0.78, 0.84, 1.0)
+            timing: SIMD4<Float>(now, 15, Float(samples.count), samples.last?.value ?? 0),
+            colors: SIMD4<Float>(0.0, 0.78, 0.84, 1.0),
+            danger: SIMD4<Float>(1, 60, 80, 60)
         )
 
         encoder.setRenderPipelineState(pipelineState)
@@ -353,13 +446,14 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
 
     struct HistorySample {
         float timestamp;
-        float framesPerSecond;
+        float value;
     };
 
     struct HistoryUniforms {
         float4 viewport;
         float4 timing;
         float4 colors;
+        float4 danger;
     };
 
     struct RasterizedVertex {
@@ -402,13 +496,16 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
         return 1.0 - ((now - sample.timestamp) / max(duration, 0.001));
     }
 
-    static float sample_y(HistorySample sample, float maxFPS, float bottom, float top) {
-        float normalizedFPS = clamp(sample.framesPerSecond / max(maxFPS, 1.0), 0.0, 1.0);
-        return mix(bottom, top, normalizedFPS);
+    static float sample_y(HistorySample sample, float maxValue, float bottom, float top) {
+        float normalizedValue = clamp(sample.value / max(maxValue, 1.0), 0.0, 1.0);
+        return mix(bottom, top, normalizedValue);
     }
 
-    static float fps_danger(HistorySample sample) {
-        return 1.0 - smoothstep(60.0, 80.0, sample.framesPerSecond);
+    static float sample_danger(HistorySample sample, float4 danger) {
+        if (danger.x < 0.5) {
+            return 0.0;
+        }
+        return 1.0 - smoothstep(danger.y, danger.z, sample.value);
     }
 
     fragment float4 frame_rate_history_fragment(
@@ -419,7 +516,7 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
         float2 uv = in.uv;
         float width = max(uniforms.viewport.x, 1.0);
         float height = max(uniforms.viewport.y, 1.0);
-        float maxFPS = max(uniforms.viewport.w, 1.0);
+        float maxValue = max(uniforms.viewport.w, 1.0);
         float now = uniforms.timing.x;
         float duration = max(uniforms.timing.y, 0.001);
         uint sampleCount = min(uint(max(uniforms.timing.z, 0.0)), 192u);
@@ -433,11 +530,13 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
         color = mix(color, float3(0.082, 0.092, 0.096), background);
 
         float gridAlpha = 0.0;
-        for (float fps = 60.0; fps < maxFPS + 1.0; fps += 60.0) {
-            float y = mix(bottom, top, clamp(fps / maxFPS, 0.0, 1.0));
+        float gridStep = max(uniforms.danger.w, 1.0);
+        for (float value = gridStep; value < maxValue + 1.0; value += gridStep) {
+            float y = mix(bottom, top, clamp(value / maxValue, 0.0, 1.0));
             gridAlpha += line_alpha(uv.y, y, 0.0013) * background * 0.30;
         }
-        color = mix(color, float3(0.25, 0.34, 0.36), clamp(gridAlpha, 0.0, 1.0));
+        float3 baseGraphColor = clamp(uniforms.colors.rgb, float3(0.0), float3(1.0));
+        color = mix(color, baseGraphColor * 0.34, clamp(gridAlpha, 0.0, 1.0));
 
         float aspect = width / height;
         float2 scaledUV = float2(uv.x * aspect, uv.y);
@@ -461,8 +560,8 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
                     continue;
                 }
 
-                float y0 = sample_y(previousSample, maxFPS, bottom, top);
-                float y1 = sample_y(currentSample, maxFPS, bottom, top);
+                float y0 = sample_y(previousSample, maxValue, bottom, top);
+                float y1 = sample_y(currentSample, maxValue, bottom, top);
                 float2 p0 = float2(x0 * aspect, y0);
                 float2 p1 = float2(x1 * aspect, y1);
                 float distance = segment_distance(scaledUV, p0, p1);
@@ -470,7 +569,7 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
                 float glowWidth = 7.5 / height;
                 float segmentLine = (1.0 - smoothstep(lineWidth, lineWidth + 1.4 / height, distance)) * edgeFade;
                 float segmentGlow = (1.0 - smoothstep(lineWidth, glowWidth, distance)) * edgeFade;
-                float danger = max(fps_danger(previousSample), fps_danger(currentSample));
+                float danger = max(sample_danger(previousSample, uniforms.danger), sample_danger(currentSample, uniforms.danger));
                 line = max(line, segmentLine);
                 glow = max(glow, segmentGlow);
                 lineDanger = max(lineDanger, segmentLine * danger);
@@ -487,27 +586,27 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
 
             HistorySample latestSample = samples[sampleCount - 1u];
             float latestX = mix(left, right, sample_x(latestSample, now, duration));
-            float latestY = sample_y(latestSample, maxFPS, bottom, top);
+            float latestY = sample_y(latestSample, maxValue, bottom, top);
             latestDot = (1.0 - smoothstep(2.0 / height, 6.0 / height, distance(scaledUV, float2(latestX * aspect, latestY)))) * edgeFade;
-            latestDanger = fps_danger(latestSample);
+            latestDanger = sample_danger(latestSample, uniforms.danger);
         }
 
         float lineDangerAmount = clamp(lineDanger / max(line, 0.0001), 0.0, 1.0);
         float glowDangerAmount = clamp(glowDanger / max(glow, 0.0001), 0.0, 1.0);
-        float3 calmGlowColor = float3(0.08, 0.70, 0.86);
+        float3 calmGlowColor = baseGraphColor * 0.82;
         float3 dangerGlowColor = float3(1.0, 0.13, 0.08);
         float3 glowColor = mix(calmGlowColor, dangerGlowColor, glowDangerAmount);
-        float3 calmLineColor = mix(float3(0.28, 0.82, 0.86), float3(0.94, 0.98, 0.99), line * 0.45);
+        float3 calmLineColor = mix(baseGraphColor * 0.82, float3(0.98, 0.99, 1.0), line * 0.45);
         float3 dangerLineColor = mix(float3(0.96, 0.20, 0.12), float3(1.0, 0.62, 0.50), line * 0.30);
         float3 lineColor = mix(calmLineColor, dangerLineColor, lineDangerAmount);
         float3 latestDotColor = mix(float3(0.96, 1.0, 1.0), float3(1.0, 0.24, 0.15), latestDanger);
-        color += glowColor * glow * 0.28 * background;
-        color = mix(color, float3(0.09, 0.34, 0.39), fill * background);
+        color += glowColor * glow * 0.24 * background;
+        color = mix(color, baseGraphColor * 0.23, fill * background);
         color = mix(color, lineColor, line * background);
         color = mix(color, latestDotColor, latestDot * 0.75 * background);
 
         float topSheen = smoothstep(top, top - 0.10, uv.y) * background * 0.08;
-        color += float3(0.18, 0.46, 0.50) * topSheen;
+        color += baseGraphColor * 0.26 * topSheen;
 
         return float4(color, 1.0);
     }
