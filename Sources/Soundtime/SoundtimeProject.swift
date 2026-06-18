@@ -110,6 +110,7 @@ enum SoundtimeProjectStore {
     static let maximumRecentProjectCount = 8
     private static let lastProjectURLKey = "Soundtime.lastProjectURL"
     private static let recentProjectURLPathsKey = "Soundtime.recentProjectURLPaths"
+    private static let projectWindowLayoutKeyPrefix = "Soundtime.projectWindowLayout."
 
     static func load(from url: URL) throws -> SoundtimeProject {
         let data = try Data(contentsOf: url)
@@ -220,9 +221,29 @@ enum SoundtimeProjectStore {
         UserDefaults.standard.removeObject(forKey: lastProjectURLKey)
     }
 
+    static func rememberWindowLayout(_ layout: SoundtimeProject.WindowLayout, for projectURL: URL) {
+        guard let data = try? JSONEncoder().encode(layout) else {
+            return
+        }
+
+        UserDefaults.standard.set(data, forKey: projectWindowLayoutKey(for: projectURL))
+    }
+
+    static func rememberedWindowLayout(for projectURL: URL) -> SoundtimeProject.WindowLayout? {
+        guard let data = UserDefaults.standard.data(forKey: projectWindowLayoutKey(for: projectURL)) else {
+            return nil
+        }
+
+        return try? JSONDecoder().decode(SoundtimeProject.WindowLayout.self, from: data)
+    }
+
     private static func recentProjectURLPaths() -> [String] {
         (UserDefaults.standard.stringArray(forKey: recentProjectURLPathsKey) ?? [])
             .filter { !$0.isEmpty }
+    }
+
+    private static func projectWindowLayoutKey(for projectURL: URL) -> String {
+        projectWindowLayoutKeyPrefix + stablePathHash(projectURL.standardizedFileURL.path)
     }
 
     private static func autosaveURL(projectURL: URL?, autosaveID: UUID) -> URL {

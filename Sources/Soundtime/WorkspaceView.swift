@@ -350,29 +350,19 @@ final class WorkspaceView: NSView {
     private let visualAudioSyncResponseDuration: TimeInterval = 0.12
     private let visualAudioSyncMinimumCorrectionInterval: TimeInterval = 0.1
     private let wavPreviewLevels = [
-        WAVPreviewLevel(targetBinCount: 512, samplesPerBin: 6),
-        WAVPreviewLevel(targetBinCount: 768, samplesPerBin: 6),
-        WAVPreviewLevel(targetBinCount: 1_024, samplesPerBin: 6),
-        WAVPreviewLevel(targetBinCount: 1_536, samplesPerBin: 6),
-        WAVPreviewLevel(targetBinCount: 2_048, samplesPerBin: 8),
-        WAVPreviewLevel(targetBinCount: 3_072, samplesPerBin: 8),
-        WAVPreviewLevel(targetBinCount: 4_096, samplesPerBin: 8),
-        WAVPreviewLevel(targetBinCount: 6_144, samplesPerBin: 10),
-        WAVPreviewLevel(targetBinCount: 8_192, samplesPerBin: 10),
-        WAVPreviewLevel(targetBinCount: 12_288, samplesPerBin: 12),
-        WAVPreviewLevel(targetBinCount: 16_384, samplesPerBin: 12),
-        WAVPreviewLevel(targetBinCount: 24_576, samplesPerBin: 12),
-        WAVPreviewLevel(targetBinCount: 32_768, samplesPerBin: 14),
-        WAVPreviewLevel(targetBinCount: 49_152, samplesPerBin: 14),
-        WAVPreviewLevel(targetBinCount: 65_536, samplesPerBin: 16),
-        WAVPreviewLevel(targetBinCount: 98_304, samplesPerBin: 10),
-        WAVPreviewLevel(targetBinCount: 131_072, samplesPerBin: 10),
-        WAVPreviewLevel(targetBinCount: 196_608, samplesPerBin: 8),
-        WAVPreviewLevel(targetBinCount: 262_144, samplesPerBin: 8),
-        WAVPreviewLevel(targetBinCount: 393_216, samplesPerBin: 6),
-        WAVPreviewLevel(targetBinCount: 524_288, samplesPerBin: 6),
-        WAVPreviewLevel(targetBinCount: 786_432, samplesPerBin: 4),
-        WAVPreviewLevel(targetBinCount: 1_048_576, samplesPerBin: 4),
+        WAVPreviewLevel(targetBinCount: 16_384, samplesPerBin: 64),
+        WAVPreviewLevel(targetBinCount: 24_576, samplesPerBin: 64),
+        WAVPreviewLevel(targetBinCount: 32_768, samplesPerBin: 56),
+        WAVPreviewLevel(targetBinCount: 49_152, samplesPerBin: 48),
+        WAVPreviewLevel(targetBinCount: 65_536, samplesPerBin: 44),
+        WAVPreviewLevel(targetBinCount: 98_304, samplesPerBin: 36),
+        WAVPreviewLevel(targetBinCount: 131_072, samplesPerBin: 32),
+        WAVPreviewLevel(targetBinCount: 196_608, samplesPerBin: 28),
+        WAVPreviewLevel(targetBinCount: 262_144, samplesPerBin: 24),
+        WAVPreviewLevel(targetBinCount: 393_216, samplesPerBin: 18),
+        WAVPreviewLevel(targetBinCount: 524_288, samplesPerBin: 16),
+        WAVPreviewLevel(targetBinCount: 786_432, samplesPerBin: 10),
+        WAVPreviewLevel(targetBinCount: 1_048_576, samplesPerBin: 8),
         WAVPreviewLevel(targetBinCount: 1_572_864, samplesPerBin: 3),
         WAVPreviewLevel(targetBinCount: 2_097_152, samplesPerBin: 3),
         WAVPreviewLevel(targetBinCount: 3_145_728, samplesPerBin: 2),
@@ -433,6 +423,7 @@ final class WorkspaceView: NSView {
     }()
 
     private let frameRateHistoryView = FrameRateHistoryView()
+    private let cpuUsageHistoryView = FrameRateHistoryView(metric: .cpuUsage)
     private let performanceDashboardButton = PerformanceDashboardButton()
     private let volumeControl = VolumeControlView()
     private let loudnessMeter = LoudnessMeterView()
@@ -541,7 +532,9 @@ final class WorkspaceView: NSView {
     private let autosaveID = UUID()
     private let autosaveDelay: TimeInterval = 1.5
     private var autosaveWorkItem: DispatchWorkItem?
+    private var projectSaveGeneration = 0
     private var isAutosaveSuppressed = false
+    private let cpuUsageSampler = ProcessCPUUsageSampler()
     private var wavFileInfoCache: [URL: WAVFileInfo] = [:]
     private var invalidWAVFileInfoCache: Set<URL> = []
 
@@ -560,6 +553,64 @@ final class WorkspaceView: NSView {
         super.mouseDown(with: event)
     }
 
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        if let addTrackHitView = hitTestAddTrackButton(point) {
+            return addTrackHitView
+        }
+
+        if agentCommandBar.frame.contains(point) {
+            let agentPoint = agentCommandBar.convert(point, from: self)
+            if let agentHitView = agentCommandBar.hitTest(agentPoint) {
+                return agentHitView
+            }
+        }
+
+        let hitView = super.hitTest(point)
+        if isAgentCommandBarHit(hitView) {
+            return hitTestExcludingAgentCommandBar(point) ?? self
+        }
+
+        if hitView !== self {
+            return hitView
+        }
+
+        return hitView
+    }
+
+    private func isAgentCommandBarHit(_ view: NSView?) -> Bool {
+        var currentView = view
+        while let view = currentView {
+            if view === agentCommandBar {
+                return true
+            }
+            currentView = view.superview
+        }
+        return false
+    }
+
+    private func hitTestAddTrackButton(_ point: NSPoint) -> NSView? {
+        guard
+            !addTrackButton.isHidden,
+            addTrackButton.alphaValue > 0.01,
+            addTrackButton.frame.contains(point)
+        else {
+            return nil
+        }
+
+        let buttonPoint = addTrackButton.convert(point, from: self)
+        return addTrackButton.hitTest(buttonPoint) ?? addTrackButton
+    }
+
+    private func hitTestExcludingAgentCommandBar(_ point: NSPoint) -> NSView? {
+        for subview in subviews.reversed() where subview !== agentCommandBar {
+            let subviewPoint = subview.convert(point, from: self)
+            if let hitView = subview.hitTest(subviewPoint) {
+                return hitView
+            }
+        }
+        return nil
+    }
+
     private func configure() {
         wantsLayer = true
         layer?.backgroundColor = SoundtimeColors.windowBackground.cgColor
@@ -568,6 +619,7 @@ final class WorkspaceView: NSView {
 
         timelineSurface.translatesAutoresizingMaskIntoConstraints = false
         frameRateHistoryView.translatesAutoresizingMaskIntoConstraints = false
+        cpuUsageHistoryView.translatesAutoresizingMaskIntoConstraints = false
         performanceDashboardButton.translatesAutoresizingMaskIntoConstraints = false
         addTrackButton.translatesAutoresizingMaskIntoConstraints = false
         transportControlPanel.translatesAutoresizingMaskIntoConstraints = false
@@ -783,6 +835,7 @@ final class WorkspaceView: NSView {
         addSubview(framesPerSecondLabel)
         addSubview(performanceDashboardButton)
         addSubview(frameRateHistoryView)
+        addSubview(cpuUsageHistoryView)
         addSubview(transportControlPanel)
         addSubview(volumeControl)
         addSubview(timeReadoutLabel)
@@ -813,8 +866,6 @@ final class WorkspaceView: NSView {
         volumeToLoudnessConstraint.priority = .defaultLow
         let framesPerSecondWidthConstraint = framesPerSecondLabel.widthAnchor.constraint(equalToConstant: 390)
         framesPerSecondWidthConstraint.priority = .defaultLow
-        let frameRateHistoryWidthConstraint = frameRateHistoryView.widthAnchor.constraint(equalToConstant: 132)
-        frameRateHistoryWidthConstraint.priority = .defaultLow
         let transportPanelWidthConstraint = transportControlPanel.widthAnchor.constraint(equalToConstant: 104)
         transportPanelWidthConstraint.priority = .defaultHigh
         let volumeControlWidthConstraint = volumeControl.widthAnchor.constraint(equalToConstant: 150)
@@ -853,9 +904,14 @@ final class WorkspaceView: NSView {
             performanceDashboardButton.heightAnchor.constraint(equalToConstant: 24),
 
             frameRateHistoryView.bottomAnchor.constraint(equalTo: loudnessMeter.topAnchor, constant: -6),
-            frameRateHistoryView.trailingAnchor.constraint(equalTo: loudnessMeter.trailingAnchor),
-            frameRateHistoryWidthConstraint,
+            frameRateHistoryView.leadingAnchor.constraint(equalTo: loudnessMeter.leadingAnchor),
+            frameRateHistoryView.trailingAnchor.constraint(equalTo: cpuUsageHistoryView.leadingAnchor, constant: -8),
             frameRateHistoryView.heightAnchor.constraint(equalToConstant: 24),
+
+            cpuUsageHistoryView.centerYAnchor.constraint(equalTo: frameRateHistoryView.centerYAnchor),
+            cpuUsageHistoryView.trailingAnchor.constraint(equalTo: loudnessMeter.trailingAnchor),
+            cpuUsageHistoryView.widthAnchor.constraint(equalTo: frameRateHistoryView.widthAnchor),
+            cpuUsageHistoryView.heightAnchor.constraint(equalTo: frameRateHistoryView.heightAnchor),
 
             transportControlPanel.centerXAnchor.constraint(equalTo: centerXAnchor),
             transportControlPanel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
@@ -943,7 +999,7 @@ final class WorkspaceView: NSView {
     }
 
     private func tearDownRuntimeState() {
-        PerformanceDashboardWindowController.shared.closeIfVisible()
+        PerformanceDashboardWindowController.closeIfLoaded()
         if let keyDownMonitor {
             NSEvent.removeMonitor(keyDownMonitor)
             self.keyDownMonitor = nil
@@ -968,7 +1024,7 @@ final class WorkspaceView: NSView {
         recordingSampleRate = 0
         recordingAccumulator = nil
         playbackController.clear()
-        deleteAllOwnedSourceFiles()
+        deleteAllOwnedSourceFiles(async: true)
         ImportWorkBudget.shared.setPlaybackActive(false)
     }
 
@@ -1031,6 +1087,7 @@ final class WorkspaceView: NSView {
         volumeControl.isHidden = !showsVolume
         loudnessMeter.isHidden = !showsLoudness
         frameRateHistoryView.isHidden = !showsFrameHistory
+        cpuUsageHistoryView.isHidden = !showsFrameHistory || !showsLoudness
         framesPerSecondLabel.isHidden = !showsFrameStatsText
         editScopeStack.isHidden = !showsEditScope
         fisheyeControlsStack.isHidden = !showsDebugSliders
@@ -1246,7 +1303,8 @@ final class WorkspaceView: NSView {
                 volume: track.volume,
                 isMuted: track.isMuted,
                 isSoloed: track.isSoloed,
-                clipRanges: timelineClipRanges(for: track)
+                clipRanges: timelineClipRanges(for: track),
+                waveformTileSource: waveformTileSource(for: track)
             )
         }
     }
@@ -1267,9 +1325,23 @@ final class WorkspaceView: NSView {
                 isMuted: track.isMuted,
                 isSoloed: track.isSoloed,
                 hasWaveform: track.waveformOverview?.isEmpty == false,
-                clipRanges: timelineClipRanges(for: track)
+                clipRanges: timelineClipRanges(for: track),
+                waveformTileSource: waveformTileSource(for: track)
             )
         }
+    }
+
+    private func waveformTileSource(for track: ProjectTrack) -> WaveformTileBuildSource? {
+        guard WaveformTiledRendererFeatureFlags.isEnabled,
+              track.editRevision == 0,
+              track.audioTimeline == nil,
+              track.fileTimeline == nil,
+              decodableWAVFileInfo(for: track.sourceURL) != nil
+        else {
+            return nil
+        }
+
+        return try? WaveformTileBuildSource(wavURL: track.sourceURL, channelMode: .monoMix)
     }
 
     private func timelineClipRanges(for track: ProjectTrack) -> [TimelineRenderState.ClipRange] {
@@ -1968,9 +2040,26 @@ final class WorkspaceView: NSView {
         }
     }
 
-    private func deleteOwnedSourceFiles(_ urls: Set<URL>) {
-        for url in urls where isOwnedRecordingURL(url) {
-            try? FileManager.default.removeItem(at: url)
+    private func deleteOwnedSourceFiles(_ urls: Set<URL>, async: Bool = false) {
+        let recordingsDirectoryPath = recordingsDirectoryURL().path
+        let deleteAction: @Sendable () -> Void = {
+            for url in urls {
+                let candidate = url.standardizedFileURL
+                guard
+                    candidate.path.hasPrefix(recordingsDirectoryPath + "/"),
+                    candidate.pathExtension.lowercased() == "wav"
+                else {
+                    continue
+                }
+
+                try? FileManager.default.removeItem(at: candidate)
+            }
+        }
+
+        if async {
+            DispatchQueue.global(qos: .utility).async(execute: deleteAction)
+        } else {
+            deleteAction()
         }
     }
 
@@ -1985,10 +2074,10 @@ final class WorkspaceView: NSView {
         deleteOwnedSourceFiles(candidateURLs.subtracting(protectedURLs))
     }
 
-    private func deleteAllOwnedSourceFiles() {
+    private func deleteAllOwnedSourceFiles(async: Bool = false) {
         var urls = ownedSourceURLs(in: projectTracks)
         urls.formUnion(ownedSourceURLs(in: editUndoStack))
-        deleteOwnedSourceFiles(urls)
+        deleteOwnedSourceFiles(urls, async: async)
     }
 
     private func markProjectSourceFilesAsSaved() {
@@ -2152,7 +2241,7 @@ final class WorkspaceView: NSView {
         playbackController.clear()
         timelineSurface.displayWaveform(nil)
         timelineSurface.displaySelection(nil)
-        displayPlaybackVisuals(progress: 0, isPlaying: false)
+        displayPlaybackVisuals(progress: 0, isPlaying: false, synchronizesRenderer: false)
         updateTimeReadout()
         metadataLabel.stringValue = "\(url.lastPathComponent) - loading..."
 
@@ -2673,7 +2762,7 @@ final class WorkspaceView: NSView {
         guard !playbackTracks.isEmpty else {
             playbackController.clear()
             currentPlayheadFrame = 0
-            displayPlaybackVisuals(progress: 0, isPlaying: false)
+            displayPlaybackVisuals(progress: 0, isPlaying: false, synchronizesRenderer: false)
             updateTimeReadout()
             updateTransportControlState(isPlaying: false)
             return
@@ -2700,11 +2789,12 @@ final class WorkspaceView: NSView {
                 progress: snapshot.progress,
                 isPlaying: snapshot.isPlaying,
                 syncPlayhead: true,
-                anchorTimestamp: snapshot.hostTimestamp
+                anchorTimestamp: snapshot.hostTimestamp,
+                synchronizesRenderer: snapshot.isPlaying
             )
         } catch {
             stopPlaybackTimer()
-            displayPlaybackVisuals(progress: 0, isPlaying: false)
+            displayPlaybackVisuals(progress: 0, isPlaying: false, synchronizesRenderer: false)
             updateStatus("project playback failed: \(error.localizedDescription)")
         }
         updateTimeReadout()
@@ -7602,35 +7692,51 @@ final class WorkspaceView: NSView {
         do {
             try prepareProjectForSerialization()
             let projectURL = normalizedProjectURL(url)
-            try SoundtimeProjectStore.save(currentProject(), to: projectURL)
-            withoutAutosave {
-                currentProjectURL = projectURL
-                markProjectSourceFilesAsSaved()
+            let project = currentProject()
+            projectSaveGeneration += 1
+            let saveGeneration = projectSaveGeneration
+            updateStatus("saving...")
+
+            DispatchQueue.global(qos: .utility).async { [project, projectURL] in
+                let result = Result {
+                    try SoundtimeProjectStore.save(project, to: projectURL)
+                }
+
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.projectSaveGeneration == saveGeneration else {
+                        return
+                    }
+
+                    switch result {
+                    case .success:
+                        self.withoutAutosave {
+                            self.currentProjectURL = projectURL
+                            self.markProjectSourceFilesAsSaved()
+                        }
+                        SoundtimeProjectStore.removeAutosave(projectURL: projectURL, autosaveID: self.autosaveID)
+                        SoundtimeProjectStore.rememberLastProjectURL(projectURL)
+                        self.window?.title = self.projectWindowTitle()
+                        self.updateLoadedProjectSummary()
+                        self.updateStatus("saved")
+                    case let .failure(error):
+                        self.updateStatus("project save failed: \(error.localizedDescription)")
+                    }
+                }
             }
-            SoundtimeProjectStore.removeAutosave(projectURL: projectURL, autosaveID: autosaveID)
-            SoundtimeProjectStore.rememberLastProjectURL(projectURL)
-            window?.title = projectWindowTitle()
-            updateLoadedProjectSummary()
-            updateStatus("saved")
         } catch {
             updateStatus("project save failed: \(error.localizedDescription)")
         }
     }
 
     func persistCurrentProjectWindowLayout() {
-        guard let currentProjectURL else {
+        guard
+            let currentProjectURL,
+            let layout = currentWindowLayout()
+        else {
             return
         }
 
-        do {
-            try prepareProjectForSerialization()
-            try SoundtimeProjectStore.save(currentProject(), to: currentProjectURL)
-            withoutAutosave {
-                markProjectSourceFilesAsSaved()
-            }
-        } catch {
-            updateStatus("project window save failed: \(error.localizedDescription)")
-        }
+        SoundtimeProjectStore.rememberWindowLayout(layout, for: currentProjectURL)
     }
 
     private func scheduleAutosaveIfNeeded() {
@@ -7711,7 +7817,7 @@ final class WorkspaceView: NSView {
                 currentProjectURL = url
             }
             SoundtimeProjectStore.rememberLastProjectURL(url)
-            applyWindowLayout(project.windowLayout)
+            applyWindowLayout(SoundtimeProjectStore.rememberedWindowLayout(for: url) ?? project.windowLayout)
             applyProjectMasterVolume(project.masterVolume)
             applyProjectTimelineViewport(project.timelineViewport)
             resetWaveformFisheyeTuningToDefaults()
@@ -7788,7 +7894,7 @@ final class WorkspaceView: NSView {
         publishSelectedTracksToTimeline()
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
         refreshProjectTimelineDisplay()
-        displayPlaybackVisuals(progress: 0, isPlaying: false)
+        displayPlaybackVisuals(progress: 0, isPlaying: false, synchronizesRenderer: false)
         updateTimeReadout()
         updateEffectCommandState()
     }
@@ -7797,7 +7903,6 @@ final class WorkspaceView: NSView {
         if recordingTrackID != nil {
             stopRecording()
         }
-        try materializeInMemoryEditedProjectTracksForSerialization()
     }
 
     private func materializeInMemoryEditedProjectTracksForSerialization() throws {
@@ -8586,7 +8691,8 @@ final class WorkspaceView: NSView {
         syncPlayhead: Bool = true,
         anchorTimestamp: TimeInterval? = nil,
         restartsFisheyeActivation: Bool = false,
-        restartsPlayheadKick: Bool = false
+        restartsPlayheadKick: Bool = false,
+        synchronizesRenderer: Bool = true
     ) {
         let timestamp = anchorTimestamp ?? CACurrentMediaTime()
         let clampedProgress = min(max(progress, 0), 1)
@@ -8597,7 +8703,8 @@ final class WorkspaceView: NSView {
                 isPlaying: isPlaying,
                 anchorTimestamp: timestamp,
                 restartsFisheyeActivation: restartsFisheyeActivation,
-                restartsPlayheadKick: restartsPlayheadKick
+                restartsPlayheadKick: restartsPlayheadKick,
+                synchronizesRenderer: synchronizesRenderer
             )
             return
         }
@@ -8614,7 +8721,8 @@ final class WorkspaceView: NSView {
         isPlaying: Bool,
         anchorTimestamp: TimeInterval,
         restartsFisheyeActivation: Bool = false,
-        restartsPlayheadKick: Bool = false
+        restartsPlayheadKick: Bool = false,
+        synchronizesRenderer: Bool = true
     ) {
         let wasVisuallyPlaying = visualPlaybackActive
         visualPlayheadProgress = min(max(progress, 0), 1)
@@ -8624,7 +8732,7 @@ final class WorkspaceView: NSView {
 
         timelineSurface.displayPlayheadProgress(
             visualPlayheadProgress,
-            syncRenderer: true,
+            syncRenderer: synchronizesRenderer,
             anchorTimestamp: anchorTimestamp,
             resetsTouchStart: isPlaying || !wasVisuallyPlaying,
             restartsFisheyeActivation: restartsFisheyeActivation,
@@ -8762,8 +8870,10 @@ final class WorkspaceView: NSView {
 
     private func updateFrameStats(_ frameStats: TimelineFrameStats) {
         SoundtimeDiagnostics.shared.recordFrameStats(frameStats)
-        PerformanceDashboardWindowController.shared.display(frameStats: frameStats)
+        PerformanceDashboardWindowController.displayIfVisible(frameStats: frameStats)
         frameRateHistoryView.display(frameStats: frameStats)
+        let cpuPercent = cpuUsageSampler.samplePercent()
+        cpuUsageHistoryView.display(cpuPercent: cpuPercent)
 
         let shaderBufferMegabytes = Int((Double(frameStats.shaderBufferByteCount) / 1_048_576).rounded())
         if debugToolsVisible {

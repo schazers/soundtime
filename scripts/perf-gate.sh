@@ -36,6 +36,9 @@ swift run Soundtime --realtime-graph-publish-smoke
 echo "== Soundtime timeline UX smoke =="
 swift run Soundtime --timeline-ux-smoke
 
+echo "== Soundtime waveform tiled render pipeline smoke =="
+swift run Soundtime --waveform-tiled-render-pipeline-smoke
+
 echo "== Soundtime timeline perf baseline =="
 swift run Soundtime --timeline-perf-baseline "${mode_args[@]}"
 
@@ -48,6 +51,7 @@ if [[ -n "${SOUNDTIME_STABILITY_REPORT_DIR:-}" ]]; then
     "edit-preview-smoke.json"
     "realtime-graph-publish-smoke.json"
     "timeline-ux-smoke.json"
+    "waveform-tiled-render-pipeline-smoke.json"
     "timeline-perf-baseline.json"
   )
 
