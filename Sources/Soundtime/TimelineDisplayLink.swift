@@ -11,6 +11,7 @@ final class TimelineDisplayLink: NSObject, CAMetalDisplayLinkDelegate {
 
     private let displayLink: CAMetalDisplayLink
     private var isInvalidated = false
+    private var isRunning = false
 
     init(metalLayer: CAMetalLayer, preferredFramesPerSecond: Int) {
         displayLink = CAMetalDisplayLink(metalLayer: metalLayer)
@@ -41,18 +42,20 @@ final class TimelineDisplayLink: NSObject, CAMetalDisplayLinkDelegate {
     }
 
     func start() {
-        guard !isInvalidated else {
+        guard !isInvalidated, !isRunning else {
             return
         }
 
+        isRunning = true
         displayLink.isPaused = false
     }
 
     func stop() {
-        guard !isInvalidated else {
+        guard !isInvalidated, isRunning else {
             return
         }
 
+        isRunning = false
         displayLink.isPaused = true
     }
 
@@ -62,6 +65,7 @@ final class TimelineDisplayLink: NSObject, CAMetalDisplayLinkDelegate {
         }
 
         isInvalidated = true
+        isRunning = false
         onFrame = nil
         displayLink.isPaused = true
         displayLink.delegate = nil

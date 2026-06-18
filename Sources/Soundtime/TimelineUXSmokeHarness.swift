@@ -149,6 +149,14 @@ enum TimelineUXSmokeHarness {
         )
         complete("ultra-zoom timeline render remains nonblank")
 
+        try verifyUltraZoomSparsePreviewStillRenders(
+            renderer: renderer,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        complete("ultra-zoom sparse preview render remains visible while final mip is pending")
+
         try verifyMultipleTrackLanesRender(
             renderer: renderer,
             track: track,
@@ -454,6 +462,44 @@ enum TimelineUXSmokeHarness {
         try require(frame.summary.brightPixelCount > 900, "ultra-zoom waveform was too dim to detect")
     }
 
+    private static func verifyUltraZoomSparsePreviewStillRenders(
+        renderer: TimelineRenderer,
+        texture: MTLTexture,
+        viewportSize: CGSize,
+        backingScale: Float
+    ) throws {
+        let overview = makeLongSparseWaveformOverview(duration: 480, binCount: 4_096)
+        let track = TimelineRenderState.Track(
+            id: UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-000000000099") ?? UUID(),
+            waveformVersion: 1,
+            waveformOverview: overview,
+            durationHint: overview.duration,
+            volume: 1,
+            isMuted: false,
+            isSoloed: false,
+            clipRanges: [TimelineRenderState.ClipRange(startProgress: 0, endProgress: 1)]
+        )
+        let viewport = TimelineViewport(startProgress: 0.516, durationProgress: 0.002)
+        let frame = try renderTimeline(
+            renderer: renderer,
+            tracks: [track],
+            viewport: viewport,
+            playheadProgress: 0.517,
+            isPlaybackActive: false,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        try require(
+            frame.summary.nonBackgroundPixelCount > 1_500,
+            "ultra-zoom sparse preview went blank before high-res waveform was ready"
+        )
+        try require(
+            frame.summary.brightPixelCount > 120,
+            "ultra-zoom sparse preview did not show detectable waveform pixels"
+        )
+    }
+
     private static func verifyMultipleTrackLanesRender(
         renderer: TimelineRenderer,
         track: TimelineRenderState.Track,
@@ -587,7 +633,14 @@ enum TimelineUXSmokeHarness {
         )
 
         let firstSelection = TimelineSelection(startProgress: 0.10, endProgress: 0.12, trackID: track.id)
-        renderer.displaySelection(firstSelection)
+        renderer.publishInteractionSelection(firstSelection)
+        renderer.publishInteractionSelectionDrag(
+            firstSelection,
+            leadingProgress: firstSelection.endProgressFloat,
+            velocityPixelsPerSecond: 920,
+            direction: 1,
+            timestamp: baseTimestamp
+        )
         let firstFrame = try renderTimeline(
             renderer: renderer,
             tracks: [track],
@@ -601,11 +654,19 @@ enum TimelineUXSmokeHarness {
         )
 
         for warmupIndex in 0..<8 {
-            renderer.displaySelection(TimelineSelection(
+            let selection = TimelineSelection(
                 startProgress: 0.10,
                 endProgress: 0.14 + Double(warmupIndex) * 0.01,
                 trackID: track.id
-            ))
+            )
+            renderer.publishInteractionSelection(selection)
+            renderer.publishInteractionSelectionDrag(
+                selection,
+                leadingProgress: selection.endProgressFloat,
+                velocityPixelsPerSecond: 980,
+                direction: 1,
+                timestamp: baseTimestamp + Double(warmupIndex + 1) / 144.0
+            )
             let renderPassDescriptor = makeRenderPassDescriptor(texture: texture)
             _ = renderer.renderOffscreen(
                 renderPassDescriptor: renderPassDescriptor,
@@ -623,7 +684,14 @@ enum TimelineUXSmokeHarness {
                 endProgress: 0.12 + t * 0.68,
                 trackID: track.id
             )
-            renderer.displaySelection(selection)
+            renderer.publishInteractionSelection(selection)
+            renderer.publishInteractionSelectionDrag(
+                selection,
+                leadingProgress: selection.endProgressFloat,
+                velocityPixelsPerSecond: 1_250,
+                direction: 1,
+                timestamp: baseTimestamp + Double(frameIndex + 10) / 144.0
+            )
 
             let renderPassDescriptor = makeRenderPassDescriptor(texture: texture)
             let startTime = CACurrentMediaTime()
@@ -638,7 +706,15 @@ enum TimelineUXSmokeHarness {
             commandBuffer?.waitUntilCompleted()
         }
 
-        renderer.displaySelection(TimelineSelection(startProgress: 0.10, endProgress: 0.80, trackID: track.id))
+        let finalSelection = TimelineSelection(startProgress: 0.10, endProgress: 0.80, trackID: track.id)
+        renderer.publishInteractionSelection(finalSelection)
+        renderer.publishInteractionSelectionDrag(
+            finalSelection,
+            leadingProgress: finalSelection.endProgressFloat,
+            velocityPixelsPerSecond: 1_250,
+            direction: 1,
+            timestamp: baseTimestamp + 0.5
+        )
         let lastFrame = try renderTimeline(
             renderer: renderer,
             tracks: [track],
@@ -973,6 +1049,27 @@ enum TimelineUXSmokeHarness {
             frameCount: frameCount,
             samplesByChannel: [left, right]
         )
+    }
+
+    private static func makeLongSparseWaveformOverview(
+        duration: TimeInterval,
+        binCount: Int
+    ) -> WaveformOverview {
+        let bins = (0..<binCount).map { index -> WaveformOverview.Bin in
+            let t = Float(index) / Float(max(binCount - 1, 1))
+            let phrase = 0.18 + 0.76 * abs(sin(t * .pi * 12.0))
+            let tremor = 0.52 + 0.48 * abs(sin(t * .pi * 37.0))
+            let peak = min(max(phrase * tremor, 0.05), 0.95)
+            return WaveformOverview.Bin(
+                minimumSample: -peak,
+                maximumSample: peak,
+                rmsSample: peak * 0.58,
+                lowEnergy: 0.26,
+                midEnergy: 0.42,
+                highEnergy: 0.32
+            )
+        }
+        return WaveformOverview(duration: duration, bins: bins)
     }
 
     private static func renderTrack(
