@@ -4,7 +4,81 @@ import Metal
 import QuartzCore
 
 final class PerformanceDashboardWindowController: NSWindowController, NSWindowDelegate {
-    static let shared = PerformanceDashboardWindowController()
+    private enum LifecycleSmokeError: Error, CustomStringConvertible {
+        case windowDidNotClose
+
+        var description: String {
+            switch self {
+            case .windowDidNotClose:
+                return "performance dashboard window remained visible after close"
+            }
+        }
+    }
+
+    private static var sharedController: PerformanceDashboardWindowController?
+
+    static var shared: PerformanceDashboardWindowController {
+        if let sharedController {
+            return sharedController
+        }
+
+        let controller = PerformanceDashboardWindowController()
+        sharedController = controller
+        return controller
+    }
+
+    static func displayIfVisible(frameStats: TimelineFrameStats) {
+        guard let controller = sharedController, controller.window?.isVisible == true else {
+            return
+        }
+
+        controller.display(frameStats: frameStats)
+    }
+
+    static func closeIfLoaded() {
+        sharedController?.closeIfVisible()
+    }
+
+    @MainActor
+    static func runLifecycleSmoke() throws {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.regular)
+
+        let controller = PerformanceDashboardWindowController.shared
+        controller.showDashboard(relativeTo: nil)
+
+        for index in 0..<12 {
+            controller.display(frameStats: TimelineFrameStats(
+                framesPerSecond: index.isMultiple(of: 4) ? 72 : 144,
+                averageFrameTimeMilliseconds: index.isMultiple(of: 4) ? 13.8 : 6.9,
+                frameTimeJitterMilliseconds: 0.4,
+                worstFrameTimeMilliseconds: index.isMultiple(of: 4) ? 18.0 : 8.2,
+                waveformRenderer: "smoke",
+                cpuWaveformVertexCount: 0,
+                gpuWaveformDrawCount: 4,
+                shaderBufferUploadCount: 0,
+                shaderBufferCount: 2,
+                shaderBufferByteCount: 2_048,
+                shaderBufferUploadInFlightCount: 0,
+                waveformMipCacheCount: 2,
+                effectVertexCount: 0,
+                effectDroppedVertexCount: 0,
+                transientParticleCount: 0,
+                deletionEffectCount: 0,
+                playheadContactEventCount: 0
+            ))
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.035))
+        }
+
+        controller.closeIfVisible()
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.2))
+
+        if controller.window?.isVisible == true {
+            throw LifecycleSmokeError.windowDidNotClose
+        }
+
+        print("Soundtime performance dashboard lifecycle smoke passed")
+    }
 
     private let dashboardView = PerformanceDashboardView()
 
@@ -109,8 +183,12 @@ private final class PerformanceDashboardView: NSView {
     private let eventsView = PerformanceEventLogView()
     private let exportButton = PerformanceActionButton(title: "Export Trace")
     private let cpuSampler = ProcessCPUUsageSampler()
+    private let dashboardRefreshInterval: TimeInterval = 0.5
+    private let graphSampleInterval: TimeInterval = 1.0 / 15.0
     private var timer: Timer?
     private var latestFrameStats: TimelineFrameStats?
+    private var lastRenderedFrameStats: TimelineFrameStats?
+    private var lastFPSGraphSampleTime: CFTimeInterval = 0
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -132,7 +210,13 @@ private final class PerformanceDashboardView: NSView {
 
     func display(frameStats: TimelineFrameStats) {
         latestFrameStats = frameStats
-        updateDashboard()
+        let now = CACurrentMediaTime()
+        guard now - lastFPSGraphSampleTime >= graphSampleInterval else {
+            return
+        }
+
+        lastFPSGraphSampleTime = now
+        fpsCard.record(sample: CGFloat(frameStats.framesPerSecond))
     }
 
     func resume() {
@@ -141,11 +225,12 @@ private final class PerformanceDashboardView: NSView {
             return
         }
 
-        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
+        let timer = Timer(timeInterval: dashboardRefreshInterval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
                 self?.updateDashboard()
             }
         }
+        timer.tolerance = dashboardRefreshInterval * 0.25
         self.timer = timer
         RunLoop.main.add(timer, forMode: .common)
         updateDashboard()
@@ -247,20 +332,23 @@ private final class PerformanceDashboardView: NSView {
         let cpuPercent = cpuSampler.samplePercent()
 
         if let frameStats {
-            fpsCard.update(
-                value: "\(frameStats.framesPerSecond)",
-                unit: "fps",
-                subtitle: String(format: "avg %.1f ms  worst %.1f ms", frameStats.averageFrameTimeMilliseconds, frameStats.worstFrameTimeMilliseconds),
-                sample: CGFloat(frameStats.framesPerSecond),
-                maximum: 144
-            )
-            renderCard.update(lines: [
-                "Renderer      \(frameStats.waveformRenderer.uppercased())",
-                "GPU draws     \(frameStats.gpuWaveformDrawCount)",
-                "Uploads       \(frameStats.shaderBufferUploadCount) / \(frameStats.shaderBufferUploadInFlightCount) in flight",
-                "GPU cache     \(frameStats.shaderBufferCount) buffers  \(frameStats.shaderBufferByteCount / 1_048_576) MB",
-                "Effects       \(frameStats.effectVertexCount) vertices  \(frameStats.deletionEffectCount) deletes",
-            ])
+            if frameStats != lastRenderedFrameStats {
+                fpsCard.update(
+                    value: "\(frameStats.framesPerSecond)",
+                    unit: "fps",
+                    subtitle: String(format: "avg %.1f ms  worst %.1f ms", frameStats.averageFrameTimeMilliseconds, frameStats.worstFrameTimeMilliseconds),
+                    sample: nil,
+                    maximum: 144
+                )
+                renderCard.update(lines: [
+                    "Renderer      \(frameStats.waveformRenderer.uppercased())",
+                    "GPU draws     \(frameStats.gpuWaveformDrawCount)",
+                    "Uploads       \(frameStats.shaderBufferUploadCount) / \(frameStats.shaderBufferUploadInFlightCount) in flight",
+                    "GPU cache     \(frameStats.shaderBufferCount) buffers  \(frameStats.shaderBufferByteCount / 1_048_576) MB",
+                    "Effects       \(frameStats.effectVertexCount) vertices  \(frameStats.deletionEffectCount) deletes",
+                ])
+                lastRenderedFrameStats = frameStats
+            }
         } else {
             fpsCard.update(value: "0", unit: "fps", subtitle: "waiting for renderer", sample: 0, maximum: 144)
             renderCard.update(lines: ["Renderer      waiting", "GPU draws     0", "Uploads       0", "GPU cache     0 MB"])
@@ -346,11 +434,17 @@ private final class PerformanceMetricCardView: NSView {
         nil
     }
 
-    func update(value: String, unit: String, subtitle: String, sample: CGFloat, maximum: CGFloat) {
+    func update(value: String, unit: String, subtitle: String, sample: CGFloat?, maximum: CGFloat) {
         valueLabel.stringValue = value
         unitLabel.stringValue = unit
         subtitleLabel.stringValue = subtitle
         sparklineView.maximumValue = maximum
+        if let sample {
+            sparklineView.append(sample)
+        }
+    }
+
+    func record(sample: CGFloat) {
         sparklineView.append(sample)
     }
 
@@ -545,7 +639,9 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
 
     var maximumValue: CGFloat = 144 {
         didSet {
-            render()
+            if oldValue != maximumValue {
+                requestRender()
+            }
         }
     }
 
@@ -553,13 +649,16 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
     private let usesLowValueDangerColor: Bool
     private let historyDuration: CFTimeInterval = 15
     private let historyExitDuration: CFTimeInterval = 1.25
-    private let maximumSampleCount = 192
+    private let staleSampleHoldDuration: Float = 0.75
+    private let maximumSampleCount = 160
+    private let renderRefreshRate: TimeInterval = 30
     private let timeOrigin = CACurrentMediaTime()
     private let sampleLock = NSLock()
     private var samples: [SparkSample] = []
     private var displayTimer: Timer?
     private var commandQueue: MTLCommandQueue?
     private var pipelineState: MTLRenderPipelineState?
+    private var isLiveResizePaused = false
     private var vertices: [SparkVertex] = [
         SparkVertex(position: SIMD2<Float>(0, 0)),
         SparkVertex(position: SIMD2<Float>(1, 0)),
@@ -577,6 +676,7 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
         self.accentColor = Self.colorVector(from: accentColor)
         self.usesLowValueDangerColor = usesLowValueDangerColor
         super.init(frame: .zero, device: MTLCreateSystemDefaultDevice())
+        drawableBackingScaleOverride = 1
         configureSparklineRenderer()
     }
 
@@ -584,6 +684,7 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
         self.accentColor = SIMD4<Float>(0.10, 0.86, 0.96, 1)
         self.usesLowValueDangerColor = false
         super.init(coder: coder)
+        drawableBackingScaleOverride = 1
         configureSparklineRenderer()
     }
 
@@ -597,9 +698,33 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
         }
     }
 
+    override var isHidden: Bool {
+        didSet {
+            if isHidden {
+                stopDisplayTimer()
+            } else {
+                startDisplayTimerIfNeeded()
+                render()
+            }
+        }
+    }
+
+    override func viewWillStartLiveResize() {
+        super.viewWillStartLiveResize()
+        isLiveResizePaused = true
+        stopDisplayTimer()
+    }
+
+    override func viewDidEndLiveResize() {
+        super.viewDidEndLiveResize()
+        isLiveResizePaused = false
+        startDisplayTimerIfNeeded()
+        render()
+    }
+
     override func layout() {
         super.layout()
-        render()
+        requestRender()
     }
 
     func append(_ sample: CGFloat) {
@@ -610,7 +735,7 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
         sampleLock.unlock()
 
         startDisplayTimerIfNeeded()
-        render()
+        requestRender()
     }
 
     private func configureSparklineRenderer() {
@@ -654,6 +779,10 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
     }
 
     private func render() {
+        guard !isLiveResizePaused, !isHiddenOrHasHiddenAncestor else {
+            return
+        }
+
         guard
             let renderTarget = makeTimelineRenderTarget(),
             let commandQueue,
@@ -718,9 +847,12 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
                     value: latestSample.value
                 ), at: 0)
             }
-            let staleAge = now - latestSample.timestamp
-            let displayedValue = usesLowValueDangerColor && staleAge > 0.75 ? 0 : latestSample.value
-            renderSamples.append(SparkSample(timestamp: now, value: displayedValue))
+            // Rendering is demand-driven, so an idle timeline can stop publishing
+            // samples. Hold briefly to avoid a snap-to-zero, then let stale values
+            // scroll away as history instead of turning them into current data.
+            if now - latestSample.timestamp <= staleSampleHoldDuration {
+                renderSamples.append(SparkSample(timestamp: now, value: latestSample.value))
+            }
         }
 
         if renderSamples.count > maximumSampleCount {
@@ -730,16 +862,21 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
     }
 
     private func startDisplayTimerIfNeeded() {
-        guard displayTimer == nil, window != nil else {
+        guard
+            displayTimer == nil,
+            window != nil,
+            !isLiveResizePaused,
+            !isHiddenOrHasHiddenAncestor
+        else {
             return
         }
 
-        let timer = Timer(timeInterval: 1 / 60, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
+        let timer = Timer(timeInterval: 1 / renderRefreshRate, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
                 self?.render()
             }
         }
-        timer.tolerance = 1 / 240
+        timer.tolerance = 1 / 120
         displayTimer = timer
         RunLoop.main.add(timer, forMode: .common)
     }
@@ -747,6 +884,14 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
     private func stopDisplayTimer() {
         displayTimer?.invalidate()
         displayTimer = nil
+    }
+
+    private func requestRender() {
+        guard window != nil else {
+            return
+        }
+
+        render()
     }
 
     private func trimSamples(now: Float) {
@@ -1114,7 +1259,7 @@ private final class PerformanceActionButton: NSControl {
     }
 }
 
-private final class ProcessCPUUsageSampler {
+final class ProcessCPUUsageSampler {
     private var previousWallTime = CACurrentMediaTime()
     private var previousCPUTime = ProcessCPUUsageSampler.currentCPUTime()
 
