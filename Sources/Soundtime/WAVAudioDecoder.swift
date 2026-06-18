@@ -105,6 +105,30 @@ enum WAVAudioDecoder {
         return sample / Float(fileInfo.channelCount)
     }
 
+    static func sample(
+        in data: Data,
+        fileInfo: WAVFileInfo,
+        frameIndex: Int,
+        channelIndex: Int
+    ) throws -> Float {
+        try validateDecodable(fileInfo)
+        guard fileInfo.frameCount > 0 else {
+            return 0
+        }
+
+        let bytesPerSample = bytesPerSample(for: fileInfo)
+        let clampedFrameIndex = min(max(frameIndex, 0), fileInfo.frameCount - 1)
+        let clampedChannelIndex = min(max(channelIndex, 0), fileInfo.channelCount - 1)
+        let frameOffset = fileInfo.dataRange.lowerBound + clampedFrameIndex * fileInfo.blockAlign
+        let sampleOffset = frameOffset + clampedChannelIndex * bytesPerSample
+        return try decodeSample(
+            in: data,
+            at: sampleOffset,
+            formatTag: fileInfo.formatTag,
+            bitsPerSample: fileInfo.bitsPerSample
+        )
+    }
+
     private static func inspect(in data: Data, url: URL) throws -> WAVFileInfo {
         guard
             data.count >= 12,
@@ -203,7 +227,8 @@ enum WAVAudioDecoder {
         }
 
         let binCount = min(max(targetBinCount, 1), fileInfo.frameCount)
-        let sampledFrameCount = max(samplesPerBin, 1)
+        let minimumSamplesPerPreviewBin = 16
+        let sampledFrameCount = max(samplesPerBin, minimumSamplesPerPreviewBin)
         var bins: [WaveformOverview.Bin] = []
         bins.reserveCapacity(binCount)
 
@@ -215,12 +240,15 @@ enum WAVAudioDecoder {
             let startFrame = binIndex * fileInfo.frameCount / binCount
             let endFrame = max((binIndex + 1) * fileInfo.frameCount / binCount, startFrame + 1)
             let frameSpan = endFrame - startFrame
-            let binSampleCount = min(sampledFrameCount, frameSpan)
+            let shouldScanEntireBin = frameSpan <= sampledFrameCount * 4
+            let binSampleCount = shouldScanEntireBin ? frameSpan : min(sampledFrameCount, frameSpan)
             var accumulator = WaveformBinAccumulator()
 
             for sampleIndex in 0..<binSampleCount {
                 let frameOffset: Int
-                if binSampleCount == 1 {
+                if shouldScanEntireBin {
+                    frameOffset = sampleIndex
+                } else if binSampleCount == 1 {
                     frameOffset = frameSpan / 2
                 } else {
                     frameOffset = sampleIndex * (frameSpan - 1) / (binSampleCount - 1)
