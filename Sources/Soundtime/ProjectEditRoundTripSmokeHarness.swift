@@ -64,6 +64,17 @@ enum ProjectEditRoundTripSmokeHarness {
         try require(pastedFrames == copiedClip.frameCount, "pasted clip frame count mismatch")
 
         let originalState = try requireValue(timeline.persistentState, "edited timeline did not persist")
+        let sourceOverview = syntheticOverview(duration: Double(sourceFrameCount) / sampleRate, binCount: 512)
+        let originalEditedOverview = timeline.waveformOverview(from: sourceOverview)
+        let waveformPreview = try requireValue(
+            SoundtimeProject.WaveformPreview(
+                sourceOverview: sourceOverview,
+                displayOverview: originalEditedOverview,
+                fileInfo: fileInfo,
+                maximumBinCount: 128
+            ),
+            "could not create launch waveform preview"
+        )
         let project = SoundtimeProject(
             tracks: [
                 SoundtimeProject.Track(
@@ -73,7 +84,8 @@ enum ProjectEditRoundTripSmokeHarness {
                     volume: 0.73,
                     isMuted: true,
                     isSoloed: false,
-                    editTimeline: originalState
+                    editTimeline: originalState,
+                    waveformPreview: waveformPreview
                 ),
             ],
             windowLayout: SoundtimeProject.WindowLayout(x: 20, y: 40, width: 1280, height: 720),
@@ -102,6 +114,25 @@ enum ProjectEditRoundTripSmokeHarness {
         try require(abs(decodedTrack.volume - 0.73) < 0.000_001, "track volume did not persist")
         try require(decodedTrack.isMuted, "track mute state did not persist")
         try require(!decodedTrack.isSoloed, "track solo state did not persist")
+        let decodedPreview = try requireValue(decodedTrack.waveformPreview, "track dropped launch waveform preview")
+        try require(decodedPreview.isValid(for: fileInfo), "launch waveform preview did not validate")
+        try require(decodedPreview.sourceOverview.bins.count == 128, "source launch preview was not compacted")
+        try require(decodedPreview.displayOverview.bins.count == 128, "display launch preview was not compacted")
+        let restoredLaunchOverview = decodedPreview.displayOverview.waveformOverview
+        try require(
+            abs(restoredLaunchOverview.duration - originalEditedOverview.duration) < 0.000_001,
+            "launch preview duration did not persist"
+        )
+        let mismatchedFileInfo = WAVFileInfo(
+            url: sourceURL,
+            formatTag: 1,
+            channelCount: 2,
+            sampleRate: sampleRate,
+            blockAlign: 4,
+            bitsPerSample: 16,
+            dataRange: 44..<(44 + (sourceFrameCount + 1) * 4)
+        )
+        try require(!decodedPreview.isValid(for: mismatchedFileInfo), "launch preview did not invalidate")
         try require(abs((decodedProject.masterVolume ?? -1) - 0.61) < 0.000_001, "master volume did not persist")
         try require(
             abs((decodedProject.timelineViewport?.startProgress ?? -1) - 0.17) < 0.000_001 &&
@@ -127,8 +158,6 @@ enum ProjectEditRoundTripSmokeHarness {
             try requireValue(restoredTimeline.persistentState, "restored timeline did not persist")
         )
 
-        let sourceOverview = syntheticOverview(duration: Double(sourceFrameCount) / sampleRate, binCount: 4_096)
-        let originalEditedOverview = timeline.waveformOverview(from: sourceOverview)
         let restoredEditedOverview = restoredTimeline.waveformOverview(from: sourceOverview)
         try requireWaveformOverviewsMatch(originalEditedOverview, restoredEditedOverview)
         try requireRenderedAudioMatchesEdits(
@@ -145,6 +174,7 @@ enum ProjectEditRoundTripSmokeHarness {
             checks: [
                 "project preserves track and mixer state",
                 "project preserves edit timeline state",
+                "project preserves compact launch waveform preview",
                 "restored timeline renders audio identical to original edits",
                 "legacy projects migrate and decode",
                 "multi-track edit graph stress round-trips",
