@@ -153,6 +153,16 @@ if CommandLine.arguments.contains("--agent-command-bar-smoke") {
     }
 }
 
+if CommandLine.arguments.contains("--audio-processing-smoke") {
+    do {
+        try AudioProcessingSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        exit(0)
+    } catch {
+        fputs("Soundtime audio processing smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
 if CommandLine.arguments.contains("--performance-dashboard-lifecycle-smoke") {
     do {
         try MainActor.assumeIsolated {
