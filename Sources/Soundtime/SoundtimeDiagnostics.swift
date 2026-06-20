@@ -8,11 +8,13 @@ enum SoundtimeDiagnosticSeverity: String, Codable, Sendable {
 }
 
 enum SoundtimeDiagnosticCategory: String, Codable, Sendable {
+    case api
     case audio
     case render
     case edit
     case device
     case interaction
+    case waveform
     case threading
     case system
 }
