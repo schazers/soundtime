@@ -139,6 +139,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let trackCount: Int
         let trackHeight: Float
         let trackScrollOffset: Float
+        let rulerLaneHeight: Float
     }
 
     private struct GridCache {
@@ -532,6 +533,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let velocityPixelsPerSecond: Float
         let direction: Float
         let timestamp: CFTimeInterval
+    }
+
+    private struct ProcessingSelectionProgress {
+        let selection: TimelineSelection
+        let startFraction: Float?
+        let targetFraction: Float?
+        let transitionStartTimestamp: CFTimeInterval
+        let pulseStartTimestamp: CFTimeInterval
     }
 
     private struct SelectionDragParticle {
@@ -930,6 +939,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var previousTrackWaveformMipLevels: [UUID: [WaveformMipLevel]] = [:]
     private let waveformMipLevelStateLock = NSLock()
     private let waveformCPUFallbackInteractionCooldown: CFTimeInterval = 0.35
+    private let processingSelectionProgressSmoothingDuration: CFTimeInterval = 0.42
     private var lastWaveformHotInteractionTimestamp: CFTimeInterval = -Double.infinity
     private var waveformSourceTracksByID: [UUID: TimelineRenderState.Track] = [:]
     private var currentTrackWaveformMipKeys: [UUID: WaveformMipCacheKey] = [:]
@@ -947,11 +957,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var lastInteractiveWaveformPrewarmKeys: [WaveformMipCacheKey] = []
     private var waveformShaderPrewarmGeneration = 0
     private var selectedTrackVertexScratch: [TimelineVertex] = []
+    private var processingTrackVertexScratch: [TimelineVertex] = []
     private var candidateRegionVertexScratch: [TimelineVertex] = []
     private var selectionVertexScratch: [TimelineVertex] = []
+    private var processingSelectionProgress: ProcessingSelectionProgress?
     private var selectionDragGlowVertexScratch: [TimelineVertex] = []
     private var selectionDragParticleVertexScratch: [TimelineVertex] = []
     private var clipBoundaryVertexScratch: [TimelineVertex] = []
+    private var loopRange = TimelineLoopRange.default
+    private var highlightedLoopEndpoint: TimelineLoopEndpoint?
     private var gridCache: GridCache?
     private var waveformTransitionStartTime: CFTimeInterval?
     private var previousRenderedPlayheadX: Float?
@@ -967,6 +981,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var lastPlayheadKickEnergyUpdateTime = CFAbsoluteTimeGetCurrent()
     private var playheadContactEvents: [PlayheadContactEvent] = []
     private var lastPlayheadContactEventTimestamp: CFTimeInterval?
+    private var isModalBackdropActive = false
     private var transientParticles: [TransientParticle] = []
     private var selectionDragParticles: [SelectionDragParticle] = []
     private var selectionDragParticleEmissionDebt: Float = 0
@@ -1084,7 +1099,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let generatedWaveformMipSamplesPerBin = 4
     private let highResolutionWaveformVisibleDurationThreshold: TimeInterval = 120
     private let waveformMipTargetBinsPerPoint: Float = 96
-    private let playbackWaveformMipTargetBinsPerPoint: Float = 32
     private let minimumWaveformMipTargetVisibleBins: Float = 8_192
     private let maximumCachedWaveformMipPyramids = 512
     private let maximumCachedWaveformShaderBinBuffers = 2_048
@@ -1672,11 +1686,66 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         renderState = renderState.withHover(progress: progress, isArmed: isArmed)
     }
 
+    func displayInteractionSuppressed(_ isSuppressed: Bool) {
+        guard isSuppressed else {
+            return
+        }
+
+        interactionStateStore.publishHover(progress: nil, isArmed: false)
+        renderState = renderState.withHover(progress: nil, isArmed: false)
+    }
+
     func displaySelection(_ selection: TimelineSelection?) {
         markWaveformHotInteraction()
         interactionStateStore.publishSelection(selection)
         interactionStateStore.publishSelectionDragEffect(nil)
         renderState = renderState.withSelection(selection)
+    }
+
+    func displayProcessingSelectionProgress(selection: TimelineSelection?, fractionCompleted: Float?) {
+        guard
+            let selection,
+            selection.durationProgress > 0
+        else {
+            processingSelectionProgress = nil
+            return
+        }
+
+        let now = CACurrentMediaTime()
+        let clampedFraction = fractionCompleted.map { min(max($0, 0), 1) }
+        let startFraction: Float?
+        let pulseStartTimestamp: CFTimeInterval
+        if let existing = processingSelectionProgress, existing.selection == selection {
+            startFraction = interpolatedProcessingSelectionFraction(existing, at: now)
+            pulseStartTimestamp = existing.pulseStartTimestamp
+        } else {
+            startFraction = clampedFraction.map { _ in 0 }
+            pulseStartTimestamp = now
+        }
+
+        processingSelectionProgress = ProcessingSelectionProgress(
+            selection: selection,
+            startFraction: startFraction,
+            targetFraction: clampedFraction,
+            transitionStartTimestamp: now,
+            pulseStartTimestamp: pulseStartTimestamp
+        )
+        if renderState.selection != selection {
+            renderState = renderState.withSelection(selection)
+        }
+    }
+
+    func displayModalBackdropActive(_ isActive: Bool) {
+        guard isModalBackdropActive != isActive else {
+            return
+        }
+
+        isModalBackdropActive = isActive
+        previousRenderedPlayheadX = nil
+        previousRenderedPlayheadTime = nil
+        if isActive {
+            playheadContactEvents.removeAll()
+        }
     }
 
     func publishInteractionSelection(_ selection: TimelineSelection?) {
@@ -1732,6 +1801,23 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         renderState = renderState.withTrimPreview(trimPreview)
     }
 
+    func displayLoopRange(_ loopRange: TimelineLoopRange) {
+        guard self.loopRange != loopRange else {
+            return
+        }
+
+        markWaveformHotInteraction()
+        self.loopRange = loopRange
+    }
+
+    func displayHighlightedLoopEndpoint(_ endpoint: TimelineLoopEndpoint?) {
+        guard highlightedLoopEndpoint != endpoint else {
+            return
+        }
+
+        highlightedLoopEndpoint = endpoint
+    }
+
     func displayGainPreview(selection: TimelineSelection?, gain: Float) {
         markWaveformHotInteraction()
         let gainPreview: TimelineRenderState.GainPreview?
@@ -1745,6 +1831,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     func displayCandidateRegions(_ candidateRegions: [TimelineRenderState.CandidateRegion]) {
         renderState = renderState.withCandidateRegions(candidateRegions)
+    }
+
+    func displayProcessingTrackHighlight(trackID: UUID?, alpha: Float) {
+        let highlight = trackID.map {
+            TimelineRenderState.ProcessingTrackHighlight(trackID: $0, alpha: alpha)
+        }
+        renderState = renderState.withProcessingTrackHighlight(highlight)
     }
 
     func inverseFisheyeViewportProgress(
@@ -2146,9 +2239,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             drawableSize: viewportSize,
             renderState: renderState
         )
-        let selectionVertices = makeSelectionVertices(
+        let processingTrackVertices = makeProcessingTrackHighlightVertices(
             drawableSize: viewportSize,
             renderState: renderState
+        )
+        let selectionVertices = makeSelectionVertices(
+            drawableSize: viewportSize,
+            renderState: renderState,
+            displayTimestamp: displayTimestamp
         )
         let selectionDragEffect = interactionStateStore.selectionDragEffectSnapshot()
         let selectionDragEffectUniform = makeSelectionDragEffectUniform(
@@ -2237,6 +2335,16 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             hasCurrent: currentShaderWaveformsReady || waveformVertices != nil,
             hasPrevious: usesPreviousWaveformShader || previousWaveformVertices != nil
         )
+        let rulerLaneVertices = makeRulerLaneVertices(
+            drawableSize: viewportSize,
+            backingScale: backingScale,
+            renderState: renderState
+        )
+        let loopRangeVertices = makeLoopRangeVertices(
+            drawableSize: viewportSize,
+            backingScale: backingScale,
+            renderState: renderState
+        )
         let trimPreviewVertices = makeTrimPreviewVertices(
             drawableSize: viewportSize,
             backingScale: backingScale,
@@ -2299,6 +2407,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         ) {
             draw(cachedVertices: gridVertices, primitiveType: .triangle, encoder: encoder)
         }
+        draw(vertices: rulerLaneVertices, primitiveType: .triangle, encoder: encoder)
         drawTimelineRulerTicks(
             drawableSize: viewportSize,
             backingScale: backingScale,
@@ -2306,7 +2415,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             encoder: encoder
         )
         encoder.setRenderPipelineState(pipelineState)
+        draw(vertices: loopRangeVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: selectedTrackVertices, primitiveType: .triangle, encoder: encoder)
+        draw(vertices: processingTrackVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: candidateRegionVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: selectionVertices, primitiveType: .triangle, encoder: encoder, fisheye: selectionFisheye)
         if let previousShaderRenderState, usesPreviousWaveformShader {
@@ -4016,10 +4127,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let targetMinorSpacingPoints: Float = 52
         let approximateMinorStep = visibleSeconds * Double(targetMinorSpacingPoints / max(width, 1))
         let minorStepSeconds = max(Float(niceSecondsStep(approximateMinorStep)), 0.000001)
-        let rulerHeightPixels = min(
-            max(18 * scale, height * scale * 0.032),
-            28 * scale
+        let trackLayout = renderState.trackLayout.resolved(
+            totalTrackCount: renderState.tracks.count,
+            viewportHeight: height
         )
+        let rulerHeightPixels = max(trackLayout.rulerLaneHeight * scale, 1)
 
         return TimelineRulerUniform(
             viewport: SIMD4<Float>(
@@ -4042,6 +4154,103 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             ),
             color: SIMD4<Float>(0.78, 0.88, 0.90, 0.72)
         )
+    }
+
+    private func makeRulerLaneVertices(
+        drawableSize: CGSize,
+        backingScale: Float,
+        renderState: TimelineRenderState
+    ) -> [TimelineVertex] {
+        let width = Float(drawableSize.width)
+        let height = Float(drawableSize.height)
+        guard width > 0, height > 0 else {
+            return []
+        }
+
+        let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
+        let rulerHeight = min(max(trackLayout.rulerLaneHeight, 0), height)
+        guard rulerHeight > 0 else {
+            return []
+        }
+
+        let size = SIMD2<Float>(width, height)
+        let lineWidth = pixelLength(backingScale: backingScale)
+        var vertices: [TimelineVertex] = []
+        vertices.reserveCapacity(12)
+        appendRectangle(
+            to: &vertices,
+            left: 0,
+            right: width,
+            top: 0,
+            bottom: rulerHeight,
+            color: SIMD4<Float>(0.055, 0.058, 0.060, 0.96),
+            drawableSize: size
+        )
+        let separatorY = pixelAligned(rulerHeight, backingScale: backingScale)
+        appendRectangle(
+            to: &vertices,
+            left: 0,
+            right: width,
+            top: max(separatorY - lineWidth, 0),
+            bottom: min(separatorY, height),
+            color: SIMD4<Float>(0.20, 0.22, 0.23, 0.72),
+            drawableSize: size
+        )
+        return vertices
+    }
+
+    private func makeLoopRangeVertices(
+        drawableSize: CGSize,
+        backingScale: Float,
+        renderState: TimelineRenderState
+    ) -> [TimelineVertex] {
+        guard
+            renderState.duration != nil,
+            !renderState.tracks.isEmpty
+        else {
+            return []
+        }
+
+        let width = Float(drawableSize.width)
+        let height = Float(drawableSize.height)
+        guard width > 0, height > 0 else {
+            return []
+        }
+
+        let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
+        let rulerHeight = min(max(trackLayout.rulerLaneHeight, 0), height)
+        guard rulerHeight > 8 else {
+            return []
+        }
+
+        let size = SIMD2<Float>(width, height)
+        var vertices: [TimelineVertex] = []
+        vertices.reserveCapacity(96)
+        appendLoopHandle(
+            to: &vertices,
+            label: "L",
+            endpoint: .start,
+            progress: loopRange.startProgress,
+            color: SIMD4<Float>(0.78, 0.82, 0.84, 0.88),
+            isHighlighted: highlightedLoopEndpoint == .start,
+            drawableSize: size,
+            rulerHeight: rulerHeight,
+            backingScale: backingScale,
+            renderState: renderState
+        )
+        appendLoopHandle(
+            to: &vertices,
+            label: "R",
+            endpoint: .end,
+            progress: loopRange.endProgress,
+            color: SIMD4<Float>(0.78, 0.82, 0.84, 0.88),
+            isHighlighted: highlightedLoopEndpoint == .end,
+            drawableSize: size,
+            rulerHeight: rulerHeight,
+            backingScale: backingScale,
+            renderState: renderState
+        )
+        return vertices
     }
 
     private func waveformMipLevelSnapshot() -> WaveformMipLevelSnapshot {
@@ -4348,7 +4557,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             viewportDuration: renderState.viewport.durationProgress,
             trackCount: max(renderState.tracks.count, 1),
             trackHeight: trackLayout.trackHeight,
-            trackScrollOffset: trackLayout.scrollOffset
+            trackScrollOffset: trackLayout.scrollOffset,
+            rulerLaneHeight: trackLayout.rulerLaneHeight
         )
         if let gridCache, gridCache.key == key {
             return gridCache.vertices
@@ -5847,9 +6057,25 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         )
     }
 
+    private func interpolatedProcessingSelectionFraction(
+        _ progress: ProcessingSelectionProgress,
+        at displayTimestamp: CFTimeInterval
+    ) -> Float? {
+        guard let targetFraction = progress.targetFraction else {
+            return nil
+        }
+
+        let startFraction = progress.startFraction ?? targetFraction
+        let elapsed = max(displayTimestamp - progress.transitionStartTimestamp, 0)
+        let rawProgress = Float(elapsed / max(processingSelectionProgressSmoothingDuration, 0.001))
+        let easedProgress = smoothStep(rawProgress)
+        return startFraction + (targetFraction - startFraction) * easedProgress
+    }
+
     private func makeSelectionVertices(
         drawableSize: CGSize,
-        renderState: TimelineRenderState
+        renderState: TimelineRenderState,
+        displayTimestamp: CFTimeInterval
     ) -> [TimelineVertex] {
         selectionVertexScratch.removeAll(keepingCapacity: true)
         guard
@@ -5869,7 +6095,24 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return selectionVertexScratch
         }
 
-        let color = SIMD4<Float>(0.0, 0.84, 0.78, 0.22)
+        let activeProcessingSelection = processingSelectionProgress.flatMap { progress in
+            progress.selection == selection ? progress : nil
+        }
+        let pulseOpacityMultiplier: Float
+        if let activeProcessingSelection {
+            let elapsed = max(displayTimestamp - activeProcessingSelection.pulseStartTimestamp, 0)
+            let wave = 0.5 + 0.5 * sin(Float(elapsed) * 2 * .pi * 1.15)
+            pulseOpacityMultiplier = 0.76 + wave * 0.24
+        } else {
+            pulseOpacityMultiplier = 1
+        }
+
+        let baseColor = isModalBackdropActive ?
+            SIMD4<Float>(0.72, 0.72, 0.72, 0.18 * pulseOpacityMultiplier) :
+            SIMD4<Float>(0.0, 0.84, 0.78, 0.22 * pulseOpacityMultiplier)
+        let progressColor = isModalBackdropActive ?
+            SIMD4<Float>(0.86, 0.86, 0.86, 0.16 + 0.10 * pulseOpacityMultiplier) :
+            SIMD4<Float>(0.20, 0.96, 1.0, 0.18 + 0.12 * pulseOpacityMultiplier)
         guard let verticalRange = selectionVerticalRange(
             for: selection,
             renderState: renderState,
@@ -5877,7 +6120,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         ) else {
             return selectionVertexScratch
         }
-        selectionVertexScratch.reserveCapacity(6)
+        selectionVertexScratch.reserveCapacity(activeProcessingSelection == nil ? 6 : 12)
 
         appendRectangle(
             to: &selectionVertexScratch,
@@ -5885,8 +6128,30 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             right: min(right, 1),
             top: verticalRange.top,
             bottom: verticalRange.bottom,
-            color: color
+            color: baseColor
         )
+
+        if
+            let activeProcessingSelection,
+            let fractionCompleted = interpolatedProcessingSelectionFraction(
+                activeProcessingSelection,
+                at: displayTimestamp
+            )
+        {
+            let fillRight = left + (right - left) * fractionCompleted
+            let visibleLeft = max(left, 0)
+            let visibleRight = min(fillRight, 1)
+            if visibleRight > visibleLeft {
+                appendRectangle(
+                    to: &selectionVertexScratch,
+                    left: visibleLeft,
+                    right: visibleRight,
+                    top: verticalRange.top,
+                    bottom: verticalRange.bottom,
+                    color: progressColor
+                )
+            }
+        }
 
         return selectionVertexScratch
     }
@@ -6022,6 +6287,71 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             )
         }
         return selectedTrackVertexScratch
+    }
+
+    private func makeProcessingTrackHighlightVertices(
+        drawableSize: CGSize,
+        renderState: TimelineRenderState
+    ) -> [TimelineVertex] {
+        processingTrackVertexScratch.removeAll(keepingCapacity: true)
+        guard
+            let highlight = renderState.processingTrackHighlight,
+            highlight.alpha > 0.001,
+            !renderState.tracks.isEmpty,
+            let trackIndex = renderState.tracks.firstIndex(where: { $0.id == highlight.trackID }),
+            let laneFrame = laneFrame(
+                forTrackIndex: trackIndex,
+                renderState: renderState,
+                drawableSize: drawableSize
+            )
+        else {
+            return processingTrackVertexScratch
+        }
+
+        let alpha = highlight.alpha
+        let fillColor = isModalBackdropActive ?
+            SIMD4<Float>(0.58, 0.58, 0.58, 0.085 * alpha) :
+            SIMD4<Float>(0.08, 0.92, 0.96, 0.10 * alpha)
+        let topEdgeColor = isModalBackdropActive ?
+            SIMD4<Float>(0.84, 0.84, 0.84, 0.22 * alpha) :
+            SIMD4<Float>(0.32, 0.98, 1.0, 0.30 * alpha)
+        let bottomEdgeColor = isModalBackdropActive ?
+            SIMD4<Float>(0.78, 0.78, 0.78, 0.14 * alpha) :
+            SIMD4<Float>(0.32, 0.98, 1.0, 0.18 * alpha)
+        let top = max(laneFrame.top, 0)
+        let bottom = min(laneFrame.bottom, 1)
+        guard bottom > top else {
+            return processingTrackVertexScratch
+        }
+
+        let pixelHeight = drawableSize.height > 0 ? Float(1.0 / drawableSize.height) : 0
+        let edgeHeight = max(pixelHeight * 2.0, 0.001)
+        processingTrackVertexScratch.reserveCapacity(18)
+        appendRectangle(
+            to: &processingTrackVertexScratch,
+            left: 0,
+            right: 1,
+            top: top,
+            bottom: bottom,
+            color: fillColor
+        )
+        appendRectangle(
+            to: &processingTrackVertexScratch,
+            left: 0,
+            right: 1,
+            top: top,
+            bottom: min(top + edgeHeight, bottom),
+            color: topEdgeColor
+        )
+        appendRectangle(
+            to: &processingTrackVertexScratch,
+            left: 0,
+            right: 1,
+            top: max(bottom - edgeHeight, top),
+            bottom: bottom,
+            color: bottomEdgeColor
+        )
+        return processingTrackVertexScratch
     }
 
     private func makeClipBoundaryVertices(
@@ -7404,7 +7734,28 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         let elapsedTime = displayTimestamp - renderState.playheadAnchorTimestamp
         let progress = clampedProgress + Float(elapsedTime / duration)
-        return min(max(progress, 0), 1)
+        return loopConstrainedPlaybackProgress(progress)
+    }
+
+    private func loopConstrainedPlaybackProgress(_ progress: Float) -> Float {
+        let clampedProgress = min(max(progress, 0), 1)
+        let start = loopRange.startProgress
+        let end = loopRange.endProgress
+        let duration = end - start
+        guard duration > 0.0001, end > start else {
+            return clampedProgress
+        }
+
+        guard clampedProgress > end else {
+            return clampedProgress
+        }
+
+        let overflow = clampedProgress - end
+        guard overflow > 0 else {
+            return start
+        }
+
+        return start + overflow.truncatingRemainder(dividingBy: duration)
     }
 
     private func currentPlayheadTouchEnergy(isPlaybackActive: Bool) -> Float {
@@ -7476,7 +7827,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return []
         }
 
-        let trimRange = renderState.trimPreview ?? TimelineTrimRange(startProgress: 0, endProgress: 1)
+        guard let trimRange = renderState.trimPreview else {
+            return []
+        }
         let viewport = renderState.viewport
         let startX = viewport.viewportProgress(forTimelineProgress: trimRange.startProgress) * width
         let endX = viewport.viewportProgress(forTimelineProgress: trimRange.endProgress) * width
@@ -7551,6 +7904,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         guard width > 0, height > 0 else {
             return []
         }
+        let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
+        let guideTop = min(max(trackLayout.rulerLaneHeight, 0), height)
+        guard guideTop < height else {
+            return []
+        }
 
         let viewport = renderState.viewport
         let guideProgress = viewport.viewportProgress(forTimelineProgress: hoverProgress)
@@ -7572,7 +7930,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             to: &vertices,
             left: left,
             right: right,
-            top: 0,
+            top: guideTop,
             bottom: height,
             color: color,
             drawableSize: size
@@ -7594,6 +7952,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         guard width > 0, height > 0 else {
             return []
         }
+        let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
+        let playheadTop = min(max(trackLayout.rulerLaneHeight, 0), height)
+        guard playheadTop < height else {
+            return []
+        }
 
         let playheadX: Float
         if !renderState.hasWaveforms {
@@ -7610,25 +7973,35 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             playheadX = min(max(playheadViewportProgress * width, 0), width)
         }
         let kickEnergy = currentPlayheadKickEnergy()
-        let baseColor = renderState.isRecordingActive ?
-            SIMD3<Float>(0.96, 0.12, 0.14) :
-            SIMD3<Float>(0.0, 0.75, 0.78)
-        let burstColor = renderState.isRecordingActive ?
-            SIMD3<Float>(1.0, 0.30, 0.24) :
-            SIMD3<Float>(0.0, 0.62, 0.86)
+        let baseColor: SIMD3<Float>
+        let burstColor: SIMD3<Float>
+        if isModalBackdropActive {
+            baseColor = SIMD3<Float>(0.58, 0.58, 0.58)
+            burstColor = SIMD3<Float>(0.72, 0.72, 0.72)
+        } else if renderState.isRecordingActive {
+            baseColor = SIMD3<Float>(0.96, 0.12, 0.14)
+            burstColor = SIMD3<Float>(1.0, 0.30, 0.24)
+        } else {
+            baseColor = SIMD3<Float>(0.0, 0.75, 0.78)
+            burstColor = SIMD3<Float>(0.0, 0.62, 0.86)
+        }
         let blendedColor = baseColor + (burstColor - baseColor) * kickEnergy
         let size = SIMD2<Float>(width, height)
         var vertices: [TimelineVertex] = []
         vertices.reserveCapacity(90)
         let baseWidth = pixelLength(4.0, backingScale: backingScale)
         let halfBaseWidth = baseWidth * 0.5
-        updatePlayheadContactEvents(
-            drawableSize: size,
-            playheadProgress: playheadProgress,
-            renderState: renderState,
-            mipLevelSnapshot: mipLevelSnapshot,
-            displayTimestamp: displayTimestamp
-        )
+        if isModalBackdropActive {
+            playheadContactEvents.removeAll()
+        } else {
+            updatePlayheadContactEvents(
+                drawableSize: size,
+                playheadProgress: playheadProgress,
+                renderState: renderState,
+                mipLevelSnapshot: mipLevelSnapshot,
+                displayTimestamp: displayTimestamp
+            )
+        }
 
         if renderState.isPlaybackActive,
            let previousRenderedPlayheadX,
@@ -7645,7 +8018,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                     to: &vertices,
                     left: max(sweepLeft, 0),
                     right: min(sweepRight, width),
-                    top: 0,
+                    top: playheadTop,
                     bottom: height,
                     color: SIMD4<Float>(
                         blendedColor.x,
@@ -7678,7 +8051,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                         centerX: originX,
                         leftWidth: halfBaseWidth,
                         rightWidth: halfBaseWidth,
-                        top: 0,
+                        top: playheadTop,
                         bottom: height,
                         color: SIMD4<Float>(
                             baseColor.x,
@@ -7705,7 +8078,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                             centerX: trailX,
                             leftWidth: halfBaseWidth,
                             rightWidth: halfBaseWidth,
-                            top: 0,
+                            top: playheadTop,
                             bottom: height,
                             color: SIMD4<Float>(
                                 baseColor.x,
@@ -7729,7 +8102,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 centerX: playheadX,
                 leftWidth: kickHalfWidth,
                 rightWidth: kickHalfWidth,
-                top: 0,
+                top: playheadTop,
                 bottom: height,
                 color: SIMD4<Float>(
                     blendedColor.x,
@@ -7747,21 +8120,23 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             centerX: playheadX,
             leftWidth: halfBaseWidth,
             rightWidth: halfBaseWidth,
-            top: 0,
+            top: playheadTop,
             bottom: height,
             color: SIMD4<Float>(blendedColor.x, blendedColor.y, blendedColor.z, 1.0),
             drawableSize: size,
             backingScale: backingScale
         )
 
-        appendPlayheadContactVertices(
-            to: &vertices,
-            playheadX: playheadX,
-            lineHalfWidth: halfBaseWidth,
-            drawableSize: size,
-            backingScale: backingScale,
-            displayTimestamp: displayTimestamp
-        )
+        if !isModalBackdropActive {
+            appendPlayheadContactVertices(
+                to: &vertices,
+                playheadX: playheadX,
+                lineHalfWidth: halfBaseWidth,
+                drawableSize: size,
+                backingScale: backingScale,
+                displayTimestamp: displayTimestamp
+            )
+        }
 
         previousRenderedPlayheadX = playheadX
         previousRenderedPlayheadTime = CFAbsoluteTimeGetCurrent()
@@ -8393,9 +8768,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         renderState: TimelineRenderState
     ) -> Float {
         let width = max(Float(drawableSize.width) * max(backingScale, 1), 1)
-        let binsPerPoint = renderState.isPlaybackActive ?
-            playbackWaveformMipTargetBinsPerPoint :
-            waveformMipTargetBinsPerPoint
+        let binsPerPoint = waveformMipTargetBinsPerPoint
         return max(width * binsPerPoint, minimumWaveformMipTargetVisibleBins)
     }
 
@@ -8888,6 +9261,306 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         )
     }
 
+    private enum LoopFlagRoundedEdge {
+        case leading
+        case trailing
+    }
+
+    private func appendLoopHandle(
+        to vertices: inout [TimelineVertex],
+        label: Character,
+        endpoint: TimelineLoopEndpoint,
+        progress: Float,
+        color: SIMD4<Float>,
+        isHighlighted: Bool,
+        drawableSize: SIMD2<Float>,
+        rulerHeight: Float,
+        backingScale: Float,
+        renderState: TimelineRenderState
+    ) {
+        let width = drawableSize.x
+        let height = drawableSize.y
+        let viewportProgress = renderState.viewport.viewportProgress(forTimelineProgress: progress)
+        guard viewportProgress >= -0.04, viewportProgress <= 1.04 else {
+            return
+        }
+
+        let clampedX = min(max(viewportProgress * width, 0), width)
+        let alignedX = pixelAligned(clampedX, backingScale: backingScale)
+        let lineWidth = max(pixelLength(2, backingScale: backingScale), 1)
+        let lineLeft = min(max(alignedX - lineWidth * 0.5, 0), width)
+        let lineRight = min(lineLeft + lineWidth, width)
+        let tabWidth: Float = 18
+        let tabHeight = min(max(rulerHeight - 14, 14), 18)
+        let tabTop: Float = 0
+        let tabBottom = min(tabHeight, rulerHeight - pixelLength(backingScale: backingScale))
+        let tabLeft: Float
+        let tabRight: Float
+        if label == "L" {
+            tabLeft = min(max(alignedX, 0), max(width - tabWidth, 0))
+            tabRight = min(tabLeft + tabWidth, width)
+        } else {
+            tabRight = max(min(alignedX, width), tabWidth)
+            tabLeft = max(tabRight - tabWidth, 0)
+        }
+
+        let guideAlpha: Float = isHighlighted ? 0.78 : 0.50
+        let guideColor = isHighlighted ?
+            SIMD4<Float>(0.90, 0.97, 1.0, guideAlpha) :
+            SIMD4<Float>(color.x, color.y, color.z, guideAlpha)
+        appendRectangle(
+            to: &vertices,
+            left: lineLeft,
+            right: lineRight,
+            top: tabBottom,
+            bottom: height,
+            color: guideColor,
+            drawableSize: drawableSize
+        )
+
+        let flagColor = isHighlighted ?
+            SIMD4<Float>(0.92, 0.97, 1.0, 0.98) :
+            color
+        appendLoopFlag(
+            to: &vertices,
+            left: tabLeft,
+            right: tabRight,
+            top: tabTop,
+            bottom: tabBottom,
+            roundedEdge: endpoint == .start ? .trailing : .leading,
+            color: flagColor,
+            drawableSize: drawableSize
+        )
+        appendLoopLabelGlyph(
+            to: &vertices,
+            label: label,
+            left: tabLeft,
+            right: tabRight,
+            top: tabTop,
+            bottom: tabBottom,
+            drawableSize: drawableSize,
+            backingScale: backingScale
+        )
+    }
+
+    private func appendLoopFlag(
+        to vertices: inout [TimelineVertex],
+        left: Float,
+        right: Float,
+        top: Float,
+        bottom: Float,
+        roundedEdge: LoopFlagRoundedEdge,
+        color: SIMD4<Float>,
+        drawableSize: SIMD2<Float>
+    ) {
+        guard right > left, bottom > top else {
+            return
+        }
+
+        let width = right - left
+        let height = bottom - top
+        let radius = min(width * 0.36, height * 0.42, 5)
+        guard radius > 0.5 else {
+            appendRectangle(
+                to: &vertices,
+                left: left,
+                right: right,
+                top: top,
+                bottom: bottom,
+                color: color,
+                drawableSize: drawableSize
+            )
+            return
+        }
+
+        let sliceCount = 6
+        switch roundedEdge {
+        case .trailing:
+            appendRectangle(
+                to: &vertices,
+                left: left,
+                right: right - radius,
+                top: top,
+                bottom: bottom,
+                color: color,
+                drawableSize: drawableSize
+            )
+            for index in 0..<sliceCount {
+                let x0 = right - radius + radius * Float(index) / Float(sliceCount)
+                let x1 = right - radius + radius * Float(index + 1) / Float(sliceCount)
+                let midX = (x0 + x1) * 0.5
+                let distanceFromSquareEdge = midX - (right - radius)
+                let inset = radius - sqrt(max(radius * radius - distanceFromSquareEdge * distanceFromSquareEdge, 0))
+                appendRectangle(
+                    to: &vertices,
+                    left: x0,
+                    right: x1,
+                    top: top + inset,
+                    bottom: bottom - inset,
+                    color: color,
+                    drawableSize: drawableSize
+                )
+            }
+        case .leading:
+            appendRectangle(
+                to: &vertices,
+                left: left + radius,
+                right: right,
+                top: top,
+                bottom: bottom,
+                color: color,
+                drawableSize: drawableSize
+            )
+            for index in 0..<sliceCount {
+                let x0 = left + radius * Float(index) / Float(sliceCount)
+                let x1 = left + radius * Float(index + 1) / Float(sliceCount)
+                let midX = (x0 + x1) * 0.5
+                let distanceFromSquareEdge = (left + radius) - midX
+                let inset = radius - sqrt(max(radius * radius - distanceFromSquareEdge * distanceFromSquareEdge, 0))
+                appendRectangle(
+                    to: &vertices,
+                    left: x0,
+                    right: x1,
+                    top: top + inset,
+                    bottom: bottom - inset,
+                    color: color,
+                    drawableSize: drawableSize
+                )
+            }
+        }
+    }
+
+    private func appendLoopLabelGlyph(
+        to vertices: inout [TimelineVertex],
+        label: Character,
+        left: Float,
+        right: Float,
+        top: Float,
+        bottom: Float,
+        drawableSize: SIMD2<Float>,
+        backingScale: Float
+    ) {
+        let stroke = max(pixelLength(2, backingScale: backingScale), 1)
+        let glyphWidth = min(max((right - left) * 0.42, 6), 8)
+        let glyphHeight = min(max((bottom - top) * 0.58, 8), 12)
+        let glyphLeft = pixelAligned((left + right - glyphWidth) * 0.5, backingScale: backingScale)
+        let glyphTop = pixelAligned((top + bottom - glyphHeight) * 0.5, backingScale: backingScale)
+        let glyphRight = glyphLeft + glyphWidth
+        let glyphBottom = glyphTop + glyphHeight
+        let glyphColor = SIMD4<Float>(0.015, 0.025, 0.030, 0.92)
+
+        appendRectangle(
+            to: &vertices,
+            left: glyphLeft,
+            right: glyphLeft + stroke,
+            top: glyphTop,
+            bottom: glyphBottom,
+            color: glyphColor,
+            drawableSize: drawableSize
+        )
+
+        if label == "L" {
+            appendRectangle(
+                to: &vertices,
+                left: glyphLeft,
+                right: glyphRight,
+                top: glyphBottom - stroke,
+                bottom: glyphBottom,
+                color: glyphColor,
+                drawableSize: drawableSize
+            )
+        } else {
+            appendRectangle(
+                to: &vertices,
+                left: glyphLeft,
+                right: glyphRight - stroke * 0.3,
+                top: glyphTop,
+                bottom: glyphTop + stroke,
+                color: glyphColor,
+                drawableSize: drawableSize
+            )
+            appendRectangle(
+                to: &vertices,
+                left: glyphLeft,
+                right: glyphRight - stroke * 0.5,
+                top: glyphTop + glyphHeight * 0.43,
+                bottom: glyphTop + glyphHeight * 0.43 + stroke,
+                color: glyphColor,
+                drawableSize: drawableSize
+            )
+            appendRectangle(
+                to: &vertices,
+                left: glyphRight - stroke,
+                right: glyphRight,
+                top: glyphTop + stroke * 0.4,
+                bottom: glyphTop + glyphHeight * 0.43 + stroke * 0.4,
+                color: glyphColor,
+                drawableSize: drawableSize
+            )
+            appendLineSegment(
+                to: &vertices,
+                start: SIMD2<Float>(
+                    glyphLeft + glyphWidth * 0.44,
+                    glyphTop + glyphHeight * 0.52
+                ),
+                end: SIMD2<Float>(
+                    glyphRight,
+                    glyphBottom
+                ),
+                thickness: stroke,
+                color: glyphColor,
+                drawableSize: drawableSize
+            )
+        }
+    }
+
+    private func appendLineSegment(
+        to vertices: inout [TimelineVertex],
+        start: SIMD2<Float>,
+        end: SIMD2<Float>,
+        thickness: Float,
+        color: SIMD4<Float>,
+        drawableSize: SIMD2<Float>
+    ) {
+        let direction = end - start
+        let length = max(simd_length(direction), 0.001)
+        let normal = SIMD2<Float>(-direction.y, direction.x) / length * max(thickness * 0.5, 0.5)
+        appendQuad(
+            to: &vertices,
+            p0: start + normal,
+            p1: end + normal,
+            p2: end - normal,
+            p3: start - normal,
+            color: color,
+            drawableSize: drawableSize
+        )
+    }
+
+    private func appendQuad(
+        to vertices: inout [TimelineVertex],
+        p0: SIMD2<Float>,
+        p1: SIMD2<Float>,
+        p2: SIMD2<Float>,
+        p3: SIMD2<Float>,
+        color: SIMD4<Float>,
+        drawableSize: SIMD2<Float>
+    ) {
+        guard drawableSize.x > 0, drawableSize.y > 0 else {
+            return
+        }
+
+        let v0 = makeVertex(normalizedPosition: SIMD2<Float>(p0.x / drawableSize.x, p0.y / drawableSize.y), color: color)
+        let v1 = makeVertex(normalizedPosition: SIMD2<Float>(p1.x / drawableSize.x, p1.y / drawableSize.y), color: color)
+        let v2 = makeVertex(normalizedPosition: SIMD2<Float>(p2.x / drawableSize.x, p2.y / drawableSize.y), color: color)
+        let v3 = makeVertex(normalizedPosition: SIMD2<Float>(p3.x / drawableSize.x, p3.y / drawableSize.y), color: color)
+        vertices.append(v0)
+        vertices.append(v1)
+        vertices.append(v3)
+        vertices.append(v1)
+        vertices.append(v2)
+        vertices.append(v3)
+    }
+
     private func pixelLength(_ pixels: Float = 1, backingScale: Float) -> Float {
         pixels / max(backingScale, 1)
     }
@@ -9276,6 +9949,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         if (yPixels > rulerHeightPixels + 1.0) {
             return float4(0.0);
         }
+        float yFromTrackTopPixels = rulerHeightPixels - yPixels;
+        if (yFromTrackTopPixels < -1.0) {
+            return float4(0.0);
+        }
 
         float projectDuration = max(in.viewport.z, 0.000001);
         float minorStepSeconds = max(in.viewport.w, 0.000001);
@@ -9314,14 +9991,17 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float mediumHeightPixels = rulerHeightPixels * 0.42;
         float majorHeightPixels = rulerHeightPixels * 0.50;
         float tickHeightPixels = isMajor ? majorHeightPixels : (isMedium ? mediumHeightPixels : minorHeightPixels);
-        float yCoverage = 1.0 - smoothstep(tickHeightPixels, tickHeightPixels + 1.0, yPixels);
+        float yCoverage = 1.0 - smoothstep(
+            tickHeightPixels,
+            tickHeightPixels + 1.0,
+            yFromTrackTopPixels
+        );
         if (yCoverage <= 0.0) {
             return float4(0.0);
         }
 
         float tickAlpha = isMajor ? 1.0 : (isMedium ? 0.68 : 0.38);
-        float edgeFade = 1.0 - smoothstep(rulerHeightPixels * 0.72, rulerHeightPixels, yPixels);
-        float alpha = in.color.a * xCoverage * yCoverage * tickAlpha * max(edgeFade, 0.15);
+        float alpha = in.color.a * xCoverage * yCoverage * tickAlpha;
         return float4(in.color.rgb, alpha);
     }
 

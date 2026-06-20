@@ -3,17 +3,21 @@ import Foundation
 struct TimelineTrackLayout: Sendable, Equatable {
     static let `default` = TimelineTrackLayout()
     static let defaultPreferredTrackHeight: Float = 148
+    static let defaultRulerLaneHeight: Float = 32
     fileprivate static let maximumAutoFitTrackCount = 4
 
     var scrollOffset: Float
     var preferredTrackHeight: Float
+    var rulerLaneHeight: Float
 
     init(
         scrollOffset: Float = 0,
-        preferredTrackHeight: Float = Self.defaultPreferredTrackHeight
+        preferredTrackHeight: Float = Self.defaultPreferredTrackHeight,
+        rulerLaneHeight: Float = Self.defaultRulerLaneHeight
     ) {
         self.scrollOffset = max(scrollOffset, 0)
         self.preferredTrackHeight = max(preferredTrackHeight, 1)
+        self.rulerLaneHeight = max(rulerLaneHeight, 0)
     }
 
     func resolved(totalTrackCount: Int, viewportHeight: Float) -> ResolvedTimelineTrackLayout {
@@ -21,7 +25,8 @@ struct TimelineTrackLayout: Sendable, Equatable {
             totalTrackCount: totalTrackCount,
             viewportHeight: viewportHeight,
             preferredTrackHeight: preferredTrackHeight,
-            requestedScrollOffset: scrollOffset
+            requestedScrollOffset: scrollOffset,
+            rulerLaneHeight: rulerLaneHeight
         )
     }
 
@@ -29,7 +34,8 @@ struct TimelineTrackLayout: Sendable, Equatable {
         let resolvedLayout = resolved(totalTrackCount: totalTrackCount, viewportHeight: viewportHeight)
         return TimelineTrackLayout(
             scrollOffset: resolvedLayout.scrollOffset,
-            preferredTrackHeight: preferredTrackHeight
+            preferredTrackHeight: preferredTrackHeight,
+            rulerLaneHeight: rulerLaneHeight
         )
     }
 
@@ -41,7 +47,8 @@ struct TimelineTrackLayout: Sendable, Equatable {
         let resolvedLayout = resolved(totalTrackCount: totalTrackCount, viewportHeight: viewportHeight)
         return TimelineTrackLayout(
             scrollOffset: min(max(resolvedLayout.scrollOffset + deltaPixels, 0), resolvedLayout.maximumScrollOffset),
-            preferredTrackHeight: preferredTrackHeight
+            preferredTrackHeight: preferredTrackHeight,
+            rulerLaneHeight: rulerLaneHeight
         )
     }
 }
@@ -52,39 +59,46 @@ struct ResolvedTimelineTrackLayout: Sendable, Equatable {
     let trackHeight: Float
     let scrollOffset: Float
     let contentHeight: Float
+    let rulerLaneHeight: Float
+    let trackViewportHeight: Float
 
     init(
         totalTrackCount: Int,
         viewportHeight: Float,
         preferredTrackHeight: Float,
-        requestedScrollOffset: Float
+        requestedScrollOffset: Float,
+        rulerLaneHeight: Float = TimelineTrackLayout.defaultRulerLaneHeight
     ) {
         let safeTrackCount = max(totalTrackCount, 0)
         let safeViewportHeight = max(viewportHeight, 1)
         let safePreferredTrackHeight = max(preferredTrackHeight, 1)
+        let safeRulerLaneHeight = min(max(rulerLaneHeight, 0), max(safeViewportHeight - 1, 0))
+        let safeTrackViewportHeight = max(safeViewportHeight - safeRulerLaneHeight, 1)
         let fillTrackHeight = safeTrackCount > 0 ?
-            safeViewportHeight / Float(safeTrackCount) :
-            safeViewportHeight
+            safeTrackViewportHeight / Float(safeTrackCount) :
+            safeTrackViewportHeight
         let resolvedTrackHeight: Float
         if safeTrackCount == 0 {
-            resolvedTrackHeight = safeViewportHeight
+            resolvedTrackHeight = safeTrackViewportHeight
         } else if safeTrackCount <= TimelineTrackLayout.maximumAutoFitTrackCount {
             resolvedTrackHeight = fillTrackHeight
         } else {
             resolvedTrackHeight = max(safePreferredTrackHeight, fillTrackHeight)
         }
         let resolvedContentHeight = resolvedTrackHeight * Float(max(safeTrackCount, 1))
-        let maximumScrollOffset = max(resolvedContentHeight - safeViewportHeight, 0)
+        let maximumScrollOffset = max(resolvedContentHeight - safeTrackViewportHeight, 0)
 
         self.totalTrackCount = safeTrackCount
         self.viewportHeight = safeViewportHeight
         self.trackHeight = resolvedTrackHeight
         self.scrollOffset = min(max(requestedScrollOffset, 0), maximumScrollOffset)
         self.contentHeight = resolvedContentHeight
+        self.rulerLaneHeight = safeRulerLaneHeight
+        self.trackViewportHeight = safeTrackViewportHeight
     }
 
     var maximumScrollOffset: Float {
-        max(contentHeight - viewportHeight, 0)
+        max(contentHeight - trackViewportHeight, 0)
     }
 
     var isScrollable: Bool {
@@ -97,7 +111,7 @@ struct ResolvedTimelineTrackLayout: Sendable, Equatable {
         }
 
         let firstVisibleIndex = Int(floor(scrollOffset / trackHeight))
-        let lastVisibleIndex = Int(ceil((scrollOffset + viewportHeight) / trackHeight))
+        let lastVisibleIndex = Int(ceil((scrollOffset + trackViewportHeight) / trackHeight))
         let lowerBound = max(firstVisibleIndex - max(overscan, 0), 0)
         let upperBound = min(lastVisibleIndex + max(overscan, 0), totalTrackCount)
         return lowerBound..<max(lowerBound, upperBound)
@@ -108,7 +122,7 @@ struct ResolvedTimelineTrackLayout: Sendable, Equatable {
             return nil
         }
 
-        let topPixels = Float(trackIndex) * trackHeight - scrollOffset
+        let topPixels = rulerLaneHeight + Float(trackIndex) * trackHeight - scrollOffset
         let bottomPixels = topPixels + trackHeight
         let top = topPixels / viewportHeight
         let bottom = bottomPixels / viewportHeight
@@ -120,7 +134,12 @@ struct ResolvedTimelineTrackLayout: Sendable, Equatable {
             return nil
         }
 
-        let index = Int(floor((min(max(yFromTop, 0), viewportHeight) + scrollOffset) / trackHeight))
+        guard yFromTop >= rulerLaneHeight else {
+            return nil
+        }
+
+        let trackYFromTop = min(max(yFromTop - rulerLaneHeight, 0), trackViewportHeight)
+        let index = Int(floor((trackYFromTop + scrollOffset) / trackHeight))
         guard index >= 0, index < totalTrackCount else {
             return nil
         }

@@ -534,11 +534,19 @@ enum TimelineUXSmokeHarness {
 
     private static func verifyTrackLayoutGeometry() throws {
         let threeTrackLayout = TimelineTrackLayout.default.resolved(totalTrackCount: 3, viewportHeight: 360)
-        try require(abs(threeTrackLayout.trackHeight - 120) < 0.000_1, "3-track layout did not fill viewport equally")
-        try require(abs(threeTrackLayout.contentHeight - 360) < 0.000_1, "3-track content height did not match viewport")
+        let expectedTrackViewportHeight = 360 - TimelineTrackLayout.defaultRulerLaneHeight
+        try require(
+            abs(threeTrackLayout.trackHeight - expectedTrackViewportHeight / 3) < 0.000_1,
+            "3-track layout did not fill track viewport equally"
+        )
+        try require(
+            abs(threeTrackLayout.contentHeight - expectedTrackViewportHeight) < 0.000_1,
+            "3-track content height did not match track viewport"
+        )
         try require(threeTrackLayout.maximumScrollOffset == 0, "3-track layout should not scroll")
         try require(threeTrackLayout.visibleRange(overscan: 0) == 0..<3, "3-track visible range was wrong")
-        try require(threeTrackLayout.trackIndex(atYFromTop: 1) == 0, "top y did not hit first track")
+        try require(threeTrackLayout.trackIndex(atYFromTop: 1) == nil, "ruler y should not hit a track")
+        try require(threeTrackLayout.trackIndex(atYFromTop: 33) == 0, "first track y did not hit first track")
         try require(threeTrackLayout.trackIndex(atYFromTop: 180) == 1, "middle y did not hit second track")
         try require(threeTrackLayout.trackIndex(atYFromTop: 359) == 2, "bottom y did not hit third track")
 
@@ -551,9 +559,10 @@ enum TimelineUXSmokeHarness {
         try require(fiveTrackLayout.visibleRange(overscan: 0) == 0..<3, "5-track initial visible range was wrong")
 
         let scrolled = TimelineTrackLayout(scrollOffset: 260).resolved(totalTrackCount: 5, viewportHeight: 360)
-        try require(scrolled.visibleRange(overscan: 0) == 1..<5, "scrolled visible range was wrong")
-        try require(scrolled.trackIndex(atYFromTop: 1) == 1, "scrolled top y did not hit expected track")
-        try require(scrolled.trackIndex(atYFromTop: 359) == 4, "scrolled bottom y did not hit expected track")
+        try require(scrolled.visibleRange(overscan: 0) == 1..<4, "scrolled visible range was wrong")
+        try require(scrolled.trackIndex(atYFromTop: 1) == nil, "scrolled ruler y should not hit a track")
+        try require(scrolled.trackIndex(atYFromTop: 33) == 1, "scrolled first track y did not hit expected track")
+        try require(scrolled.trackIndex(atYFromTop: 359) == 3, "scrolled bottom y did not hit expected track")
 
         for trackIndex in 0..<5 {
             guard let laneFrame = scrolled.laneFrame(forTrackIndex: trackIndex) else {
