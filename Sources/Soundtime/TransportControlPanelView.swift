@@ -297,7 +297,7 @@ final class TransportControlPanelView: TimelineMetalLayerView {
     }
 
     private func buttonLayout() -> [NSRect] {
-        let buttonSize: CGFloat = 58
+        let buttonSize: CGFloat = 68
         let y = bounds.midY - buttonSize * 0.5
         return [
             NSRect(
@@ -433,8 +433,12 @@ private final class TransportControlPanelRenderer {
         }
 
         let displayTime = target.displayTimestamp
-        let hoverPoint = state.hoveredPoint ?? CGPoint(x: -10_000, y: -10_000)
-        let pressedPoint = state.pressedPoint ?? CGPoint(x: -10_000, y: -10_000)
+        let hoverPoint = state.hoveredPoint.map {
+            CGPoint(x: $0.x, y: target.viewportSize.height - $0.y)
+        } ?? CGPoint(x: -10_000, y: -10_000)
+        let pressedPoint = state.pressedPoint.map {
+            CGPoint(x: $0.x, y: target.viewportSize.height - $0.y)
+        } ?? CGPoint(x: -10_000, y: -10_000)
         var uniform = Uniform(
             metrics: SIMD4<Float>(
                 Float(target.viewportSize.width),
@@ -573,9 +577,9 @@ private final class TransportControlPanelRenderer {
     static float play_icon_coverage(float2 p, float2 center, float aa, float grow) {
         return triangle_coverage(
             p,
-            center + float2(7.0 + grow, 0.0),
-            center + float2(-5.0 - grow * 0.35, -8.4 - grow),
-            center + float2(-5.0 - grow * 0.35, 8.4 + grow),
+            center + float2(8.2 + grow, 0.0),
+            center + float2(-5.9 - grow * 0.35, -9.7 - grow),
+            center + float2(-5.9 - grow * 0.35, 9.7 + grow),
             aa
         );
     }
@@ -583,15 +587,15 @@ private final class TransportControlPanelRenderer {
     static float pause_icon_coverage(float2 p, float2 center, float aa, float grow) {
         float leftPause = rect_coverage(
             p,
-            center + float2(-4.6 - grow * 0.12, 0.0),
-            float2(2.1 + grow * 0.18, 8.2 + grow),
+            center + float2(-5.3 - grow * 0.12, 0.0),
+            float2(2.45 + grow * 0.18, 9.45 + grow),
             1.6,
             aa
         );
         float rightPause = rect_coverage(
             p,
-            center + float2(4.6 + grow * 0.12, 0.0),
-            float2(2.1 + grow * 0.18, 8.2 + grow),
+            center + float2(5.3 + grow * 0.12, 0.0),
+            float2(2.45 + grow * 0.18, 9.45 + grow),
             1.6,
             aa
         );
@@ -741,7 +745,7 @@ private final class TransportControlPanelRenderer {
             float depth = enabled * (0.08 * activeEnergy + 0.13 * pressed + 0.13 * pointerPressed);
 
             float2 buttonCenter = center + float2(0.0, depth * 0.95);
-            float buttonRadius = 22.0 - depth * 0.45;
+            float buttonRadius = 26.0 - depth * 0.45;
             float2 halfSize = float2(buttonRadius - depth * 0.55, buttonRadius - depth * 0.35);
             float buttonSDF = rounded_box_sdf(p - buttonCenter, halfSize, buttonRadius);
             float buttonCoverage = coverage_from_sdf(buttonSDF, aa);
@@ -809,7 +813,7 @@ private final class TransportControlPanelRenderer {
         float4 hotIconColor = float4(float3(0.96, 1.0, 1.0), iconAlpha);
 
         float2 playCenter = center;
-        float2 iconLocal = (p - playCenter) / 18.0;
+        float2 iconLocal = (p - playCenter) / 21.0;
         float iconRefraction = (0.18 + activeEnergy * 0.24 + audioEnergy * 0.12) * enabled;
         float2 iconWarp = float2(
             sin(time * 1.08 + iconLocal.y * 5.2 + iconLocal.x * 1.7),
