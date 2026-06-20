@@ -1,7 +1,8 @@
 import Foundation
 
 struct SoundtimeProject: Codable, Sendable {
-    static let currentSchemaVersion = 3
+    static let currentSchemaVersion = 4
+    static let launchWaveformPreviewBinCount = 4_096
 
     struct WindowLayout: Codable, Sendable {
         var x: Double
@@ -39,6 +40,172 @@ struct SoundtimeProject: Codable, Sendable {
         var activeCandidateID: UUID?
     }
 
+    struct WaveformPreview: Codable, Sendable {
+        struct FileFingerprint: Codable, Sendable, Equatable {
+            var frameCount: Int
+            var sampleRate: Double
+            var channelCount: Int
+            var bitsPerSample: Int
+            var dataByteCount: Int
+            var fileSize: Int64?
+            var modificationTime: TimeInterval?
+
+            init(fileInfo: WAVFileInfo) {
+                frameCount = fileInfo.frameCount
+                sampleRate = fileInfo.sampleRate
+                channelCount = fileInfo.channelCount
+                bitsPerSample = fileInfo.bitsPerSample
+                dataByteCount = fileInfo.dataRange.count
+
+                let resourceValues = try? fileInfo.url.resourceValues(
+                    forKeys: [.fileSizeKey, .contentModificationDateKey]
+                )
+                fileSize = resourceValues?.fileSize.map(Int64.init)
+                modificationTime = resourceValues?.contentModificationDate?.timeIntervalSince1970
+            }
+
+            func matches(fileInfo: WAVFileInfo) -> Bool {
+                guard
+                    frameCount == fileInfo.frameCount,
+                    abs(sampleRate - fileInfo.sampleRate) < 0.001,
+                    channelCount == fileInfo.channelCount,
+                    bitsPerSample == fileInfo.bitsPerSample,
+                    dataByteCount == fileInfo.dataRange.count
+                else {
+                    return false
+                }
+
+                let currentValues = try? fileInfo.url.resourceValues(
+                    forKeys: [.fileSizeKey, .contentModificationDateKey]
+                )
+                if
+                    let fileSize,
+                    let currentFileSize = currentValues?.fileSize.map(Int64.init),
+                    fileSize != currentFileSize
+                {
+                    return false
+                }
+                if
+                    let modificationTime,
+                    let currentModificationTime = currentValues?.contentModificationDate?.timeIntervalSince1970,
+                    abs(modificationTime - currentModificationTime) > 0.001
+                {
+                    return false
+                }
+
+                return true
+            }
+        }
+
+        struct Overview: Codable, Sendable {
+            struct Bin: Codable, Sendable {
+                var minimumSample: Float
+                var maximumSample: Float
+                var rmsSample: Float
+                var lowEnergy: Float
+                var midEnergy: Float
+                var highEnergy: Float
+
+                init(_ bin: WaveformOverview.Bin) {
+                    minimumSample = bin.minimumSample
+                    maximumSample = bin.maximumSample
+                    rmsSample = bin.rmsSample
+                    lowEnergy = bin.lowEnergy
+                    midEnergy = bin.midEnergy
+                    highEnergy = bin.highEnergy
+                }
+
+                var waveformBin: WaveformOverview.Bin {
+                    WaveformOverview.Bin(
+                        minimumSample: minimumSample,
+                        maximumSample: maximumSample,
+                        rmsSample: rmsSample,
+                        lowEnergy: lowEnergy,
+                        midEnergy: midEnergy,
+                        highEnergy: highEnergy
+                    )
+                }
+            }
+
+            var duration: TimeInterval
+            var bins: [Bin]
+
+            init(_ overview: WaveformOverview) {
+                duration = overview.duration
+                bins = overview.bins.map(Bin.init)
+            }
+
+            var waveformOverview: WaveformOverview {
+                WaveformOverview(
+                    duration: duration,
+                    bins: bins.map(\.waveformBin)
+                )
+            }
+        }
+
+        var fileFingerprint: FileFingerprint
+        var sourceOverview: Overview
+        var displayOverview: Overview
+
+        init?(
+            sourceOverview: WaveformOverview?,
+            displayOverview: WaveformOverview?,
+            fileInfo: WAVFileInfo,
+            maximumBinCount: Int = SoundtimeProject.launchWaveformPreviewBinCount
+        ) {
+            guard let displayOverview, !displayOverview.isEmpty else {
+                return nil
+            }
+
+            let sourceOverview = sourceOverview?.isEmpty == false ? sourceOverview! : displayOverview
+            fileFingerprint = FileFingerprint(fileInfo: fileInfo)
+            self.sourceOverview = Overview(Self.reducedOverview(
+                sourceOverview,
+                maximumBinCount: maximumBinCount
+            ))
+            self.displayOverview = Overview(Self.reducedOverview(
+                displayOverview,
+                maximumBinCount: maximumBinCount
+            ))
+        }
+
+        func isValid(for fileInfo: WAVFileInfo) -> Bool {
+            fileFingerprint.matches(fileInfo: fileInfo) &&
+                sourceOverview.duration.isFinite &&
+                displayOverview.duration.isFinite &&
+                !sourceOverview.bins.isEmpty &&
+                !displayOverview.bins.isEmpty
+        }
+
+        private static func reducedOverview(
+            _ overview: WaveformOverview,
+            maximumBinCount: Int
+        ) -> WaveformOverview {
+            guard overview.bins.count > maximumBinCount, maximumBinCount > 0 else {
+                return overview
+            }
+
+            let sourceBins = overview.bins
+            let sourceCount = sourceBins.count
+            var bins: [WaveformOverview.Bin] = []
+            bins.reserveCapacity(maximumBinCount)
+            let binsPerOutput = Double(sourceCount) / Double(maximumBinCount)
+
+            for outputIndex in 0..<maximumBinCount {
+                let startIndex = min(max(Int((Double(outputIndex) * binsPerOutput).rounded(.down)), 0), sourceCount - 1)
+                let rawEndIndex = Int((Double(outputIndex + 1) * binsPerOutput).rounded(.down))
+                let endIndex = min(max(rawEndIndex, startIndex + 1), sourceCount)
+                var accumulator = WaveformBinAccumulator()
+                for sourceIndex in startIndex..<endIndex {
+                    accumulator.addBin(sourceBins[sourceIndex])
+                }
+                bins.append(accumulator.makeBin())
+            }
+
+            return WaveformOverview(duration: overview.duration, bins: bins)
+        }
+    }
+
     struct Track: Codable, Sendable {
         var id: UUID
         var editGroupID: UUID? = nil
@@ -48,6 +215,7 @@ struct SoundtimeProject: Codable, Sendable {
         var isMuted: Bool
         var isSoloed: Bool
         var editTimeline: AudioFileEditTimeline.PersistentState?
+        var waveformPreview: WaveformPreview? = nil
     }
 
     var tracks: [Track]
