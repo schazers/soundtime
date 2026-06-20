@@ -202,18 +202,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(
             title: "Cut",
-            action: #selector(TimelineView.cutTimelineSelection(_:)),
+            action: #selector(NSText.cut(_:)),
             keyEquivalent: "x"
         ))
         menu.addItem(NSMenuItem(
             title: "Copy",
-            action: #selector(TimelineView.copyTimelineSelection(_:)),
+            action: #selector(NSText.copy(_:)),
             keyEquivalent: "c"
         ))
         menu.addItem(NSMenuItem(
             title: "Paste",
-            action: #selector(TimelineView.pasteTimelineAudio(_:)),
+            action: #selector(NSText.paste(_:)),
             keyEquivalent: "v"
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Select All",
+            action: #selector(NSText.selectAll(_:)),
+            keyEquivalent: "a"
         ))
         menu.addItem(NSMenuItem(
             title: "Duplicate Region",
@@ -318,6 +323,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(
             title: "Normalize",
             action: #selector(TimelineView.normalizeTimelineSelection(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Denoise Selection",
+            action: #selector(TimelineView.denoiseTimelineSelection(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Separate Music Stems",
+            action: #selector(TimelineView.separateMusicStemsTimelineSelection(_:)),
             keyEquivalent: ""
         ))
         menu.addItem(NSMenuItem(

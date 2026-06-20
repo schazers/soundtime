@@ -25,6 +25,7 @@ let package = Package(
                 .linkedFramework("AudioToolbox"),
                 .linkedFramework("CoreAudio"),
                 .linkedFramework("Metal"),
+                .linkedFramework("Security"),
             ]
         ),
         .testTarget(

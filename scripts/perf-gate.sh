@@ -30,6 +30,9 @@ swift run Soundtime --edit-graph-smoke
 echo "== Soundtime edit preview smoke =="
 swift run Soundtime --edit-preview-smoke
 
+echo "== Soundtime audio processing smoke =="
+swift run Soundtime --audio-processing-smoke
+
 echo "== Soundtime realtime graph publish smoke =="
 swift run Soundtime --realtime-graph-publish-smoke
 
@@ -49,6 +52,7 @@ if [[ -n "${SOUNDTIME_STABILITY_REPORT_DIR:-}" ]]; then
     "project-edit-roundtrip-smoke.json"
     "edit-graph-smoke.json"
     "edit-preview-smoke.json"
+    "audio-processing-smoke.json"
     "realtime-graph-publish-smoke.json"
     "timeline-ux-smoke.json"
     "waveform-tiled-render-pipeline-smoke.json"
