@@ -35,6 +35,14 @@ final class PerformanceDashboardWindowController: NSWindowController, NSWindowDe
         controller.display(frameStats: frameStats)
     }
 
+    static func refreshIfVisible() {
+        guard let controller = sharedController, controller.window?.isVisible == true else {
+            return
+        }
+
+        controller.refresh()
+    }
+
     static func closeIfLoaded() {
         sharedController?.closeIfVisible()
     }
@@ -89,7 +97,7 @@ final class PerformanceDashboardWindowController: NSWindowController, NSWindowDe
             backing: .buffered,
             defer: false
         )
-        window.title = "Soundtime Performance"
+        window.title = "Soundtime Development Console"
         window.minSize = NSSize(width: 620, height: 720)
         window.isReleasedWhenClosed = false
         window.contentView = dashboardView
@@ -119,6 +127,10 @@ final class PerformanceDashboardWindowController: NSWindowController, NSWindowDe
 
     func display(frameStats: TimelineFrameStats) {
         dashboardView.display(frameStats: frameStats)
+    }
+
+    func refresh() {
+        dashboardView.refresh()
     }
 
     func closeIfVisible() {
@@ -168,7 +180,7 @@ final class PerformanceDashboardWindowController: NSWindowController, NSWindowDe
 }
 
 private final class PerformanceDashboardView: NSView {
-    private let titleLabel = NSTextField(labelWithString: "Performance Monitor")
+    private let titleLabel = NSTextField(labelWithString: "Development Console")
     private let subtitleLabel = NSTextField(labelWithString: "Audio, render, GPU, queues, and trace health")
     private let fpsCard = PerformanceMetricCardView(
         title: "FPS",
@@ -217,6 +229,10 @@ private final class PerformanceDashboardView: NSView {
 
         lastFPSGraphSampleTime = now
         fpsCard.record(sample: CGFloat(frameStats.framesPerSecond))
+    }
+
+    func refresh() {
+        updateDashboard()
     }
 
     func resume() {
@@ -326,7 +342,7 @@ private final class PerformanceDashboardView: NSView {
     }
 
     private func updateDashboard() {
-        let diagnostics = SoundtimeDiagnostics.shared.snapshot(limit: 60)
+        let diagnostics = SoundtimeDiagnostics.shared.snapshot(limit: 240)
         let importBudget = ImportWorkBudget.shared.snapshot()
         let frameStats = latestFrameStats ?? diagnostics.frameStats
         let cpuPercent = cpuSampler.samplePercent()
@@ -567,17 +583,16 @@ private final class PerformanceEventLogView: NSView {
     }
 
     func update(events: [SoundtimeDiagnosticEvent]) {
-        let formatter = DateComponentsFormatter()
-        formatter.allowedUnits = [.minute, .second]
-        formatter.zeroFormattingBehavior = .pad
-        let lines = events.suffix(36).reversed().map { event -> String in
+        let lines = events.suffix(160).reversed().map { event -> String in
             let severity = event.severity.rawValue.uppercased()
             let fields = event.fields
                 .sorted { $0.key < $1.key }
-                .prefix(4)
+                .prefix(8)
                 .map { "\($0.key)=\($0.value)" }
                 .joined(separator: " ")
-            return "[\(severity)] \(event.category.rawValue).\(event.name)  \(event.message)  \(fields)"
+            let timestamp = String(format: "%8.3f", event.timestamp)
+            let suffix = fields.isEmpty ? "" : "  \(fields)"
+            return "\(timestamp)  [\(severity)] \(event.category.rawValue).\(event.name)  \(event.message)\(suffix)"
         }
         textView.string = lines.isEmpty ? "No diagnostic events yet." : lines.joined(separator: "\n")
     }

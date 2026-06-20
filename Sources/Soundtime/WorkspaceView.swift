@@ -37,6 +37,8 @@ final class WorkspaceView: NSView {
     private enum LastEffect {
         case gain(decibels: Double)
         case normalize
+        case denoise
+        case separateMusicStems
         case fade(FadeEffect)
     }
 
@@ -147,6 +149,51 @@ final class WorkspaceView: NSView {
         let editedDuration: TimeInterval
         let editedAudioTimeline: AudioEditTimeline?
         let editedFileTimeline: AudioFileEditTimeline?
+    }
+
+    private struct DenoiseProcessingResult: Sendable {
+        let materialized: (
+            buffer: DecodedAudioBuffer,
+            timeline: AudioEditTimeline,
+            waveformOverview: WaveformOverview,
+            zeroCrossingIndex: AudioZeroCrossingIndex
+        )
+        let beforeBuffer: DecodedAudioBuffer
+        let afterBuffer: DecodedAudioBuffer
+        let processedFrameCount: Int
+        let providerSummary: String
+    }
+
+    private struct PendingDenoiseReview {
+        let requestID: UUID
+        let trackID: UUID
+        let editRevision: Int
+        let displaySelection: TimelineSelection
+        let editSelection: TimelineSelection
+        let trackName: String
+        let result: DenoiseProcessingResult
+    }
+
+    private struct StemSeparationStemResult: Sendable {
+        let name: String
+        let buffer: DecodedAudioBuffer
+    }
+
+    private struct StemSeparationProcessingResult: Sendable {
+        let beforeBuffer: DecodedAudioBuffer
+        let stems: [StemSeparationStemResult]
+        let timelineStartTime: TimeInterval
+        let providerSummary: String
+    }
+
+    private struct PendingStemSeparationReview {
+        let requestID: UUID
+        let trackID: UUID
+        let editRevision: Int
+        let displaySelection: TimelineSelection
+        let editSelection: TimelineSelection
+        let trackName: String
+        let result: StemSeparationProcessingResult
     }
 
     private struct SplitTrackEdit {
@@ -282,6 +329,7 @@ final class WorkspaceView: NSView {
     private var selectedAudioFile: AudioFileMetadata?
     private var decodedAudioBuffer: DecodedAudioBuffer?
     private var audioTimeline: AudioEditTimeline?
+    private let waveformOverviewDiskCache = WaveformOverviewDiskCacheStore()
     private var editUndoStack: [UndoAction] = [] {
         didSet {
             scheduleAutosaveIfNeeded()
@@ -294,7 +342,19 @@ final class WorkspaceView: NSView {
     private var deadAirAuditionStopTask: Task<Void, Never>?
     private let highConfidenceSilenceThreshold: Float = 0.86
     private var lastEffect: LastEffect?
+    private var activeDenoiseRequestID: UUID?
+    private var activeDenoiseProvider: AudioProcessingProvider?
+    private var activeDenoiseTask: Task<Void, Never>?
+    private var activeDenoiseTrackID: UUID?
+    private var activeDenoiseDisplaySelection: TimelineSelection?
+    private var denoiseHighlightFadeTask: Task<Void, Never>?
+    private var pendingDenoiseReview: PendingDenoiseReview?
+    private var pendingStemSeparationReview: PendingStemSeparationReview?
+    private var activeAudioProcessingOperation: AudioProcessingOperation?
+    private var isDenoiseModalInteractionLocked = false
     private var currentPlayheadFrame = 0
+    private var timelineLoopRange = TimelineLoopRange.default
+    private var previousLoopPlaybackProgress: Float?
     private var displayedFrameCount = 0
     private var displayedSampleRate: Double = 0
     private var currentPlaybackStatus = "idle"
@@ -335,7 +395,9 @@ final class WorkspaceView: NSView {
         requestedScrollOffset: 0
     )
     private let playbackController: PlaybackEngine = PlaybackEngineFactory.makeDefault()
-    private let playbackRefreshRate: TimeInterval = 10
+    private var playbackRefreshRate: TimeInterval {
+        timelineLoopRange.durationProgress < 0.999 ? 60 : 10
+    }
     private let loudnessMeterRefreshRate: TimeInterval = 60
     private let fallbackLoudnessMaximumAudibleTracks = 32
     private let fallbackLoudnessMaximumFrameCount = 384
@@ -525,6 +587,9 @@ final class WorkspaceView: NSView {
     private let addTrackButton = AddTrackButton()
     private let exportProgressOverlay = ExportProgressOverlayView()
     private let gainEffectOverlay = GainEffectOverlayView()
+    private let denoiseProgressOverlay = DenoiseProgressOverlayView()
+    private let denoiseReviewOverlay = DenoiseReviewOverlayView()
+    private let stemSeparationReviewOverlay = StemSeparationReviewOverlayView()
     private var framesPerSecondWidthConstraint: NSLayoutConstraint?
     private var trackControlsBelowDebugConstraint: NSLayoutConstraint?
     private var trackControlsBelowHeaderConstraint: NSLayoutConstraint?
@@ -549,11 +614,55 @@ final class WorkspaceView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        guard !isDenoiseModalInteractionActive else {
+            return
+        }
+
         clearSelectedTrack()
         super.mouseDown(with: event)
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
+        if isDenoiseModalInteractionActive {
+            let overlay: NSView
+            if pendingStemSeparationReview != nil {
+                overlay = stemSeparationReviewOverlay
+            } else if pendingDenoiseReview != nil {
+                overlay = denoiseReviewOverlay
+            } else {
+                overlay = denoiseProgressOverlay
+            }
+            let overlayPoint = overlay.convert(point, from: self)
+            return overlay.hitTest(overlayPoint) ?? overlay
+        }
+
+        if
+            !stemSeparationReviewOverlay.isHidden,
+            stemSeparationReviewOverlay.alphaValue > 0.01,
+            stemSeparationReviewOverlay.frame.contains(point)
+        {
+            let overlayPoint = stemSeparationReviewOverlay.convert(point, from: self)
+            return stemSeparationReviewOverlay.hitTest(overlayPoint) ?? stemSeparationReviewOverlay
+        }
+
+        if
+            !denoiseReviewOverlay.isHidden,
+            denoiseReviewOverlay.alphaValue > 0.01,
+            denoiseReviewOverlay.frame.contains(point)
+        {
+            let overlayPoint = denoiseReviewOverlay.convert(point, from: self)
+            return denoiseReviewOverlay.hitTest(overlayPoint) ?? denoiseReviewOverlay
+        }
+
+        if
+            !denoiseProgressOverlay.isHidden,
+            denoiseProgressOverlay.alphaValue > 0.01,
+            denoiseProgressOverlay.frame.contains(point)
+        {
+            let overlayPoint = denoiseProgressOverlay.convert(point, from: self)
+            return denoiseProgressOverlay.hitTest(overlayPoint) ?? denoiseProgressOverlay
+        }
+
         if let addTrackHitView = hitTestAddTrackButton(point) {
             return addTrackHitView
         }
@@ -575,6 +684,20 @@ final class WorkspaceView: NSView {
         }
 
         return hitView
+    }
+
+    private var isDenoiseModalInteractionActive: Bool {
+        isDenoiseModalInteractionLocked
+    }
+
+    private func setDenoiseModalInteractionLocked(_ isLocked: Bool) {
+        guard isDenoiseModalInteractionLocked != isLocked else {
+            timelineSurface.setInteractionSuppressed(isLocked)
+            return
+        }
+
+        isDenoiseModalInteractionLocked = isLocked
+        timelineSurface.setInteractionSuppressed(isLocked)
     }
 
     private func isAgentCommandBarHit(_ view: NSView?) -> Bool {
@@ -716,6 +839,12 @@ final class WorkspaceView: NSView {
         timelineSurface.onNormalizeRequested = { [weak self] in
             self?.applyNormalizeEffect()
         }
+        timelineSurface.onDenoiseRequested = { [weak self] in
+            self?.applyDenoiseEffect()
+        }
+        timelineSurface.onSeparateMusicStemsRequested = { [weak self] in
+            self?.applyStemSeparationEffect()
+        }
         timelineSurface.onDeleteSilenceRequested = { [weak self] in
             self?.reviewDeadAir()
         }
@@ -769,6 +898,9 @@ final class WorkspaceView: NSView {
         }
         timelineSurface.onTrackLaneLayoutChanged = { [weak self] layout in
             self?.updateTrackLaneLayout(layout)
+        }
+        timelineSurface.onLoopRangeChanged = { [weak self] loopRange in
+            self?.updateTimelineLoopRange(loopRange)
         }
         addTrackButton.onPressed = { [weak self] in
             self?.addEmptyTrack()
@@ -829,6 +961,21 @@ final class WorkspaceView: NSView {
         gainEffectOverlay.onCancel = { [weak self] in
             self?.cancelSelectedGainPreview()
         }
+        denoiseProgressOverlay.onCancel = { [weak self] in
+            self?.cancelActiveDenoiseProcessing()
+        }
+        denoiseReviewOverlay.onAccept = { [weak self] in
+            self?.acceptPendingDenoiseReview()
+        }
+        denoiseReviewOverlay.onReject = { [weak self] in
+            self?.rejectPendingDenoiseReview()
+        }
+        stemSeparationReviewOverlay.onAccept = { [weak self] in
+            self?.acceptPendingStemSeparationReview()
+        }
+        stemSeparationReviewOverlay.onReject = { [weak self] in
+            self?.rejectPendingStemSeparationReview()
+        }
 
         addSubview(titleLabel)
         addSubview(metadataLabel)
@@ -848,6 +995,9 @@ final class WorkspaceView: NSView {
         addSubview(agentCommandBar)
         addSubview(exportProgressOverlay)
         addSubview(gainEffectOverlay)
+        addSubview(denoiseProgressOverlay)
+        addSubview(denoiseReviewOverlay)
+        addSubview(stemSeparationReviewOverlay)
 
         let fisheyeTrailingConstraint = fisheyeControlsStack.trailingAnchor.constraint(
             lessThanOrEqualTo: loudnessMeter.leadingAnchor,
@@ -866,7 +1016,7 @@ final class WorkspaceView: NSView {
         volumeToLoudnessConstraint.priority = .defaultLow
         let framesPerSecondWidthConstraint = framesPerSecondLabel.widthAnchor.constraint(equalToConstant: 390)
         framesPerSecondWidthConstraint.priority = .defaultLow
-        let transportPanelWidthConstraint = transportControlPanel.widthAnchor.constraint(equalToConstant: 104)
+        let transportPanelWidthConstraint = transportControlPanel.widthAnchor.constraint(equalToConstant: 116)
         transportPanelWidthConstraint.priority = .defaultHigh
         let volumeControlWidthConstraint = volumeControl.widthAnchor.constraint(equalToConstant: 150)
         volumeControlWidthConstraint.priority = .defaultLow
@@ -916,7 +1066,7 @@ final class WorkspaceView: NSView {
             transportControlPanel.centerXAnchor.constraint(equalTo: centerXAnchor),
             transportControlPanel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
             transportPanelWidthConstraint,
-            transportControlPanel.heightAnchor.constraint(equalToConstant: 96),
+            transportControlPanel.heightAnchor.constraint(equalToConstant: 106),
 
             volumeControl.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
             volumeControl.leadingAnchor.constraint(equalTo: transportControlPanel.trailingAnchor, constant: 20),
@@ -973,6 +1123,21 @@ final class WorkspaceView: NSView {
             gainEffectOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
             gainEffectOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
             gainEffectOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            denoiseProgressOverlay.topAnchor.constraint(equalTo: topAnchor),
+            denoiseProgressOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
+            denoiseProgressOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
+            denoiseProgressOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            denoiseReviewOverlay.topAnchor.constraint(equalTo: topAnchor),
+            denoiseReviewOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
+            denoiseReviewOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
+            denoiseReviewOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            stemSeparationReviewOverlay.topAnchor.constraint(equalTo: topAnchor),
+            stemSeparationReviewOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stemSeparationReviewOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stemSeparationReviewOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
 
         updateEffectCommandState()
@@ -992,6 +1157,9 @@ final class WorkspaceView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         guard window == nil else {
+            if !isDenoiseModalInteractionLocked, activeDenoiseRequestID == nil, pendingDenoiseReview == nil {
+                timelineSurface.setInteractionSuppressed(false)
+            }
             return
         }
 
@@ -1014,6 +1182,23 @@ final class WorkspaceView: NSView {
         pendingProjectTrackMixUpdate = false
         loudnessMeterTimer?.invalidate()
         loudnessMeterTimer = nil
+        activeDenoiseTask?.cancel()
+        activeDenoiseTask = nil
+        activeDenoiseRequestID = nil
+        activeDenoiseProvider = nil
+        activeDenoiseTrackID = nil
+        activeDenoiseDisplaySelection = nil
+        pendingDenoiseReview = nil
+        pendingStemSeparationReview = nil
+        activeAudioProcessingOperation = nil
+        denoiseProgressOverlay.hide(animated: false)
+        denoiseReviewOverlay.hide(animated: false)
+        stemSeparationReviewOverlay.hide(animated: false)
+        setDenoiseModalInteractionLocked(false)
+        timelineSurface.displayModalBackdropActive(false)
+        timelineSurface.displayProcessingSelectionProgress(selection: nil, fractionCompleted: nil)
+        denoiseHighlightFadeTask?.cancel()
+        denoiseHighlightFadeTask = nil
         inputRecorder.stop()
         inputRecorder.onChunk = nil
         recordingTakeWriter?.cancel()
@@ -1109,6 +1294,11 @@ final class WorkspaceView: NSView {
     }
 
     private func handleTransportAction(_ action: TransportControlPanelView.TransportAction) {
+        guard !isDenoiseProcessingActive else {
+            updateTransportControlState(isPlaying: false)
+            return
+        }
+
         switch action {
         case .togglePlayback:
             togglePlayback()
@@ -1119,8 +1309,10 @@ final class WorkspaceView: NSView {
     }
 
     private func updateTransportControlState(isPlaying: Bool) {
-        transportControlPanel.isPlaying = isPlaying
-        transportControlPanel.isTransportEnabled = playbackController.hasSource || recordingTrackID != nil
+        let isDenoiseModalActive = isDenoiseModalInteractionLocked
+        transportControlPanel.isPlaying = isDenoiseModalActive ? false : isPlaying
+        transportControlPanel.isTransportEnabled = !isDenoiseModalActive &&
+            (playbackController.hasSource || recordingTrackID != nil)
     }
 
     private func updateWaveformFisheyeTuning() {
@@ -1194,6 +1386,48 @@ final class WorkspaceView: NSView {
     private func handleWindowKeyDown(_ event: NSEvent) -> NSEvent? {
         guard event.window === window else {
             return event
+        }
+
+        if pendingDenoiseReview != nil {
+            if event.keyCode == 49 {
+                guard !event.isARepeat else {
+                    return nil
+                }
+                denoiseReviewOverlay.togglePreviewPlayback()
+                return nil
+            }
+            if event.keyCode == 53 {
+                rejectPendingDenoiseReview()
+                return nil
+            }
+            if event.keyCode == 36 || event.keyCode == 76 {
+                acceptPendingDenoiseReview()
+                return nil
+            }
+            return event.modifierFlags.contains(.command) ? event : nil
+        }
+
+        if pendingStemSeparationReview != nil {
+            if event.keyCode == 49 {
+                guard !event.isARepeat else {
+                    return nil
+                }
+                stemSeparationReviewOverlay.togglePreviewPlayback()
+                return nil
+            }
+            if event.keyCode == 53 {
+                rejectPendingStemSeparationReview()
+                return nil
+            }
+            if event.keyCode == 36 || event.keyCode == 76 {
+                acceptPendingStemSeparationReview()
+                return nil
+            }
+            return event.modifierFlags.contains(.command) ? event : nil
+        }
+
+        if isDenoiseModalInteractionLocked {
+            return event.modifierFlags.contains(.command) ? event : nil
         }
 
         if window?.firstResponder is NSTextView {
@@ -1275,6 +1509,9 @@ final class WorkspaceView: NSView {
         rebuildControls: Bool = true,
         animateWaveformTransition: Bool = true
     ) {
+        if !isDenoiseModalInteractionLocked, activeDenoiseRequestID == nil, pendingDenoiseReview == nil {
+            timelineSurface.setInteractionSuppressed(false)
+        }
         timelineSurface.displayTracks(
             timelineRenderTracks(),
             animateWaveformTransition: animateWaveformTransition
@@ -1286,6 +1523,9 @@ final class WorkspaceView: NSView {
     }
 
     private func refreshProjectTrackMixDisplay() {
+        if !isDenoiseModalInteractionLocked, activeDenoiseRequestID == nil, pendingDenoiseReview == nil {
+            timelineSurface.setInteractionSuppressed(false)
+        }
         timelineSurface.displayTrackMixSettings(timelineMixRenderTracks())
     }
 
@@ -1491,6 +1731,14 @@ final class WorkspaceView: NSView {
 
         currentTrackLaneLayout = layout
         refreshTrackControls()
+    }
+
+    private func updateTimelineLoopRange(_ loopRange: TimelineLoopRange) {
+        timelineLoopRange = loopRange
+        previousLoopPlaybackProgress = nil
+        if playbackController.isPlaying {
+            startPlaybackTimer()
+        }
     }
 
     private func layoutTrackControlViews() {
@@ -1885,6 +2133,12 @@ final class WorkspaceView: NSView {
                         fileInfo: fileInfo,
                         waveformOverview: waveformOverview
                     )
+                    self.cacheWaveformOverview(
+                        waveformOverview,
+                        targetBinCount: previewLevel.targetBinCount,
+                        samplesPerBin: previewLevel.samplesPerBin,
+                        fileInfo: fileInfo
+                    )
                 } catch {
                     guard self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
                         return
@@ -1906,6 +2160,29 @@ final class WorkspaceView: NSView {
         let safeTrackName = sanitizedSourceStem(trackName)
         let fileName = "\(safeTrackName.isEmpty ? "Recording" : safeTrackName)-\(UUID().uuidString).wav"
         return recordingsDirectory.appendingPathComponent(fileName)
+    }
+
+    private func audioProcessingDirectoryURL() -> URL {
+        let baseDirectory = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        return baseDirectory
+            .appendingPathComponent("Soundtime", isDirectory: true)
+            .appendingPathComponent("APIProcessing", isDirectory: true)
+            .standardizedFileURL
+    }
+
+    private func audioProcessingInputURL(trackName: String) -> URL {
+        let processingDirectory = audioProcessingDirectoryURL()
+        try? FileManager.default.createDirectory(
+            at: processingDirectory,
+            withIntermediateDirectories: true
+        )
+
+        let safeTrackName = sanitizedSourceStem(trackName)
+        let fileName = "\(safeTrackName.isEmpty ? "Audio" : safeTrackName)-Processing-Input-\(UUID().uuidString).wav"
+        return processingDirectory.appendingPathComponent(fileName).standardizedFileURL
     }
 
     private func recordingsDirectoryURL() -> URL {
@@ -2345,6 +2622,18 @@ final class WorkspaceView: NSView {
         let importID = UUID()
         let trackName = settings?.name ?? url.deletingPathExtension().lastPathComponent
         let fileInfo = try? WAVAudioDecoder.inspect(url: url)
+        let launchPreview = fileInfo.flatMap { fileInfo -> SoundtimeProject.WaveformPreview? in
+            guard
+                let waveformPreview = settings?.waveformPreview,
+                waveformPreview.isValid(for: fileInfo)
+            else {
+                return nil
+            }
+
+            return waveformPreview
+        }
+        let launchSourceOverview = launchPreview?.sourceOverview.waveformOverview
+        let launchDisplayOverview = launchPreview?.displayOverview.waveformOverview
         let persistedFileTimeline: AudioFileEditTimeline?
         if
             let editTimeline = settings?.editTimeline,
@@ -2356,15 +2645,15 @@ final class WorkspaceView: NSView {
         } else {
             persistedFileTimeline = nil
         }
-        let durationHint = persistedFileTimeline?.duration ?? fileInfo?.duration
+        let durationHint = launchDisplayOverview?.duration ?? persistedFileTimeline?.duration ?? fileInfo?.duration
         let track = ProjectTrack(
             id: trackID,
             editGroupID: settings?.editGroupID ?? defaultEditGroupID,
             name: trackName,
             sourceURL: url,
             durationHint: durationHint,
-            sourceWaveformOverview: nil,
-            waveformOverview: nil,
+            sourceWaveformOverview: launchSourceOverview,
+            waveformOverview: launchDisplayOverview,
             decodedAudioBuffer: nil,
             zeroCrossingIndex: nil,
             zeroCrossingProbe: nil,
@@ -2388,27 +2677,144 @@ final class WorkspaceView: NSView {
         if !isLoadingProject {
             reloadPlaybackFromProjectTracks(preserveProgress: true)
         }
-        updateStatus("\(trackName) loading")
+        let launchPreviewReason: String
+        if launchPreview != nil {
+            launchPreviewReason = "valid"
+        } else if settings?.waveformPreview != nil {
+            launchPreviewReason = fileInfo == nil ? "file-inspection-failed" : "fingerprint-mismatch"
+        } else {
+            launchPreviewReason = "not-stored"
+        }
+        recordWaveformCacheDecision(
+            name: launchPreview == nil ? "launch-preview-miss" : "launch-preview-hit",
+            message: launchPreview == nil ?
+                "No saved project launch waveform preview was usable for this track." :
+                "Loaded saved project launch waveform preview for this track.",
+            tier: "projectLaunchPreview",
+            result: launchPreview == nil ? "miss" : "hit",
+            trackID: trackID,
+            trackName: trackName,
+            sourceURL: url,
+            binCount: launchDisplayOverview?.bins.count,
+            reason: launchPreviewReason
+        )
+        updateStatus(launchPreview == nil ? "\(trackName) loading" : "launch preview ready - resolving waveform")
 
         let wavPreviewLevels = wavPreviewLevels
-        Task { [weak self, trackID, importID, url, wavPreviewLevels] in
+        Task { [weak self, trackID, importID, url, fileInfo, wavPreviewLevels] in
             do {
                 guard let initialPreviewLevel = wavPreviewLevels.first else {
                     return
                 }
 
-                let previewResult = try await AudioImportPipeline.loadWAVPreview(
-                    at: url,
-                    targetBinCount: initialPreviewLevel.targetBinCount,
-                    samplesPerBin: initialPreviewLevel.samplesPerBin
-                )
-
                 guard let self, self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
                     return
                 }
 
-                self.applyTrackPreview(trackID: trackID, previewResult: previewResult)
-                var latestPreviewBinCount = previewResult.waveformOverview.bins.count
+                var latestPreviewBinCount = launchDisplayOverview?.bins.count ?? 0
+                var latestFileInfo = fileInfo
+                if let fileInfo {
+                    let cachedEntry = await self.cachedWaveformOverview(at: url, fileInfo: fileInfo)
+                    if
+                        let cachedEntry,
+                        self.isTrackImportCurrent(trackID: trackID, importID: importID),
+                        cachedEntry.overview.bins.count > latestPreviewBinCount
+                    {
+                        self.recordWaveformCacheDecision(
+                            name: "raw-overview-cache-hit",
+                            message: "Loaded raw waveform overview from disk cache.",
+                            tier: "rawOverviewDiskCache",
+                            result: "hit",
+                            trackID: trackID,
+                            trackName: trackName,
+                            sourceURL: url,
+                            binCount: cachedEntry.overview.bins.count,
+                            targetBinCount: cachedEntry.level.targetBinCount,
+                            samplesPerBin: cachedEntry.level.samplesPerBin
+                        )
+                        latestPreviewBinCount = cachedEntry.overview.bins.count
+                        latestFileInfo = cachedEntry.fileInfo
+                        let editedDisplayOverview = await self.cachedEditedDisplayOverviewForTrack(
+                            trackID: trackID,
+                            sourceURL: url,
+                            fileInfo: cachedEntry.fileInfo
+                        )
+                        self.applyTrackPreviewRefinement(
+                            trackID: trackID,
+                            fileInfo: cachedEntry.fileInfo,
+                            waveformOverview: cachedEntry.overview,
+                            displayOverviewOverride: editedDisplayOverview
+                        )
+                    } else if self.isTrackImportCurrent(trackID: trackID, importID: importID) {
+                        self.recordWaveformCacheDecision(
+                            name: "raw-overview-cache-miss",
+                            message: "Raw waveform overview disk cache was unavailable or not finer than the current preview.",
+                            tier: "rawOverviewDiskCache",
+                            result: "miss",
+                            trackID: trackID,
+                            trackName: trackName,
+                            sourceURL: url,
+                            binCount: cachedEntry?.overview.bins.count,
+                            targetBinCount: cachedEntry?.level.targetBinCount,
+                            samplesPerBin: cachedEntry?.level.samplesPerBin,
+                            reason: cachedEntry == nil ? "not-found" : "not-finer-than-current-preview"
+                        )
+                    }
+                } else {
+                    self.recordWaveformCacheDecision(
+                        name: "raw-overview-cache-miss",
+                        message: "Raw waveform overview disk cache could not be checked because the WAV file was not inspectable.",
+                        tier: "rawOverviewDiskCache",
+                        result: "miss",
+                        trackID: trackID,
+                        trackName: trackName,
+                        sourceURL: url,
+                        reason: "file-inspection-failed"
+                    )
+                }
+
+                if latestPreviewBinCount < min(initialPreviewLevel.targetBinCount, latestFileInfo?.frameCount ?? Int.max) {
+                    self.recordWaveformCacheDecision(
+                        name: "preview-rebuild",
+                        message: "Building initial waveform preview in the background.",
+                        tier: "backgroundRebuild",
+                        result: "build",
+                        trackID: trackID,
+                        trackName: trackName,
+                        sourceURL: url,
+                        targetBinCount: initialPreviewLevel.targetBinCount,
+                        samplesPerBin: initialPreviewLevel.samplesPerBin,
+                        reason: "cache-missing-or-too-coarse"
+                    )
+                    let previewResult = try await AudioImportPipeline.loadWAVPreview(
+                        at: url,
+                        targetBinCount: initialPreviewLevel.targetBinCount,
+                        samplesPerBin: initialPreviewLevel.samplesPerBin
+                    )
+
+                    guard self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
+                        return
+                    }
+
+                    let editedDisplayOverview = await self.cachedEditedDisplayOverviewForTrack(
+                        trackID: trackID,
+                        sourceURL: url,
+                        fileInfo: previewResult.fileInfo
+                    )
+                    self.applyTrackPreview(
+                        trackID: trackID,
+                        previewResult: previewResult,
+                        displayOverviewOverride: editedDisplayOverview
+                    )
+                    self.cacheWaveformOverview(
+                        previewResult.waveformOverview,
+                        targetBinCount: initialPreviewLevel.targetBinCount,
+                        samplesPerBin: initialPreviewLevel.samplesPerBin,
+                        fileInfo: previewResult.fileInfo
+                    )
+                    latestPreviewBinCount = previewResult.waveformOverview.bins.count
+                    latestFileInfo = previewResult.fileInfo
+                }
 
                 for previewLevel in wavPreviewLevels.dropFirst() {
                     guard self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
@@ -2418,12 +2824,23 @@ final class WorkspaceView: NSView {
                         return
                     }
 
-                    let nextBinCount = min(previewLevel.targetBinCount, previewResult.fileInfo.frameCount)
+                    let nextBinCount = min(previewLevel.targetBinCount, latestFileInfo?.frameCount ?? Int.max)
                     guard nextBinCount > latestPreviewBinCount else {
                         continue
                     }
 
                     do {
+                        self.recordWaveformCacheDecision(
+                            name: "preview-refinement-rebuild",
+                            message: "Building finer waveform preview level in the background.",
+                            tier: "backgroundRebuild",
+                            result: "build",
+                            trackID: trackID,
+                            trackName: trackName,
+                            sourceURL: url,
+                            targetBinCount: previewLevel.targetBinCount,
+                            samplesPerBin: previewLevel.samplesPerBin
+                        )
                         let (fileInfo, waveformOverview) = try await AudioImportPipeline.loadWAVPreviewOverview(
                             at: url,
                             targetBinCount: previewLevel.targetBinCount,
@@ -2438,10 +2855,23 @@ final class WorkspaceView: NSView {
                         }
 
                         latestPreviewBinCount = waveformOverview.bins.count
+                        latestFileInfo = fileInfo
+                        let editedDisplayOverview = await self.cachedEditedDisplayOverviewForTrack(
+                            trackID: trackID,
+                            sourceURL: url,
+                            fileInfo: fileInfo
+                        )
                         self.applyTrackPreviewRefinement(
                             trackID: trackID,
                             fileInfo: fileInfo,
-                            waveformOverview: waveformOverview
+                            waveformOverview: waveformOverview,
+                            displayOverviewOverride: editedDisplayOverview
+                        )
+                        self.cacheWaveformOverview(
+                            waveformOverview,
+                            targetBinCount: previewLevel.targetBinCount,
+                            samplesPerBin: previewLevel.samplesPerBin,
+                            fileInfo: fileInfo
                         )
                     } catch {
                         break
@@ -2457,6 +2887,16 @@ final class WorkspaceView: NSView {
                         return
                     }
 
+                    self.recordWaveformCacheDecision(
+                        name: "full-waveform-decode",
+                        message: "Building full-resolution waveform overview from decoded WAV audio.",
+                        tier: "backgroundRebuild",
+                        result: "build",
+                        trackID: trackID,
+                        trackName: trackName,
+                        sourceURL: url,
+                        reason: "final-decode"
+                    )
                     let (decodedAudioBuffer, waveformOverview, zeroCrossingIndex) =
                         try await AudioImportPipeline.loadDecodedWAV(at: url)
 
@@ -2473,6 +2913,14 @@ final class WorkspaceView: NSView {
                         waveformOverview: waveformOverview,
                         zeroCrossingIndex: zeroCrossingIndex
                     )
+                    if let latestFileInfo {
+                        self.cacheWaveformOverview(
+                            waveformOverview,
+                            targetBinCount: waveformOverview.bins.count,
+                            samplesPerBin: 1,
+                            fileInfo: latestFileInfo
+                        )
+                    }
                 } catch {
                     guard self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
                         return
@@ -2539,6 +2987,193 @@ final class WorkspaceView: NSView {
         return isCurrent() && !Task.isCancelled
     }
 
+    private func cachedWaveformOverview(
+        at url: URL,
+        fileInfo: WAVFileInfo
+    ) async -> WaveformOverviewDiskCacheEntry? {
+        let cache = waveformOverviewDiskCache
+        return await Task.detached(priority: .userInitiated) {
+            try? cache.loadBestOverview(
+                for: url,
+                fileInfo: fileInfo
+            )
+        }.value
+    }
+
+    private func recordWaveformCacheDecision(
+        name: String,
+        message: String,
+        tier: String,
+        result: String,
+        trackID: UUID? = nil,
+        trackName: String? = nil,
+        sourceURL: URL? = nil,
+        binCount: Int? = nil,
+        targetBinCount: Int? = nil,
+        samplesPerBin: Int? = nil,
+        editRevision: Int? = nil,
+        reason: String? = nil
+    ) {
+        var fields: [String: String] = [
+            "tier": tier,
+            "result": result,
+        ]
+        if let trackID {
+            fields["trackID"] = trackID.uuidString
+        }
+        if let trackName {
+            fields["trackName"] = trackName
+        }
+        if let sourceURL {
+            fields["file"] = sourceURL.lastPathComponent
+        }
+        if let binCount {
+            fields["bins"] = "\(binCount)"
+        }
+        if let targetBinCount {
+            fields["targetBins"] = "\(targetBinCount)"
+        }
+        if let samplesPerBin {
+            fields["samplesPerBin"] = "\(samplesPerBin)"
+        }
+        if let editRevision {
+            fields["editRevision"] = "\(editRevision)"
+        }
+        if let reason {
+            fields["reason"] = reason
+        }
+
+        SoundtimeDiagnostics.shared.record(
+            category: .waveform,
+            severity: .info,
+            name: name,
+            message: message,
+            fields: fields
+        )
+        PerformanceDashboardWindowController.refreshIfVisible()
+    }
+
+    private func cachedWAVPreviewResult(
+        at url: URL,
+        fileInfo: WAVFileInfo
+    ) async -> WAVPreviewImportResult? {
+        let cache = waveformOverviewDiskCache
+        return await Task.detached(priority: .userInitiated) {
+            guard
+                let cachedEntry = try? cache.loadBestOverview(
+                    for: url,
+                    fileInfo: fileInfo
+                )
+            else {
+                return nil
+            }
+
+            let metadata: AudioFileMetadata
+            do {
+                metadata = try AudioFileMetadataLoader.loadQuickMetadata(
+                    for: url,
+                    duration: fileInfo.duration
+                )
+            } catch {
+                return nil
+            }
+            let zeroCrossingProbe = try? WAVAudioDecoder.makeZeroCrossingProbe(
+                url: url,
+                fileInfo: fileInfo
+            )
+            return WAVPreviewImportResult(
+                metadata: metadata,
+                fileInfo: fileInfo,
+                waveformOverview: cachedEntry.overview,
+                zeroCrossingProbe: zeroCrossingProbe
+            )
+        }.value
+    }
+
+    private func cacheWaveformOverview(
+        _ overview: WaveformOverview,
+        targetBinCount: Int,
+        samplesPerBin: Int,
+        fileInfo: WAVFileInfo
+    ) {
+        let cache = waveformOverviewDiskCache
+        Task.detached(priority: .utility) {
+            _ = try? cache.saveOverview(
+                overview,
+                targetBinCount: targetBinCount,
+                samplesPerBin: samplesPerBin,
+                fileInfo: fileInfo
+            )
+        }
+    }
+
+    private func cachedEditedWaveformOverview(
+        at url: URL,
+        fileInfo: WAVFileInfo,
+        fileTimeline: AudioFileEditTimeline
+    ) async -> EditedWaveformOverviewDiskCacheEntry? {
+        let cache = waveformOverviewDiskCache
+        return await Task.detached(priority: .userInitiated) {
+            try? cache.loadEditedOverview(
+                for: url,
+                fileInfo: fileInfo,
+                editTimeline: fileTimeline
+            )
+        }.value
+    }
+
+    private func cachedEditedDisplayOverviewForTrack(
+        trackID: UUID,
+        sourceURL: URL,
+        fileInfo: WAVFileInfo
+    ) async -> WaveformOverview? {
+        guard
+            let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }),
+            let fileTimeline = projectTracks[trackIndex].fileTimeline,
+            fileTimeline.hasEdits
+        else {
+            return nil
+        }
+
+        let trackName = projectTracks[trackIndex].name
+        let editRevision = projectTracks[trackIndex].editRevision
+        let cachedOverview = await cachedEditedWaveformOverview(
+            at: sourceURL,
+            fileInfo: fileInfo,
+            fileTimeline: fileTimeline
+        )?.overview
+        recordWaveformCacheDecision(
+            name: cachedOverview == nil ? "edited-overview-cache-miss" : "edited-overview-cache-hit",
+            message: cachedOverview == nil ?
+                "No edited waveform overview disk cache was available for this track state." :
+                "Loaded edited waveform overview from disk cache.",
+            tier: "editedOverviewDiskCache",
+            result: cachedOverview == nil ? "miss" : "hit",
+            trackID: trackID,
+            trackName: trackName,
+            sourceURL: sourceURL,
+            binCount: cachedOverview?.bins.count,
+            editRevision: editRevision,
+            reason: cachedOverview == nil ? "not-found-for-edit-state" : nil
+        )
+        return cachedOverview
+    }
+
+    private func cacheEditedWaveformOverview(
+        _ overview: WaveformOverview,
+        fileInfo: WAVFileInfo,
+        fileTimeline: AudioFileEditTimeline
+    ) {
+        let cache = waveformOverviewDiskCache
+        Task.detached(priority: .utility) {
+            try? cache.saveEditedOverview(
+                overview,
+                fileInfo: fileInfo,
+                editTimeline: fileTimeline
+            )
+        }
+    }
+
     private func removeProjectTrack(_ trackID: UUID) {
         if recordingTrackID == trackID {
             stopRecording()
@@ -2564,7 +3199,11 @@ final class WorkspaceView: NSView {
         cleanupOwnedSourceFiles(replacedTracks: replacedTracks)
     }
 
-    private func applyTrackPreview(trackID: UUID, previewResult: WAVPreviewImportResult) {
+    private func applyTrackPreview(
+        trackID: UUID,
+        previewResult: WAVPreviewImportResult,
+        displayOverviewOverride: WaveformOverview? = nil
+    ) {
         guard let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }) else {
             return
         }
@@ -2573,7 +3212,7 @@ final class WorkspaceView: NSView {
         let fileTimeline = projectTracks[trackIndex].fileTimeline
         projectTracks[trackIndex].durationHint = fileTimeline?.duration ?? previewResult.fileInfo.duration
         projectTracks[trackIndex].sourceWaveformOverview = previewResult.waveformOverview
-        projectTracks[trackIndex].waveformOverview = fileTimeline?.waveformOverview(
+        projectTracks[trackIndex].waveformOverview = displayOverviewOverride ?? fileTimeline?.waveformOverview(
             from: previewResult.waveformOverview
         ) ?? previewResult.waveformOverview
         projectTracks[trackIndex].zeroCrossingProbe = previewResult.zeroCrossingProbe
@@ -2589,7 +3228,8 @@ final class WorkspaceView: NSView {
     private func applyTrackPreviewRefinement(
         trackID: UUID,
         fileInfo: WAVFileInfo,
-        waveformOverview: WaveformOverview
+        waveformOverview: WaveformOverview,
+        displayOverviewOverride: WaveformOverview? = nil
     ) {
         guard let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }) else {
             return
@@ -2597,7 +3237,8 @@ final class WorkspaceView: NSView {
 
         let fileTimeline = projectTracks[trackIndex].fileTimeline
         projectTracks[trackIndex].sourceWaveformOverview = waveformOverview
-        projectTracks[trackIndex].waveformOverview = fileTimeline?.waveformOverview(from: waveformOverview) ??
+        projectTracks[trackIndex].waveformOverview = displayOverviewOverride ??
+            fileTimeline?.waveformOverview(from: waveformOverview) ??
             waveformOverview
         projectTracks[trackIndex].durationHint = fileTimeline?.duration ?? fileInfo.duration
         refreshProjectTimelineDisplay(rebuildControls: false)
@@ -3400,6 +4041,15 @@ final class WorkspaceView: NSView {
             cancelEditWaveformRefinement(for: trackID)
             return
         }
+        guard
+            let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }),
+            let fileInfo = decodableWAVFileInfo(for: projectTracks[trackIndex].sourceURL)
+        else {
+            cancelEditWaveformRefinement(for: trackID)
+            return
+        }
+        let sourceURL = projectTracks[trackIndex].sourceURL
+        let trackName = projectTracks[trackIndex].name
 
         editWaveformRefinementTasks[trackID]?.cancel()
         let requestID = UUID()
@@ -3408,9 +4058,12 @@ final class WorkspaceView: NSView {
         let task = Task { [
             weak self,
             trackID,
+            sourceURL,
+            fileInfo,
             fileTimeline,
             sourceOverview,
             editRevision,
+            trackName,
             editWaveformRefinementDelay = delay ?? editWaveformRefinementDelay,
             requestID
         ] in
@@ -3420,9 +4073,55 @@ final class WorkspaceView: NSView {
                 return
             }
 
-            let refinedOverview = await Task.detached(priority: .utility) {
-                fileTimeline.waveformOverview(from: sourceOverview)
-            }.value
+            let cachedOverview = await self?.cachedEditedWaveformOverview(
+                at: sourceURL,
+                fileInfo: fileInfo,
+                fileTimeline: fileTimeline
+            )?.overview
+            let refinedOverview: WaveformOverview
+            let didLoadCachedOverview: Bool
+            if let cachedOverview {
+                self?.recordWaveformCacheDecision(
+                    name: "edited-overview-cache-hit",
+                    message: "Loaded edited waveform refinement from disk cache.",
+                    tier: "editedOverviewDiskCache",
+                    result: "hit",
+                    trackID: trackID,
+                    trackName: trackName,
+                    sourceURL: sourceURL,
+                    binCount: cachedOverview.bins.count,
+                    editRevision: editRevision
+                )
+                refinedOverview = cachedOverview
+                didLoadCachedOverview = true
+            } else {
+                self?.recordWaveformCacheDecision(
+                    name: "edited-overview-cache-miss",
+                    message: "Edited waveform refinement cache was unavailable; rebuilding from edit timeline.",
+                    tier: "editedOverviewDiskCache",
+                    result: "miss",
+                    trackID: trackID,
+                    trackName: trackName,
+                    sourceURL: sourceURL,
+                    editRevision: editRevision,
+                    reason: "not-found-for-edit-state"
+                )
+                self?.recordWaveformCacheDecision(
+                    name: "edited-overview-rebuild",
+                    message: "Building edited waveform overview in the background.",
+                    tier: "backgroundRebuild",
+                    result: "build",
+                    trackID: trackID,
+                    trackName: trackName,
+                    sourceURL: sourceURL,
+                    binCount: sourceOverview.bins.count,
+                    editRevision: editRevision
+                )
+                refinedOverview = await Task.detached(priority: .utility) {
+                    fileTimeline.waveformOverview(from: sourceOverview)
+                }.value
+                didLoadCachedOverview = false
+            }
 
             guard let self else {
                 return
@@ -3446,6 +4145,13 @@ final class WorkspaceView: NSView {
                 animateWaveformTransition: false
             )
             self.updateProjectDisplayTiming()
+            if !didLoadCachedOverview {
+                self.cacheEditedWaveformOverview(
+                    refinedOverview,
+                    fileInfo: fileInfo,
+                    fileTimeline: fileTimeline
+                )
+            }
         }
         editWaveformRefinementTasks[trackID] = task
     }
@@ -3885,18 +4591,82 @@ final class WorkspaceView: NSView {
                     return
                 }
 
-                let previewResult = try await AudioImportPipeline.loadWAVPreview(
-                    at: url,
-                    targetBinCount: initialPreviewLevel.targetBinCount,
-                    samplesPerBin: initialPreviewLevel.samplesPerBin
-                )
-
                 guard let self, self.activeImportID == importID else {
                     return
                 }
 
-                self.applyPreview(previewResult)
-                var latestPreviewBinCount = previewResult.waveformOverview.bins.count
+                var latestPreviewBinCount = 0
+                var latestFileInfo: WAVFileInfo?
+                if let fileInfo = try? WAVAudioDecoder.inspect(url: url) {
+                    let cachedPreview = await self.cachedWAVPreviewResult(at: url, fileInfo: fileInfo)
+                    if let cachedPreview, self.activeImportID == importID {
+                        self.recordWaveformCacheDecision(
+                            name: "raw-overview-cache-hit",
+                            message: "Loaded raw waveform overview from disk cache for single-file preview.",
+                            tier: "rawOverviewDiskCache",
+                            result: "hit",
+                            trackName: cachedPreview.metadata.displayName,
+                            sourceURL: url,
+                            binCount: cachedPreview.waveformOverview.bins.count
+                        )
+                        self.applyPreview(cachedPreview)
+                        latestPreviewBinCount = cachedPreview.waveformOverview.bins.count
+                        latestFileInfo = cachedPreview.fileInfo
+                    } else if self.activeImportID == importID {
+                        self.recordWaveformCacheDecision(
+                            name: "raw-overview-cache-miss",
+                            message: "Raw waveform overview disk cache was unavailable for single-file preview.",
+                            tier: "rawOverviewDiskCache",
+                            result: "miss",
+                            trackName: url.deletingPathExtension().lastPathComponent,
+                            sourceURL: url,
+                            reason: "not-found"
+                        )
+                    }
+                } else {
+                    self.recordWaveformCacheDecision(
+                        name: "raw-overview-cache-miss",
+                        message: "Raw waveform overview disk cache could not be checked because the WAV file was not inspectable.",
+                        tier: "rawOverviewDiskCache",
+                        result: "miss",
+                        trackName: url.deletingPathExtension().lastPathComponent,
+                        sourceURL: url,
+                        reason: "file-inspection-failed"
+                    )
+                }
+
+                if latestPreviewBinCount < min(initialPreviewLevel.targetBinCount, latestFileInfo?.frameCount ?? Int.max) {
+                    self.recordWaveformCacheDecision(
+                        name: "preview-rebuild",
+                        message: "Building initial waveform preview in the background for single-file preview.",
+                        tier: "backgroundRebuild",
+                        result: "build",
+                        trackName: url.deletingPathExtension().lastPathComponent,
+                        sourceURL: url,
+                        targetBinCount: initialPreviewLevel.targetBinCount,
+                        samplesPerBin: initialPreviewLevel.samplesPerBin,
+                        reason: "cache-missing-or-too-coarse"
+                    )
+                    let previewResult = try await AudioImportPipeline.loadWAVPreview(
+                        at: url,
+                        targetBinCount: initialPreviewLevel.targetBinCount,
+                        samplesPerBin: initialPreviewLevel.samplesPerBin
+                    )
+
+                    guard self.activeImportID == importID else {
+                        return
+                    }
+
+                    self.applyPreview(previewResult)
+                    self.cacheWaveformOverview(
+                        previewResult.waveformOverview,
+                        targetBinCount: initialPreviewLevel.targetBinCount,
+                        samplesPerBin: initialPreviewLevel.samplesPerBin,
+                        fileInfo: previewResult.fileInfo
+                    )
+                    latestPreviewBinCount = previewResult.waveformOverview.bins.count
+                    latestFileInfo = previewResult.fileInfo
+                }
 
                 for previewLevel in wavPreviewLevels.dropFirst() {
                     guard self.activeImportID == importID else {
@@ -3906,12 +4676,22 @@ final class WorkspaceView: NSView {
                         return
                     }
 
-                    let nextBinCount = min(previewLevel.targetBinCount, previewResult.fileInfo.frameCount)
+                    let nextBinCount = min(previewLevel.targetBinCount, latestFileInfo?.frameCount ?? Int.max)
                     guard nextBinCount > latestPreviewBinCount else {
                         continue
                     }
 
                     do {
+                        self.recordWaveformCacheDecision(
+                            name: "preview-refinement-rebuild",
+                            message: "Building finer waveform preview level in the background for single-file preview.",
+                            tier: "backgroundRebuild",
+                            result: "build",
+                            trackName: url.deletingPathExtension().lastPathComponent,
+                            sourceURL: url,
+                            targetBinCount: previewLevel.targetBinCount,
+                            samplesPerBin: previewLevel.samplesPerBin
+                        )
                         let (fileInfo, waveformOverview) = try await AudioImportPipeline.loadWAVPreviewOverview(
                             at: url,
                             targetBinCount: previewLevel.targetBinCount,
@@ -3926,9 +4706,16 @@ final class WorkspaceView: NSView {
                         }
 
                         latestPreviewBinCount = waveformOverview.bins.count
+                        latestFileInfo = fileInfo
                         self.applyPreviewRefinement(
                             fileInfo: fileInfo,
                             waveformOverview: waveformOverview
+                        )
+                        self.cacheWaveformOverview(
+                            waveformOverview,
+                            targetBinCount: previewLevel.targetBinCount,
+                            samplesPerBin: previewLevel.samplesPerBin,
+                            fileInfo: fileInfo
                         )
                     } catch {
                         break
@@ -3943,6 +4730,15 @@ final class WorkspaceView: NSView {
                         return
                     }
 
+                    self.recordWaveformCacheDecision(
+                        name: "full-waveform-decode",
+                        message: "Building full-resolution waveform overview from decoded WAV audio for single-file preview.",
+                        tier: "backgroundRebuild",
+                        result: "build",
+                        trackName: url.deletingPathExtension().lastPathComponent,
+                        sourceURL: url,
+                        reason: "final-decode"
+                    )
                     let (decodedAudioBuffer, waveformOverview, zeroCrossingIndex) =
                         try await AudioImportPipeline.loadDecodedWAV(at: url)
 
@@ -3958,6 +4754,14 @@ final class WorkspaceView: NSView {
                         waveformOverview: waveformOverview,
                         zeroCrossingIndex: zeroCrossingIndex
                     )
+                    if let latestFileInfo {
+                        self.cacheWaveformOverview(
+                            waveformOverview,
+                            targetBinCount: waveformOverview.bins.count,
+                            samplesPerBin: 1,
+                            fileInfo: latestFileInfo
+                        )
+                    }
                 } catch {
                     guard self.activeImportID == importID else {
                         return
@@ -6929,6 +7733,16 @@ final class WorkspaceView: NSView {
                 return
             }
             applyNormalizeEffect()
+        case .denoise:
+            guard canApplyDenoiseEffect else {
+                return
+            }
+            applyDenoiseEffect()
+        case .separateMusicStems:
+            guard canApplyStemSeparationEffect else {
+                return
+            }
+            applyStemSeparationEffect()
         case let .fade(fadeEffect):
             guard canApplyFadeEffect else {
                 return
@@ -7008,6 +7822,1232 @@ final class WorkspaceView: NSView {
             gain: gain,
             status: String(format: "normalized %+.1f dB", decibels),
             lastEffect: .normalize
+        )
+    }
+
+    private func applyDenoiseEffect() {
+        guard !isDenoiseProcessingActive else {
+            updateStatus("denoise already running")
+            return
+        }
+
+        guard
+            let target = currentEditableSelectionTarget() ?? editableClipAtPlayheadTarget(),
+            projectTracks.indices.contains(target.trackIndex)
+        else {
+            updateStatus("select audio to denoise")
+            return
+        }
+
+        let trackIndex = target.trackIndex
+        let track = projectTracks[trackIndex]
+        let trackID = track.id
+        let editRevision = track.editRevision
+        let selectionToProcess = target.editSelection
+        let displaySelection = target.displaySelection
+        let sourceURL = track.sourceURL
+        let trackName = track.name
+        let inputURL = audioProcessingInputURL(trackName: trackName)
+        let outputDirectory = audioProcessingDirectoryURL()
+        let currentTimeline = track.audioTimeline
+        let currentFileTimeline: AudioFileEditTimeline?
+        do {
+            currentFileTimeline = currentTimeline == nil ?
+                try preferredFileTimelineForEditing(trackIndex: trackIndex) :
+                nil
+        } catch {
+            updateStatus("denoise failed: \(error.localizedDescription)")
+            return
+        }
+
+        guard currentTimeline != nil || currentFileTimeline != nil else {
+            updateStatus("track is not ready to denoise")
+            return
+        }
+
+        let requestID = UUID()
+        let provider = AudioProcessingProviderFactory.makeDenoiseProvider()
+        let providerDisplayName = provider.displayName
+        updateStatus("denoising selection with \(providerDisplayName)")
+        beginDenoiseProcessing(
+            requestID: requestID,
+            provider: provider,
+            trackID: trackID,
+            displaySelection: displaySelection,
+            trackName: trackName,
+            providerName: providerDisplayName
+        )
+        SoundtimeDiagnostics.shared.record(
+            category: .api,
+            severity: .info,
+            name: "denoise-selection",
+            message: "User requested provider-backed denoise processing.",
+            fields: [
+                "provider": provider.identifier,
+                "providerName": providerDisplayName,
+                "requestID": requestID.uuidString,
+                "trackID": trackID.uuidString,
+                "trackName": trackName,
+                "startProgress": String(format: "%.9f", selectionToProcess.startProgress),
+                "endProgress": String(format: "%.9f", selectionToProcess.endProgress),
+            ]
+        )
+        PerformanceDashboardWindowController.refreshIfVisible()
+
+        let progressHandler: AudioProcessingProgressHandler = { [weak self] progress in
+            Task { @MainActor [weak self] in
+                self?.handleDenoiseProgress(progress)
+            }
+        }
+
+        activeDenoiseTask = Task { [
+            weak self,
+            provider,
+            requestID,
+            trackID,
+            editRevision,
+            trackName,
+            sourceURL,
+            currentTimeline,
+            currentFileTimeline,
+            selectionToProcess,
+            displaySelection,
+            inputURL,
+            outputDirectory
+        ] in
+            let processingResult = await Task.detached(priority: .userInitiated) {
+                try await Self.processDenoiseSelection(
+                    requestID: requestID,
+                    provider: provider,
+                    trackID: trackID,
+                    trackName: trackName,
+                    sourceURL: sourceURL,
+                    currentTimeline: currentTimeline,
+                    currentFileTimeline: currentFileTimeline,
+                    selection: selectionToProcess,
+                    inputURL: inputURL,
+                    outputDirectory: outputDirectory,
+                    progress: progressHandler
+                )
+            }.result
+
+            guard let self else {
+                return
+            }
+            guard self.activeDenoiseRequestID == requestID else {
+                return
+            }
+
+            guard
+                let currentTrackIndex = self.projectTracks.firstIndex(where: { $0.id == trackID }),
+                self.projectTracks[currentTrackIndex].editRevision == editRevision
+            else {
+                self.finishDenoiseProcessing(
+                    requestID: requestID,
+                    status: "denoise skipped: track changed",
+                    fadesHighlight: true
+                )
+                return
+            }
+
+            switch processingResult {
+            case let .success(result):
+                self.recordDenoiseAPIEvent(
+                    severity: .info,
+                    name: "denoise-request-completed",
+                    message: "Audio processing provider returned a denoise result.",
+                    provider: provider,
+                    requestID: requestID,
+                    trackID: trackID,
+                    trackName: trackName,
+                    selection: selectionToProcess,
+                    extraFields: [
+                        "processedFrames": "\(result.processedFrameCount)",
+                        "summary": result.providerSummary,
+                    ]
+                )
+                self.handleDenoiseProgress(AudioProcessingProgress(
+                    requestID: requestID,
+                    stage: .applying,
+                    fractionCompleted: 0.96,
+                    message: "preparing denoise review"
+                ))
+                self.showDenoiseReview(
+                    requestID: requestID,
+                    trackID: trackID,
+                    editRevision: editRevision,
+                    displaySelection: displaySelection,
+                    editSelection: selectionToProcess,
+                    trackName: trackName,
+                    result: result
+                )
+            case let .failure(error):
+                if Self.isCancellation(error) {
+                    self.recordDenoiseAPIEvent(
+                        severity: .info,
+                        name: "denoise-request-canceled",
+                        message: "Audio processing request was canceled.",
+                        provider: provider,
+                        requestID: requestID,
+                        trackID: trackID,
+                        trackName: trackName,
+                        selection: selectionToProcess
+                    )
+                    self.finishDenoiseProcessing(
+                        requestID: requestID,
+                        status: "denoise canceled",
+                        fadesHighlight: true
+                    )
+                } else {
+                    self.recordDenoiseAPIEvent(
+                        severity: .warning,
+                        name: "denoise-request-failed",
+                        message: "Audio processing provider failed the denoise request.",
+                        provider: provider,
+                        requestID: requestID,
+                        trackID: trackID,
+                        trackName: trackName,
+                        selection: selectionToProcess,
+                        error: error
+                    )
+                    self.finishDenoiseProcessing(
+                        requestID: requestID,
+                        status: "denoise failed: \(error.localizedDescription)",
+                        fadesHighlight: true,
+                        showsStatus: false
+                    )
+                }
+            }
+        }
+    }
+
+    private func applyStemSeparationEffect() {
+        guard !isDenoiseProcessingActive else {
+            updateStatus("audio processing already running")
+            return
+        }
+
+        guard
+            let target = currentEditableSelectionTarget() ?? editableClipAtPlayheadTarget(),
+            projectTracks.indices.contains(target.trackIndex)
+        else {
+            updateStatus("select music to separate")
+            return
+        }
+
+        let provider: AudioProcessingProvider
+        do {
+            provider = try AudioProcessingProviderFactory.makeMusicStemProvider()
+        } catch {
+            updateStatus("stem separation failed: \(error.localizedDescription)")
+            SoundtimeDiagnostics.shared.record(
+                category: .api,
+                severity: .warning,
+                name: "music-stem-request-unavailable",
+                message: "AudioShake Music Stems provider could not be created.",
+                fields: ["error": error.localizedDescription]
+            )
+            PerformanceDashboardWindowController.refreshIfVisible()
+            return
+        }
+
+        let trackIndex = target.trackIndex
+        let track = projectTracks[trackIndex]
+        let trackID = track.id
+        let editRevision = track.editRevision
+        let selectionToProcess = target.editSelection
+        let displaySelection = target.displaySelection
+        let sourceURL = track.sourceURL
+        let trackName = track.name
+        let inputURL = audioProcessingInputURL(trackName: "\(trackName)-Stems")
+        let outputDirectory = audioProcessingDirectoryURL()
+        let currentTimeline = track.audioTimeline
+        let currentFileTimeline: AudioFileEditTimeline?
+        do {
+            currentFileTimeline = currentTimeline == nil ?
+                try preferredFileTimelineForEditing(trackIndex: trackIndex) :
+                nil
+        } catch {
+            updateStatus("stem separation failed: \(error.localizedDescription)")
+            return
+        }
+
+        guard currentTimeline != nil || currentFileTimeline != nil else {
+            updateStatus("track is not ready for stem separation")
+            return
+        }
+
+        let requestID = UUID()
+        let providerDisplayName = provider.displayName
+        updateStatus("separating music stems with \(providerDisplayName)")
+        beginDenoiseProcessing(
+            requestID: requestID,
+            provider: provider,
+            trackID: trackID,
+            displaySelection: displaySelection,
+            trackName: trackName,
+            providerName: providerDisplayName,
+            title: "Separating Stems",
+            operation: .separateMusicStems
+        )
+        SoundtimeDiagnostics.shared.record(
+            category: .api,
+            severity: .info,
+            name: "music-stem-separation",
+            message: "User requested AudioShake-backed music stem separation.",
+            fields: [
+                "provider": provider.identifier,
+                "providerName": providerDisplayName,
+                "requestID": requestID.uuidString,
+                "trackID": trackID.uuidString,
+                "trackName": trackName,
+                "startProgress": String(format: "%.9f", selectionToProcess.startProgress),
+                "endProgress": String(format: "%.9f", selectionToProcess.endProgress),
+            ]
+        )
+        PerformanceDashboardWindowController.refreshIfVisible()
+
+        let progressHandler: AudioProcessingProgressHandler = { [weak self] progress in
+            Task { @MainActor [weak self] in
+                self?.handleDenoiseProgress(progress)
+            }
+        }
+
+        activeDenoiseTask = Task { [
+            weak self,
+            provider,
+            requestID,
+            trackID,
+            editRevision,
+            trackName,
+            sourceURL,
+            currentTimeline,
+            currentFileTimeline,
+            selectionToProcess,
+            displaySelection,
+            inputURL,
+            outputDirectory
+        ] in
+            let processingResult = await Task.detached(priority: .userInitiated) {
+                try await Self.processStemSeparationSelection(
+                    requestID: requestID,
+                    provider: provider,
+                    trackID: trackID,
+                    trackName: trackName,
+                    sourceURL: sourceURL,
+                    currentTimeline: currentTimeline,
+                    currentFileTimeline: currentFileTimeline,
+                    selection: selectionToProcess,
+                    inputURL: inputURL,
+                    outputDirectory: outputDirectory,
+                    progress: progressHandler
+                )
+            }.result
+
+            guard let self else {
+                return
+            }
+            guard self.activeDenoiseRequestID == requestID else {
+                return
+            }
+
+            guard
+                let currentTrackIndex = self.projectTracks.firstIndex(where: { $0.id == trackID }),
+                self.projectTracks[currentTrackIndex].editRevision == editRevision
+            else {
+                self.finishDenoiseProcessing(
+                    requestID: requestID,
+                    status: "stem separation skipped: track changed",
+                    fadesHighlight: true
+                )
+                return
+            }
+
+            switch processingResult {
+            case let .success(result):
+                self.recordDenoiseAPIEvent(
+                    severity: .info,
+                    name: "music-stem-request-completed",
+                    message: "Audio processing provider returned separated music stems.",
+                    provider: provider,
+                    requestID: requestID,
+                    trackID: trackID,
+                    trackName: trackName,
+                    selection: selectionToProcess,
+                    extraFields: [
+                        "stemCount": "\(result.stems.count)",
+                        "summary": result.providerSummary,
+                    ]
+                )
+                self.handleDenoiseProgress(AudioProcessingProgress(
+                    requestID: requestID,
+                    stage: .applying,
+                    fractionCompleted: 0.96,
+                    message: "preparing stem review"
+                ))
+                self.showStemSeparationReview(
+                    requestID: requestID,
+                    trackID: trackID,
+                    editRevision: editRevision,
+                    displaySelection: displaySelection,
+                    editSelection: selectionToProcess,
+                    trackName: trackName,
+                    result: result
+                )
+            case let .failure(error):
+                if Self.isCancellation(error) {
+                    self.recordDenoiseAPIEvent(
+                        severity: .info,
+                        name: "music-stem-request-canceled",
+                        message: "Music stem separation request was canceled.",
+                        provider: provider,
+                        requestID: requestID,
+                        trackID: trackID,
+                        trackName: trackName,
+                        selection: selectionToProcess
+                    )
+                    self.finishDenoiseProcessing(
+                        requestID: requestID,
+                        status: "stem separation canceled",
+                        fadesHighlight: true
+                    )
+                } else {
+                    self.recordDenoiseAPIEvent(
+                        severity: .warning,
+                        name: "music-stem-request-failed",
+                        message: "Audio processing provider failed the music stem separation request.",
+                        provider: provider,
+                        requestID: requestID,
+                        trackID: trackID,
+                        trackName: trackName,
+                        selection: selectionToProcess,
+                        error: error
+                    )
+                    self.finishDenoiseProcessing(
+                        requestID: requestID,
+                        status: "stem separation failed: \(error.localizedDescription)",
+                        fadesHighlight: true,
+                        showsStatus: false
+                    )
+                }
+            }
+        }
+    }
+
+    private func beginDenoiseProcessing(
+        requestID: UUID,
+        provider: AudioProcessingProvider,
+        trackID: UUID,
+        displaySelection: TimelineSelection,
+        trackName: String,
+        providerName: String,
+        title: String = "Denoising",
+        operation: AudioProcessingOperation = .denoise
+    ) {
+        denoiseHighlightFadeTask?.cancel()
+        denoiseHighlightFadeTask = nil
+        activeDenoiseRequestID = requestID
+        activeDenoiseProvider = provider
+        activeDenoiseTrackID = trackID
+        activeDenoiseDisplaySelection = displaySelection
+        activeAudioProcessingOperation = operation
+        if playbackController.isPlaying {
+            playbackController.pause()
+            stopPlaybackTimer()
+            refreshPlaybackProgress(syncPlayheadWhenPlaying: false)
+        }
+        denoiseProgressOverlay.show(trackName: trackName, providerName: providerName, title: title)
+        timelineSurface.displaySelection(displaySelection)
+        timelineSurface.displayProcessingSelectionProgress(selection: displaySelection, fractionCompleted: 0.04)
+        setDenoiseModalInteractionLocked(true)
+        timelineSurface.displayModalBackdropActive(true)
+        timelineSurface.displayProcessingTrackHighlight(trackID: trackID, alpha: 1)
+        updateTransportControlState(isPlaying: false)
+        window?.makeFirstResponder(denoiseProgressOverlay)
+        updateEffectCommandState()
+    }
+
+    private func handleDenoiseProgress(_ progress: AudioProcessingProgress) {
+        guard activeDenoiseRequestID == progress.requestID else {
+            return
+        }
+
+        denoiseProgressOverlay.update(progress: progress)
+        if let displaySelection = activeDenoiseDisplaySelection {
+            timelineSurface.displayProcessingSelectionProgress(
+                selection: displaySelection,
+                fractionCompleted: progress.fractionCompleted.map(Float.init)
+            )
+        }
+        updateStatus(progress.message)
+    }
+
+    private func recordDenoiseAPIEvent(
+        severity: SoundtimeDiagnosticSeverity,
+        name: String,
+        message: String,
+        provider: AudioProcessingProvider,
+        requestID: UUID,
+        trackID: UUID,
+        trackName: String,
+        selection: TimelineSelection,
+        error: Error? = nil,
+        extraFields: [String: String] = [:]
+    ) {
+        var fields: [String: String] = [
+            "provider": provider.identifier,
+            "providerName": provider.displayName,
+            "requestID": requestID.uuidString,
+            "trackID": trackID.uuidString,
+            "trackName": trackName,
+            "startProgress": String(format: "%.9f", selection.startProgress),
+            "endProgress": String(format: "%.9f", selection.endProgress),
+        ]
+        fields.merge(extraFields) { _, new in new }
+        if let error {
+            fields["error"] = error.localizedDescription
+            fields["errorType"] = String(reflecting: type(of: error))
+            if let audioShakeError = error as? AudioShakeAudioProcessingProvider.ProcessingError {
+                fields.merge(Self.audioShakeDiagnosticFields(for: audioShakeError)) { _, new in new }
+            }
+        }
+
+        SoundtimeDiagnostics.shared.record(
+            category: .api,
+            severity: severity,
+            name: name,
+            message: message,
+            fields: fields
+        )
+        PerformanceDashboardWindowController.refreshIfVisible()
+    }
+
+    private nonisolated static func audioShakeDiagnosticFields(
+        for error: AudioShakeAudioProcessingProvider.ProcessingError
+    ) -> [String: String] {
+        switch error {
+        case .unsupportedOperation:
+            return ["providerError": "unsupportedOperation"]
+        case .missingAPIKey:
+            return ["providerError": "missingAPIKey"]
+        case .missingInput:
+            return ["providerError": "missingInput"]
+        case .failedToCreateOutputDirectory:
+            return ["providerError": "failedToCreateOutputDirectory"]
+        case let .invalidResponse(message):
+            return [
+                "providerError": "invalidResponse",
+                "providerMessage": message,
+            ]
+        case let .httpError(statusCode, body):
+            return [
+                "providerError": "httpError",
+                "statusCode": "\(statusCode)",
+                "response": body,
+            ]
+        case .taskTimedOut:
+            return ["providerError": "taskTimedOut"]
+        case let .targetFailed(message):
+            return [
+                "providerError": "targetFailed",
+                "providerMessage": message,
+            ]
+        case .missingOutput:
+            return ["providerError": "missingOutput"]
+        case let .invalidDownloadURL(value):
+            return [
+                "providerError": "invalidDownloadURL",
+                "downloadURL": value,
+            ]
+        }
+    }
+
+    private func showDenoiseReview(
+        requestID: UUID,
+        trackID: UUID,
+        editRevision: Int,
+        displaySelection: TimelineSelection,
+        editSelection: TimelineSelection,
+        trackName: String,
+        result: DenoiseProcessingResult
+    ) {
+        guard activeDenoiseRequestID == requestID else {
+            return
+        }
+
+        activeDenoiseTask = nil
+        activeDenoiseProvider = nil
+        pendingDenoiseReview = PendingDenoiseReview(
+            requestID: requestID,
+            trackID: trackID,
+            editRevision: editRevision,
+            displaySelection: displaySelection,
+            editSelection: editSelection,
+            trackName: trackName,
+            result: result
+        )
+        denoiseProgressOverlay.hide()
+        timelineSurface.displayProcessingSelectionProgress(selection: nil, fractionCompleted: nil)
+        setDenoiseModalInteractionLocked(true)
+        timelineSurface.displayModalBackdropActive(true)
+        updateEffectCommandState()
+        updateTransportControlState(isPlaying: false)
+
+        do {
+            if playbackController.isPlaying {
+                playbackController.pause()
+                stopPlaybackTimer()
+                refreshPlaybackProgress(syncPlayheadWhenPlaying: false)
+            }
+            try denoiseReviewOverlay.show(
+                beforeBuffer: result.beforeBuffer,
+                afterBuffer: result.afterBuffer,
+                trackName: trackName,
+                providerSummary: result.providerSummary
+            )
+            updateStatus("review denoise result")
+        } catch {
+            finishDenoiseProcessing(
+                requestID: requestID,
+                status: "denoise review failed: \(error.localizedDescription)",
+                fadesHighlight: true
+            )
+        }
+    }
+
+    private func acceptPendingDenoiseReview() {
+        guard
+            let review = pendingDenoiseReview,
+            activeDenoiseRequestID == review.requestID
+        else {
+            return
+        }
+
+        guard
+            let currentTrackIndex = projectTracks.firstIndex(where: { $0.id == review.trackID }),
+            projectTracks[currentTrackIndex].editRevision == review.editRevision
+        else {
+            finishDenoiseProcessing(
+                requestID: review.requestID,
+                status: "denoise skipped: track changed",
+                fadesHighlight: true
+            )
+            return
+        }
+
+        let undoSnapshot = ProjectTrackUndoSnapshot(
+            tracks: projectTracks,
+            activeTrackID: activeTrackID,
+            selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
+            selectedTimelineRange: selectedTimelineRange,
+            restoreProgress: review.displaySelection.startProgressFloat
+        )
+        editUndoStack.append(.projectTracks(undoSnapshot))
+        cancelEditMaterialization(for: review.trackID)
+        projectTracks[currentTrackIndex].editRevision += 1
+        let nextRevision = projectTracks[currentTrackIndex].editRevision
+        lastEffect = .denoise
+        selectedTimelineRange = nil
+        timelineSurface.displaySelection(nil)
+        timelineSurface.displayGainPreview(selection: nil, gain: 1)
+        denoiseReviewOverlay.hide()
+
+        let duration = Double(review.result.processedFrameCount) /
+            max(review.result.materialized.buffer.sampleRate, 1)
+        let status = "\(review.result.providerSummary) - \(formatDuration(duration))"
+        applyMaterializedTrackEdit(
+            trackID: review.trackID,
+            editRevision: nextRevision,
+            materialized: review.result.materialized,
+            status: status,
+            preservePlaybackProgress: true,
+            reloadPlaybackSource: true,
+            preserveTimelineSource: false,
+            animateWaveformTransition: true
+        )
+        finishDenoiseProcessing(
+            requestID: review.requestID,
+            status: status,
+            fadesHighlight: true
+        )
+    }
+
+    private func showStemSeparationReview(
+        requestID: UUID,
+        trackID: UUID,
+        editRevision: Int,
+        displaySelection: TimelineSelection,
+        editSelection: TimelineSelection,
+        trackName: String,
+        result: StemSeparationProcessingResult
+    ) {
+        guard activeDenoiseRequestID == requestID else {
+            return
+        }
+
+        activeDenoiseTask = nil
+        activeDenoiseProvider = nil
+        pendingStemSeparationReview = PendingStemSeparationReview(
+            requestID: requestID,
+            trackID: trackID,
+            editRevision: editRevision,
+            displaySelection: displaySelection,
+            editSelection: editSelection,
+            trackName: trackName,
+            result: result
+        )
+        denoiseProgressOverlay.hide()
+        timelineSurface.displayProcessingSelectionProgress(selection: nil, fractionCompleted: nil)
+        setDenoiseModalInteractionLocked(true)
+        timelineSurface.displayModalBackdropActive(true)
+        updateEffectCommandState()
+        updateTransportControlState(isPlaying: false)
+
+        do {
+            if playbackController.isPlaying {
+                playbackController.pause()
+                stopPlaybackTimer()
+                refreshPlaybackProgress(syncPlayheadWhenPlaying: false)
+            }
+            try stemSeparationReviewOverlay.show(
+                originalBuffer: result.beforeBuffer,
+                stems: result.stems.map {
+                    StemSeparationPreviewItem(name: $0.name, buffer: $0.buffer)
+                },
+                trackName: trackName,
+                providerSummary: result.providerSummary
+            )
+            updateStatus("review music stems")
+        } catch {
+            finishDenoiseProcessing(
+                requestID: requestID,
+                status: "stem review failed: \(error.localizedDescription)",
+                fadesHighlight: true
+            )
+        }
+    }
+
+    private func acceptPendingStemSeparationReview() {
+        guard
+            let review = pendingStemSeparationReview,
+            activeDenoiseRequestID == review.requestID
+        else {
+            return
+        }
+
+        guard
+            let currentTrackIndex = projectTracks.firstIndex(where: { $0.id == review.trackID }),
+            projectTracks[currentTrackIndex].editRevision == review.editRevision
+        else {
+            finishDenoiseProcessing(
+                requestID: review.requestID,
+                status: "stem separation skipped: track changed",
+                fadesHighlight: true
+            )
+            return
+        }
+
+        do {
+            let undoSnapshot = ProjectTrackUndoSnapshot(
+                tracks: projectTracks,
+                activeTrackID: activeTrackID,
+                selectedTrackID: selectedTrackID,
+                selectedTrackIDs: selectedTrackIDs,
+                selectedTimelineRange: selectedTimelineRange,
+                restoreProgress: review.displaySelection.startProgressFloat
+            )
+            let newTracks = try makeStemSeparationTracks(
+                sourceTrack: projectTracks[currentTrackIndex],
+                result: review.result
+            )
+            guard !newTracks.isEmpty else {
+                throw AudioShakeAudioProcessingProvider.ProcessingError.missingOutput
+            }
+
+            editUndoStack.append(.projectTracks(undoSnapshot))
+            let insertionIndex = min(currentTrackIndex + 1, projectTracks.count)
+            projectTracks.insert(contentsOf: newTracks, at: insertionIndex)
+            activeTrackID = newTracks.first?.id
+            selectedTrackID = newTracks.first?.id
+            selectedTrackIDs = Set(newTracks.map(\.id))
+            trackSelectionAnchorID = selectedTrackID
+            selectedTimelineRange = nil
+            timelineSurface.displaySelection(nil)
+            timelineSurface.displayGainPreview(selection: nil, gain: 1)
+            stemSeparationReviewOverlay.hide()
+            lastEffect = .separateMusicStems
+
+            syncActiveTrackFields()
+            publishSelectedTracksToTimeline()
+            refreshProjectTimelineDisplay()
+            updateProjectDisplayTiming()
+            reloadPlaybackFromProjectTracks(preserveProgress: true)
+            scheduleAutosaveIfNeeded()
+
+            let status = "added \(newTracks.count) music stem\(newTracks.count == 1 ? "" : "s")"
+            finishDenoiseProcessing(
+                requestID: review.requestID,
+                status: status,
+                fadesHighlight: true
+            )
+        } catch {
+            finishDenoiseProcessing(
+                requestID: review.requestID,
+                status: "stem accept failed: \(error.localizedDescription)",
+                fadesHighlight: true
+            )
+        }
+    }
+
+    private func rejectPendingStemSeparationReview() {
+        guard
+            let review = pendingStemSeparationReview,
+            activeDenoiseRequestID == review.requestID
+        else {
+            return
+        }
+
+        finishDenoiseProcessing(
+            requestID: review.requestID,
+            status: "stem separation rejected",
+            fadesHighlight: true
+        )
+    }
+
+    private func makeStemSeparationTracks(
+        sourceTrack: ProjectTrack,
+        result: StemSeparationProcessingResult
+    ) throws -> [ProjectTrack] {
+        try result.stems.map { stem in
+            let paddedBuffer = Self.bufferByPaddingLeadingSilence(
+                stem.buffer,
+                leadingDuration: result.timelineStartTime
+            )
+            let trackName = "\(sourceTrack.name) - \(stem.name)"
+            let destinationURL = recordingFileURL(trackName: trackName)
+            try WAVFileWriter.write(paddedBuffer, to: destinationURL)
+            let fileInfo = try WAVAudioDecoder.inspect(url: destinationURL)
+            let waveformOverview = WaveformOverviewBuilder.build(from: paddedBuffer)
+            return ProjectTrack(
+                id: UUID(),
+                editGroupID: sourceTrack.editGroupID ?? defaultEditGroupID,
+                name: trackName,
+                sourceURL: destinationURL,
+                durationHint: paddedBuffer.duration,
+                sourceWaveformOverview: waveformOverview,
+                waveformOverview: waveformOverview,
+                decodedAudioBuffer: nil,
+                zeroCrossingIndex: AudioZeroCrossingIndex.build(from: paddedBuffer),
+                zeroCrossingProbe: try? WAVAudioDecoder.makeZeroCrossingProbe(
+                    url: destinationURL,
+                    fileInfo: fileInfo
+                ),
+                audioTimeline: nil,
+                fileTimeline: nil,
+                ownsSourceFile: true,
+                volume: sourceTrack.volume,
+                isMuted: false,
+                isSoloed: false,
+                importID: UUID(),
+                editRevision: 0
+            )
+        }
+    }
+
+    private func rejectPendingDenoiseReview() {
+        guard
+            let review = pendingDenoiseReview,
+            activeDenoiseRequestID == review.requestID
+        else {
+            return
+        }
+
+        finishDenoiseProcessing(
+            requestID: review.requestID,
+            status: "denoise rejected",
+            fadesHighlight: true
+        )
+    }
+
+    private func cancelActiveDenoiseProcessing() {
+        guard
+            let requestID = activeDenoiseRequestID,
+            let provider = activeDenoiseProvider
+        else {
+            return
+        }
+
+        let isStemSeparation = activeAudioProcessingOperation == .separateMusicStems
+        denoiseProgressOverlay.showCanceling(
+            message: isStemSeparation ? "Canceling stem separation" : "Canceling denoise"
+        )
+        updateStatus(isStemSeparation ? "canceling stem separation" : "canceling denoise")
+        activeDenoiseTask?.cancel()
+        Task { [weak self, provider, requestID] in
+            let cancellationResult = await provider.cancel(requestID: requestID)
+            await MainActor.run {
+                guard let self, self.activeDenoiseRequestID == requestID else {
+                    return
+                }
+
+                let status: String
+                let eventName: String
+                switch cancellationResult {
+                case .canceledRemotely:
+                    status = isStemSeparation ? "stem separation canceled" : "denoise canceled"
+                    eventName = isStemSeparation ?
+                        "music-stem-request-canceled-remotely" :
+                        "denoise-request-canceled-remotely"
+                case .remoteCancellationUnsupported:
+                    status = isStemSeparation ?
+                        "stem separation canceled locally; provider cancellation unavailable" :
+                        "denoise canceled locally; provider cancellation unavailable"
+                    eventName = isStemSeparation ?
+                        "music-stem-request-cancel-unsupported" :
+                        "denoise-request-cancel-unsupported"
+                }
+                if
+                    let trackID = self.activeDenoiseTrackID,
+                    let displaySelection = self.activeDenoiseDisplaySelection
+                {
+                    let trackName = self.projectTracks.first(where: { $0.id == trackID })?.name ?? "Unknown Track"
+                    self.recordDenoiseAPIEvent(
+                        severity: cancellationResult == .canceledRemotely ? .info : .warning,
+                        name: eventName,
+                        message: status,
+                        provider: provider,
+                        requestID: requestID,
+                        trackID: trackID,
+                        trackName: trackName,
+                        selection: displaySelection
+                    )
+                }
+                self.finishDenoiseProcessing(
+                    requestID: requestID,
+                    status: status,
+                    fadesHighlight: true
+                )
+            }
+        }
+    }
+
+    private func finishDenoiseProcessing(
+        requestID: UUID,
+        status: String,
+        fadesHighlight: Bool,
+        showsStatus: Bool = true
+    ) {
+        guard activeDenoiseRequestID == requestID else {
+            return
+        }
+
+        let trackID = activeDenoiseTrackID
+        activeDenoiseTask = nil
+        activeDenoiseProvider = nil
+        activeDenoiseRequestID = nil
+        activeDenoiseTrackID = nil
+        activeDenoiseDisplaySelection = nil
+        pendingDenoiseReview = nil
+        pendingStemSeparationReview = nil
+        activeAudioProcessingOperation = nil
+        denoiseProgressOverlay.hide()
+        denoiseReviewOverlay.hide()
+        stemSeparationReviewOverlay.hide()
+        timelineSurface.displayProcessingSelectionProgress(selection: nil, fractionCompleted: nil)
+        setDenoiseModalInteractionLocked(false)
+        timelineSurface.displayModalBackdropActive(false)
+        updateStatus(showsStatus ? status : "ready")
+        updateEffectCommandState()
+        updateTransportControlState(isPlaying: playbackController.isPlaying)
+        clearDenoiseProcessingHighlight(trackID: trackID, fadesHighlight: fadesHighlight)
+        window?.makeFirstResponder(timelineSurface)
+    }
+
+    private func clearDenoiseProcessingHighlight(trackID: UUID?, fadesHighlight: Bool) {
+        denoiseHighlightFadeTask?.cancel()
+        denoiseHighlightFadeTask = nil
+
+        guard let trackID, fadesHighlight else {
+            timelineSurface.displayProcessingTrackHighlight(trackID: nil, alpha: 0)
+            return
+        }
+
+        denoiseHighlightFadeTask = Task { [weak self, trackID] in
+            let steps = 12
+            for step in 0...steps {
+                if Task.isCancelled {
+                    return
+                }
+
+                let progress = Float(step) / Float(steps)
+                let alpha = 1 - progress * progress * (3 - 2 * progress)
+                await MainActor.run {
+                    self?.timelineSurface.displayProcessingTrackHighlight(trackID: trackID, alpha: alpha)
+                }
+                try? await Task.sleep(for: .milliseconds(14))
+            }
+
+            await MainActor.run { [weak self] in
+                self?.timelineSurface.displayProcessingTrackHighlight(trackID: nil, alpha: 0)
+                self?.denoiseHighlightFadeTask = nil
+            }
+        }
+    }
+
+    private nonisolated static func isCancellation(_ error: Error) -> Bool {
+        if error is CancellationError {
+            return true
+        }
+        if let urlError = error as? URLError, urlError.code == .cancelled {
+            return true
+        }
+        return false
+    }
+
+    private nonisolated static func processDenoiseSelection(
+        requestID: UUID,
+        provider: AudioProcessingProvider,
+        trackID: UUID,
+        trackName: String,
+        sourceURL: URL,
+        currentTimeline: AudioEditTimeline?,
+        currentFileTimeline: AudioFileEditTimeline?,
+        selection: TimelineSelection,
+        inputURL: URL,
+        outputDirectory: URL,
+        progress: @escaping AudioProcessingProgressHandler
+    ) async throws -> DenoiseProcessingResult {
+        progress(AudioProcessingProgress(
+            requestID: requestID,
+            stage: .preparing,
+            fractionCompleted: 0.04,
+            message: "rendering selected audio"
+        ))
+        let timeline: AudioEditTimeline
+        if let currentTimeline {
+            timeline = currentTimeline
+        } else if let currentFileTimeline {
+            let sourceBuffer = try WAVAudioDecoder.decode(url: sourceURL)
+            timeline = currentFileTimeline.audioTimeline(sourceBuffer: sourceBuffer)
+        } else {
+            throw PlaybackError.invalidFormat
+        }
+
+        let renderedSelection = timeline.render(selection: selection)
+        guard renderedSelection.frameCount > 0 else {
+            throw PlaybackError.noAudioLoaded
+        }
+
+        try WAVFileWriter.write(renderedSelection, to: inputURL)
+        try Task.checkCancellation()
+        let inputAsset = AudioProcessingInputAsset(
+            id: UUID(),
+            trackID: trackID,
+            url: inputURL,
+            displayName: trackName,
+            sampleRate: renderedSelection.sampleRate,
+            channelCount: renderedSelection.channelCount,
+            frameCount: renderedSelection.frameCount,
+            timelineStartTime: selection.startProgress * timeline.duration
+        )
+        let request = AudioProcessingRequest(
+            id: requestID,
+            operation: .denoise,
+            renderMode: .perTrackSelection,
+            inputAssets: [inputAsset],
+            outputDirectory: outputDirectory
+        )
+        let processedResult = try await provider.process(request, progress: progress)
+        guard
+            let outputAsset = processedResult.outputAssets.first(where: { $0.inputAssetID == inputAsset.id }) ??
+                processedResult.outputAssets.first
+        else {
+            throw LocalDenoiseAudioProcessingProvider.ProcessingError.missingInput
+        }
+
+        progress(AudioProcessingProgress(
+            requestID: requestID,
+            stage: .applying,
+            fractionCompleted: 0.92,
+            message: "preparing denoised waveform"
+        ))
+        let rawProcessedBuffer = try WAVAudioDecoder.decode(url: outputAsset.url)
+        let processedBuffer = normalizedProcessingOutput(
+            rawProcessedBuffer,
+            toMatch: renderedSelection
+        )
+        return DenoiseProcessingResult(
+            materialized: try materializePaste(
+                timeline: timeline,
+                selection: selection,
+                clipboardBuffer: processedBuffer
+            ),
+            beforeBuffer: renderedSelection,
+            afterBuffer: processedBuffer,
+            processedFrameCount: processedBuffer.frameCount,
+            providerSummary: processedResult.summary
+        )
+    }
+
+    private nonisolated static func processStemSeparationSelection(
+        requestID: UUID,
+        provider: AudioProcessingProvider,
+        trackID: UUID,
+        trackName: String,
+        sourceURL: URL,
+        currentTimeline: AudioEditTimeline?,
+        currentFileTimeline: AudioFileEditTimeline?,
+        selection: TimelineSelection,
+        inputURL: URL,
+        outputDirectory: URL,
+        progress: @escaping AudioProcessingProgressHandler
+    ) async throws -> StemSeparationProcessingResult {
+        progress(AudioProcessingProgress(
+            requestID: requestID,
+            stage: .preparing,
+            fractionCompleted: 0.04,
+            message: "rendering selected music"
+        ))
+        let timeline: AudioEditTimeline
+        if let currentTimeline {
+            timeline = currentTimeline
+        } else if let currentFileTimeline {
+            let sourceBuffer = try WAVAudioDecoder.decode(url: sourceURL)
+            timeline = currentFileTimeline.audioTimeline(sourceBuffer: sourceBuffer)
+        } else {
+            throw PlaybackError.invalidFormat
+        }
+
+        let renderedSelection = timeline.render(selection: selection)
+        guard renderedSelection.frameCount > 0 else {
+            throw PlaybackError.noAudioLoaded
+        }
+
+        try WAVFileWriter.write(renderedSelection, to: inputURL)
+        try Task.checkCancellation()
+        let inputAsset = AudioProcessingInputAsset(
+            id: UUID(),
+            trackID: trackID,
+            url: inputURL,
+            displayName: trackName,
+            sampleRate: renderedSelection.sampleRate,
+            channelCount: renderedSelection.channelCount,
+            frameCount: renderedSelection.frameCount,
+            timelineStartTime: selection.startProgress * timeline.duration
+        )
+        let request = AudioProcessingRequest(
+            id: requestID,
+            operation: .separateMusicStems,
+            renderMode: .perTrackSelection,
+            inputAssets: [inputAsset],
+            outputDirectory: outputDirectory
+        )
+        let processedResult = try await provider.process(request, progress: progress)
+        let matchingOutputs = processedResult.outputAssets.filter { $0.inputAssetID == inputAsset.id }
+        let outputAssets = matchingOutputs.isEmpty ? processedResult.outputAssets : matchingOutputs
+        guard !outputAssets.isEmpty else {
+            throw AudioShakeAudioProcessingProvider.ProcessingError.missingOutput
+        }
+
+        progress(AudioProcessingProgress(
+            requestID: requestID,
+            stage: .applying,
+            fractionCompleted: 0.92,
+            message: "preparing separated waveforms"
+        ))
+        let stems = try outputAssets.map { outputAsset in
+            let rawStemBuffer = try WAVAudioDecoder.decode(url: outputAsset.url)
+            let stemBuffer = normalizedProcessingOutput(rawStemBuffer, toMatch: renderedSelection)
+            return StemSeparationStemResult(
+                name: outputAsset.displayName ?? outputAsset.url.deletingPathExtension().lastPathComponent,
+                buffer: stemBuffer
+            )
+        }
+        return StemSeparationProcessingResult(
+            beforeBuffer: renderedSelection,
+            stems: stems,
+            timelineStartTime: inputAsset.timelineStartTime,
+            providerSummary: processedResult.summary
+        )
+    }
+
+    private nonisolated static func normalizedProcessingOutput(
+        _ processedBuffer: DecodedAudioBuffer,
+        toMatch referenceBuffer: DecodedAudioBuffer
+    ) -> DecodedAudioBuffer {
+        guard
+            referenceBuffer.frameCount > 0,
+            referenceBuffer.channelCount > 0,
+            referenceBuffer.sampleRate > 0
+        else {
+            return processedBuffer
+        }
+
+        let channelCount = referenceBuffer.channelCount
+        let frameCount = referenceBuffer.frameCount
+        let sourceFrameCount = max(processedBuffer.frameCount, 1)
+        var samplesByChannel = (0..<channelCount).map { _ in
+            [Float](repeating: 0, count: frameCount)
+        }
+
+        for channelIndex in 0..<channelCount {
+            let sourceChannel = processedBuffer.channelCount == 1 ?
+                0 :
+                min(channelIndex, max(processedBuffer.channelCount - 1, 0))
+            guard
+                processedBuffer.samplesByChannel.indices.contains(sourceChannel),
+                !processedBuffer.samplesByChannel[sourceChannel].isEmpty
+            else {
+                continue
+            }
+
+            let sourceSamples = processedBuffer.samplesByChannel[sourceChannel]
+            if sourceSamples.count == frameCount {
+                samplesByChannel[channelIndex] = sourceSamples
+                continue
+            }
+
+            for frameIndex in 0..<frameCount {
+                let sourcePosition = Double(frameIndex) *
+                    Double(max(sourceFrameCount - 1, 0)) /
+                    Double(max(frameCount - 1, 1))
+                let lowerIndex = min(max(Int(sourcePosition.rounded(.down)), 0), sourceSamples.count - 1)
+                let upperIndex = min(lowerIndex + 1, sourceSamples.count - 1)
+                let fraction = Float(sourcePosition - Double(lowerIndex))
+                samplesByChannel[channelIndex][frameIndex] =
+                    sourceSamples[lowerIndex] +
+                    (sourceSamples[upperIndex] - sourceSamples[lowerIndex]) * fraction
+            }
+        }
+
+        return DecodedAudioBuffer(
+            url: processedBuffer.url,
+            sampleRate: referenceBuffer.sampleRate,
+            channelCount: channelCount,
+            frameCount: frameCount,
+            samplesByChannel: samplesByChannel
+        )
+    }
+
+    private nonisolated static func bufferByPaddingLeadingSilence(
+        _ buffer: DecodedAudioBuffer,
+        leadingDuration: TimeInterval
+    ) -> DecodedAudioBuffer {
+        let leadingFrameCount = max(Int((leadingDuration * buffer.sampleRate).rounded()), 0)
+        guard leadingFrameCount > 0, buffer.channelCount > 0 else {
+            return buffer
+        }
+
+        let samplesByChannel = buffer.samplesByChannel.map { samples in
+            [Float](repeating: 0, count: leadingFrameCount) + samples
+        }
+        return DecodedAudioBuffer(
+            url: buffer.url,
+            sampleRate: buffer.sampleRate,
+            channelCount: buffer.channelCount,
+            frameCount: leadingFrameCount + buffer.frameCount,
+            samplesByChannel: samplesByChannel
         )
     }
 
@@ -7373,6 +9413,11 @@ final class WorkspaceView: NSView {
     }
 
     private func togglePlayback() {
+        guard !isDenoiseProcessingActive else {
+            updateTransportControlState(isPlaying: false)
+            return
+        }
+
         if recordingTrackID != nil {
             stopRecording()
             return
@@ -7396,6 +9441,7 @@ final class WorkspaceView: NSView {
                 try playbackController.play()
                 isPlaying = true
             }
+            previousLoopPlaybackProgress = nil
             refreshPlaybackProgress(syncPlayheadWhenPlaying: true)
 
             if isPlaying {
@@ -7418,6 +9464,7 @@ final class WorkspaceView: NSView {
 
         do {
             let wasPlaying = playbackController.isPlaying
+            previousLoopPlaybackProgress = nil
             try playbackController.seek(toProgress: progress)
             refreshPlaybackProgress(
                 syncPlayheadWhenPlaying: true,
@@ -7445,6 +9492,7 @@ final class WorkspaceView: NSView {
 
         do {
             let wasPlaying = playbackController.isPlaying
+            previousLoopPlaybackProgress = nil
             try playbackController.seek(toProgress: progress)
 
             if !playbackController.isPlaying {
@@ -7966,7 +10014,7 @@ final class WorkspaceView: NSView {
     private func currentProject() -> SoundtimeProject {
         SoundtimeProject(
             tracks: projectTracks.compactMap { track in
-                guard decodableWAVFileInfo(for: track.sourceURL) != nil else {
+                guard let fileInfo = decodableWAVFileInfo(for: track.sourceURL) else {
                     return nil
                 }
 
@@ -7978,7 +10026,12 @@ final class WorkspaceView: NSView {
                     volume: track.volume,
                     isMuted: track.isMuted,
                     isSoloed: track.isSoloed,
-                    editTimeline: persistedEditTimeline(for: track)
+                    editTimeline: persistedEditTimeline(for: track),
+                    waveformPreview: SoundtimeProject.WaveformPreview(
+                        sourceOverview: track.sourceWaveformOverview,
+                        displayOverview: track.waveformOverview,
+                        fileInfo: fileInfo
+                    )
                 )
             },
             windowLayout: currentWindowLayout(),
@@ -8806,7 +10859,28 @@ final class WorkspaceView: NSView {
 
         let elapsedTime = timestamp - visualPlayheadAnchorTimestamp
         let projectedProgress = visualPlayheadProgress + Float(elapsedTime / duration)
-        return min(max(projectedProgress, 0), 1)
+        return loopConstrainedVisualProgress(projectedProgress)
+    }
+
+    private func loopConstrainedVisualProgress(_ progress: Float) -> Float {
+        let clampedProgress = min(max(progress, 0), 1)
+        let start = timelineLoopRange.startProgress
+        let end = timelineLoopRange.endProgress
+        let duration = end - start
+        guard duration > 0.0001, end > start else {
+            return clampedProgress
+        }
+
+        guard clampedProgress > end else {
+            return clampedProgress
+        }
+
+        let overflow = clampedProgress - end
+        guard overflow > 0 else {
+            return start
+        }
+
+        return start + overflow.truncatingRemainder(dividingBy: duration)
     }
 
     private func displayPlaybackActiveIfNeeded(_ isPlaying: Bool, forceTimelineUpdate: Bool = false) {
@@ -8826,7 +10900,8 @@ final class WorkspaceView: NSView {
         restartsFisheyeActivation: Bool = false,
         restartsPlayheadKick: Bool = false
     ) {
-        let snapshot = playbackController.snapshot()
+        var snapshot = playbackController.snapshot()
+        snapshot = applyTimelineLoopIfNeeded(to: snapshot)
         currentPlayheadFrame = snapshot.frameIndex
         updateEffectCommandState()
         displayPlaybackVisuals(
@@ -8840,10 +10915,42 @@ final class WorkspaceView: NSView {
         updateTimeReadout()
 
         if !snapshot.isPlaying {
+            previousLoopPlaybackProgress = nil
             stopPlaybackTimer()
             if snapshot.isAtEnd {
                 updateStatus("finished")
             }
+        }
+    }
+
+    private func applyTimelineLoopIfNeeded(to snapshot: PlaybackSnapshot) -> PlaybackSnapshot {
+        guard
+            snapshot.isPlaying,
+            timelineLoopRange.durationProgress > 0.0001
+        else {
+            return snapshot
+        }
+
+        let start = timelineLoopRange.startProgress
+        let end = timelineLoopRange.endProgress
+        let currentProgress = snapshot.progress
+        guard end > start else {
+            previousLoopPlaybackProgress = currentProgress
+            return snapshot
+        }
+
+        guard currentProgress >= end else {
+            previousLoopPlaybackProgress = currentProgress
+            return snapshot
+        }
+
+        do {
+            try playbackController.seekExactly(toProgress: start)
+            previousLoopPlaybackProgress = start
+            return playbackController.snapshot()
+        } catch {
+            updateStatus("loop seek failed: \(error.localizedDescription)")
+            return snapshot
         }
     }
 
@@ -8901,7 +11008,19 @@ final class WorkspaceView: NSView {
         }
     }
 
+    private var isDenoiseProcessingActive: Bool {
+        activeDenoiseRequestID != nil
+    }
+
+    private var canPerformTimelineEditCommand: Bool {
+        !isDenoiseProcessingActive
+    }
+
     private var canApplyGainEffect: Bool {
+        guard canPerformTimelineEditCommand else {
+            return false
+        }
+
         guard
             let target = currentEditableSelectionTarget() ?? editableClipAtPlayheadTarget(),
             projectTracks.indices.contains(target.trackIndex)
@@ -8918,6 +11037,10 @@ final class WorkspaceView: NSView {
     }
 
     private var canApplyFadeEffect: Bool {
+        guard canPerformTimelineEditCommand else {
+            return false
+        }
+
         guard
             let target = currentEditableSelectionTarget() ?? editableClipAtPlayheadTarget(),
             projectTracks.indices.contains(target.trackIndex)
@@ -8933,7 +11056,35 @@ final class WorkspaceView: NSView {
         return hasEditableTimeline && target.editSelection.durationProgress > 0
     }
 
+    private var canApplyDenoiseEffect: Bool {
+        guard canPerformTimelineEditCommand else {
+            return false
+        }
+
+        guard
+            let target = currentEditableSelectionTarget() ?? editableClipAtPlayheadTarget(),
+            projectTracks.indices.contains(target.trackIndex)
+        else {
+            return false
+        }
+
+        let track = projectTracks[target.trackIndex]
+        let hasEditableTimeline =
+            track.audioTimeline != nil ||
+            track.fileTimeline != nil ||
+            decodableWAVFileInfo(for: track.sourceURL) != nil
+        return hasEditableTimeline && target.editSelection.durationProgress > 0
+    }
+
+    private var canApplyStemSeparationEffect: Bool {
+        canApplyDenoiseEffect
+    }
+
     private var canSplitAtPlayhead: Bool {
+        guard canPerformTimelineEditCommand else {
+            return false
+        }
+
         guard
             let trackIndex = activeProjectTrackIndex(),
             projectTracks.indices.contains(trackIndex)
@@ -8969,6 +11120,10 @@ final class WorkspaceView: NSView {
     }
 
     private var canDeleteSilence: Bool {
+        guard canPerformTimelineEditCommand else {
+            return false
+        }
+
         guard
             let target = silenceCleanupTarget(),
             projectTracks.indices.contains(target.trackIndex)
@@ -8983,23 +11138,43 @@ final class WorkspaceView: NSView {
     }
 
     private var canDeleteSelection: Bool {
-        !selectedTrackIDs.isEmpty || selectedTrackID != nil || currentEditableSelectionTarget() != nil
+        guard canPerformTimelineEditCommand else {
+            return false
+        }
+
+        return !selectedTrackIDs.isEmpty || selectedTrackID != nil || currentEditableSelectionTarget() != nil
     }
 
     private var canClearSelection: Bool {
-        currentEditableSelectionTarget() != nil
+        guard canPerformTimelineEditCommand else {
+            return false
+        }
+
+        return currentEditableSelectionTarget() != nil
     }
 
     private var canCopySelection: Bool {
-        currentEditableSelectionTarget() != nil
+        guard canPerformTimelineEditCommand else {
+            return false
+        }
+
+        return currentEditableSelectionTarget() != nil
     }
 
     private var canCutSelection: Bool {
-        currentEditableSelectionTarget() != nil
+        guard canPerformTimelineEditCommand else {
+            return false
+        }
+
+        return currentEditableSelectionTarget() != nil
     }
 
     private var canPasteAudio: Bool {
-        audioClipboard != nil && activeProjectTrackIndex() != nil
+        guard canPerformTimelineEditCommand else {
+            return false
+        }
+
+        return audioClipboard != nil && activeProjectTrackIndex() != nil
     }
 
     private func isEditableRippleDeleteTarget(_ target: EditableSelectionTarget) -> Bool {
@@ -9069,6 +11244,8 @@ final class WorkspaceView: NSView {
     private func updateEffectCommandState() {
         timelineSurface.canApplyGainEffect = canApplyGainEffect
         timelineSurface.canApplyFadeEffect = canApplyFadeEffect
+        timelineSurface.canApplyDenoiseEffect = canApplyDenoiseEffect
+        timelineSurface.canApplyStemSeparationEffect = canApplyStemSeparationEffect
         timelineSurface.canReapplyLastEffect = canReapplyLastEffect
         timelineSurface.canSplitAtPlayhead = canSplitAtPlayhead
         timelineSurface.canCutSelection = canCutSelection
@@ -9077,7 +11254,7 @@ final class WorkspaceView: NSView {
         timelineSurface.canDeleteSelection = canDeleteSelection
         timelineSurface.canClearSelection = canClearSelection
         timelineSurface.canDeleteSilence = canDeleteSilence
-        timelineSurface.canUseDeadAirCandidate = activeDeadAirCandidate() != nil
+        timelineSurface.canUseDeadAirCandidate = canPerformTimelineEditCommand && activeDeadAirCandidate() != nil
         updateEditScopeHint()
     }
 
@@ -9089,6 +11266,10 @@ final class WorkspaceView: NSView {
         switch lastEffect {
         case .gain, .normalize:
             return canApplyGainEffect
+        case .denoise:
+            return canApplyDenoiseEffect
+        case .separateMusicStems:
+            return canApplyStemSeparationEffect
         case .fade:
             return canApplyFadeEffect
         }
