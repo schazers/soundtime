@@ -191,15 +191,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private let selectionDragEffectRenderPulseDuration: CFTimeInterval = 0.28
     private let targetFramesPerSecond = 144
     private let scrollZoomSensitivity: Float = 0.01
-    private let supportedAudioExtensions: Set<String> = [
-        "aif",
-        "aiff",
-        "flac",
-        "m4a",
-        "mp3",
-        "wav",
-        "wave",
-    ]
+    private let supportedAudioExtensions = AudioAssetImporter.supportedAudioFileExtensions
 
     init() {
         let metalDevice = MTLCreateSystemDefaultDevice()

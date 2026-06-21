@@ -216,6 +216,7 @@ struct SoundtimeProject: Codable, Sendable {
         var isSoloed: Bool
         var editTimeline: AudioFileEditTimeline.PersistentState?
         var waveformPreview: WaveformPreview? = nil
+        var ownsSourceFile: Bool? = nil
     }
 
     var tracks: [Track]

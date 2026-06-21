@@ -2495,6 +2495,11 @@ final class WorkspaceView: NSView {
             return
         }
 
+        if AudioAssetImporter.canImport(url) {
+            addDroppedAudioAssetTrack(at: url)
+            return
+        }
+
         let importID = UUID()
         activeImportID = importID
         selectedAudioFile = nil
@@ -2617,10 +2622,81 @@ final class WorkspaceView: NSView {
         }
     }
 
-    private func addDroppedWAVTrack(at url: URL, settings: SoundtimeProject.Track? = nil) {
+    private func addDroppedAudioAssetTrack(at url: URL) {
+        let importName = url.deletingPathExtension().lastPathComponent
+        updateStatus("\(importName) importing")
+        SoundtimeDiagnostics.shared.record(
+            category: .audio,
+            severity: .info,
+            name: "audio-import-start",
+            message: "Started importing a non-WAV audio file into an editable proxy.",
+            fields: [
+                "file": url.lastPathComponent,
+                "format": AudioAssetFormat.inferred(from: url).displayName,
+            ]
+        )
+        PerformanceDashboardWindowController.refreshIfVisible()
+
+        Task { [weak self, url, importName] in
+            do {
+                let proxyResult = try await AudioImportPipeline.importEditableAsset(at: url)
+                guard let self else {
+                    return
+                }
+
+                self.addDroppedWAVTrack(
+                    at: proxyResult.proxyURL,
+                    displayName: importName,
+                    ownsSourceFile: !proxyResult.usesOriginalFile
+                )
+                let sourceRate = proxyResult.originalInfo.sampleRate.map { String(format: "%.0f", $0) } ?? "unknown"
+                let proxyRate = String(format: "%.0f", proxyResult.proxyFileInfo.sampleRate)
+                self.updateStatus("\(importName) imported")
+                SoundtimeDiagnostics.shared.record(
+                    category: .audio,
+                    severity: .info,
+                    name: "audio-import-complete",
+                    message: "Imported audio through an editable WAV proxy.",
+                    fields: [
+                        "file": url.lastPathComponent,
+                        "format": proxyResult.originalInfo.format.displayName,
+                        "sourceSampleRate": sourceRate,
+                        "proxySampleRate": proxyRate,
+                        "proxy": proxyResult.proxyURL.lastPathComponent,
+                    ]
+                )
+                PerformanceDashboardWindowController.refreshIfVisible()
+            } catch {
+                guard let self else {
+                    return
+                }
+
+                self.updateStatus("\(importName) import failed: \(error.localizedDescription)")
+                SoundtimeDiagnostics.shared.record(
+                    category: .audio,
+                    severity: .warning,
+                    name: "audio-import-failed",
+                    message: "Could not import audio through an editable proxy.",
+                    fields: [
+                        "file": url.lastPathComponent,
+                        "format": AudioAssetFormat.inferred(from: url).displayName,
+                        "error": error.localizedDescription,
+                    ]
+                )
+                PerformanceDashboardWindowController.refreshIfVisible()
+            }
+        }
+    }
+
+    private func addDroppedWAVTrack(
+        at url: URL,
+        settings: SoundtimeProject.Track? = nil,
+        displayName: String? = nil,
+        ownsSourceFile: Bool = false
+    ) {
         let trackID = settings?.id ?? UUID()
         let importID = UUID()
-        let trackName = settings?.name ?? url.deletingPathExtension().lastPathComponent
+        let trackName = settings?.name ?? displayName ?? url.deletingPathExtension().lastPathComponent
         let fileInfo = try? WAVAudioDecoder.inspect(url: url)
         let launchPreview = fileInfo.flatMap { fileInfo -> SoundtimeProject.WaveformPreview? in
             guard
@@ -2659,7 +2735,7 @@ final class WorkspaceView: NSView {
             zeroCrossingProbe: nil,
             audioTimeline: nil,
             fileTimeline: persistedFileTimeline,
-            ownsSourceFile: false,
+            ownsSourceFile: settings?.ownsSourceFile ?? ownsSourceFile,
             volume: settings?.volume ?? 1,
             isMuted: settings?.isMuted ?? false,
             isSoloed: settings?.isSoloed ?? false,
@@ -10031,7 +10107,8 @@ final class WorkspaceView: NSView {
                         sourceOverview: track.sourceWaveformOverview,
                         displayOverview: track.waveformOverview,
                         fileInfo: fileInfo
-                    )
+                    ),
+                    ownsSourceFile: track.ownsSourceFile
                 )
             },
             windowLayout: currentWindowLayout(),
