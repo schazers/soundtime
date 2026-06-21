@@ -361,12 +361,15 @@ enum AudioAssetImporter {
     ) async throws -> AudioAssetProxyResult {
         try await Task.detached(priority: .userInitiated) {
             try ImportWorkBudget.shared.performScheduledHeavyWork(.backgroundDecode) {
+                try Task.checkCancellation()
                 let originalInfo = try inspectSynchronously(url: url)
+                try Task.checkCancellation()
                 if originalInfo.format.isWAVFastPath {
                     guard let proxyFileInfo = originalInfo.wavFileInfo else {
                         throw ImportError.missingWAVFileInfo
                     }
                     let decodedAudioBuffer = try WAVAudioDecoder.decode(url: url)
+                    try Task.checkCancellation()
                     let waveformOverview = WaveformOverviewBuilder.build(from: decodedAudioBuffer)
                     let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: decodedAudioBuffer)
                     return AudioAssetProxyResult(
@@ -384,10 +387,12 @@ enum AudioAssetImporter {
                     url: url,
                     format: originalInfo.format
                 )
+                try Task.checkCancellation()
                 decodedAudioBuffer = try resampleIfNeeded(
                     decodedAudioBuffer,
                     targetSampleRate: targetSampleRate
                 )
+                try Task.checkCancellation()
 
                 let proxyURL = try makeEditableProxyURL(for: url, format: originalInfo.format)
                 let proxyBuffer = DecodedAudioBuffer(
@@ -397,7 +402,14 @@ enum AudioAssetImporter {
                     frameCount: decodedAudioBuffer.frameCount,
                     samplesByChannel: decodedAudioBuffer.samplesByChannel
                 )
+                try Task.checkCancellation()
                 try WAVFileWriter.write(proxyBuffer, to: proxyURL)
+                do {
+                    try Task.checkCancellation()
+                } catch {
+                    try? FileManager.default.removeItem(at: proxyURL)
+                    throw error
+                }
                 let proxyFileInfo = try WAVAudioDecoder.inspect(url: proxyURL)
                 let waveformOverview = WaveformOverviewBuilder.build(from: proxyBuffer)
                 let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: proxyBuffer)
@@ -563,6 +575,9 @@ enum AudioAssetImporter {
             var output = [Float](repeating: 0, count: targetFrameCount)
             let sourceLastIndex = max(source.count - 1, 0)
             for targetIndex in 0..<targetFrameCount {
+                if targetIndex % 16_384 == 0 {
+                    try Task.checkCancellation()
+                }
                 let sourcePosition = Double(targetIndex) / ratio
                 let lowerIndex = min(max(Int(sourcePosition.rounded(.down)), 0), sourceLastIndex)
                 let upperIndex = min(lowerIndex + 1, sourceLastIndex)

@@ -30,6 +30,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     var onAudioFileDropped: ((URL) -> Void)?
+    var onAudioFileDragEntered: ((URL) -> Void)?
+    var onAudioFileDragExited: ((URL) -> Void)?
     var onTogglePlayback: (() -> Void)?
     var onDeleteSelection: (() -> Void)?
     var onRemoveTimeRangeRequested: (() -> Void)?
@@ -48,6 +50,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onSelectAllClipsOnTrackRequested: (() -> Void)?
     var onUndo: (() -> Void)?
     var onExportRequested: (() -> Void)?
+    var onImportAudioFileRequested: (() -> Void)?
     var onOpenProjectRequested: (() -> Void)?
     var onOpenRecentProjectRequested: ((URL) -> Void)?
     var onClearRecentProjectsRequested: (() -> Void)?
@@ -119,6 +122,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var timelineRenderer: TimelineRenderer?
     private var currentTrackIDs: [UUID] = []
     private var currentRenderTracks: [TimelineRenderState.Track] = []
+    private let dropPreviewLayer = CALayer()
+    private let dropPreviewAccentLayer = CALayer()
+    private let dropPreviewTextLayer = CATextLayer()
+    private var activeDropPreviewURL: URL?
+    private var hasAcceptedCurrentDrag = false
     private let timelineRenderQueue = DispatchQueue(
         label: "Soundtime.timeline.renderer",
         qos: .userInteractive
@@ -704,6 +712,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         wantsLayer = true
         layer?.cornerRadius = 8
         layer?.masksToBounds = true
+        configureDropPreviewLayer()
 
         registerForDraggedTypes([.fileURL])
     }
@@ -711,6 +720,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     override func layout() {
         super.layout()
         updateTrackLayoutForCurrentBounds(requestRender: false)
+        updateDropPreviewLayout()
         requestTimelineRender()
     }
 
@@ -768,6 +778,124 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         } catch {
             Swift.print("Soundtime could not create the timeline renderer: \(error)")
         }
+    }
+
+    private func configureDropPreviewLayer() {
+        dropPreviewLayer.opacity = 0
+        dropPreviewLayer.isHidden = true
+        dropPreviewLayer.cornerRadius = 12
+        dropPreviewLayer.borderWidth = 1
+        dropPreviewLayer.borderColor = NSColor.systemTeal.withAlphaComponent(0.72).cgColor
+        dropPreviewLayer.backgroundColor = NSColor.systemTeal.withAlphaComponent(0.10).cgColor
+        dropPreviewLayer.shadowColor = NSColor.systemTeal.cgColor
+        dropPreviewLayer.shadowOpacity = 0.24
+        dropPreviewLayer.shadowRadius = 16
+        dropPreviewLayer.shadowOffset = .zero
+        dropPreviewLayer.masksToBounds = false
+
+        dropPreviewAccentLayer.cornerRadius = 2
+        dropPreviewAccentLayer.backgroundColor = NSColor.systemTeal.withAlphaComponent(0.85).cgColor
+        dropPreviewLayer.addSublayer(dropPreviewAccentLayer)
+
+        dropPreviewTextLayer.contentsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        dropPreviewTextLayer.foregroundColor = NSColor.white.withAlphaComponent(0.94).cgColor
+        dropPreviewTextLayer.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        dropPreviewTextLayer.fontSize = 13
+        dropPreviewTextLayer.alignmentMode = .left
+        dropPreviewTextLayer.truncationMode = .end
+        dropPreviewLayer.addSublayer(dropPreviewTextLayer)
+
+        layer?.addSublayer(dropPreviewLayer)
+    }
+
+    private func showDropPreview(for url: URL) {
+        activeDropPreviewURL = url
+        dropPreviewTextLayer.string = "Drop to create new track - \(url.deletingPathExtension().lastPathComponent)"
+        dropPreviewLayer.isHidden = false
+        updateDropPreviewLayout()
+
+        dropPreviewLayer.removeAnimation(forKey: "fade")
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(0.12)
+        dropPreviewLayer.opacity = 1
+        CATransaction.commit()
+    }
+
+    private func hideDropPreview(fades: Bool) {
+        activeDropPreviewURL = nil
+        guard !dropPreviewLayer.isHidden else {
+            return
+        }
+
+        dropPreviewLayer.removeAnimation(forKey: "fade")
+        if fades {
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(0.18)
+            CATransaction.setCompletionBlock { [weak self] in
+                guard let self, self.activeDropPreviewURL == nil else {
+                    return
+                }
+                self.dropPreviewLayer.isHidden = true
+            }
+            dropPreviewLayer.opacity = 0
+            CATransaction.commit()
+        } else {
+            dropPreviewLayer.opacity = 0
+            dropPreviewLayer.isHidden = true
+        }
+    }
+
+    private func updateDropPreviewLayout() {
+        guard activeDropPreviewURL != nil, bounds.width > 0, bounds.height > 0 else {
+            return
+        }
+
+        let resolvedLayout = trackLayout.resolved(
+            totalTrackCount: currentTrackIDs.count + 1,
+            viewportHeight: Float(max(bounds.height, 1))
+        )
+        let newTrackIndex = max(currentTrackIDs.count, 0)
+        let laneFrame = resolvedLayout.laneFrame(forTrackIndex: newTrackIndex)
+        let laneRect: CGRect
+        if let laneFrame, laneFrame.isVisible {
+            let topFromTop = CGFloat(laneFrame.clampedTop) * bounds.height
+            let bottomFromTop = CGFloat(laneFrame.clampedBottom) * bounds.height
+            laneRect = CGRect(
+                x: 0,
+                y: bounds.height - bottomFromTop,
+                width: bounds.width,
+                height: max(bottomFromTop - topFromTop, 1)
+            )
+        } else {
+            let rulerHeight = CGFloat(min(max(resolvedLayout.rulerLaneHeight, 0), Float(bounds.height)))
+            let trackAreaHeight = max(bounds.height - rulerHeight, 1)
+            let previewHeight = min(CGFloat(resolvedLayout.trackHeight), trackAreaHeight)
+            laneRect = CGRect(
+                x: 0,
+                y: 0,
+                width: bounds.width,
+                height: max(previewHeight, 64)
+            )
+        }
+
+        let insetRect = laneRect.insetBy(dx: 8, dy: 8)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        dropPreviewLayer.frame = insetRect
+        dropPreviewAccentLayer.frame = CGRect(
+            x: 12,
+            y: 12,
+            width: 4,
+            height: max(insetRect.height - 24, 12)
+        )
+        dropPreviewTextLayer.contentsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        dropPreviewTextLayer.frame = CGRect(
+            x: 28,
+            y: max((insetRect.height - 18) * 0.5, 0),
+            width: max(insetRect.width - 44, 1),
+            height: 20
+        )
+        CATransaction.commit()
     }
 
     private func updateTimelineRenderer(_ update: @escaping @Sendable (TimelineRenderer) -> Void) {
@@ -989,20 +1117,47 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        guard firstSupportedAudioURL(from: sender.draggingPasteboard) != nil else {
+        guard let url = firstSupportedAudioURL(from: sender.draggingPasteboard) else {
             return []
         }
 
+        hasAcceptedCurrentDrag = false
         setDropHighlightVisible(true)
+        showDropPreview(for: url)
+        onAudioFileDragEntered?(url)
+        return .copy
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard let url = firstSupportedAudioURL(from: sender.draggingPasteboard) else {
+            return []
+        }
+
+        if activeDropPreviewURL != url {
+            showDropPreview(for: url)
+            onAudioFileDragEntered?(url)
+        } else {
+            updateDropPreviewLayout()
+        }
         return .copy
     }
 
     override func draggingExited(_ sender: NSDraggingInfo?) {
+        let exitingURL = activeDropPreviewURL ?? sender.flatMap { firstSupportedAudioURL(from: $0.draggingPasteboard) }
         setDropHighlightVisible(false)
+        hideDropPreview(fades: true)
+        if let url = exitingURL {
+            onAudioFileDragExited?(url)
+        }
     }
 
     override func draggingEnded(_ sender: NSDraggingInfo) {
         setDropHighlightVisible(false)
+        hideDropPreview(fades: !hasAcceptedCurrentDrag)
+        if !hasAcceptedCurrentDrag, let url = firstSupportedAudioURL(from: sender.draggingPasteboard) {
+            onAudioFileDragExited?(url)
+        }
+        hasAcceptedCurrentDrag = false
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
@@ -1012,6 +1167,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return false
         }
 
+        hasAcceptedCurrentDrag = true
+        hideDropPreview(fades: false)
         NSApplication.shared.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(self)
@@ -1063,7 +1220,17 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         if
             event.charactersIgnoringModifiers?.lowercased() == "i",
-            event.modifierFlags.contains(.command)
+            event.modifierFlags.contains(.command),
+            event.modifierFlags.contains(.shift)
+        {
+            onImportAudioFileRequested?()
+            return
+        }
+
+        if
+            event.charactersIgnoringModifiers?.lowercased() == "i",
+            event.modifierFlags.contains(.command),
+            !event.modifierFlags.contains(.shift)
         {
             onInsertSilenceRequested?()
             return
@@ -1203,6 +1370,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     @objc func exportAudio(_ sender: Any?) {
         onExportRequested?()
+    }
+
+    @objc func importAudioFile(_ sender: Any?) {
+        onImportAudioFileRequested?()
     }
 
     @objc func exportWAVAudio(_ sender: Any?) {

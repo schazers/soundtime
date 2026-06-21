@@ -97,6 +97,11 @@ final class WorkspaceView: NSView {
         var restoreProgress: Float?
     }
 
+    private struct AudioImportPrewarm {
+        let url: URL
+        let task: Task<AudioAssetProxyResult, Error>
+    }
+
     private enum UndoAction {
         case timeline(trackID: UUID?, timeline: AudioEditTimeline)
         case projectTracks(ProjectTrackUndoSnapshot)
@@ -326,6 +331,7 @@ final class WorkspaceView: NSView {
         }
     }
     private var activeImportID = UUID()
+    private var audioImportPrewarm: AudioImportPrewarm?
     private var selectedAudioFile: AudioFileMetadata?
     private var decodedAudioBuffer: DecodedAudioBuffer?
     private var audioTimeline: AudioEditTimeline?
@@ -749,6 +755,12 @@ final class WorkspaceView: NSView {
         timelineSurface.onAudioFileDropped = { [weak self] url in
             self?.loadDroppedAudioFile(at: url)
         }
+        timelineSurface.onAudioFileDragEntered = { [weak self] url in
+            self?.beginAudioImportPrewarm(for: url)
+        }
+        timelineSurface.onAudioFileDragExited = { [weak self] url in
+            self?.cancelAudioImportPrewarm(for: url)
+        }
         timelineSurface.onTogglePlayback = { [weak self] in
             self?.togglePlayback()
         }
@@ -802,6 +814,9 @@ final class WorkspaceView: NSView {
         }
         timelineSurface.onExportRequested = { [weak self] in
             self?.exportCurrentAudio()
+        }
+        timelineSurface.onImportAudioFileRequested = { [weak self] in
+            self?.importAudioFile()
         }
         timelineSurface.onExportWAVRequested = { [weak self] in
             self?.exportWAVMixdown()
@@ -2496,7 +2511,10 @@ final class WorkspaceView: NSView {
         }
 
         if AudioAssetImporter.canImport(url) {
-            addDroppedAudioAssetTrack(at: url)
+            addDroppedAudioAssetTrack(
+                at: url,
+                prewarmedImportTask: consumeAudioImportPrewarm(for: url)
+            )
             return
         }
 
@@ -2622,7 +2640,90 @@ final class WorkspaceView: NSView {
         }
     }
 
-    private func addDroppedAudioAssetTrack(at url: URL) {
+    private func beginAudioImportPrewarm(for url: URL) {
+        let normalizedURL = url.standardizedFileURL
+        guard AudioAssetImporter.canImport(normalizedURL), !WAVAudioDecoder.canDecode(normalizedURL) else {
+            return
+        }
+        if audioImportPrewarm?.url == normalizedURL {
+            return
+        }
+
+        cancelAudioImportPrewarm()
+        let task = Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            return try await AudioImportPipeline.importEditableAsset(at: normalizedURL)
+        }
+        audioImportPrewarm = AudioImportPrewarm(url: normalizedURL, task: task)
+        SoundtimeDiagnostics.shared.record(
+            category: .audio,
+            severity: .info,
+            name: "audio-import-prewarm-start",
+            message: "Started prewarming an audio import while the file is hovering over the timeline.",
+            fields: [
+                "file": normalizedURL.lastPathComponent,
+                "format": AudioAssetFormat.inferred(from: normalizedURL).displayName,
+            ]
+        )
+        PerformanceDashboardWindowController.refreshIfVisible()
+    }
+
+    private func cancelAudioImportPrewarm(for url: URL? = nil) {
+        guard let prewarm = audioImportPrewarm else {
+            return
+        }
+        if let url, prewarm.url != url.standardizedFileURL {
+            return
+        }
+
+        audioImportPrewarm = nil
+        prewarm.task.cancel()
+        Task.detached(priority: .utility) {
+            do {
+                let proxyResult = try await prewarm.task.value
+                if !proxyResult.usesOriginalFile {
+                    try? FileManager.default.removeItem(at: proxyResult.proxyURL)
+                }
+            } catch {}
+        }
+        SoundtimeDiagnostics.shared.record(
+            category: .audio,
+            severity: .info,
+            name: "audio-import-prewarm-cancel",
+            message: "Canceled audio import prewarm because the file drag left the timeline.",
+            fields: [
+                "file": prewarm.url.lastPathComponent,
+                "format": AudioAssetFormat.inferred(from: prewarm.url).displayName,
+            ]
+        )
+        PerformanceDashboardWindowController.refreshIfVisible()
+    }
+
+    private func consumeAudioImportPrewarm(for url: URL) -> Task<AudioAssetProxyResult, Error>? {
+        let normalizedURL = url.standardizedFileURL
+        guard let prewarm = audioImportPrewarm, prewarm.url == normalizedURL else {
+            return nil
+        }
+
+        audioImportPrewarm = nil
+        SoundtimeDiagnostics.shared.record(
+            category: .audio,
+            severity: .info,
+            name: "audio-import-prewarm-consume",
+            message: "Using prewarmed audio import work for a dropped file.",
+            fields: [
+                "file": normalizedURL.lastPathComponent,
+                "format": AudioAssetFormat.inferred(from: normalizedURL).displayName,
+            ]
+        )
+        PerformanceDashboardWindowController.refreshIfVisible()
+        return prewarm.task
+    }
+
+    private func addDroppedAudioAssetTrack(
+        at url: URL,
+        prewarmedImportTask: Task<AudioAssetProxyResult, Error>? = nil
+    ) {
         let importName = url.deletingPathExtension().lastPathComponent
         updateStatus("\(importName) importing")
         SoundtimeDiagnostics.shared.record(
@@ -2639,7 +2740,12 @@ final class WorkspaceView: NSView {
 
         Task { [weak self, url, importName] in
             do {
-                let proxyResult = try await AudioImportPipeline.importEditableAsset(at: url)
+                let proxyResult: AudioAssetProxyResult
+                if let prewarmedImportTask {
+                    proxyResult = try await prewarmedImportTask.value
+                } else {
+                    proxyResult = try await AudioImportPipeline.importEditableAsset(at: url)
+                }
                 guard let self else {
                     return
                 }
@@ -9749,6 +9855,33 @@ final class WorkspaceView: NSView {
                 to: folderURL,
                 includeMixdown: includeMixdown
             )
+        }
+
+        if let window {
+            openPanel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(openPanel.runModal())
+        }
+    }
+
+    private func importAudioFile() {
+        let openPanel = NSOpenPanel()
+        openPanel.title = "Import Audio File"
+        openPanel.prompt = "Import"
+        openPanel.canChooseFiles = true
+        openPanel.canChooseDirectories = false
+        openPanel.allowsMultipleSelection = false
+        let supportedTypes = AudioAssetImporter.supportedAudioFileExtensions
+            .sorted()
+            .compactMap { UTType(filenameExtension: $0) }
+        openPanel.allowedContentTypes = supportedTypes.isEmpty ? [.audio] : supportedTypes
+
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .OK, let url = openPanel.url else {
+                return
+            }
+
+            self?.loadDroppedAudioFile(at: url)
         }
 
         if let window {

@@ -92,6 +92,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             action: #selector(TimelineView.openProject(_:)),
             keyEquivalent: "o"
         ))
+        let importAudioItem = NSMenuItem(
+            title: "Import Audio File...",
+            action: #selector(TimelineView.importAudioFile(_:)),
+            keyEquivalent: "i"
+        )
+        importAudioItem.keyEquivalentModifierMask = [.command, .shift]
+        menu.addItem(importAudioItem)
         menu.addItem(makeOpenRecentMenuItem())
         menu.addItem(NSMenuItem(
             title: "Save",
