@@ -61,6 +61,16 @@ if CommandLine.arguments.contains("--waveform-disk-cache-smoke") {
     }
 }
 
+if CommandLine.arguments.contains("--audio-asset-importer-smoke") {
+    do {
+        try AudioAssetImporterSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        exit(0)
+    } catch {
+        fputs("Soundtime audio asset importer smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
 if CommandLine.arguments.contains("--waveform-peak-tile-builder-smoke") {
     do {
         try WaveformPeakTileBuilderSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)

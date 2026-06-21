@@ -17,28 +17,27 @@ enum AudioImportPipeline {
         targetBinCount: Int = 512,
         samplesPerBin: Int = 8
     ) async throws -> WAVPreviewImportResult {
-        try await Task.detached(priority: .userInitiated) {
-            let (fileInfo, waveformOverview) = try WAVAudioDecoder.buildSparsePreview(
-                url: url,
-                targetBinCount: targetBinCount,
-                samplesPerBin: samplesPerBin
-            )
-            let metadata = try AudioFileMetadataLoader.loadQuickMetadata(
-                for: url,
-                duration: fileInfo.duration
-            )
-            let zeroCrossingProbe = try? WAVAudioDecoder.makeZeroCrossingProbe(
-                url: url,
-                fileInfo: fileInfo
-            )
+        let preview = try await AudioAssetImporter.loadPreview(
+            at: url,
+            targetBinCount: targetBinCount,
+            samplesPerBin: samplesPerBin
+        )
+        guard let wavPreview = preview.wavPreviewResult else {
+            throw AudioAssetImporter.ImportError.missingWAVFileInfo
+        }
+        return wavPreview
+    }
 
-            return WAVPreviewImportResult(
-                metadata: metadata,
-                fileInfo: fileInfo,
-                waveformOverview: waveformOverview,
-                zeroCrossingProbe: zeroCrossingProbe
-            )
-        }.value
+    static func loadPreview(
+        at url: URL,
+        targetBinCount: Int = 512,
+        samplesPerBin: Int = 8
+    ) async throws -> AudioAssetPreviewResult {
+        try await AudioAssetImporter.loadPreview(
+            at: url,
+            targetBinCount: targetBinCount,
+            samplesPerBin: samplesPerBin
+        )
     }
 
     static func loadWAVPreviewOverview(
@@ -46,15 +45,27 @@ enum AudioImportPipeline {
         targetBinCount: Int,
         samplesPerBin: Int
     ) async throws -> (WAVFileInfo, WaveformOverview) {
-        try await Task.detached(priority: .utility) {
-            try ImportWorkBudget.shared.performScheduledHeavyWork(.previewRefinement) {
-                try WAVAudioDecoder.buildSparsePreview(
-                    url: url,
-                    targetBinCount: targetBinCount,
-                    samplesPerBin: samplesPerBin
-                )
-            }
-        }.value
+        let (assetInfo, waveformOverview) = try await AudioAssetImporter.loadPreviewOverview(
+            at: url,
+            targetBinCount: targetBinCount,
+            samplesPerBin: samplesPerBin
+        )
+        guard let fileInfo = assetInfo.wavFileInfo else {
+            throw AudioAssetImporter.ImportError.missingWAVFileInfo
+        }
+        return (fileInfo, waveformOverview)
+    }
+
+    static func loadPreviewOverview(
+        at url: URL,
+        targetBinCount: Int,
+        samplesPerBin: Int
+    ) async throws -> (AudioAssetInfo, WaveformOverview) {
+        try await AudioAssetImporter.loadPreviewOverview(
+            at: url,
+            targetBinCount: targetBinCount,
+            samplesPerBin: samplesPerBin
+        )
     }
 
     static func loadDecodedWAV(at url: URL) async throws -> (
@@ -62,32 +73,34 @@ enum AudioImportPipeline {
         WaveformOverview,
         AudioZeroCrossingIndex
     ) {
-        try await Task.detached(priority: .background) {
-            try ImportWorkBudget.shared.performScheduledHeavyWork(.backgroundDecode) {
-                let decodedAudioBuffer = try WAVAudioDecoder.decode(url: url)
-                let waveformOverview = WaveformOverviewBuilder.build(from: decodedAudioBuffer)
-                let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: decodedAudioBuffer)
-                return (decodedAudioBuffer, waveformOverview, zeroCrossingIndex)
-            }
-        }.value
+        let (_, decodedAudioBuffer, waveformOverview, zeroCrossingIndex) =
+            try await AudioAssetImporter.loadDecodedAsset(at: url)
+        return (decodedAudioBuffer, waveformOverview, zeroCrossingIndex)
+    }
+
+    static func loadDecodedAsset(at url: URL) async throws -> (
+        AudioAssetInfo,
+        DecodedAudioBuffer,
+        WaveformOverview,
+        AudioZeroCrossingIndex
+    ) {
+        try await AudioAssetImporter.loadDecodedAsset(at: url)
     }
 
     static func loadDroppedFile(at url: URL) async throws -> AudioImportResult {
         try await Task.detached(priority: .userInitiated) {
             let metadata = try await AudioFileMetadataLoader.loadMetadata(for: url)
 
-            guard WAVAudioDecoder.canDecode(url) else {
+            guard AudioAssetImporter.canImport(url) else {
+                return AudioImportResult(metadata: metadata, decodeStatus: .unsupported)
+            }
+            guard AudioAssetFormat.inferred(from: url).isWAVFastPath else {
                 return AudioImportResult(metadata: metadata, decodeStatus: .unsupported)
             }
 
             do {
-                let (decodedAudioBuffer, waveformOverview, zeroCrossingIndex) =
-                    try ImportWorkBudget.shared.performScheduledHeavyWork(.backgroundDecode) {
-                        let decodedAudioBuffer = try WAVAudioDecoder.decode(url: url)
-                        let waveformOverview = WaveformOverviewBuilder.build(from: decodedAudioBuffer)
-                        let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: decodedAudioBuffer)
-                        return (decodedAudioBuffer, waveformOverview, zeroCrossingIndex)
-                    }
+                let (_, decodedAudioBuffer, waveformOverview, zeroCrossingIndex) =
+                    try await AudioAssetImporter.loadDecodedAsset(at: url)
                 return AudioImportResult(
                     metadata: metadata,
                     decodeStatus: .decoded(decodedAudioBuffer, waveformOverview, zeroCrossingIndex)
