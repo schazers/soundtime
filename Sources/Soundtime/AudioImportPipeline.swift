@@ -87,14 +87,15 @@ enum AudioImportPipeline {
         try await AudioAssetImporter.loadDecodedAsset(at: url)
     }
 
+    static func importEditableAsset(at url: URL) async throws -> AudioAssetProxyResult {
+        try await AudioAssetImporter.importEditableAsset(at: url)
+    }
+
     static func loadDroppedFile(at url: URL) async throws -> AudioImportResult {
         try await Task.detached(priority: .userInitiated) {
             let metadata = try await AudioFileMetadataLoader.loadMetadata(for: url)
 
             guard AudioAssetImporter.canImport(url) else {
-                return AudioImportResult(metadata: metadata, decodeStatus: .unsupported)
-            }
-            guard AudioAssetFormat.inferred(from: url).isWAVFastPath else {
                 return AudioImportResult(metadata: metadata, decodeStatus: .unsupported)
             }
 

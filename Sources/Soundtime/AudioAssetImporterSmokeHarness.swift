@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 
 private final class AudioAssetImporterSmokeResultBox<T: Sendable>: @unchecked Sendable {
@@ -27,16 +28,18 @@ enum AudioAssetImporterSmokeHarness {
 
         try verifyCommonFormatRecognition()
         try verifyWAVFacadeRoundTrip(rootDirectory: rootDirectory)
+        try verifyNativeEditableProxyImport(rootDirectory: rootDirectory)
 
         let checks = [
             "common audio format recognition",
             "wav importer facade preview/decode round trip",
+            "native audio decode to editable wav proxy",
         ]
         if let reportURL = StabilityReportWriter.writePassedSuite(
             name: "audio-asset-importer-smoke",
             startedAtNanoseconds: startedAtNanoseconds,
             checks: checks,
-            metadata: ["nonWAVDecode": "not-yet-wired"],
+            metadata: ["nonWAVDecode": "native-avfoundation-proxy"],
             arguments: arguments
         ) {
             print("Soundtime audio asset importer smoke report: \(reportURL.path)")
@@ -72,7 +75,45 @@ enum AudioAssetImporterSmokeHarness {
         for (fileName, format) in expectedFormats {
             let url = URL(fileURLWithPath: "/tmp/\(fileName)")
             try require(AudioAssetFormat.inferred(from: url) == format, "\(fileName) inferred wrong format")
-            try require(AudioAssetImporter.canImport(url), "\(fileName) was not importable")
+        }
+
+        let importableFileNames = [
+            "voice.wav",
+            "voice.wave",
+            "music.aiff",
+            "music.aif",
+            "music.aifc",
+            "episode.mp3",
+            "mix.m4a",
+            "movie.mp4",
+            "lossless.alac",
+            "clip.aac",
+            "master.flac",
+            "recording.caf",
+            "surround.ac3",
+            "surround.eac3",
+            "phone.amr",
+            "sample.au",
+            "sample.snd",
+        ]
+        for fileName in importableFileNames {
+            try require(
+                AudioAssetImporter.canImport(URL(fileURLWithPath: "/tmp/\(fileName)")),
+                "\(fileName) was not importable"
+            )
+        }
+
+        let recognizedButUnsupportedFileNames = [
+            "archive.ogg",
+            "archive.oga",
+            "call.opus",
+            "legacy.wma",
+        ]
+        for fileName in recognizedButUnsupportedFileNames {
+            try require(
+                !AudioAssetImporter.canImport(URL(fileURLWithPath: "/tmp/\(fileName)")),
+                "\(fileName) should be recognized but not accepted by the native importer"
+            )
         }
 
         let unknownURL = URL(fileURLWithPath: "/tmp/not-audio.xyz")
@@ -111,9 +152,45 @@ enum AudioAssetImporterSmokeHarness {
         try require(!decoded.2.bins.isEmpty, "decoded facade returned empty waveform")
     }
 
-    private static func makeSyntheticBuffer(url: URL) -> DecodedAudioBuffer {
-        let sampleRate = 48_000.0
-        let frameCount = 4_096
+    private static func verifyNativeEditableProxyImport(rootDirectory: URL) throws {
+        let aiffURL = rootDirectory.appendingPathComponent("NativeImport.aiff")
+        let sourceBuffer = makeSyntheticBuffer(url: aiffURL, sampleRate: 44_100, frameCount: 8_192)
+        try writeNativeAudioFixture(sourceBuffer, to: aiffURL)
+
+        let info = try AudioAssetImporter.inspectSynchronously(url: aiffURL)
+        try require(info.format == .aiff, "native importer did not report AIFF format")
+        try require(info.wavFileInfo == nil, "native importer should not report WAV file info for AIFF")
+        try require(info.sampleRate == sourceBuffer.sampleRate, "native importer sample rate mismatch")
+        try require(info.channelCount == sourceBuffer.channelCount, "native importer channel count mismatch")
+        try require(info.requiresEditableProxy, "native importer should require an editable proxy")
+
+        let decoded = try awaitValue {
+            try await AudioAssetImporter.loadDecodedAsset(at: aiffURL)
+        }
+        try require(decoded.0.format == .aiff, "native decoded asset did not report AIFF format")
+        try require(decoded.1.sampleRate == sourceBuffer.sampleRate, "native decoded sample rate mismatch")
+        try require(decoded.1.frameCount == sourceBuffer.frameCount, "native decoded frame count mismatch")
+        try require(!decoded.2.bins.isEmpty, "native decoded waveform was empty")
+
+        let proxyResult = try awaitValue {
+            try await AudioAssetImporter.importEditableAsset(at: aiffURL)
+        }
+        try require(!proxyResult.usesOriginalFile, "native import should create a proxy")
+        try require(proxyResult.proxyURL.pathExtension.lowercased() == "wav", "native import proxy should be a WAV")
+        try require(WAVAudioDecoder.canDecode(proxyResult.proxyURL), "native import proxy was not decodable as WAV")
+        try require(
+            abs(proxyResult.proxyFileInfo.sampleRate - AudioAssetImporter.editableProxySampleRate) < 0.5,
+            "native import proxy did not normalize sample rate"
+        )
+        try require(proxyResult.decodedAudioBuffer.url == proxyResult.proxyURL, "native import proxy buffer URL mismatch")
+        try require(proxyResult.decodedAudioBuffer.frameCount > 0, "native import proxy buffer was empty")
+    }
+
+    private static func makeSyntheticBuffer(
+        url: URL,
+        sampleRate: Double = 48_000,
+        frameCount: Int = 4_096
+    ) -> DecodedAudioBuffer {
         var left = [Float](repeating: 0, count: frameCount)
         var right = [Float](repeating: 0, count: frameCount)
         for frameIndex in 0..<frameCount {
@@ -129,6 +206,40 @@ enum AudioAssetImporterSmokeHarness {
             frameCount: frameCount,
             samplesByChannel: [left, right]
         )
+    }
+
+    private static func writeNativeAudioFixture(_ buffer: DecodedAudioBuffer, to url: URL) throws {
+        guard
+            let format = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: buffer.sampleRate,
+                channels: AVAudioChannelCount(buffer.channelCount),
+                interleaved: false
+            ),
+            let pcmBuffer = AVAudioPCMBuffer(
+                pcmFormat: format,
+                frameCapacity: AVAudioFrameCount(buffer.frameCount)
+            )
+        else {
+            throw SmokeError.failed("could not create native fixture audio buffer")
+        }
+
+        pcmBuffer.frameLength = AVAudioFrameCount(buffer.frameCount)
+        guard let floatChannelData = pcmBuffer.floatChannelData else {
+            throw SmokeError.failed("native fixture buffer did not expose float channel data")
+        }
+
+        for channelIndex in 0..<buffer.channelCount {
+            let source = channelIndex < buffer.samplesByChannel.count ?
+                buffer.samplesByChannel[channelIndex] :
+                []
+            for frameIndex in 0..<buffer.frameCount {
+                floatChannelData[channelIndex][frameIndex] = frameIndex < source.count ? source[frameIndex] : 0
+            }
+        }
+
+        let file = try AVAudioFile(forWriting: url, settings: format.settings)
+        try file.write(from: pcmBuffer)
     }
 
     private static func awaitValue<T: Sendable>(_ operation: @escaping @Sendable () async throws -> T) throws -> T {
