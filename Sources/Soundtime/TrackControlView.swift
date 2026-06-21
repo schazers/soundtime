@@ -138,7 +138,9 @@ final class TrackControlView: NSView {
     private func configure() {
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
+        layer?.masksToBounds = true
         panelView.wantsLayer = true
+        panelView.layer?.masksToBounds = true
         panelView.translatesAutoresizingMaskIntoConstraints = false
         selectedAccentView.wantsLayer = true
         selectedAccentView.layer?.backgroundColor = NSColor(red: 0.15, green: 0.82, blue: 0.92, alpha: 1).cgColor

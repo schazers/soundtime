@@ -153,6 +153,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var isDraggingSelection = false
     private var isDraggingTrim = false
     private var isDraggingLoop = false
+    private var trackInsertionAnimationTimer: Timer?
+    private var trackInsertionAnimationStartTime: CFTimeInterval?
+    private var trackInsertionAnimationIndex: Int?
+    private let trackInsertionAnimationDuration: CFTimeInterval = 0.22
     private var rightPanPreviousPoint: CGPoint?
     private var rightPanPreviousTime: TimeInterval?
     private var rightPanLastMovementTime: TimeInterval?
@@ -364,6 +368,37 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             displayHoverProgress(nil)
             onSelectionChanged?(nil)
         }
+    }
+
+    func prepareTrackInsertionAnimation(at trackIndex: Int) {
+        stopTrackInsertionAnimation(clearsLayout: false)
+        trackInsertionAnimationIndex = max(trackIndex, 0)
+        trackInsertionAnimationStartTime = nil
+        trackLayout = trackLayout.insertingTrack(at: trackIndex, progress: 0)
+    }
+
+    func startPreparedTrackInsertionAnimation() {
+        guard let trackInsertionAnimationIndex else {
+            return
+        }
+
+        trackInsertionAnimationStartTime = CACurrentMediaTime()
+        publishTrackLayout(
+            trackLayout.insertingTrack(at: trackInsertionAnimationIndex, progress: 0),
+            requestRender: true
+        )
+
+        let timer = Timer(timeInterval: 1.0 / Double(targetFramesPerSecond), repeats: true) { [weak self] timer in
+            guard let self else {
+                timer.invalidate()
+                return
+            }
+            Task { @MainActor [weak self] in
+                self?.advanceTrackInsertionAnimation()
+            }
+        }
+        trackInsertionAnimationTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     var currentViewport: TimelineViewport {
@@ -2453,6 +2488,70 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             totalTrackCount: currentTrackIDs.count,
             viewportHeight: Float(max(bounds.height, 1))
         )
+    }
+
+    private func advanceTrackInsertionAnimation() {
+        guard
+            let trackInsertionAnimationStartTime,
+            let trackInsertionAnimationIndex
+        else {
+            trackInsertionAnimationTimer?.invalidate()
+            trackInsertionAnimationTimer = nil
+            return
+        }
+
+        let elapsed = CACurrentMediaTime() - trackInsertionAnimationStartTime
+        let rawProgress = Float(min(max(elapsed / trackInsertionAnimationDuration, 0), 1))
+        let easedProgress = easeInOutCubic(rawProgress)
+        if rawProgress >= 1 {
+            stopTrackInsertionAnimation(clearsLayout: true)
+            return
+        }
+
+        publishTrackLayout(
+            trackLayout.insertingTrack(at: trackInsertionAnimationIndex, progress: easedProgress),
+            requestRender: true
+        )
+    }
+
+    private func stopTrackInsertionAnimation(clearsLayout: Bool) {
+        trackInsertionAnimationTimer?.invalidate()
+        trackInsertionAnimationTimer = nil
+        trackInsertionAnimationStartTime = nil
+        trackInsertionAnimationIndex = nil
+
+        if clearsLayout {
+            publishTrackLayout(trackLayout.clearingInsertionAnimation(), requestRender: true)
+        }
+    }
+
+    private func publishTrackLayout(_ nextTrackLayout: TimelineTrackLayout, requestRender: Bool) {
+        let clampedLayout = nextTrackLayout.clamped(
+            totalTrackCount: currentTrackIDs.count,
+            viewportHeight: Float(max(bounds.height, 1))
+        )
+        trackLayout = clampedLayout
+        let resolvedLayout = resolvedTrackLayoutForCurrentBounds()
+        if lastPublishedTrackLayout != resolvedLayout {
+            lastPublishedTrackLayout = resolvedLayout
+            onTrackLaneLayoutChanged?(resolvedLayout)
+        }
+        updateTimelineRendererImmediately { renderer in
+            renderer.displayTrackLayout(clampedLayout)
+        }
+        if requestRender {
+            requestTimelineRender()
+        }
+    }
+
+    private func easeInOutCubic(_ progress: Float) -> Float {
+        let clamped = min(max(progress, 0), 1)
+        if clamped < 0.5 {
+            return 4 * clamped * clamped * clamped
+        }
+
+        let shifted = -2 * clamped + 2
+        return 1 - (shifted * shifted * shifted) * 0.5
     }
 
     private func updateTrackLayoutForCurrentBounds(requestRender: Bool) {

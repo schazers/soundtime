@@ -1739,13 +1739,21 @@ final class WorkspaceView: NSView {
     }
 
     private func updateTrackLaneLayout(_ layout: ResolvedTimelineTrackLayout) {
+        let previousLayout = currentTrackLaneLayout
         guard currentTrackLaneLayout != layout else {
             layoutTrackControlViews()
             return
         }
 
         currentTrackLaneLayout = layout
-        refreshTrackControls()
+        if
+            previousLayout.totalTrackCount == layout.totalTrackCount,
+            trackControlViewsByID.count == projectTracks.count
+        {
+            layoutTrackControlViews()
+        } else {
+            refreshTrackControls()
+        }
     }
 
     private func updateTimelineLoopRange(_ loopRange: TimelineLoopRange) {
@@ -1800,6 +1808,7 @@ final class WorkspaceView: NSView {
 
         let trackID = UUID()
         let trackName = "Track \(projectTracks.count + 1)"
+        let insertionIndex = projectTracks.count
         let track = ProjectTrack(
             id: trackID,
             editGroupID: defaultEditGroupID,
@@ -1821,10 +1830,12 @@ final class WorkspaceView: NSView {
             editRevision: 0
         )
 
+        timelineSurface.prepareTrackInsertionAnimation(at: insertionIndex)
         projectTracks.append(track)
         activeTrackID = trackID
         selectedTimelineRange = nil
-        refreshProjectTimelineDisplay()
+        refreshProjectTimelineDisplay(animateWaveformTransition: false)
+        timelineSurface.startPreparedTrackInsertionAnimation()
         selectTrack(trackID)
         updateProjectDisplayTiming()
         updateEffectCommandState()
