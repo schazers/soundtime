@@ -32,6 +32,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onAudioFileDropped: ((URL) -> Void)?
     var onAudioFileDragEntered: ((URL) -> Void)?
     var onAudioFileDragExited: ((URL) -> Void)?
+    var onUnsupportedAudioFileDropped: ((URL) -> Void)?
     var onTogglePlayback: (() -> Void)?
     var onDeleteSelection: (() -> Void)?
     var onRemoveTimeRangeRequested: (() -> Void)?
@@ -1152,25 +1153,33 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        guard let url = firstSupportedAudioURL(from: sender.draggingPasteboard) else {
+        guard let fileURL = firstFileURL(from: sender.draggingPasteboard) else {
             return []
         }
 
         hasAcceptedCurrentDrag = false
+        guard supportedAudioExtensions.contains(fileURL.pathExtension.lowercased()) else {
+            return .copy
+        }
+
         setDropHighlightVisible(true)
-        showDropPreview(for: url)
-        onAudioFileDragEntered?(url)
+        showDropPreview(for: fileURL)
+        onAudioFileDragEntered?(fileURL)
         return .copy
     }
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        guard let url = firstSupportedAudioURL(from: sender.draggingPasteboard) else {
+        guard let fileURL = firstFileURL(from: sender.draggingPasteboard) else {
             return []
         }
 
-        if activeDropPreviewURL != url {
-            showDropPreview(for: url)
-            onAudioFileDragEntered?(url)
+        guard supportedAudioExtensions.contains(fileURL.pathExtension.lowercased()) else {
+            return .copy
+        }
+
+        if activeDropPreviewURL != fileURL {
+            showDropPreview(for: fileURL)
+            onAudioFileDragEntered?(fileURL)
         } else {
             updateDropPreviewLayout()
         }
@@ -1198,16 +1207,22 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         setDropHighlightVisible(false)
 
-        guard let url = firstSupportedAudioURL(from: sender.draggingPasteboard) else {
-            return false
-        }
-
         hasAcceptedCurrentDrag = true
         hideDropPreview(fades: false)
         NSApplication.shared.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(self)
-        onAudioFileDropped?(url)
+
+        if let url = firstSupportedAudioURL(from: sender.draggingPasteboard) {
+            onAudioFileDropped?(url)
+            return true
+        }
+
+        guard let unsupportedURL = firstFileURL(from: sender.draggingPasteboard) else {
+            return false
+        }
+
+        onUnsupportedAudioFileDropped?(unsupportedURL)
         return true
     }
 
@@ -2343,6 +2358,16 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     private func firstSupportedAudioURL(from pasteboard: NSPasteboard) -> URL? {
+        firstFileURLs(from: pasteboard).first { url in
+            supportedAudioExtensions.contains(url.pathExtension.lowercased())
+        }
+    }
+
+    private func firstFileURL(from pasteboard: NSPasteboard) -> URL? {
+        firstFileURLs(from: pasteboard).first
+    }
+
+    private func firstFileURLs(from pasteboard: NSPasteboard) -> [URL] {
         let options: [NSPasteboard.ReadingOptionKey: Any] = [
             .urlReadingFileURLsOnly: true,
         ]
@@ -2350,12 +2375,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         guard
             let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: options) as? [URL]
         else {
-            return nil
+            return []
         }
 
-        return urls.first { url in
-            supportedAudioExtensions.contains(url.pathExtension.lowercased())
-        }
+        return urls
     }
 
     private func setDropHighlightVisible(_ isVisible: Bool) {

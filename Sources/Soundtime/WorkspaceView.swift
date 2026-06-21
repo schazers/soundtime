@@ -761,6 +761,9 @@ final class WorkspaceView: NSView {
         timelineSurface.onAudioFileDragExited = { [weak self] url in
             self?.cancelAudioImportPrewarm(for: url)
         }
+        timelineSurface.onUnsupportedAudioFileDropped = { [weak self] url in
+            self?.showUnsupportedAudioFileAlert(for: url)
+        }
         timelineSurface.onTogglePlayback = { [weak self] in
             self?.togglePlayback()
         }
@@ -2729,6 +2732,37 @@ final class WorkspaceView: NSView {
         )
         PerformanceDashboardWindowController.refreshIfVisible()
         return prewarm.task
+    }
+
+    private func showUnsupportedAudioFileAlert(for url: URL) {
+        let fileExtension = url.pathExtension.isEmpty ? "no file extension" : ".\(url.pathExtension.lowercased())"
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Unsupported Audio File"
+        alert.informativeText = """
+        Soundtime can't import "\(url.lastPathComponent)" because \(fileExtension) is not one of the supported audio formats.
+
+        Supported formats: \(AudioAssetImporter.supportedAudioFormatSummary).
+        """
+        alert.addButton(withTitle: "OK")
+
+        SoundtimeDiagnostics.shared.record(
+            category: .audio,
+            severity: .warning,
+            name: "unsupported-audio-import",
+            message: "User dropped an unsupported audio file type.",
+            fields: [
+                "file": url.lastPathComponent,
+                "extension": fileExtension,
+            ]
+        )
+        PerformanceDashboardWindowController.refreshIfVisible()
+
+        if let window {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
     }
 
     private func addDroppedAudioAssetTrack(

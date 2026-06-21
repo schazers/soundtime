@@ -237,6 +237,9 @@ enum AudioAssetImporter {
         "au", "snd",
     ]
 
+    static let supportedAudioFormatSummary =
+        "WAV, AIFF, MP3, M4A/AAC/ALAC, FLAC, CAF, AC3/EAC3, AMR, AU, and SND"
+
     static func canImport(_ url: URL) -> Bool {
         supportedAudioFileExtensions.contains(url.pathExtension.lowercased())
     }
