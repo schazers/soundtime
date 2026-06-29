@@ -40,6 +40,8 @@ struct SoundtimeDiagnosticsSnapshot: Sendable {
 
 final class SoundtimeDiagnostics: @unchecked Sendable {
     static let shared = SoundtimeDiagnostics()
+    static let didRecordEventNotification = Notification.Name("SoundtimeDiagnostics.didRecordEvent")
+    static let recordedEventUserInfoKey = "event"
 
     private let lock = NSLock()
     private let maximumEventCount = 2_048
@@ -296,6 +298,13 @@ final class SoundtimeDiagnostics: @unchecked Sendable {
             events.removeFirst(events.count - maximumEventCount)
         }
         lock.unlock()
+        NotificationCenter.default.post(
+            name: Self.didRecordEventNotification,
+            object: self,
+            userInfo: [
+                Self.recordedEventUserInfoKey: event,
+            ]
+        )
     }
 
     private func writeTraceIfNeeded(for event: SoundtimeDiagnosticEvent) {

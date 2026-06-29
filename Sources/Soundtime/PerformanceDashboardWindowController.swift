@@ -6,11 +6,17 @@ import QuartzCore
 final class PerformanceDashboardWindowController: NSWindowController, NSWindowDelegate {
     private enum LifecycleSmokeError: Error, CustomStringConvertible {
         case windowDidNotClose
+        case eventLogDidNotRender
+        case eventLogDidNotFollowBottom
 
         var description: String {
             switch self {
             case .windowDidNotClose:
                 return "performance dashboard window remained visible after close"
+            case .eventLogDidNotRender:
+                return "performance dashboard did not render a diagnostic event in Recent Events"
+            case .eventLogDidNotFollowBottom:
+                return "performance dashboard event log did not stay pinned to the newest events"
             }
         }
     }
@@ -54,6 +60,29 @@ final class PerformanceDashboardWindowController: NSWindowController, NSWindowDe
 
         let controller = PerformanceDashboardWindowController.shared
         controller.showDashboard(relativeTo: nil)
+        SoundtimeDiagnostics.shared.record(
+            category: .system,
+            severity: .info,
+            name: "performance-dashboard-event-smoke",
+            message: "Performance dashboard event log smoke event."
+        )
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1))
+
+        if !controller.dashboardView.displayedEventLogText.contains("performance-dashboard-event-smoke") {
+            throw LifecycleSmokeError.eventLogDidNotRender
+        }
+        for index in 0..<80 {
+            SoundtimeDiagnostics.shared.record(
+                category: .system,
+                severity: .info,
+                name: "performance-dashboard-scroll-smoke-\(index)",
+                message: "Performance dashboard event log scroll smoke event \(index)."
+            )
+        }
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1))
+        if controller.dashboardView.eventLogBottomDistanceForSmoke > 8 {
+            throw LifecycleSmokeError.eventLogDidNotFollowBottom
+        }
 
         for index in 0..<12 {
             controller.display(frameStats: TimelineFrameStats(
@@ -123,6 +152,12 @@ final class PerformanceDashboardWindowController: NSWindowController, NSWindowDe
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        SoundtimeDiagnostics.shared.record(
+            category: .system,
+            severity: .info,
+            name: "development-console-opened",
+            message: "Development Console opened and diagnostics event display is active."
+        )
     }
 
     func display(frameStats: TimelineFrameStats) {
@@ -201,6 +236,7 @@ private final class PerformanceDashboardView: NSView {
     private var latestFrameStats: TimelineFrameStats?
     private var lastRenderedFrameStats: TimelineFrameStats?
     private var lastFPSGraphSampleTime: CFTimeInterval = 0
+    private var diagnosticsEventObserver: NSObjectProtocol?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -235,7 +271,16 @@ private final class PerformanceDashboardView: NSView {
         updateDashboard()
     }
 
+    var displayedEventLogText: String {
+        eventsView.displayedText
+    }
+
+    var eventLogBottomDistanceForSmoke: CGFloat {
+        eventsView.bottomDistanceForSmoke
+    }
+
     func resume() {
+        installDiagnosticsEventObserverIfNeeded()
         guard timer == nil else {
             updateDashboard()
             return
@@ -255,6 +300,26 @@ private final class PerformanceDashboardView: NSView {
     func pause() {
         timer?.invalidate()
         timer = nil
+        if let diagnosticsEventObserver {
+            NotificationCenter.default.removeObserver(diagnosticsEventObserver)
+            self.diagnosticsEventObserver = nil
+        }
+    }
+
+    private func installDiagnosticsEventObserverIfNeeded() {
+        guard diagnosticsEventObserver == nil else {
+            return
+        }
+
+        diagnosticsEventObserver = NotificationCenter.default.addObserver(
+            forName: SoundtimeDiagnostics.didRecordEventNotification,
+            object: SoundtimeDiagnostics.shared,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.updateDashboard()
+            }
+        }
     }
 
     private func configure() {
@@ -569,9 +634,18 @@ private final class PerformanceInfoCardView: NSView {
 }
 
 private final class PerformanceEventLogView: NSView {
+    private static let eventTextColor = NSColor(white: 0.82, alpha: 1)
+    private static let eventTextFont = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .regular)
+
     private let titleLabel = NSTextField(labelWithString: "Recent Events")
     private let textView = NSTextView()
     private let scrollView = NSScrollView()
+    private let jumpToLatestButton = PerformanceEventJumpButton()
+    private var displayedEventFingerprint = ""
+    private var hasUnseenBottomEvents = false
+    private var isFollowingTail = true
+    private var isApplyingEventText = false
+    private var isForcingBottomScroll = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -582,8 +656,28 @@ private final class PerformanceEventLogView: NSView {
         nil
     }
 
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    override func layout() {
+        super.layout()
+        updateTextDocumentGeometry()
+        if isFollowingTail {
+            forceClipViewToBottom()
+        }
+        updateJumpButtonVisibility()
+    }
+
     func update(events: [SoundtimeDiagnosticEvent]) {
-        let lines = events.suffix(160).reversed().map { event -> String in
+        let shouldFollowTail = isFollowingTail || isPinnedToBottom()
+        let previousFingerprint = displayedEventFingerprint
+        let nextFingerprint = eventFingerprint(for: events.last)
+        let hasNewTailEvent = !nextFingerprint.isEmpty && nextFingerprint != previousFingerprint
+        displayedEventFingerprint = nextFingerprint
+
+        titleLabel.stringValue = "Recent Events (\(events.count))"
+        let lines = events.suffix(160).map { event -> String in
             let severity = event.severity.rawValue.uppercased()
             let fields = event.fields
                 .sorted { $0.key < $1.key }
@@ -594,7 +688,29 @@ private final class PerformanceEventLogView: NSView {
             let suffix = fields.isEmpty ? "" : "  \(fields)"
             return "\(timestamp)  [\(severity)] \(event.category.rawValue).\(event.name)  \(event.message)\(suffix)"
         }
-        textView.string = lines.isEmpty ? "No diagnostic events yet." : lines.joined(separator: "\n")
+        let text = lines.isEmpty ? "No diagnostic events yet." : lines.joined(separator: "\n")
+        isApplyingEventText = true
+        textView.textStorage?.setAttributedString(NSAttributedString(
+            string: text,
+            attributes: eventTextAttributes()
+        ))
+        updateTextDocumentGeometry()
+        isApplyingEventText = false
+        textView.needsDisplay = true
+        scrollView.contentView.needsDisplay = true
+
+        if shouldFollowTail || previousFingerprint.isEmpty {
+            isFollowingTail = true
+            scrollToBottom(deferred: true)
+            hasUnseenBottomEvents = false
+        } else if hasNewTailEvent {
+            hasUnseenBottomEvents = true
+        }
+        updateJumpButtonVisibility()
+    }
+
+    var displayedText: String {
+        textView.string
     }
 
     private func configure() {
@@ -608,20 +724,42 @@ private final class PerformanceEventLogView: NSView {
         titleLabel.textColor = NSColor(white: 0.70, alpha: 1)
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
 
+        scrollView.borderType = .noBorder
         scrollView.drawsBackground = false
+        scrollView.contentView.drawsBackground = false
         scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
         scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.contentView.postsBoundsChangedNotifications = true
 
         textView.isEditable = false
         textView.isSelectable = true
+        textView.isRichText = false
+        textView.importsGraphics = false
         textView.drawsBackground = false
-        textView.font = .monospacedSystemFont(ofSize: 10.5, weight: .regular)
-        textView.textColor = NSColor(white: 0.82, alpha: 1)
+        textView.backgroundColor = .clear
+        textView.font = Self.eventTextFont
+        textView.textColor = Self.eventTextColor
+        textView.insertionPointColor = Self.eventTextColor
         textView.textContainerInset = NSSize(width: 10, height: 8)
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.widthTracksTextView = true
+        textView.isHorizontallyResizable = false
+        textView.isVerticallyResizable = true
+        textView.autoresizingMask = [.width]
         scrollView.documentView = textView
+
+        jumpToLatestButton.translatesAutoresizingMaskIntoConstraints = false
+        jumpToLatestButton.isHidden = true
+        jumpToLatestButton.onPressed = { [weak self] in
+            self?.scrollToBottom(deferred: true)
+            self?.hasUnseenBottomEvents = false
+            self?.updateJumpButtonVisibility()
+        }
 
         addSubview(titleLabel)
         addSubview(scrollView)
+        addSubview(jumpToLatestButton)
 
         NSLayoutConstraint.activate([
             titleLabel.topAnchor.constraint(equalTo: topAnchor, constant: 12),
@@ -631,7 +769,216 @@ private final class PerformanceEventLogView: NSView {
             scrollView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
             scrollView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
             scrollView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -6),
+
+            jumpToLatestButton.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
+            jumpToLatestButton.bottomAnchor.constraint(equalTo: scrollView.bottomAnchor, constant: -14),
+            jumpToLatestButton.widthAnchor.constraint(equalToConstant: 34),
+            jumpToLatestButton.heightAnchor.constraint(equalToConstant: 28),
         ])
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(scrollBoundsDidChange(_:)),
+            name: NSView.boundsDidChangeNotification,
+            object: scrollView.contentView
+        )
+    }
+
+    private func eventTextAttributes() -> [NSAttributedString.Key: Any] {
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.lineBreakMode = .byWordWrapping
+        paragraphStyle.lineSpacing = 1.5
+        return [
+            .font: Self.eventTextFont,
+            .foregroundColor: Self.eventTextColor,
+            .paragraphStyle: paragraphStyle,
+        ]
+    }
+
+    private func updateTextDocumentGeometry() {
+        let viewport = scrollView.contentView.bounds
+        let width = max(1, viewport.width)
+        let viewportHeight = max(1, viewport.height)
+        textView.minSize = NSSize(width: 0, height: viewportHeight)
+        textView.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.textContainer?.containerSize = NSSize(
+            width: width,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.textContainer?.widthTracksTextView = true
+
+        var targetHeight = viewportHeight
+        if let textContainer = textView.textContainer {
+            textView.layoutManager?.ensureLayout(for: textContainer)
+            let usedHeight = textView.layoutManager?.usedRect(for: textContainer).height ?? 0
+            targetHeight = max(viewportHeight, ceil(usedHeight + textView.textContainerInset.height * 2))
+        }
+        textView.frame = NSRect(x: 0, y: 0, width: width, height: targetHeight)
+    }
+
+    private func eventFingerprint(for event: SoundtimeDiagnosticEvent?) -> String {
+        guard let event else {
+            return ""
+        }
+        return [
+            String(format: "%.6f", event.timestamp),
+            event.category.rawValue,
+            event.severity.rawValue,
+            event.name,
+            event.message,
+        ].joined(separator: "|")
+    }
+
+    var bottomDistanceForSmoke: CGFloat {
+        bottomDistance()
+    }
+
+    private func scrollToBottom(deferred: Bool) {
+        forceScrollToBottom()
+        guard deferred else {
+            return
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.forceScrollToBottom()
+            self?.isFollowingTail = true
+            self?.hasUnseenBottomEvents = false
+            self?.updateJumpButtonVisibility()
+        }
+    }
+
+    private func isPinnedToBottom() -> Bool {
+        bottomDistance() <= 8
+    }
+
+    private func bottomDistance() -> CGFloat {
+        guard let documentView = scrollView.documentView else {
+            return 0
+        }
+        return max(0, textContentBottomY() - documentView.visibleRect.maxY)
+    }
+
+    private func forceScrollToBottom() {
+        updateTextDocumentGeometry()
+        forceClipViewToBottom()
+    }
+
+    private func forceClipViewToBottom() {
+        guard let documentView = scrollView.documentView else {
+            return
+        }
+        let visibleHeight = max(1, documentView.visibleRect.height)
+        let bottomY = max(documentView.bounds.minY, textContentBottomY() - visibleHeight)
+        let targetRect = NSRect(
+            x: documentView.bounds.minX,
+            y: bottomY,
+            width: max(1, documentView.bounds.width),
+            height: visibleHeight
+        )
+        isForcingBottomScroll = true
+        documentView.scrollToVisible(targetRect)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        isForcingBottomScroll = false
+    }
+
+    private func textContentBottomY() -> CGFloat {
+        guard let textContainer = textView.textContainer else {
+            return textView.bounds.maxY
+        }
+        textView.layoutManager?.ensureLayout(for: textContainer)
+        let usedRect = textView.layoutManager?.usedRect(for: textContainer) ?? .zero
+        let contentBottom = usedRect.maxY + textView.textContainerInset.height
+        return min(textView.bounds.maxY, max(textView.bounds.minY, contentBottom))
+    }
+
+    @objc private func scrollBoundsDidChange(_ notification: Notification) {
+        guard !isForcingBottomScroll, !isApplyingEventText else {
+            return
+        }
+        if isPinnedToBottom() {
+            isFollowingTail = true
+            hasUnseenBottomEvents = false
+        } else {
+            isFollowingTail = false
+        }
+        updateJumpButtonVisibility()
+    }
+
+    private func updateJumpButtonVisibility() {
+        jumpToLatestButton.isHidden = !hasUnseenBottomEvents || isPinnedToBottom()
+    }
+}
+
+private final class PerformanceEventJumpButton: NSControl {
+    var onPressed: (() -> Void)?
+    private var isHovered = false {
+        didSet {
+            needsDisplay = true
+        }
+    }
+    private var trackingArea: NSTrackingArea?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        trackingArea = area
+        addTrackingArea(area)
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onPressed?()
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let path = NSBezierPath(roundedRect: rect, xRadius: rect.height * 0.5, yRadius: rect.height * 0.5)
+        let fill = isHovered
+            ? NSColor(calibratedRed: 0.18, green: 0.27, blue: 0.30, alpha: 0.96)
+            : NSColor(calibratedWhite: 0.13, alpha: 0.92)
+        fill.setFill()
+        path.fill()
+
+        NSColor(calibratedRed: 0.72, green: 0.95, blue: 1.0, alpha: isHovered ? 1.0 : 0.82).setStroke()
+        let arrow = NSBezierPath()
+        let center = NSPoint(x: bounds.midX, y: bounds.midY - 1)
+        arrow.lineWidth = 2.2
+        arrow.lineCapStyle = .round
+        arrow.lineJoinStyle = .round
+        arrow.move(to: NSPoint(x: center.x - 6, y: center.y + 3))
+        arrow.line(to: NSPoint(x: center.x, y: center.y - 4))
+        arrow.line(to: NSPoint(x: center.x + 6, y: center.y + 3))
+        arrow.stroke()
     }
 }
 
