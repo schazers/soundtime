@@ -105,6 +105,12 @@ enum ProjectEditRoundTripSmokeHarness {
         try require(decodedProject.tracks.count == 1, "project track count mismatch")
         try requireLegacyProjectWithoutMasterVolumeDecodes()
         try requireProjectStoreMigratesLegacyProject()
+        try requireAutosaveRecoveryPreservesSavedWaveformPreviews(
+            fileInfo: fileInfo,
+            trackID: trackID,
+            editTimeline: originalState,
+            waveformPreview: waveformPreview
+        )
         try requireMultiTrackEditGraphStressRoundTrip(fileInfo: fileInfo)
 
         let decodedTrack = try requireValue(decodedProject.tracks.first, "decoded project has no track")
@@ -177,6 +183,7 @@ enum ProjectEditRoundTripSmokeHarness {
                 "project preserves compact launch waveform preview",
                 "restored timeline renders audio identical to original edits",
                 "legacy projects migrate and decode",
+                "autosave recovery preserves saved launch waveform previews",
                 "multi-track edit graph stress round-trips",
             ],
             metadata: [
@@ -215,6 +222,82 @@ enum ProjectEditRoundTripSmokeHarness {
             ))
         }
         return WaveformOverview(duration: duration, bins: bins)
+    }
+
+    private static func requireAutosaveRecoveryPreservesSavedWaveformPreviews(
+        fileInfo: WAVFileInfo,
+        trackID: UUID,
+        editTimeline: AudioFileEditTimeline.PersistentState,
+        waveformPreview: SoundtimeProject.WaveformPreview
+    ) throws {
+        let projectURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("SoundtimeAutosavePreviewMerge-\(UUID().uuidString)")
+            .appendingPathExtension(SoundtimeProjectStore.fileExtension)
+        let autosaveID = UUID(uuidString: "00000000-0000-0000-0000-000000000000") ?? UUID()
+
+        defer {
+            try? FileManager.default.removeItem(at: projectURL)
+            SoundtimeProjectStore.removeAutosave(projectURL: projectURL, autosaveID: autosaveID)
+        }
+
+        let savedProject = SoundtimeProject(
+            tracks: [
+                SoundtimeProject.Track(
+                    id: trackID,
+                    name: "Saved Preview Track",
+                    filePath: fileInfo.url.path,
+                    volume: 0.25,
+                    isMuted: false,
+                    isSoloed: false,
+                    editTimeline: editTimeline,
+                    waveformPreview: waveformPreview
+                ),
+            ],
+            windowLayout: SoundtimeProject.WindowLayout(x: 5, y: 6, width: 900, height: 500),
+            masterVolume: 0.4,
+            timelineViewport: SoundtimeProject.TimelineViewport(startProgress: 0.1, durationProgress: 0.5)
+        )
+        try JSONEncoder().encode(savedProject).write(to: projectURL, options: [.atomic])
+
+        // Autosaves intentionally skip waveform previews on the hot path. Recovery
+        // should still borrow matching previews from the saved project file.
+        Thread.sleep(forTimeInterval: 0.02)
+        let autosaveProject = SoundtimeProject(
+            tracks: [
+                SoundtimeProject.Track(
+                    id: trackID,
+                    name: "Autosaved Track",
+                    filePath: fileInfo.url.path,
+                    volume: 0.9,
+                    isMuted: true,
+                    isSoloed: false,
+                    editTimeline: editTimeline,
+                    waveformPreview: nil
+                ),
+            ],
+            windowLayout: SoundtimeProject.WindowLayout(x: 7, y: 8, width: 1000, height: 640),
+            masterVolume: 0.7,
+            timelineViewport: SoundtimeProject.TimelineViewport(startProgress: 0.2, durationProgress: 0.25)
+        )
+        try SoundtimeProjectStore.saveAutosave(
+            autosaveProject,
+            projectURL: projectURL,
+            autosaveID: autosaveID
+        )
+
+        let recoveredProject = try SoundtimeProjectStore.loadRecoveringAutosave(from: projectURL)
+        let recoveredTrack = try requireValue(recoveredProject.tracks.first, "autosave recovery dropped track")
+        try require(recoveredTrack.name == "Autosaved Track", "autosave recovery did not load autosave state")
+        try require(abs(recoveredTrack.volume - 0.9) < 0.000_001, "autosave recovery did not preserve autosave volume")
+        let recoveredPreview = try requireValue(
+            recoveredTrack.waveformPreview,
+            "autosave recovery dropped saved waveform preview"
+        )
+        try require(recoveredPreview.isValid(for: fileInfo), "autosave recovery preview is invalid")
+        try require(
+            recoveredPreview.displayOverview.bins.count == waveformPreview.displayOverview.bins.count,
+            "autosave recovery preview bin count mismatch"
+        )
     }
 
     private static func requireRenderedAudioMatchesEdits(

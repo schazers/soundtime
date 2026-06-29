@@ -164,6 +164,18 @@ enum AudioAssetImporterSmokeHarness {
         try require(info.channelCount == sourceBuffer.channelCount, "native importer channel count mismatch")
         try require(info.requiresEditableProxy, "native importer should require an editable proxy")
 
+        let preview = try awaitValue {
+            try await AudioAssetImporter.loadPreview(
+                at: aiffURL,
+                targetBinCount: 512,
+                samplesPerBin: 64
+            )
+        }
+        try require(preview.assetInfo.format == .aiff, "native preview did not report AIFF format")
+        try require(preview.wavPreviewResult == nil, "native preview should not bridge to WAV preview result")
+        try require(preview.waveformOverview.bins.count == 512, "native preview bin count mismatch")
+        try require(!preview.waveformOverview.bins.allSatisfy { $0.peakMagnitude == 0 }, "native preview was silent")
+
         let decoded = try awaitValue {
             try await AudioAssetImporter.loadDecodedAsset(at: aiffURL)
         }

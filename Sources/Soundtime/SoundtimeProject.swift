@@ -243,6 +243,34 @@ struct SoundtimeProject: Codable, Sendable {
         self.schemaVersion = schemaVersion
     }
 
+    fileprivate func mergingMissingWaveformPreviews(from savedProject: SoundtimeProject) -> SoundtimeProject {
+        let savedPreviewsByTrack = Dictionary(
+            uniqueKeysWithValues: savedProject.tracks.compactMap { track -> (String, WaveformPreview)? in
+                guard let waveformPreview = track.waveformPreview else {
+                    return nil
+                }
+
+                return (SoundtimeProjectStore.waveformPreviewMergeKey(for: track), waveformPreview)
+            }
+        )
+
+        var mergedProject = self
+        mergedProject.tracks = tracks.map { track in
+            guard track.waveformPreview == nil else {
+                return track
+            }
+
+            guard let waveformPreview = savedPreviewsByTrack[SoundtimeProjectStore.waveformPreviewMergeKey(for: track)] else {
+                return track
+            }
+
+            var mergedTrack = track
+            mergedTrack.waveformPreview = waveformPreview
+            return mergedTrack
+        }
+        return mergedProject
+    }
+
     private enum CodingKeys: String, CodingKey {
         case schemaVersion
         case tracks
@@ -288,14 +316,22 @@ enum SoundtimeProjectStore {
 
     static func loadRecoveringAutosave(from url: URL) throws -> SoundtimeProject {
         let autosaveURL = autosaveURL(for: url)
+        let savedProjectResult = Result {
+            try load(from: url)
+        }
         guard
             FileManager.default.fileExists(atPath: autosaveURL.path),
             autosaveURL.isNewerThan(url)
         else {
-            return try load(from: url)
+            return try savedProjectResult.get()
         }
 
-        return try load(from: autosaveURL)
+        let autosaveProject = try load(from: autosaveURL)
+        guard case let .success(savedProject) = savedProjectResult else {
+            return autosaveProject
+        }
+
+        return autosaveProject.mergingMissingWaveformPreviews(from: savedProject)
     }
 
     static func save(_ project: SoundtimeProject, to url: URL) throws {
@@ -357,6 +393,11 @@ enum SoundtimeProjectStore {
         return migratedProject
     }
 
+    fileprivate static func waveformPreviewMergeKey(for track: SoundtimeProject.Track) -> String {
+        let standardizedPath = URL(fileURLWithPath: track.filePath).standardizedFileURL.path
+        return "\(track.id.uuidString)|\(standardizedPath)"
+    }
+
     static func rememberLastProjectURL(_ url: URL) {
         UserDefaults.standard.set(url.path, forKey: lastProjectURLKey)
         rememberRecentProjectURL(url)
@@ -368,6 +409,10 @@ enum SoundtimeProjectStore {
         }
 
         return URL(fileURLWithPath: path)
+    }
+
+    static func forgetLastProjectURL() {
+        UserDefaults.standard.removeObject(forKey: lastProjectURLKey)
     }
 
     static func rememberRecentProjectURL(_ url: URL) {
