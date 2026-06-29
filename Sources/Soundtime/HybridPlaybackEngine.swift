@@ -140,7 +140,6 @@ final class HybridPlaybackEngine: PlaybackEngine {
     func loadProjectTracks(_ tracks: [ProjectPlaybackTrack]) throws {
         cancelSourcePreparation()
         previewEngine.clear()
-        let requiresSampleSynchronousPlayback = tracks.count > 1
         if let realtimeEngine {
             multitrackEngine.clear()
             do {
@@ -150,14 +149,7 @@ final class HybridPlaybackEngine: PlaybackEngine {
                 return
             } catch {
                 realtimeEngine.clear()
-                guard !requiresSampleSynchronousPlayback else {
-                    throw error
-                }
             }
-        }
-
-        guard !requiresSampleSynchronousPlayback else {
-            throw PlaybackError.invalidFormat
         }
 
         try multitrackEngine.loadProjectTracks(tracks)
@@ -173,9 +165,15 @@ final class HybridPlaybackEngine: PlaybackEngine {
         }
 
         if activeEngine == .realtime, let realtimeEngine {
-            try realtimeEngine.updateProjectTracks(tracks)
-            realtimeEngine.setPerceptualVolume(perceptualVolume)
-            return
+            do {
+                try realtimeEngine.updateProjectTracks(tracks)
+                realtimeEngine.setPerceptualVolume(perceptualVolume)
+                return
+            } catch {
+                realtimeEngine.clear()
+                try loadProjectTracks(tracks)
+                return
+            }
         }
 
         try loadProjectTracks(tracks)
