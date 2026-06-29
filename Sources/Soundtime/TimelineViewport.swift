@@ -55,4 +55,22 @@ struct TimelineViewport: Equatable, Sendable {
             durationProgress: nextDuration
         )
     }
+
+    func preservingAbsoluteTimes(previousDuration: TimeInterval, nextDuration: TimeInterval) -> TimelineViewport {
+        guard
+            previousDuration.isFinite,
+            nextDuration.isFinite,
+            previousDuration > 0,
+            nextDuration > 0
+        else {
+            return self
+        }
+
+        let absoluteStart = Double(startProgress) * previousDuration
+        let absoluteDuration = Double(durationProgress) * previousDuration
+        return TimelineViewport(
+            startProgress: Float(absoluteStart / nextDuration),
+            durationProgress: Float(absoluteDuration / nextDuration)
+        )
+    }
 }

@@ -18,6 +18,31 @@ struct TimelineRenderState: Sendable {
     }
 
     struct Track: Sendable {
+        struct WaveformSegment: Sendable, Hashable {
+            let outputStartProgress: Float
+            let outputEndProgress: Float
+            let sourceStartProgress: Float
+            let sourceEndProgress: Float
+            let gainStart: Float
+            let gainEnd: Float
+
+            init(
+                outputStartProgress: Float,
+                outputEndProgress: Float,
+                sourceStartProgress: Float,
+                sourceEndProgress: Float,
+                gainStart: Float = 1,
+                gainEnd: Float = 1
+            ) {
+                self.outputStartProgress = min(max(outputStartProgress, 0), 1)
+                self.outputEndProgress = min(max(outputEndProgress, self.outputStartProgress), 1)
+                self.sourceStartProgress = min(max(sourceStartProgress, 0), 1)
+                self.sourceEndProgress = min(max(sourceEndProgress, 0), 1)
+                self.gainStart = gainStart
+                self.gainEnd = gainEnd
+            }
+        }
+
         let id: UUID
         let waveformVersion: Int
         let waveformOverview: WaveformOverview?
@@ -27,6 +52,7 @@ struct TimelineRenderState: Sendable {
         let isMuted: Bool
         let isSoloed: Bool
         let clipRanges: [ClipRange]
+        let waveformSegments: [WaveformSegment]
         let waveformTileSource: WaveformTileBuildSource?
 
         init(
@@ -39,6 +65,7 @@ struct TimelineRenderState: Sendable {
             isSoloed: Bool,
             hasWaveform: Bool? = nil,
             clipRanges: [ClipRange] = [],
+            waveformSegments: [WaveformSegment] = [],
             waveformTileSource: WaveformTileBuildSource? = nil
         ) {
             self.id = id
@@ -50,6 +77,7 @@ struct TimelineRenderState: Sendable {
             self.isSoloed = isSoloed
             self.hasWaveform = hasWaveform ?? (waveformOverview?.isEmpty == false)
             self.clipRanges = clipRanges.filter { $0.durationProgress > 0 }
+            self.waveformSegments = waveformSegments.filter { $0.outputEndProgress > $0.outputStartProgress }
             self.waveformTileSource = waveformTileSource
         }
     }

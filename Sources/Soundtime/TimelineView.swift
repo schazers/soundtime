@@ -176,6 +176,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var isProcessingSelectionAnimationActive = false
     private var needsTimelineRender = false
     private var isRenderDataPreparedRenderPending = false
+    private var pendingRenderSubmittedCallbacks: [(CFTimeInterval) -> Void] = []
     private let renderFlightGate = RenderFlightGate()
     private var isTimelinePlaybackActive = false
     private var timelineDuration: TimeInterval = 0
@@ -202,6 +203,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private let playbackStopTouchTrailRenderPulseDuration: CFTimeInterval = 1.25
     private let waveformTransitionRenderPulseDuration: CFTimeInterval = 0.24
     private let selectionDragEffectRenderPulseDuration: CFTimeInterval = 0.28
+    private let deletionEffectRenderPulseDuration: CFTimeInterval = 2.10
     private let targetFramesPerSecond = 144
     private let scrollZoomSensitivity: Float = 0.01
     private let supportedAudioExtensions = AudioAssetImporter.supportedAudioFileExtensions
@@ -319,16 +321,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         if !wasSelectionEnabled || !isSelectionEnabled {
             setViewport(.full, kicksImmediateRender: false)
         } else if
-            !animateWaveformTransition,
             previousTimelineDuration > 0,
             nextTimelineDuration > 0,
             previousTimelineDuration != nextTimelineDuration
         {
-            let absoluteStart = Double(previousViewport.startProgress) * previousTimelineDuration
-            let absoluteDuration = Double(previousViewport.durationProgress) * previousTimelineDuration
-            let preservedViewport = TimelineViewport(
-                startProgress: Float(absoluteStart / nextTimelineDuration),
-                durationProgress: Float(absoluteDuration / nextTimelineDuration)
+            let preservedViewport = previousViewport.preservingAbsoluteTimes(
+                previousDuration: previousTimelineDuration,
+                nextDuration: nextTimelineDuration
             )
             setViewport(preservedViewport, kicksImmediateRender: false)
         }
@@ -469,6 +468,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                 isSoloed: track.isSoloed,
                 hasWaveform: track.hasWaveform || current?.hasWaveform == true,
                 clipRanges: track.clipRanges.isEmpty ? (current?.clipRanges ?? []) : track.clipRanges,
+                waveformSegments: track.waveformSegments.isEmpty ? (current?.waveformSegments ?? []) : track.waveformSegments,
                 waveformTileSource: track.waveformTileSource ?? current?.waveformTileSource
             )
         }
@@ -724,18 +724,29 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         requestTimelineRender()
     }
 
+    func prepareDeletionEffectRendering() {
+        updateTimelineRendererImmediately { renderer in
+            renderer.prepareVisibleWaveformShaderBuffersForDeletion()
+        }
+    }
+
     func triggerDeletionEffect(selection: TimelineSelection, sourceSelection: TimelineSelection? = nil) {
-        updateTimelineRenderer { renderer in
+        updateTimelineRendererImmediately { renderer in
             renderer.triggerDeletionEffect(selection: selection, sourceSelection: sourceSelection)
         }
         requestTimelineRender()
-        startTransientRenderPulse(duration: 0.34)
+        startTransientRenderPulse(duration: deletionEffectRenderPulseDuration)
     }
 
     func clearDeletionEffects() {
         updateTimelineRenderer { renderer in
             renderer.clearDeletionEffects()
         }
+        requestTimelineRender()
+    }
+
+    func notifyAfterNextSubmittedTimelineRender(_ callback: @escaping (CFTimeInterval) -> Void) {
+        pendingRenderSubmittedCallbacks.append(callback)
         requestTimelineRender()
     }
 
@@ -1075,9 +1086,25 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         latestSubmittedPresentationTimestamp = frame.targetPresentationTimestamp
         timelineRenderQueue.async { [weak self, timelineRenderer, renderTarget] in
             timelineRenderer.render(to: renderTarget)
+            let submittedAt = CACurrentMediaTime()
+            DispatchQueue.main.async { [weak self] in
+                self?.finishPendingRenderSubmittedCallbacks(submittedAt: submittedAt)
+            }
             self?.renderFlightGate.finish()
         }
         return true
+    }
+
+    private func finishPendingRenderSubmittedCallbacks(submittedAt: CFTimeInterval) {
+        guard !pendingRenderSubmittedCallbacks.isEmpty else {
+            return
+        }
+
+        let callbacks = pendingRenderSubmittedCallbacks
+        pendingRenderSubmittedCallbacks.removeAll(keepingCapacity: true)
+        for callback in callbacks {
+            callback(submittedAt)
+        }
     }
 
     private func shouldPublishTimelineFrameStats() -> Bool {
@@ -1385,6 +1412,18 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         if event.keyCode == 51 || event.keyCode == 117 {
+            SoundtimeDiagnostics.shared.record(
+                category: .edit,
+                severity: .info,
+                name: "timeline-delete-keydown",
+                message: "TimelineView received a delete key event.",
+                fields: [
+                    "keyCode": "\(event.keyCode)",
+                    "hasCommand": "\(event.modifierFlags.contains(.command))",
+                    "canDeleteSelection": "\(canDeleteSelection)",
+                    "isInteractionSuppressed": "\(isInteractionSuppressed)",
+                ]
+            )
             onDeleteSelection?()
             return
         }
@@ -1506,6 +1545,16 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     @objc func deleteTimelineSelection(_ sender: Any?) {
+        SoundtimeDiagnostics.shared.record(
+            category: .edit,
+            severity: .info,
+            name: "timeline-delete-action",
+            message: "TimelineView received the Delete Time menu/action command.",
+            fields: [
+                "canDeleteSelection": "\(canDeleteSelection)",
+                "isInteractionSuppressed": "\(isInteractionSuppressed)",
+            ]
+        )
         onDeleteSelection?()
     }
 

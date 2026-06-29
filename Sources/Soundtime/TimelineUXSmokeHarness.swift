@@ -205,8 +205,30 @@ enum TimelineUXSmokeHarness {
         )
         complete("delete animation effect appears and expires")
 
+        try verifyDeleteAnimationKeepsLeftSideStable(
+            renderer: renderer,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        complete("delete animation keeps pre-selection waveform pixels stable")
+
+        try verifyGroupedDeleteKeepsLargeWaveformsDetailed(
+            renderer: renderer,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        complete("grouped delete keeps large visible waveforms detailed")
+
         try verifyHitTestingMathSurvivesDurationChanges()
         complete("timeline hit-testing maps clicked x before and after edits")
+
+        try verifyViewportPreservesAbsoluteTimeAfterDelete()
+        complete("delete refresh preserves visible time window")
+
+        try verifyDeleteSelectionDeletesExactFrameRange()
+        complete("delete selection removes exact selected frame range")
 
         try verifyRenderLoopStatsStayAlive(
             renderer: renderer,
@@ -890,7 +912,7 @@ enum TimelineUXSmokeHarness {
             viewport: .full,
             playheadProgress: 0.24,
             isPlaybackActive: false,
-            displayTimestamp: baseTimestamp + 0.30,
+            displayTimestamp: baseTimestamp + 2.20,
             texture: texture,
             viewportSize: viewportSize,
             backingScale: backingScale
@@ -898,6 +920,257 @@ enum TimelineUXSmokeHarness {
         try require(
             pixelDifferenceCount(baseFrame.bytes, expiredFrame.bytes, threshold: 12) < 600,
             "delete animation effect did not visually expire"
+        )
+        renderer.clearDeletionEffects()
+    }
+
+    private static func verifyDeleteAnimationKeepsLeftSideStable(
+        renderer: TimelineRenderer,
+        texture: MTLTexture,
+        viewportSize: CGSize,
+        backingScale: Float
+    ) throws {
+        renderer.clearDeletionEffects()
+        let durationBeforeDelete = 20.0
+        let selection = TimelineSelection(
+            startProgress: 0.36,
+            endProgress: 0.46,
+            trackID: UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-000000000901") ?? UUID()
+        )
+        let durationAfterDelete = durationBeforeDelete * (1 - selection.durationProgress)
+        let overviewBeforeDelete = makeLongSparseWaveformOverview(
+            duration: durationBeforeDelete,
+            binCount: 4_096
+        )
+        let overviewAfterDelete = deleteOverview(
+            overviewBeforeDelete,
+            selection: selection,
+            targetDuration: durationAfterDelete
+        )
+        let trackID = selection.trackID ?? UUID()
+        let trackBeforeDelete = TimelineRenderState.Track(
+            id: trackID,
+            waveformVersion: 1,
+            waveformOverview: overviewBeforeDelete,
+            durationHint: durationBeforeDelete,
+            volume: 1,
+            isMuted: false,
+            isSoloed: false,
+            clipRanges: [TimelineRenderState.ClipRange(startProgress: 0, endProgress: 1)]
+        )
+        let trackAfterDelete = TimelineRenderState.Track(
+            id: trackID,
+            waveformVersion: 2,
+            waveformOverview: overviewAfterDelete,
+            durationHint: durationAfterDelete,
+            volume: 1,
+            isMuted: false,
+            isSoloed: false,
+            clipRanges: [TimelineRenderState.ClipRange(startProgress: 0, endProgress: 1)]
+        )
+        let viewportBeforeDelete = TimelineViewport(startProgress: 0.20, durationProgress: 0.40)
+        let viewportAfterDelete = viewportBeforeDelete.preservingAbsoluteTimes(
+            previousDuration: durationBeforeDelete,
+            nextDuration: durationAfterDelete
+        )
+        let displayTimestamp = CACurrentMediaTime()
+        let beforeFrame = try renderTimeline(
+            renderer: renderer,
+            tracks: [trackBeforeDelete],
+            viewport: viewportBeforeDelete,
+            playheadProgress: 0,
+            isPlaybackActive: false,
+            displayTimestamp: displayTimestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+
+        renderer.triggerDeletionEffect(selection: selection)
+        let afterFrame = try renderTimeline(
+            renderer: renderer,
+            tracks: [trackAfterDelete],
+            viewport: viewportAfterDelete,
+            playheadProgress: 0,
+            isPlaybackActive: false,
+            displayTimestamp: displayTimestamp + 0.035,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+
+        let width = texture.width
+        let height = texture.height
+        let selectionStartX = Int(
+            (viewportBeforeDelete.viewportProgress(
+                forTimelineProgress: selection.startProgressFloat
+            ) * Float(width)).rounded(.down)
+        )
+        let stableColumns = 0..<max(selectionStartX - 128, 0)
+        let laneRows = Int(Double(height) * 0.18)..<Int(Double(height) * 0.86)
+        let changedPixels = brightPixelDifferenceCount(
+            beforeFrame.bytes,
+            afterFrame.bytes,
+            width: width,
+            columns: stableColumns,
+            rows: laneRows,
+            threshold: 18,
+            minimumLuminance: 76
+        )
+        let stablePixelBudget = max(stableColumns.count * laneRows.count / 180, 24)
+        try require(
+            changedPixels <= stablePixelBudget,
+            "delete animation changed \(changedPixels) stable left-side pixels, budget \(stablePixelBudget)"
+        )
+        renderer.clearDeletionEffects()
+    }
+
+    private static func verifyGroupedDeleteKeepsLargeWaveformsDetailed(
+        renderer: TimelineRenderer,
+        texture: MTLTexture,
+        viewportSize: CGSize,
+        backingScale: Float
+    ) throws {
+        renderer.clearDeletionEffects()
+        let durationBeforeDelete = 120.0
+        let selection = TimelineSelection(startProgress: 0.34, endProgress: 0.40)
+        let durationAfterDelete = durationBeforeDelete * (1 - selection.durationProgress)
+        let viewportBeforeDelete = TimelineViewport(startProgress: 0.16, durationProgress: 0.54)
+        let viewportAfterDelete = viewportBeforeDelete.preservingAbsoluteTimes(
+            previousDuration: durationBeforeDelete,
+            nextDuration: durationAfterDelete
+        )
+        let trackIDs = [
+            UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-000000000A01") ?? UUID(),
+            UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-000000000A02") ?? UUID(),
+            UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-000000000A03") ?? UUID(),
+        ]
+        let beforeTracks = trackIDs.enumerated().map { index, trackID in
+            let overview = makeDetailedWaveformOverview(
+                duration: durationBeforeDelete,
+                binCount: 65_536,
+                seed: UInt32(index + 11)
+            )
+            return TimelineRenderState.Track(
+                id: trackID,
+                waveformVersion: 10 + index,
+                waveformOverview: overview,
+                durationHint: durationBeforeDelete,
+                volume: 1,
+                isMuted: false,
+                isSoloed: false,
+                clipRanges: [TimelineRenderState.ClipRange(startProgress: 0, endProgress: 1)]
+            )
+        }
+        let displayTimestamp = CACurrentMediaTime()
+        _ = try renderTimeline(
+            renderer: renderer,
+            tracks: beforeTracks,
+            viewport: viewportBeforeDelete,
+            playheadProgress: 0,
+            isPlaybackActive: false,
+            displayTimestamp: displayTimestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        renderer.prepareVisibleWaveformShaderBuffersForDeletion()
+        let beforeFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: displayTimestamp + 0.08,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+
+        let afterTracks = beforeTracks.map { track in
+            let sourceOverview = track.waveformOverview!
+            let editedOverview = deleteOverview(
+                sourceOverview,
+                selection: selection,
+                targetDuration: durationAfterDelete
+            )
+            return TimelineRenderState.Track(
+                id: track.id,
+                waveformVersion: track.waveformVersion + 100,
+                waveformOverview: editedOverview,
+                durationHint: durationAfterDelete,
+                volume: track.volume,
+                isMuted: false,
+                isSoloed: false,
+                clipRanges: [TimelineRenderState.ClipRange(startProgress: 0, endProgress: 1)]
+            )
+        }
+        for trackID in trackIDs {
+            renderer.triggerDeletionEffect(
+                selection: TimelineSelection(
+                    startProgress: selection.startProgress,
+                    endProgress: selection.endProgress,
+                    trackID: trackID
+                )
+            )
+        }
+        let afterFrame = try renderTimeline(
+            renderer: renderer,
+            tracks: afterTracks,
+            viewport: viewportAfterDelete,
+            playheadProgress: 0,
+            isPlaybackActive: false,
+            displayTimestamp: displayTimestamp + 0.10,
+            animateWaveformTransition: true,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+
+        let width = texture.width
+        let height = texture.height
+        let selectionStartX = Int(
+            (viewportBeforeDelete.viewportProgress(
+                forTimelineProgress: selection.startProgressFloat
+            ) * Float(width)).rounded(.down)
+        )
+        let selectionEndX = Int(
+            (viewportBeforeDelete.viewportProgress(
+                forTimelineProgress: selection.endProgressFloat
+            ) * Float(width)).rounded(.up)
+        )
+        let midAnimationFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: displayTimestamp + 0.76,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        let movingColumns = min(selectionEndX + 18, width)..<width
+        let movingRows = Int(Double(height) * 0.18)..<Int(Double(height) * 0.93)
+        let movedPixels = pixelDifferenceCount(
+            afterFrame.bytes,
+            midAnimationFrame.bytes,
+            width: width,
+            columns: movingColumns,
+            rows: movingRows,
+            threshold: 12
+        )
+        try require(
+            movedPixels > 500,
+            "grouped delete only moved \(movedPixels) right-side pixels during the deletion animation"
+        )
+        let stableColumns = 0..<max(selectionStartX - 180, 0)
+        let laneRows = Int(Double(height) * 0.18)..<Int(Double(height) * 0.93)
+        let changedPixels = brightPixelDifferenceCount(
+            beforeFrame.bytes,
+            afterFrame.bytes,
+            width: width,
+            columns: stableColumns,
+            rows: laneRows,
+            threshold: 20,
+            minimumLuminance: 58
+        )
+        let stablePixelBudget = max(stableColumns.count * laneRows.count / 80, 600)
+        try require(
+            changedPixels <= stablePixelBudget,
+            "grouped delete changed \(changedPixels) stable high-detail pixels, budget \(stablePixelBudget)"
         )
         renderer.clearDeletionEffects()
     }
@@ -919,6 +1192,86 @@ enum TimelineUXSmokeHarness {
         let pannedViewport = viewport.panned(byProgress: 0.10)
         let progressAfterPan = pannedViewport.timelineProgress(forViewportProgress: clickedViewportProgress)
         try require(abs(progressAfterPan - 0.60) < 0.000_001, "panned hit test mapped to \(progressAfterPan), expected 0.60")
+    }
+
+    private static func verifyDeleteSelectionDeletesExactFrameRange() throws {
+        let frameCount = 120
+        let samples = (0..<frameCount).map { Float($0) }
+        let buffer = DecodedAudioBuffer(
+            url: URL(fileURLWithPath: "/tmp/SoundtimeDeleteSelectionSmoke.wav"),
+            sampleRate: 100,
+            channelCount: 1,
+            frameCount: frameCount,
+            samplesByChannel: [samples]
+        )
+        let selection = TimelineSelection(startProgress: 0.25, endProgress: 0.50)
+
+        var audioTimeline = AudioEditTimeline(sourceBuffer: buffer)
+        let audioRange = audioTimeline.frameRange(for: selection)
+        try require(audioRange == 30..<60, "audio delete frame range was \(audioRange), expected 30..<60")
+        let audioDeletedFrames = audioTimeline.delete(selection)
+        try require(audioDeletedFrames == 30, "audio delete removed \(audioDeletedFrames) frames, expected 30")
+        let rendered = audioTimeline.render()
+        try require(rendered.frameCount == 90, "audio delete rendered \(rendered.frameCount) frames, expected 90")
+        let renderedSamples = rendered.samplesByChannel[0]
+        try require(renderedSamples.count == 90, "audio delete sample count was \(renderedSamples.count), expected 90")
+        for frame in 0..<30 {
+            try require(renderedSamples[frame] == Float(frame), "audio delete changed frame \(frame)")
+        }
+        for frame in 30..<90 {
+            let expected = Float(frame + 30)
+            try require(renderedSamples[frame] == expected, "audio delete output frame \(frame) was \(renderedSamples[frame]), expected \(expected)")
+        }
+
+        guard var fileTimeline = AudioFileEditTimeline(
+            sourceFrameCount: frameCount,
+            sourceSampleRate: 100,
+            playbackSegments: [
+                AudioEditTimeline.PlaybackSegment(
+                    outputStartFrame: 0,
+                    sourceStartFrame: 0,
+                    frameCount: frameCount,
+                    sourceFrameScale: 1,
+                    gainStart: 1,
+                    gainEnd: 1
+                ),
+            ]
+        ) else {
+            throw SmokeError.checkFailed("could not construct file-backed delete timeline")
+        }
+        let fileRange = fileTimeline.frameRange(for: selection)
+        try require(fileRange == 30..<60, "file delete frame range was \(fileRange), expected 30..<60")
+        let fileDeletedFrames = fileTimeline.delete(selection)
+        try require(fileDeletedFrames == 30, "file delete removed \(fileDeletedFrames) frames, expected 30")
+        try require(fileTimeline.frameCount == 90, "file delete left \(fileTimeline.frameCount) frames, expected 90")
+    }
+
+    private static func verifyViewportPreservesAbsoluteTimeAfterDelete() throws {
+        let beforeDuration = 120.0
+        let afterDuration = 100.0
+        let viewport = TimelineViewport(startProgress: 0.25, durationProgress: 0.25)
+        let preserved = viewport.preservingAbsoluteTimes(
+            previousDuration: beforeDuration,
+            nextDuration: afterDuration
+        )
+        let preservedStartTime = Double(preserved.startProgress) * afterDuration
+        let preservedVisibleDuration = Double(preserved.durationProgress) * afterDuration
+        try require(
+            abs(preservedStartTime - 30.0) < 0.000_1,
+            "preserved viewport start time was \(preservedStartTime), expected 30s"
+        )
+        try require(
+            abs(preservedVisibleDuration - 30.0) < 0.000_1,
+            "preserved viewport duration was \(preservedVisibleDuration), expected 30s"
+        )
+
+        let nearEndViewport = TimelineViewport(startProgress: 0.75, durationProgress: 0.20)
+        let clamped = nearEndViewport.preservingAbsoluteTimes(
+            previousDuration: beforeDuration,
+            nextDuration: afterDuration
+        )
+        try require(clamped.endProgress <= 1.000_001, "preserved near-end viewport exceeded timeline bounds")
+        try require(clamped.durationProgress <= 1, "preserved near-end viewport duration exceeded full timeline")
     }
 
     private static func verifyRenderLoopStatsStayAlive(
@@ -994,11 +1347,12 @@ enum TimelineUXSmokeHarness {
         displayTimestamp: CFTimeInterval = CACurrentMediaTime(),
         playheadAnchorTimestamp: CFTimeInterval? = nil,
         trackLayout: TimelineTrackLayout = .default,
+        animateWaveformTransition: Bool = false,
         texture: MTLTexture,
         viewportSize: CGSize,
         backingScale: Float
     ) throws -> RenderedFrame {
-        renderer.displayTracks(tracks, animateWaveformTransition: false)
+        renderer.displayTracks(tracks, animateWaveformTransition: animateWaveformTransition)
         renderer.displayTrackLayout(trackLayout)
         renderer.displayViewport(viewport)
         renderer.displayPlaybackActive(isPlaybackActive)
@@ -1009,6 +1363,22 @@ enum TimelineUXSmokeHarness {
             resetsTouchStart: true
         )
 
+        return try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: displayTimestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+    }
+
+    private static func renderCurrentTimeline(
+        renderer: TimelineRenderer,
+        displayTimestamp: CFTimeInterval = CACurrentMediaTime(),
+        texture: MTLTexture,
+        viewportSize: CGSize,
+        backingScale: Float
+    ) throws -> RenderedFrame {
         let renderPassDescriptor = makeRenderPassDescriptor(texture: texture)
         guard renderer.renderOffscreen(
             renderPassDescriptor: renderPassDescriptor,
@@ -1032,6 +1402,32 @@ enum TimelineUXSmokeHarness {
         return RenderedFrame(
             bytes: bytes,
             summary: MetalPixelSmokeSummary.analyzeBGRA8(bytes, width: width, height: height)
+        )
+    }
+
+    private static func waitForVisibleWaveformBuffers(
+        renderer: TimelineRenderer,
+        texture: MTLTexture,
+        viewportSize: CGSize,
+        backingScale: Float,
+        displayTimestamp: CFTimeInterval
+    ) throws {
+        for attempt in 0..<80 {
+            if renderer.visibleWaveformShaderBuffersAreResident(drawableSize: viewportSize) {
+                return
+            }
+            _ = try renderCurrentTimeline(
+                renderer: renderer,
+                displayTimestamp: displayTimestamp + Double(attempt) * 0.01,
+                texture: texture,
+                viewportSize: viewportSize,
+                backingScale: backingScale
+            )
+            usleep(10_000)
+        }
+        try require(
+            renderer.visibleWaveformShaderBuffersAreResident(drawableSize: viewportSize),
+            "large waveform buffers did not become resident before grouped delete smoke"
         )
     }
 
@@ -1079,6 +1475,71 @@ enum TimelineUXSmokeHarness {
             )
         }
         return WaveformOverview(duration: duration, bins: bins)
+    }
+
+    private static func makeDetailedWaveformOverview(
+        duration: TimeInterval,
+        binCount: Int,
+        seed: UInt32
+    ) -> WaveformOverview {
+        let bins = (0..<binCount).map { index -> WaveformOverview.Bin in
+            let t = Float(index) / Float(max(binCount - 1, 1))
+            let phrase = 0.20 + 0.78 * abs(sin(t * .pi * 17.0 + Float(seed) * 0.13))
+            let fast = 0.28 + 0.72 * abs(sin(t * .pi * 941.0 + Float(seed) * 0.71))
+            let hashed = Float(timelineSmokeHash(UInt32(index) &* 1_103_515_245 &+ seed) & 0xFFFF) / 65_535.0
+            let spike: Float = hashed > 0.968 ? 1.0 : 0.0
+            let peak = min(max(phrase * fast * (0.44 + hashed * 0.42) + spike * 0.38, 0.02), 0.98)
+            return WaveformOverview.Bin(
+                minimumSample: -peak,
+                maximumSample: peak * (0.86 + 0.14 * hashed),
+                rmsSample: peak * 0.42,
+                lowEnergy: 0.22 + hashed * 0.10,
+                midEnergy: 0.38 + hashed * 0.18,
+                highEnergy: 0.18 + hashed * 0.22
+            )
+        }
+        return WaveformOverview(duration: duration, bins: bins)
+    }
+
+    private static func timelineSmokeHash(_ value: UInt32) -> UInt32 {
+        var x = value
+        x ^= x >> 16
+        x &*= 0x7FEB_352D
+        x ^= x >> 15
+        x &*= 0x846C_A68B
+        x ^= x >> 16
+        return x
+    }
+
+    private static func deleteOverview(
+        _ overview: WaveformOverview,
+        selection: TimelineSelection,
+        targetDuration: TimeInterval
+    ) -> WaveformOverview {
+        let binCount = overview.bins.count
+        guard binCount > 0 else {
+            return WaveformOverview(duration: targetDuration, bins: [])
+        }
+
+        let startIndex = min(
+            max(Int((selection.startProgress * Double(binCount)).rounded(.down)), 0),
+            binCount
+        )
+        let targetBinCount = min(
+            max(Int((Double(binCount) * targetDuration / max(overview.duration, 0.000_001)).rounded()), 0),
+            binCount
+        )
+        let removedBinCount = min(max(binCount - targetBinCount, 0), binCount - startIndex)
+        let endIndex = min(startIndex + removedBinCount, binCount)
+        var bins: [WaveformOverview.Bin] = []
+        bins.reserveCapacity(binCount - (endIndex - startIndex))
+        if startIndex > 0 {
+            bins.append(contentsOf: overview.bins[0..<startIndex])
+        }
+        if endIndex < binCount {
+            bins.append(contentsOf: overview.bins[endIndex..<binCount])
+        }
+        return WaveformOverview(duration: targetDuration, bins: bins)
     }
 
     private static func renderTrack(
@@ -1142,6 +1603,89 @@ enum TimelineUXSmokeHarness {
             let redDelta = abs(Int(lhs[byteIndex + 2]) - Int(rhs[byteIndex + 2]))
             if max(blueDelta, greenDelta, redDelta) > threshold {
                 count += 1
+            }
+        }
+        return count
+    }
+
+    private static func pixelDifferenceCount(
+        _ lhs: [UInt8],
+        _ rhs: [UInt8],
+        width: Int,
+        columns: Range<Int>,
+        rows: Range<Int>,
+        threshold: Int = 20
+    ) -> Int {
+        guard width > 0, !columns.isEmpty, !rows.isEmpty else {
+            return 0
+        }
+
+        let pixelCount = min(lhs.count, rhs.count) / 4
+        let height = pixelCount / width
+        let clampedColumns = max(columns.lowerBound, 0)..<min(columns.upperBound, width)
+        let clampedRows = max(rows.lowerBound, 0)..<min(rows.upperBound, height)
+        guard !clampedColumns.isEmpty, !clampedRows.isEmpty else {
+            return 0
+        }
+
+        var count = 0
+        for row in clampedRows {
+            for column in clampedColumns {
+                let byteIndex = (row * width + column) * 4
+                let blueDelta = abs(Int(lhs[byteIndex]) - Int(rhs[byteIndex]))
+                let greenDelta = abs(Int(lhs[byteIndex + 1]) - Int(rhs[byteIndex + 1]))
+                let redDelta = abs(Int(lhs[byteIndex + 2]) - Int(rhs[byteIndex + 2]))
+                if max(blueDelta, greenDelta, redDelta) > threshold {
+                    count += 1
+                }
+            }
+        }
+        return count
+    }
+
+    private static func brightPixelDifferenceCount(
+        _ lhs: [UInt8],
+        _ rhs: [UInt8],
+        width: Int,
+        columns: Range<Int>,
+        rows: Range<Int>,
+        threshold: Int = 20,
+        minimumLuminance: Int
+    ) -> Int {
+        guard width > 0, !columns.isEmpty, !rows.isEmpty else {
+            return 0
+        }
+
+        let pixelCount = min(lhs.count, rhs.count) / 4
+        let height = pixelCount / width
+        let clampedColumns = max(columns.lowerBound, 0)..<min(columns.upperBound, width)
+        let clampedRows = max(rows.lowerBound, 0)..<min(rows.upperBound, height)
+        guard !clampedColumns.isEmpty, !clampedRows.isEmpty else {
+            return 0
+        }
+
+        var count = 0
+        for row in clampedRows {
+            for column in clampedColumns {
+                let byteIndex = (row * width + column) * 4
+                let lhsBlue = Int(lhs[byteIndex])
+                let lhsGreen = Int(lhs[byteIndex + 1])
+                let lhsRed = Int(lhs[byteIndex + 2])
+                let rhsBlue = Int(rhs[byteIndex])
+                let rhsGreen = Int(rhs[byteIndex + 1])
+                let rhsRed = Int(rhs[byteIndex + 2])
+                let lhsLuminance = (lhsRed * 54 + lhsGreen * 183 + lhsBlue * 19) / 256
+                let rhsLuminance = (rhsRed * 54 + rhsGreen * 183 + rhsBlue * 19) / 256
+                guard lhsLuminance >= minimumLuminance || rhsLuminance >= minimumLuminance else {
+                    continue
+                }
+
+                let blueDelta = abs(lhsBlue - rhsBlue)
+                let greenDelta = abs(lhsGreen - rhsGreen)
+                let redDelta = abs(lhsRed - rhsRed)
+                if max(blueDelta, greenDelta, redDelta) > threshold {
+                    count += 1
+                }
             }
         }
         return count

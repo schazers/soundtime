@@ -749,7 +749,7 @@ struct AudioFileEditTimeline: Sendable {
         }
     }
 
-    private func frameRange(for selection: TimelineSelection) -> Range<Int> {
+    func frameRange(for selection: TimelineSelection) -> Range<Int> {
         let startFrame = Int((selection.startProgress * Double(frameCount)).rounded(.down))
         let endFrame = Int((selection.endProgress * Double(frameCount)).rounded(.up))
         return max(startFrame, 0)..<min(max(endFrame, startFrame), frameCount)
