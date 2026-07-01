@@ -20,6 +20,10 @@ final class WorkspaceView: NSView {
         static let activationMilliseconds = 111.0
     }
 
+    private enum SelectionDragTuningDefaults {
+        static let value = SelectionDragWaveformTuning.defaultValue
+    }
+
     private enum FadeEffect {
         case fadeIn
         case fadeOut
@@ -593,10 +597,18 @@ final class WorkspaceView: NSView {
     private let transportControlPanel = TransportControlPanelView()
     private let editScopeStack: NSStackView = {
         let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 6
+        stack.alphaValue = 0
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        return stack
+    }()
+    private let editScopeControlsRow: NSStackView = {
+        let stack = NSStackView()
         stack.orientation = .horizontal
         stack.alignment = .centerY
         stack.spacing = 8
-        stack.alphaValue = 0
         stack.translatesAutoresizingMaskIntoConstraints = false
         return stack
     }()
@@ -669,6 +681,72 @@ final class WorkspaceView: NSView {
         range: 40...1_200,
         valueFormat: "%.0fms"
     )
+    private let selectionDragMinimumSpeedControl = TimelineTuningSliderView(
+        title: "Tickle Min",
+        value: Double(SelectionDragTuningDefaults.value.minimumSpeedPixelsPerSecond),
+        range: 0...800,
+        valueFormat: "%.0f"
+    )
+    private let selectionDragFullSpeedControl = TimelineTuningSliderView(
+        title: "Tickle Full",
+        value: Double(SelectionDragTuningDefaults.value.fullSpeedPixelsPerSecond),
+        range: 300...3_600,
+        valueFormat: "%.0f"
+    )
+    private let selectionDragLifetimeControl = TimelineTuningSliderView(
+        title: "Fade",
+        value: SelectionDragTuningDefaults.value.contactLifetime * 1_000,
+        range: 80...240,
+        valueFormat: "%.0fms"
+    )
+    private let selectionDragRadiusControl = TimelineTuningSliderView(
+        title: "Front",
+        value: Double(SelectionDragTuningDefaults.value.frontRadiusPixels),
+        range: 1...48,
+        valueFormat: "%.0fpx"
+    )
+    private let selectionDragExtraRadiusControl = TimelineTuningSliderView(
+        title: "Back",
+        value: Double(SelectionDragTuningDefaults.value.backRadiusPixels),
+        range: 1...90,
+        valueFormat: "%.0fpx"
+    )
+    private let selectionDragCoreRadiusControl = TimelineTuningSliderView(
+        title: "Core",
+        value: Double(SelectionDragTuningDefaults.value.contactCoreRadiusPixels),
+        range: 1...18,
+        valueFormat: "%.0fpx"
+    )
+    private let selectionDragExpansionControl = TimelineTuningSliderView(
+        title: "Lift",
+        value: Double(SelectionDragTuningDefaults.value.maximumExpansion),
+        range: 0...1.1,
+        valueFormat: "%.2f"
+    )
+    private let selectionDragWhiteningControl = TimelineTuningSliderView(
+        title: "White",
+        value: Double(SelectionDragTuningDefaults.value.maximumWhitening),
+        range: 0...1,
+        valueFormat: "%.2f"
+    )
+    private let selectionDragParticleLimitControl = TimelineTuningSliderView(
+        title: "Contacts",
+        value: Double(SelectionDragTuningDefaults.value.maximumContactCount),
+        range: 0...8,
+        valueFormat: "%.0f"
+    )
+    private let selectionDragTuningPanel = DebugTuningPanelView()
+    private let selectionDragTuningControlsStack: NSStackView = {
+        let stackView = NSStackView()
+        stackView.orientation = .vertical
+        stackView.alignment = .leading
+        stackView.distribution = .fill
+        stackView.spacing = 5
+        stackView.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        stackView.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        stackView.translatesAutoresizingMaskIntoConstraints = false
+        return stackView
+    }()
     private let fisheyeControlsStack: NSStackView = {
         let stackView = NSStackView()
         stackView.orientation = .horizontal
@@ -694,6 +772,7 @@ final class WorkspaceView: NSView {
     private let stemSeparationReviewOverlay = StemSeparationReviewOverlayView()
     private var framesPerSecondWidthConstraint: NSLayoutConstraint?
     private var trackControlsBelowDebugConstraint: NSLayoutConstraint?
+    private var trackControlsBelowSelectionDragDebugConstraint: NSLayoutConstraint?
     private var trackControlsBelowHeaderConstraint: NSLayoutConstraint?
     private var lastResponsiveLayoutWidth: CGFloat = -1
     private let autosaveID = UUID()
@@ -1061,9 +1140,11 @@ final class WorkspaceView: NSView {
         }
         editScopeControl.target = self
         editScopeControl.action = #selector(editScopeChanged(_:))
-        editScopeStack.addArrangedSubview(editScopeTitleLabel)
-        editScopeStack.addArrangedSubview(editScopeControl)
-        editScopeStack.addArrangedSubview(editScopeHintLabel)
+        editScopeControlsRow.addArrangedSubview(editScopeTitleLabel)
+        editScopeControlsRow.addArrangedSubview(editScopeControl)
+        editScopeControlsRow.addArrangedSubview(editScopeHintLabel)
+        editScopeStack.addArrangedSubview(editScopeControlsRow)
+        editScopeStack.addArrangedSubview(selectionDragTuningPanel)
         transportControlPanel.onAction = { [weak self] action in
             self?.handleTransportAction(action)
         }
@@ -1093,6 +1174,7 @@ final class WorkspaceView: NSView {
             self?.updateStatus(result.message)
         }
         configureFisheyeTuningControls()
+        configureSelectionDragTuningControls()
         installAudioDevicePreferencesObserver()
         gainEffectOverlay.onGainChanged = { [weak self] _, gain in
             self?.previewSelectedGain(gain)
@@ -1170,12 +1252,17 @@ final class WorkspaceView: NSView {
             equalTo: fisheyeControlsStack.bottomAnchor,
             constant: 14
         )
+        let trackControlsBelowSelectionDragDebugConstraint = trackControlsStack.topAnchor.constraint(
+            equalTo: titleLabel.bottomAnchor,
+            constant: 126
+        )
         let trackControlsBelowHeaderConstraint = trackControlsStack.topAnchor.constraint(
             equalTo: titleLabel.bottomAnchor,
             constant: 56
         )
         self.framesPerSecondWidthConstraint = framesPerSecondWidthConstraint
         self.trackControlsBelowDebugConstraint = trackControlsBelowDebugConstraint
+        self.trackControlsBelowSelectionDragDebugConstraint = trackControlsBelowSelectionDragDebugConstraint
         self.trackControlsBelowHeaderConstraint = trackControlsBelowHeaderConstraint
 
         NSLayoutConstraint.activate([
@@ -1227,8 +1314,10 @@ final class WorkspaceView: NSView {
             editScopeStack.leadingAnchor.constraint(equalTo: trackControlsStack.trailingAnchor, constant: 10),
             editScopeStack.trailingAnchor.constraint(lessThanOrEqualTo: loudnessMeter.leadingAnchor, constant: -20),
             editScopeStack.bottomAnchor.constraint(equalTo: trackControlsStack.topAnchor, constant: -10),
-            editScopeStack.heightAnchor.constraint(equalToConstant: 26),
+            editScopeControlsRow.heightAnchor.constraint(equalToConstant: 26),
             editScopeHintLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 220),
+            selectionDragTuningPanel.widthAnchor.constraint(lessThanOrEqualToConstant: 700),
+            selectionDragTuningPanel.heightAnchor.constraint(equalToConstant: 92),
 
             fisheyeControlsStack.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 12),
             fisheyeControlsStack.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
@@ -1284,6 +1373,7 @@ final class WorkspaceView: NSView {
 
         updateEffectCommandState()
         updateWaveformFisheyeTuning()
+        updateSelectionDragWaveformTuning()
         setDebugToolsVisible(Self.defaultDebugToolsVisible)
         updateLoudnessMeter()
         updateTransportControlState(isPlaying: false)
@@ -1378,6 +1468,66 @@ final class WorkspaceView: NSView {
         }
     }
 
+    private func configureSelectionDragTuningControls() {
+        selectionDragTuningPanel.addSubview(selectionDragTuningControlsStack)
+        NSLayoutConstraint.activate([
+            selectionDragTuningControlsStack.topAnchor.constraint(equalTo: selectionDragTuningPanel.topAnchor, constant: 10),
+            selectionDragTuningControlsStack.leadingAnchor.constraint(equalTo: selectionDragTuningPanel.leadingAnchor, constant: 12),
+            selectionDragTuningControlsStack.trailingAnchor.constraint(lessThanOrEqualTo: selectionDragTuningPanel.trailingAnchor, constant: -12),
+            selectionDragTuningControlsStack.bottomAnchor.constraint(equalTo: selectionDragTuningPanel.bottomAnchor, constant: -10),
+        ])
+
+        func makeRow() -> NSStackView {
+            let row = NSStackView()
+            row.orientation = .horizontal
+            row.alignment = .centerY
+            row.distribution = .fill
+            row.spacing = 8
+            row.translatesAutoresizingMaskIntoConstraints = false
+            return row
+        }
+
+        let timingRow = makeRow()
+        let shapeRow = makeRow()
+        selectionDragTuningControlsStack.addArrangedSubview(timingRow)
+        selectionDragTuningControlsStack.addArrangedSubview(shapeRow)
+
+        func addControl(_ control: TimelineTuningSliderView, to row: NSStackView) {
+            control.onValueChanged = { [weak self] _ in
+                self?.updateSelectionDragWaveformTuning()
+            }
+            control.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            control.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            row.addArrangedSubview(control)
+            let widthConstraint = control.widthAnchor.constraint(equalToConstant: 128)
+            widthConstraint.priority = .defaultLow
+            widthConstraint.isActive = true
+            control.heightAnchor.constraint(equalToConstant: 34).isActive = true
+        }
+
+        let timingControls = [
+            selectionDragMinimumSpeedControl,
+            selectionDragFullSpeedControl,
+            selectionDragLifetimeControl,
+            selectionDragParticleLimitControl,
+        ]
+        let shapeControls = [
+            selectionDragRadiusControl,
+            selectionDragExtraRadiusControl,
+            selectionDragCoreRadiusControl,
+            selectionDragExpansionControl,
+            selectionDragWhiteningControl,
+        ]
+
+        for control in timingControls {
+            addControl(control, to: timingRow)
+        }
+        for control in shapeControls {
+            addControl(control, to: shapeRow)
+        }
+        selectionDragTuningPanel.isHidden = true
+    }
+
     private func toggleDebugTools() {
         setDebugToolsVisible(!debugToolsVisible)
     }
@@ -1420,8 +1570,23 @@ final class WorkspaceView: NSView {
         updateEditScopeVisibility(animated: false)
         fisheyeControlsStack.isHidden = !showsDebugSliders
         framesPerSecondWidthConstraint?.constant = showsDebugText ? 390 : 58
-        trackControlsBelowDebugConstraint?.isActive = showsDebugSliders
-        trackControlsBelowHeaderConstraint?.isActive = !showsDebugSliders
+        updateDebugTuningPanelLayout()
+    }
+
+    private func updateDebugTuningPanelLayout() {
+        let width = bounds.width
+        let showsDebugSliders = SoundtimeFeatureFlags.waveformFisheye && debugToolsVisible && width >= 980
+        let showsSelectionDragTuning =
+            debugToolsVisible &&
+            width >= 980 &&
+            editScopeLayoutAllowsDisplay &&
+            hasSelectedTimelineRegion
+
+        selectionDragTuningPanel.isHidden = !showsSelectionDragTuning
+        trackControlsBelowSelectionDragDebugConstraint?.constant = showsDebugSliders ? 196 : 146
+        trackControlsBelowSelectionDragDebugConstraint?.isActive = showsSelectionDragTuning
+        trackControlsBelowDebugConstraint?.isActive = showsDebugSliders && !showsSelectionDragTuning
+        trackControlsBelowHeaderConstraint?.isActive = !showsDebugSliders && !showsSelectionDragTuning
     }
 
     private var hasSelectedTimelineRegion: Bool {
@@ -1437,6 +1602,7 @@ final class WorkspaceView: NSView {
         editScopeTitleLabel.isEnabled = shouldShow
         editScopeControl.isEnabled = shouldShow
         editScopeHintLabel.isEnabled = shouldShow
+        updateDebugTuningPanelLayout()
 
         guard editScopeLayoutAllowsDisplay else {
             editScopeStack.isHidden = true
@@ -1510,6 +1676,21 @@ final class WorkspaceView: NSView {
             fadeCurve: Float(fisheyeCurveControl.value),
             activationDuration: fisheyeActivateDurationControl.value / 1_000
         )
+    }
+
+    private func updateSelectionDragWaveformTuning() {
+        let tuning = SelectionDragWaveformTuning(
+            minimumSpeedPixelsPerSecond: Float(selectionDragMinimumSpeedControl.value),
+            fullSpeedPixelsPerSecond: Float(selectionDragFullSpeedControl.value),
+            contactLifetime: selectionDragLifetimeControl.value / 1_000,
+            frontRadiusPixels: Float(selectionDragRadiusControl.value),
+            backRadiusPixels: Float(selectionDragExtraRadiusControl.value),
+            contactCoreRadiusPixels: Float(selectionDragCoreRadiusControl.value),
+            maximumExpansion: Float(selectionDragExpansionControl.value),
+            maximumWhitening: Float(selectionDragWhiteningControl.value),
+            maximumContactCount: Int(selectionDragParticleLimitControl.value.rounded())
+        )
+        timelineSurface.updateSelectionDragWaveformTuning(tuning)
     }
 
     private func resetWaveformFisheyeTuningToDefaults() {
@@ -1837,9 +2018,7 @@ final class WorkspaceView: NSView {
 
     private func waveformTileSource(for track: ProjectTrack) -> WaveformTileBuildSource? {
         guard WaveformTiledRendererFeatureFlags.isEnabled,
-              track.editRevision == 0,
               track.audioTimeline == nil,
-              track.fileTimeline == nil,
               decodableWAVFileInfo(for: track.sourceURL) != nil
         else {
             return nil
@@ -13124,6 +13303,27 @@ final class WorkspaceView: NSView {
     }
 }
 
+private final class DebugTuningPanelView: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configure()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configure()
+    }
+
+    private func configure() {
+        wantsLayer = true
+        layer?.backgroundColor = NSColor(white: 0.09, alpha: 0.92).cgColor
+        layer?.borderColor = NSColor(white: 0.30, alpha: 0.50).cgColor
+        layer?.borderWidth = 1
+        layer?.cornerRadius = 8
+        translatesAutoresizingMaskIntoConstraints = false
+    }
+}
+
 private final class TimelineTuningSliderView: NSView {
     var onValueChanged: ((Double) -> Void)?
 
@@ -13158,9 +13358,8 @@ private final class TimelineTuningSliderView: NSView {
         titleLabel = NSTextField(labelWithString: title)
         valueLabel = NSTextField(labelWithString: "")
         super.init(frame: .zero)
-        slider.doubleValue = min(max(value, range.lowerBound), range.upperBound)
         configure()
-        updateValueLabel()
+        self.value = value
     }
 
     required init?(coder: NSCoder) {
@@ -13198,9 +13397,9 @@ private final class TimelineTuningSliderView: NSView {
 
             valueLabel.topAnchor.constraint(equalTo: topAnchor),
             valueLabel.trailingAnchor.constraint(equalTo: trailingAnchor),
-            valueLabel.widthAnchor.constraint(equalToConstant: 48),
+            valueLabel.widthAnchor.constraint(equalToConstant: 42),
 
-            slider.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 1),
+            slider.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
             slider.leadingAnchor.constraint(equalTo: leadingAnchor, constant: -2),
             slider.trailingAnchor.constraint(equalTo: trailingAnchor, constant: 2),
             slider.bottomAnchor.constraint(equalTo: bottomAnchor),

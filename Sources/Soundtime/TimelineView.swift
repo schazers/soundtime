@@ -184,7 +184,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var pagingPlayheadAnchorTimestamp = CACurrentMediaTime()
     private var latestSubmittedPresentationTimestamp = CACurrentMediaTime()
     private let selectionDragThreshold: CGFloat = 0.01
-    private let selectionDragVelocitySmoothing: CGFloat = 0.34
+    private let selectionDragVelocityRiseTimeConstant: CFTimeInterval = 0.055
+    private let selectionDragVelocityFallTimeConstant: CFTimeInterval = 0.18
+    private let selectionDragVelocityMaximumSampleInterval: CFTimeInterval = 1.0 / 30.0
     private let trimHandleHitWidth: CGFloat = 18
     private let loopFlagWidth: CGFloat = 18
     private let loopFlagHeight: CGFloat = 18
@@ -202,11 +204,12 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private let transientRenderPulseDuration: CFTimeInterval = 0.18
     private let playbackStopTouchTrailRenderPulseDuration: CFTimeInterval = 1.25
     private let waveformTransitionRenderPulseDuration: CFTimeInterval = 0.24
-    private let selectionDragEffectRenderPulseDuration: CFTimeInterval = 0.28
+    private let selectionDragEffectRenderPulseDuration: CFTimeInterval = 0.72
     private let deletionEffectRenderPulseDuration: CFTimeInterval = 2.10
     private let targetFramesPerSecond = 144
     private let scrollZoomSensitivity: Float = 0.01
     private let supportedAudioExtensions = AudioAssetImporter.supportedAudioFileExtensions
+    private var selectionDragWaveformTuning = SelectionDragWaveformTuning.defaultValue
 
     init() {
         let metalDevice = MTLCreateSystemDefaultDevice()
@@ -510,6 +513,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         requestTimelineRender()
     }
 
+    func updateSelectionDragWaveformTuning(_ tuning: SelectionDragWaveformTuning) {
+        selectionDragWaveformTuning = tuning.sanitized
+        updateTimelineRenderer { renderer in
+            renderer.updateSelectionDragWaveformTuning(tuning)
+        }
+        requestTimelineRender()
+    }
+
     func displayPlayheadProgress(
         _ progress: Float,
         syncRenderer: Bool = true,
@@ -635,7 +646,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         leadingProgress: Double,
         velocityPixelsPerSecond: CGFloat,
         direction: CGFloat,
-        timestamp: CFTimeInterval
+        timestamp: CFTimeInterval,
+        schedulesRender: Bool = true
     ) {
         currentSelection = selection
         timelineRenderer?.publishInteractionSelection(selection)
@@ -646,8 +658,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             direction: Float(direction),
             timestamp: timestamp
         )
-        startTransientRenderPulse(duration: selectionDragEffectRenderPulseDuration)
-        requestTimelineRender()
+        startTransientRenderPulse(duration: selectionDragWaveformRenderPulseDuration)
+        if schedulesRender {
+            kickInteractionRenderIfPossible()
+        }
     }
 
     func displaySelectedTrack(_ trackID: UUID?) {
@@ -1053,6 +1067,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        if refreshLiveSelectionFromCurrentMouse(at: CACurrentMediaTime()) {
+            needsTimelineRender = true
+        }
+
         if
             isTimelinePlaybackActive,
             !viewport.isFull,
@@ -1130,9 +1148,48 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         requestTimelineRender()
     }
 
+    private func currentMousePointInTimeline() -> CGPoint? {
+        guard let window else {
+            return nil
+        }
+
+        let windowPoint = window.convertPoint(fromScreen: NSEvent.mouseLocation)
+        return convert(windowPoint, from: nil)
+    }
+
+    private func refreshLiveSelectionFromCurrentMouse(at timestamp: CFTimeInterval) -> Bool {
+        guard
+            isSelectionEnabled,
+            activeDragMode == .selection,
+            isDraggingSelection,
+            let selectionAnchorProgress,
+            let point = currentMousePointInTimeline()
+        else {
+            return false
+        }
+
+        let dragVelocity = updateSelectionDragVelocity(to: point, timestamp: timestamp)
+        let dragProgress = preciseProgress(for: point)
+        updateSelection(
+            from: selectionAnchorProgress,
+            to: dragProgress,
+            notifyChange: false,
+            liveLeadingProgress: dragProgress,
+            liveVelocityPixelsPerSecond: dragVelocity.speed,
+            liveDirection: dragVelocity.direction,
+            liveTimestamp: timestamp,
+            schedulesRender: false
+        )
+        return true
+    }
+
     private func startTransientRenderPulse(duration: CFTimeInterval? = nil) {
         transientRenderEndTime = CFAbsoluteTimeGetCurrent() + (duration ?? transientRenderPulseDuration)
         startTimelineDisplayLink()
+    }
+
+    private var selectionDragWaveformRenderPulseDuration: CFTimeInterval {
+        max(selectionDragEffectRenderPulseDuration, selectionDragWaveformTuning.contactLifetime + 0.18)
     }
 
     private func projectedPagingPlayheadProgress(at timestamp: CFTimeInterval) -> Float? {
@@ -2124,7 +2181,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             }
         } else if isDraggingSelection {
             updateSelection(from: selectionAnchorProgress, to: preciseProgress(for: point), notifyChange: true)
-            startTransientRenderPulse(duration: 0.35)
+            startTransientRenderPulse(duration: selectionDragWaveformRenderPulseDuration)
         } else {
             displaySelection(nil)
             onSelectionChanged?(nil)
@@ -2762,7 +2819,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         liveLeadingProgress: Double? = nil,
         liveVelocityPixelsPerSecond: CGFloat = 0,
         liveDirection: CGFloat = 0,
-        liveTimestamp: CFTimeInterval = CACurrentMediaTime()
+        liveTimestamp: CFTimeInterval = CACurrentMediaTime(),
+        schedulesRender: Bool = true
     ) {
         let selection = TimelineSelection(
             startProgress: startProgress,
@@ -2780,7 +2838,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                 leadingProgress: liveLeadingProgress ?? endProgress,
                 velocityPixelsPerSecond: liveVelocityPixelsPerSecond,
                 direction: liveDirection,
-                timestamp: liveTimestamp
+                timestamp: liveTimestamp,
+                schedulesRender: schedulesRender
             )
         }
     }
@@ -2806,12 +2865,18 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return (0, 0)
         }
 
-        let elapsed = max(timestamp - previousTimestamp, 0.000_1)
+        let elapsed = min(
+            max(timestamp - previousTimestamp, 0.000_1),
+            selectionDragVelocityMaximumSampleInterval
+        )
         let deltaX = point.x - previousPoint.x
         let instantaneousSpeed = abs(deltaX) / CGFloat(elapsed)
-        selectionDragVelocityPixelsPerSecond =
-            selectionDragVelocityPixelsPerSecond * (1 - selectionDragVelocitySmoothing) +
-            instantaneousSpeed * selectionDragVelocitySmoothing
+        let timeConstant = instantaneousSpeed > selectionDragVelocityPixelsPerSecond ?
+            selectionDragVelocityRiseTimeConstant :
+            selectionDragVelocityFallTimeConstant
+        let alpha = 1 - exp(-elapsed / max(timeConstant, 0.000_1))
+        selectionDragVelocityPixelsPerSecond +=
+            (instantaneousSpeed - selectionDragVelocityPixelsPerSecond) * CGFloat(alpha)
         selectionDragPreviousPoint = point
         selectionDragPreviousTimestamp = timestamp
 
