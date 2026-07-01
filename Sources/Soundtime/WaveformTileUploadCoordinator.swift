@@ -36,17 +36,27 @@ struct WaveformTileUploadBatchSummary: Equatable, Sendable {
     var consideredCount = 0
     var uploadedCount = 0
     var uploadedBytes = 0
+    var uploadedAddresses: [WaveformTileAddress] = []
     var skippedResidentCount = 0
     var skippedMissingPayloadCount = 0
     var skippedBudgetCount = 0
     var staleUploadCount = 0
     var evictedCount = 0
+    var evictedAddresses: [WaveformTileAddress] = []
+}
+
+struct WaveformTileGPUResidencyRecord: Equatable, Sendable {
+    let address: WaveformTileAddress
+    let resourceID: WaveformTileGPUResourceID
+    let byteCount: Int
+    let lastAccessSerial: UInt64
 }
 
 struct WaveformTileGPUResidencySnapshot: Equatable, Sendable {
     let residentCount: Int
     let residentBytes: Int
     let maximumResidentBytes: Int
+    let residentTiles: [WaveformTileGPUResidencyRecord]
 }
 
 final class WaveformTileGPUResidencyStore: @unchecked Sendable {
@@ -140,15 +150,42 @@ final class WaveformTileGPUResidencyStore: @unchecked Sendable {
         return recordsByAddress.keys.sorted()
     }
 
+    func record(for address: WaveformTileAddress) -> WaveformTileGPUResidencyRecord? {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        guard let record = recordsByAddress[address] else {
+            return nil
+        }
+        return WaveformTileGPUResidencyRecord(
+            address: address,
+            resourceID: record.resource.id,
+            byteCount: record.resource.byteCount,
+            lastAccessSerial: record.lastAccessSerial
+        )
+    }
+
     func snapshot() -> WaveformTileGPUResidencySnapshot {
         lock.lock()
         defer {
             lock.unlock()
         }
+        let residentTiles = recordsByAddress.map { address, record in
+            WaveformTileGPUResidencyRecord(
+                address: address,
+                resourceID: record.resource.id,
+                byteCount: record.resource.byteCount,
+                lastAccessSerial: record.lastAccessSerial
+            )
+        }.sorted { lhs, rhs in
+            lhs.address < rhs.address
+        }
         return WaveformTileGPUResidencySnapshot(
             residentCount: recordsByAddress.count,
             residentBytes: residentBytes,
-            maximumResidentBytes: maximumResidentBytes
+            maximumResidentBytes: maximumResidentBytes,
+            residentTiles: residentTiles
         )
     }
 
@@ -207,6 +244,7 @@ final class WaveformTileUploadCoordinator: @unchecked Sendable {
         prioritizedAddresses: [WaveformTileAddress],
         budget: WaveformTileUploadBudget,
         beforeUpload: ((WaveformTileAddress) -> Void)? = nil,
+        discardUpload: ((WaveformTileAddress, WaveformTileGPUResource) -> Void)? = nil,
         upload: UploadHandler
     ) -> WaveformTileUploadBatchSummary {
         var summary = WaveformTileUploadBatchSummary()
@@ -253,6 +291,7 @@ final class WaveformTileUploadCoordinator: @unchecked Sendable {
                 guard currentGeneration(for: address.sourceID) == generation,
                       tileStore.payload(for: address) != nil
                 else {
+                    discardUpload?(address, resource)
                     summary.staleUploadCount += 1
                     continue
                 }
@@ -265,6 +304,8 @@ final class WaveformTileUploadCoordinator: @unchecked Sendable {
                 summary.uploadedCount += 1
                 summary.uploadedBytes += resource.byteCount
                 summary.evictedCount += evicted.count
+                summary.uploadedAddresses.append(address)
+                summary.evictedAddresses.append(contentsOf: evicted)
                 uploadedTiles += 1
                 uploadedBytes += estimatedBytes
             } catch {

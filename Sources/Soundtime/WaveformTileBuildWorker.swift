@@ -8,6 +8,7 @@ struct WaveformTileBuildSource: Sendable {
     let frameCount: Int64
     let sampleRate: Double
     let channelMode: WaveformChannelMode
+    let editGraphID: String?
 
     init(
         url: URL,
@@ -15,7 +16,8 @@ struct WaveformTileBuildSource: Sendable {
         duration: TimeInterval,
         frameCount: Int64,
         sampleRate: Double,
-        channelMode: WaveformChannelMode
+        channelMode: WaveformChannelMode,
+        editGraphID: String? = nil
     ) {
         self.url = url.standardizedFileURL
         self.fingerprint = fingerprint
@@ -24,6 +26,7 @@ struct WaveformTileBuildSource: Sendable {
         self.frameCount = max(0, frameCount)
         self.sampleRate = max(1, sampleRate)
         self.channelMode = channelMode
+        self.editGraphID = editGraphID?.isEmpty == true ? nil : editGraphID
     }
 
     init(wavURL: URL, channelMode: WaveformChannelMode = .monoMix) throws {
@@ -42,6 +45,7 @@ struct WaveformTileBuildSource: Sendable {
     var metadata: WaveformTileSourceMetadata {
         WaveformTileSourceMetadata(
             sourceID: sourceID,
+            editGraphID: editGraphID,
             duration: duration,
             frameCount: frameCount,
             sampleRate: sampleRate,

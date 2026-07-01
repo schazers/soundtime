@@ -66,6 +66,75 @@ struct WaveformTileSchedulerViewport: Hashable, Sendable {
     }
 }
 
+struct WaveformTileSchedulerSegment: Hashable, Sendable {
+    let outputStartTime: TimeInterval
+    let outputEndTime: TimeInterval
+    let sourceStartTime: TimeInterval
+    let sourceEndTime: TimeInterval
+
+    init(
+        outputStartTime: TimeInterval,
+        outputEndTime: TimeInterval,
+        sourceStartTime: TimeInterval,
+        sourceEndTime: TimeInterval
+    ) {
+        let safeOutputStart = max(0, outputStartTime)
+        let safeOutputEnd = max(safeOutputStart, outputEndTime)
+        let safeSourceStart = max(0, sourceStartTime)
+        let safeSourceEnd = max(safeSourceStart, sourceEndTime)
+        self.outputStartTime = safeOutputStart
+        self.outputEndTime = safeOutputEnd
+        self.sourceStartTime = safeSourceStart
+        self.sourceEndTime = safeSourceEnd
+    }
+
+    init(
+        outputStartProgress: Float,
+        outputEndProgress: Float,
+        sourceStartProgress: Float,
+        sourceEndProgress: Float,
+        outputDuration: TimeInterval,
+        sourceDuration: TimeInterval
+    ) {
+        let safeOutputDuration = max(0, outputDuration)
+        let safeSourceDuration = max(0, sourceDuration)
+        self.init(
+            outputStartTime: TimeInterval(min(max(outputStartProgress, 0), 1)) * safeOutputDuration,
+            outputEndTime: TimeInterval(min(max(outputEndProgress, 0), 1)) * safeOutputDuration,
+            sourceStartTime: TimeInterval(min(max(sourceStartProgress, 0), 1)) * safeSourceDuration,
+            sourceEndTime: TimeInterval(min(max(sourceEndProgress, 0), 1)) * safeSourceDuration
+        )
+    }
+
+    func sourceViewport(intersecting outputViewport: WaveformTileSchedulerViewport) -> WaveformTileSchedulerViewport? {
+        let outputDuration = outputEndTime - outputStartTime
+        let sourceDuration = sourceEndTime - sourceStartTime
+        guard outputDuration > 0, sourceDuration > 0 else {
+            return nil
+        }
+
+        let overlapStart = max(outputViewport.startTime, outputStartTime)
+        let overlapEnd = min(outputViewport.endTime, outputEndTime)
+        guard overlapEnd > overlapStart else {
+            return nil
+        }
+
+        let startRatio = (overlapStart - outputStartTime) / outputDuration
+        let endRatio = (overlapEnd - outputStartTime) / outputDuration
+        let sourceStart = sourceStartTime + startRatio * sourceDuration
+        let sourceEnd = sourceStartTime + endRatio * sourceDuration
+        let widthRatio = outputViewport.duration > 0 ?
+            (overlapEnd - overlapStart) / outputViewport.duration :
+            1
+
+        return WaveformTileSchedulerViewport(
+            startTime: sourceStart,
+            endTime: sourceEnd,
+            widthPixels: max(outputViewport.widthPixels * widthRatio, 1)
+        )
+    }
+}
+
 enum WaveformTileRequestPurpose: Int, Sendable {
     case visible = 0
     case nearPrefetch = 1
@@ -152,83 +221,139 @@ enum WaveformTileScheduler {
         predictedViewport: WaveformTileSchedulerViewport? = nil,
         config: WaveformTileSchedulerConfig = WaveformTileSchedulerConfig()
     ) -> [WaveformTileRequest] {
+        requests(
+            for: source,
+            visibleViewports: [viewport],
+            predictedViewports: predictedViewport.map { [$0] } ?? [],
+            config: config
+        )
+    }
+
+    static func requests(
+        for source: WaveformTileSourceMetadata,
+        viewport: WaveformTileSchedulerViewport,
+        segments: [WaveformTileSchedulerSegment],
+        predictedViewport: WaveformTileSchedulerViewport? = nil,
+        config: WaveformTileSchedulerConfig = WaveformTileSchedulerConfig()
+    ) -> [WaveformTileRequest] {
+        let sourceVisibleViewports = segments.compactMap { segment in
+            segment.sourceViewport(intersecting: viewport)
+        }
+        guard !sourceVisibleViewports.isEmpty else {
+            return []
+        }
+
+        let sourcePredictedViewports = predictedViewport.map { predictedViewport in
+            segments.compactMap { segment in
+                segment.sourceViewport(intersecting: predictedViewport)
+            }
+        } ?? []
+
+        return requests(
+            for: source,
+            visibleViewports: sourceVisibleViewports,
+            predictedViewports: sourcePredictedViewports,
+            config: config
+        )
+    }
+
+    private static func requests(
+        for source: WaveformTileSourceMetadata,
+        visibleViewports: [WaveformTileSchedulerViewport],
+        predictedViewports: [WaveformTileSchedulerViewport],
+        config: WaveformTileSchedulerConfig
+    ) -> [WaveformTileRequest] {
         guard source.frameCount > 0, source.duration > 0 else {
             return []
         }
 
-        let preferred = preferredTileShape(
-            source: source,
-            viewport: viewport,
-            config: config
-        )
-        let visibleRange = viewport.frameRange(
-            sampleRate: source.sampleRate,
-            frameCount: source.frameCount
-        )
-        guard let visibleSpan = tileSpan(
-            for: visibleRange,
-            framesPerTile: preferred.framesPerTile,
-            frameCount: source.frameCount
-        ) else {
+        guard !visibleViewports.isEmpty else {
             return []
         }
 
-        let visibleTileSet = Set(visibleSpan)
         var requestsByAddress: [WaveformTileAddress: WaveformTileRequest] = [:]
 
-        for tileIndex in visibleSpan {
-            insertRequest(
-                tileIndex: tileIndex,
-                purpose: .visible,
-                distance: 0,
+        for visibleViewport in visibleViewports {
+            let preferred = preferredTileShape(
                 source: source,
-                shape: preferred,
-                samplesPerPixel: preferred.samplesPerPixel,
-                frameCount: source.frameCount,
-                into: &requestsByAddress
+                viewport: visibleViewport,
+                config: config
             )
-        }
-
-        insertPrefetchRequests(
-            around: visibleSpan,
-            radius: config.nearPrefetchTileRadius,
-            excluding: visibleTileSet,
-            purpose: .nearPrefetch,
-            source: source,
-            shape: preferred,
-            frameCount: source.frameCount,
-            into: &requestsByAddress
-        )
-
-        if let predictedViewport {
-            let predictedRange = predictedViewport.frameRange(
+            let visibleRange = visibleViewport.frameRange(
                 sampleRate: source.sampleRate,
                 frameCount: source.frameCount
             )
-            if let predictedSpan = tileSpan(
-                for: predictedRange,
+            guard let visibleSpan = tileSpan(
+                for: visibleRange,
                 framesPerTile: preferred.framesPerTile,
                 frameCount: source.frameCount
-            ) {
-                insertPrefetchRequests(
-                    around: predictedSpan,
-                    radius: config.predictedPrefetchTileRadius,
-                    excluding: visibleTileSet,
-                    purpose: .predictedPrefetch,
+            ) else {
+                continue
+            }
+
+            let visibleTileSet = Set(visibleSpan)
+
+            for tileIndex in visibleSpan {
+                insertRequest(
+                    tileIndex: tileIndex,
+                    purpose: .visible,
+                    distance: 0,
                     source: source,
                     shape: preferred,
+                    samplesPerPixel: preferred.samplesPerPixel,
+                    frameCount: source.frameCount,
+                    into: &requestsByAddress
+                )
+            }
+
+            insertPrefetchRequests(
+                around: visibleSpan,
+                radius: config.nearPrefetchTileRadius,
+                excluding: visibleTileSet,
+                purpose: .nearPrefetch,
+                source: source,
+                shape: preferred,
+                frameCount: source.frameCount,
+                into: &requestsByAddress
+            )
+
+            if preferred.kind == .peak, config.maximumBackgroundRequests > 0 {
+                insertBackgroundRequests(
+                    visibleSpan: visibleSpan,
+                    source: source,
+                    shape: preferred,
+                    config: config,
                     frameCount: source.frameCount,
                     into: &requestsByAddress
                 )
             }
         }
 
-        if preferred.kind == .peak, config.maximumBackgroundRequests > 0 {
-            insertBackgroundRequests(
-                visibleSpan: visibleSpan,
+        for predictedViewport in predictedViewports {
+            let preferred = preferredTileShape(
+                source: source,
+                viewport: predictedViewport,
+                config: config
+            )
+            let predictedRange = predictedViewport.frameRange(
+                sampleRate: source.sampleRate,
+                frameCount: source.frameCount
+            )
+            guard let predictedSpan = tileSpan(
+                for: predictedRange,
+                framesPerTile: preferred.framesPerTile,
+                frameCount: source.frameCount
+            ) else {
+                continue
+            }
+
+            insertPrefetchRequests(
+                around: predictedSpan,
+                radius: config.predictedPrefetchTileRadius,
+                excluding: [],
+                purpose: .predictedPrefetch,
                 source: source,
                 shape: preferred,
-                config: config,
                 frameCount: source.frameCount,
                 into: &requestsByAddress
             )
@@ -379,11 +504,14 @@ enum WaveformTileScheduler {
         let endFrame = min(startFrame + shape.framesPerTile, frameCount)
         let frameRange = WaveformFrameRange(startFrame: startFrame, endFrame: endFrame)
         let expectedBinCount: Int
+        let startBin: Int64
         switch shape.kind {
         case .peak:
             expectedBinCount = Int((frameRange.frameCount + Int64(shape.framesPerBin) - 1) / Int64(shape.framesPerBin))
+            startBin = startFrame / Int64(max(shape.framesPerBin, 1))
         case .rawSamples:
             expectedBinCount = Int(frameRange.frameCount)
+            startBin = startFrame
         }
 
         return WaveformTileDescriptor(
@@ -396,6 +524,10 @@ enum WaveformTileScheduler {
                 tileIndex: tileIndex
             ),
             frameRange: frameRange,
+            binRange: WaveformBinRange(
+                startBin: startBin,
+                endBin: startBin + Int64(expectedBinCount)
+            ),
             framesPerBin: shape.framesPerBin,
             expectedBinCount: expectedBinCount
         )

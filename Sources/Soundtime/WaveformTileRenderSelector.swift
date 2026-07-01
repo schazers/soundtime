@@ -40,16 +40,32 @@ private struct WaveformTileRenderFallbackKey: Hashable {
     }
 }
 
+private struct WaveformTileRenderHoldKey: Hashable {
+    let sourceID: WaveformSourceID
+    let editGraphID: String?
+    let channelMode: WaveformChannelMode
+
+    init(address: WaveformTileAddress) {
+        self.sourceID = address.sourceID
+        self.editGraphID = address.editGraphID
+        self.channelMode = address.channelMode
+    }
+}
+
 final class WaveformTileRenderSelector: @unchecked Sendable {
+    private static let maximumLastGoodRecordsPerKey = 512
+
     private struct LastGoodRecord {
         let descriptor: WaveformTileDescriptor
         let resource: WaveformTileGPUResource
+        let rememberedSerial: UInt64
     }
 
     private let tileStore: WaveformTileStore
     private let residencyStore: WaveformTileGPUResidencyStore
     private let lock = NSLock()
-    private var lastGoodByKey: [WaveformTileRenderFallbackKey: LastGoodRecord] = [:]
+    private var lastGoodByKey: [WaveformTileRenderHoldKey: [WaveformTileAddress: LastGoodRecord]] = [:]
+    private var lastGoodSerial: UInt64 = 0
 
     init(
         tileStore: WaveformTileStore,
@@ -172,34 +188,80 @@ final class WaveformTileRenderSelector: @unchecked Sendable {
     }
 
     private func lastGoodTile(for descriptor: WaveformTileDescriptor) -> WaveformRenderableTile? {
-        let key = WaveformTileRenderFallbackKey(address: descriptor.address)
+        let key = WaveformTileRenderHoldKey(address: descriptor.address)
         lock.lock()
-        let record = lastGoodByKey[key]
+        let records = lastGoodByKey[key].map { Array($0.values) } ?? []
         lock.unlock()
 
-        guard let record,
-              record.descriptor.frameRange.intersects(descriptor.frameRange),
-              tileStore.payload(for: record.descriptor.address) != nil,
-              let resource = residencyStore.resource(for: record.descriptor.address)
-        else {
+        let candidates = records.compactMap { record -> (record: LastGoodRecord, resource: WaveformTileGPUResource, overlap: Int64)? in
+            guard record.descriptor.frameRange.intersects(descriptor.frameRange),
+                  tileStore.payload(for: record.descriptor.address) != nil,
+                  let resource = residencyStore.resource(for: record.descriptor.address)
+            else {
+                return nil
+            }
+
+            let overlap = min(record.descriptor.frameRange.endFrame, descriptor.frameRange.endFrame) -
+                max(record.descriptor.frameRange.startFrame, descriptor.frameRange.startFrame)
+            return (record, resource, max(0, overlap))
+        }
+
+        guard let best = candidates.max(by: { lhs, rhs in
+            let lhsSameKind = lhs.record.descriptor.address.kind == descriptor.address.kind
+            let rhsSameKind = rhs.record.descriptor.address.kind == descriptor.address.kind
+            if lhsSameKind != rhsSameKind {
+                return !lhsSameKind && rhsSameKind
+            }
+
+            let lhsLevelDistance = abs(lhs.record.descriptor.address.level - descriptor.address.level)
+            let rhsLevelDistance = abs(rhs.record.descriptor.address.level - descriptor.address.level)
+            if lhsLevelDistance != rhsLevelDistance {
+                return lhsLevelDistance > rhsLevelDistance
+            }
+
+            if lhs.overlap != rhs.overlap {
+                return lhs.overlap < rhs.overlap
+            }
+
+            if lhs.record.rememberedSerial != rhs.record.rememberedSerial {
+                return lhs.record.rememberedSerial < rhs.record.rememberedSerial
+            }
+
+            return lhs.record.descriptor.address > rhs.record.descriptor.address
+        }) else {
             return nil
         }
 
         return WaveformRenderableTile(
             requestedDescriptor: descriptor,
-            selectedDescriptor: record.descriptor,
-            resource: resource,
+            selectedDescriptor: best.record.descriptor,
+            resource: best.resource,
             source: .lastGoodResident
         )
     }
 
     private func rememberLastGood(_ tile: WaveformRenderableTile) {
-        let key = WaveformTileRenderFallbackKey(address: tile.requestedDescriptor.address)
+        let key = WaveformTileRenderHoldKey(address: tile.selectedDescriptor.address)
         lock.lock()
-        lastGoodByKey[key] = LastGoodRecord(
+        lastGoodSerial &+= 1
+        var records = lastGoodByKey[key] ?? [:]
+        records[tile.selectedDescriptor.address] = LastGoodRecord(
             descriptor: tile.selectedDescriptor,
-            resource: tile.resource
+            resource: tile.resource,
+            rememberedSerial: lastGoodSerial
         )
+        if records.count > Self.maximumLastGoodRecordsPerKey {
+            let sortedRecords = records.sorted { lhs, rhs in
+                if lhs.value.rememberedSerial != rhs.value.rememberedSerial {
+                    return lhs.value.rememberedSerial > rhs.value.rememberedSerial
+                }
+                return lhs.key < rhs.key
+            }
+            records = Dictionary(uniqueKeysWithValues: sortedRecords.prefix(Self.maximumLastGoodRecordsPerKey).map { entry in
+                (entry.key, entry.value)
+            })
+        }
+        lastGoodByKey[key] = records
         lock.unlock()
     }
 }

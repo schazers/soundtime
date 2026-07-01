@@ -16,15 +16,19 @@ enum WaveformTileModelSmokeHarness {
         let startedAtNanoseconds = DispatchTime.now().uptimeNanoseconds
 
         try verifyFingerprintStability()
+        try verifyStableSourceIdentitySurvivesTimelineEdits()
         try verifyTileAddressSeparation()
         try verifyFrameRangeSemantics()
+        try verifyBinRangeSemantics()
         try verifyTileStoreStateTransitions()
         try verifySourceScopedRemoval()
 
         let checks = [
             "fingerprint stability",
+            "stable source identity survives timeline edits",
             "tile address separation",
             "frame range semantics",
+            "bin range semantics",
             "tile store state transitions",
             "source scoped removal",
         ]
@@ -70,6 +74,67 @@ enum WaveformTileModelSmokeHarness {
         try require(WaveformSourceID(fingerprint: first) == WaveformSourceID(fingerprint: second), "source IDs are not stable")
     }
 
+    private static func verifyStableSourceIdentitySurvivesTimelineEdits() throws {
+        let fingerprint = WaveformFileFingerprint(
+            url: URL(fileURLWithPath: "/tmp/Soundtime Stable Source.wav"),
+            fileSize: 987_654,
+            modificationDate: Date(timeIntervalSinceReferenceDate: 9_876.5),
+            sampleRate: 48_000,
+            channelCount: 2
+        )
+        let source = WaveformTileBuildSource(
+            url: URL(fileURLWithPath: "/tmp/Soundtime Stable Source.wav"),
+            fingerprint: fingerprint,
+            duration: 120,
+            frameCount: 5_760_000,
+            sampleRate: 48_000,
+            channelMode: .monoMix
+        )
+        let timelineEditRevision = 42
+        let afterRippleDelete = WaveformTileBuildSource(
+            url: source.url,
+            fingerprint: fingerprint,
+            duration: source.duration,
+            frameCount: source.frameCount,
+            sampleRate: 48_000,
+            channelMode: .monoMix
+        )
+        let renderedEffectVersion = WaveformTileBuildSource(
+            url: source.url,
+            fingerprint: fingerprint,
+            duration: source.duration,
+            frameCount: source.frameCount,
+            sampleRate: 48_000,
+            channelMode: .monoMix,
+            editGraphID: "rendered-effect-\(timelineEditRevision)"
+        )
+
+        try require(
+            source.sourceID == afterRippleDelete.sourceID,
+            "timeline edits should not change the underlying source ID"
+        )
+        try require(
+            source.metadata.editGraphID == nil && afterRippleDelete.metadata.editGraphID == nil,
+            "normal timeline edits should remap source tiles without creating an edit graph identity"
+        )
+        try require(
+            source.metadata.channelMode == afterRippleDelete.metadata.channelMode,
+            "channel mode should stay part of stable tile metadata"
+        )
+        try require(
+            source.metadata.sampleRate == afterRippleDelete.metadata.sampleRate,
+            "sample rate should stay part of stable tile metadata"
+        )
+        try require(
+            renderedEffectVersion.sourceID == source.sourceID,
+            "rendered effect versions should still point at the same source content fingerprint"
+        )
+        try require(
+            renderedEffectVersion.metadata.editGraphID != source.metadata.editGraphID,
+            "rendered effect versions need an edit graph identity to avoid colliding with source tiles"
+        )
+    }
+
     private static func verifyTileAddressSeparation() throws {
         let sourceID = WaveformSourceID(rawValue: "source-a")
         let monoPeak = WaveformTileAddress(
@@ -100,10 +165,19 @@ enum WaveformTileModelSmokeHarness {
             level: 0,
             tileIndex: 1
         )
+        let editedGraphPeak = WaveformTileAddress(
+            sourceID: sourceID,
+            editGraphID: "rendered-effect-1",
+            kind: .peak,
+            channelMode: .monoMix,
+            level: 0,
+            tileIndex: 0
+        )
 
         try require(monoPeak != leftPeak, "channel mode was not part of tile identity")
         try require(monoPeak != monoRaw, "tile kind was not part of tile identity")
         try require(monoPeak != nextTile, "tile index was not part of tile identity")
+        try require(monoPeak != editedGraphPeak, "edit graph ID was not part of tile identity")
     }
 
     private static func verifyFrameRangeSemantics() throws {
@@ -118,6 +192,34 @@ enum WaveformTileModelSmokeHarness {
         try require(range.intersects(overlapping), "overlap was not detected")
         try require(!range.intersects(adjacent), "adjacent range should not intersect")
         try require(clamped.isEmpty, "inverted ranges should clamp to empty")
+    }
+
+    private static func verifyBinRangeSemantics() throws {
+        let range = WaveformBinRange(startBin: 128, endBin: 256)
+        let overlapping = WaveformBinRange(startBin: 200, endBin: 300)
+        let adjacent = WaveformBinRange(startBin: 256, endBin: 400)
+        let clamped = WaveformBinRange(startBin: 500, endBin: 400)
+        let descriptor = WaveformTileDescriptor(
+            address: WaveformTileAddress(
+                sourceID: WaveformSourceID(rawValue: "bin-range-source"),
+                kind: .peak,
+                channelMode: .monoMix,
+                level: 5,
+                tileIndex: 3
+            ),
+            frameRange: WaveformFrameRange(startFrame: 12_288, endFrame: 16_384),
+            framesPerBin: 32,
+            expectedBinCount: 128
+        )
+
+        try require(range.binCount == 128, "bin range count was incorrect")
+        try require(range.contains(bin: 128), "bin range should include start bin")
+        try require(!range.contains(bin: 256), "bin range should exclude end bin")
+        try require(range.intersects(overlapping), "bin overlap was not detected")
+        try require(!range.intersects(adjacent), "adjacent bin ranges should not intersect")
+        try require(clamped.isEmpty, "inverted bin ranges should clamp to empty")
+        try require(descriptor.binRange.startBin == 384, "descriptor did not derive global start bin")
+        try require(descriptor.binRange.endBin == 512, "descriptor did not derive global end bin")
     }
 
     private static func verifyTileStoreStateTransitions() throws {

@@ -19,6 +19,8 @@ enum WaveformTileRenderSelectorSmokeHarness {
         try verifyExactResidentSelection()
         try verifyCoarserResidentFallback()
         try verifyLastGoodResidentFallback()
+        try verifyLastGoodKeepsMultiplePreviouslyVisibleTiles()
+        try verifyLastGoodCanHoldAcrossTileKinds()
         try verifySourceRemovalClearsLastGood()
 
         let checks = [
@@ -26,6 +28,8 @@ enum WaveformTileRenderSelectorSmokeHarness {
             "exact resident selection",
             "coarser resident fallback",
             "last-good resident fallback",
+            "last-good keeps multiple previously visible tiles",
+            "last-good can hold across tile kinds",
             "source removal clears last-good",
         ]
         if let reportURL = StabilityReportWriter.writePassedSuite(
@@ -103,6 +107,59 @@ enum WaveformTileRenderSelectorSmokeHarness {
         try require(secondSelection.lastGoodResidentCount == 1, "last-good count was wrong")
         try require(secondSelection.tiles[0].selectedDescriptor.address == finer.descriptor.address, "selected wrong last-good tile")
         try require(secondSelection.tiles[0].source == .lastGoodResident, "selection source was not last-good")
+    }
+
+    private static func verifyLastGoodKeepsMultiplePreviouslyVisibleTiles() throws {
+        let fixture = makeFixture()
+        let first = peakTile(level: 4, tileIndex: 0)
+        let second = peakTile(level: 4, tileIndex: 1)
+        commitResident(first, into: fixture)
+        commitResident(second, into: fixture)
+
+        let firstSelection = fixture.selector.selectRenderableTiles(
+            for: [request(for: first.descriptor), request(for: second.descriptor)]
+        )
+        try require(firstSelection.exactResidentCount == 2, "setup did not select both exact resident tiles")
+
+        let missingFirst = peakTile(level: 6, tileIndex: 0)
+        let missingSecond = peakTile(level: 6, tileIndex: 1)
+        let secondSelection = fixture.selector.selectRenderableTiles(
+            for: [request(for: missingFirst.descriptor), request(for: missingSecond.descriptor)]
+        )
+
+        try require(secondSelection.selectedCount == 2, "last-good should hold both previously visible tiles")
+        try require(secondSelection.lastGoodResidentCount == 2, "both held tiles should be counted as last-good")
+        let selectedAddresses = Set(secondSelection.tiles.map(\.selectedDescriptor.address))
+        try require(selectedAddresses == Set([first.descriptor.address, second.descriptor.address]), "last-good did not retain the full previous tile set")
+    }
+
+    private static func verifyLastGoodCanHoldAcrossTileKinds() throws {
+        let fixture = makeFixture()
+        let peak = peakTile(level: 5, tileIndex: 0)
+        commitResident(peak, into: fixture)
+
+        let firstSelection = fixture.selector.selectRenderableTiles(for: [request(for: peak.descriptor)])
+        try require(firstSelection.exactResidentCount == 1, "setup did not select exact peak tile")
+
+        let rawDescriptor = WaveformTileDescriptor(
+            address: WaveformTileAddress(
+                sourceID: peak.descriptor.address.sourceID,
+                kind: .rawSamples,
+                channelMode: peak.descriptor.address.channelMode,
+                level: 0,
+                tileIndex: 0
+            ),
+            frameRange: peak.descriptor.frameRange,
+            framesPerBin: 1,
+            expectedBinCount: Int(peak.descriptor.frameRange.frameCount)
+        )
+        let secondSelection = fixture.selector.selectRenderableTiles(
+            for: [request(for: rawDescriptor)]
+        )
+
+        try require(secondSelection.selectedCount == 1, "last-good should hold peak tile while raw tile is missing")
+        try require(secondSelection.lastGoodResidentCount == 1, "cross-kind hold should be counted as last-good")
+        try require(secondSelection.tiles[0].selectedDescriptor.address == peak.descriptor.address, "cross-kind hold selected the wrong tile")
     }
 
     private static func verifySourceRemovalClearsLastGood() throws {

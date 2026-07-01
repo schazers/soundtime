@@ -119,6 +119,32 @@ struct WaveformFrameRange: Hashable, Codable, Sendable {
     }
 }
 
+struct WaveformBinRange: Hashable, Codable, Sendable {
+    let startBin: Int64
+    let endBin: Int64
+
+    init(startBin: Int64, endBin: Int64) {
+        self.startBin = max(0, startBin)
+        self.endBin = max(self.startBin, endBin)
+    }
+
+    var binCount: Int64 {
+        endBin - startBin
+    }
+
+    var isEmpty: Bool {
+        binCount == 0
+    }
+
+    func contains(bin: Int64) -> Bool {
+        bin >= startBin && bin < endBin
+    }
+
+    func intersects(_ other: WaveformBinRange) -> Bool {
+        startBin < other.endBin && other.startBin < endBin
+    }
+}
+
 struct WaveformTileAddress: Hashable, Codable, Sendable, Comparable {
     let sourceID: WaveformSourceID
     let editGraphID: String?
@@ -165,12 +191,14 @@ struct WaveformTileAddress: Hashable, Codable, Sendable, Comparable {
 struct WaveformTileDescriptor: Hashable, Codable, Sendable {
     let address: WaveformTileAddress
     let frameRange: WaveformFrameRange
+    let binRange: WaveformBinRange
     let framesPerBin: Int
     let expectedBinCount: Int
 
     init(
         address: WaveformTileAddress,
         frameRange: WaveformFrameRange,
+        binRange: WaveformBinRange? = nil,
         framesPerBin: Int,
         expectedBinCount: Int
     ) {
@@ -178,6 +206,15 @@ struct WaveformTileDescriptor: Hashable, Codable, Sendable {
         self.frameRange = frameRange
         self.framesPerBin = max(1, framesPerBin)
         self.expectedBinCount = max(0, expectedBinCount)
+        if let binRange {
+            self.binRange = binRange
+        } else {
+            let startBin = frameRange.startFrame / Int64(self.framesPerBin)
+            self.binRange = WaveformBinRange(
+                startBin: startBin,
+                endBin: startBin + Int64(self.expectedBinCount)
+            )
+        }
     }
 }
 

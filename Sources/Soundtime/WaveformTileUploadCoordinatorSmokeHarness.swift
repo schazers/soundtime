@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 
 enum WaveformTileUploadCoordinatorSmokeHarness {
     private enum SmokeError: Error, CustomStringConvertible {
@@ -20,6 +21,7 @@ enum WaveformTileUploadCoordinatorSmokeHarness {
         try verifyLRUEvictionReturnsTilesToCPUCommitted()
         try verifyStaleUploadDoesNotBecomeResident()
         try verifyRawSampleByteEstimate()
+        try verifyMetalBufferStoreUploadIfAvailable()
 
         let checks = [
             "upload budget limits batch",
@@ -27,6 +29,7 @@ enum WaveformTileUploadCoordinatorSmokeHarness {
             "LRU eviction returns tiles to CPU committed",
             "stale upload does not become resident",
             "raw sample byte estimate",
+            "metal buffer store upload if available",
         ]
         if let reportURL = StabilityReportWriter.writePassedSuite(
             name: "waveform-tile-upload-coordinator-smoke",
@@ -57,9 +60,13 @@ enum WaveformTileUploadCoordinatorSmokeHarness {
         try require(summary.consideredCount == 4, "upload coordinator did not consider all addresses")
         try require(summary.uploadedCount == 2, "byte budget should allow exactly two 96-byte peak tiles")
         try require(summary.uploadedBytes == 192, "uploaded byte count was not tracked")
+        try require(summary.uploadedAddresses == Array(addresses.prefix(2)), "uploaded addresses were not tracked per tile")
         try require(summary.skippedBudgetCount == 2, "budget skips were not counted")
         try require(fixture.tileStore.state(for: addresses[0]) == .residentGPU, "first tile did not become GPU resident")
         try require(fixture.tileStore.state(for: addresses[2]) == .committedCPU, "budget-skipped tile should remain CPU committed")
+        let snapshot = fixture.residencyStore.snapshot()
+        try require(snapshot.residentCount == 2, "residency snapshot did not count resident tiles")
+        try require(snapshot.residentTiles.map(\.address) == Array(addresses.prefix(2)), "residency snapshot did not list resident tile addresses")
     }
 
     private static func verifyResidentTilesAreSkipped() throws {
@@ -106,6 +113,8 @@ enum WaveformTileUploadCoordinatorSmokeHarness {
 
         try require(summary.uploadedCount == 1, "third tile did not upload")
         try require(summary.evictedCount == 1, "LRU eviction did not evict exactly one tile")
+        try require(summary.uploadedAddresses == [third.descriptor.address], "uploaded tile address was not reported")
+        try require(summary.evictedAddresses == [second.descriptor.address], "evicted tile address was not reported")
         try require(fixture.tileStore.state(for: first.descriptor.address) == .residentGPU, "recently touched tile should remain resident")
         try require(fixture.tileStore.state(for: second.descriptor.address) == .committedCPU, "least recently used tile should return to CPU committed")
         try require(fixture.tileStore.state(for: third.descriptor.address) == .residentGPU, "new tile should become resident")
@@ -115,19 +124,27 @@ enum WaveformTileUploadCoordinatorSmokeHarness {
         let fixture = makeFixture(maximumResidentBytes: 1_000_000)
         let tile = peakTile(sourceID: WaveformSourceID(rawValue: "stale-source"), tileIndex: 0, binCount: 4)
         fixture.tileStore.commit(.peak(tile))
+        var discardedUploads: [(WaveformTileAddress, WaveformTileGPUResource)] = []
 
         let summary = fixture.coordinator.uploadNextBatch(
             prioritizedAddresses: [tile.descriptor.address],
             budget: WaveformTileUploadBudget(maximumBytesPerBatch: 512, maximumTilesPerBatch: 1),
-            beforeUpload: { address in
-                fixture.coordinator.removeAll(for: address.sourceID)
-                fixture.tileStore.removeAll(for: address.sourceID)
+            discardUpload: { address, resource in
+                discardedUploads.append((address, resource))
             },
-            upload: fakeUpload
+            upload: { payload in
+                let resource = fakeUpload(payload)
+                fixture.coordinator.removeAll(for: payload.descriptor.address.sourceID)
+                fixture.tileStore.removeAll(for: payload.descriptor.address.sourceID)
+                return resource
+            }
         )
 
         try require(summary.uploadedCount == 0, "stale tile should not upload")
         try require(summary.staleUploadCount == 1, "stale upload was not counted")
+        try require(discardedUploads.count == 1, "stale uploaded resource was not discarded")
+        try require(discardedUploads.first?.0 == tile.descriptor.address, "discarded stale upload had unexpected address")
+        try require(discardedUploads.first?.1.id.rawValue.contains("stale-source") == true, "discarded stale upload had unexpected resource")
         try require(fixture.residencyStore.resource(for: tile.descriptor.address) == nil, "stale tile became resident")
         try require(fixture.tileStore.state(for: tile.descriptor.address) == .missing, "stale source should be removed from tile store")
     }
@@ -157,6 +174,53 @@ enum WaveformTileUploadCoordinatorSmokeHarness {
             WaveformTileUploadCoordinator.estimatedUploadBytes(for: .rawSamples(tile)) == 64,
             "raw sample byte estimate should be channel sample count * Float stride"
         )
+    }
+
+    private static func verifyMetalBufferStoreUploadIfAvailable() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            return
+        }
+
+        let store = WaveformTileMetalBufferStore(device: device)
+        let peak = peakTile(tileIndex: 9, binCount: 3)
+        let peakResource = try store.upload(.peak(peak))
+        guard let peakAllocation = store.allocation(for: peak.descriptor.address) else {
+            throw SmokeError.failed("metal buffer store did not retain peak allocation")
+        }
+        try require(peakAllocation.resourceID == peakResource.id, "peak allocation did not use returned resource ID")
+        try require(peakAllocation.binCount == 3, "peak allocation bin count was incorrect")
+        try require(peakAllocation.byteCount == peakResource.byteCount, "peak allocation byte count did not match resource")
+
+        store.remove(resourceID: peakResource.id)
+        try require(store.allocation(for: peak.descriptor.address) == nil, "resource removal did not clear peak allocation")
+
+        let rawDescriptor = WaveformTileDescriptor(
+            address: WaveformTileAddress(
+                sourceID: WaveformSourceID(rawValue: "metal-raw-source"),
+                kind: .rawSamples,
+                channelMode: .stereoPair,
+                level: 0,
+                tileIndex: 0
+            ),
+            frameRange: WaveformFrameRange(startFrame: 0, endFrame: 4),
+            framesPerBin: 1,
+            expectedBinCount: 4
+        )
+        let rawTile = WaveformRawSampleTile(
+            descriptor: rawDescriptor,
+            samplesByChannel: [
+                [0.1, -0.2, 0.3, -0.4],
+                [-0.1, 0.2, -0.3, 0.4],
+            ]
+        )
+        let rawResource = try store.upload(.rawSamples(rawTile))
+        guard let rawAllocation = store.allocation(for: rawDescriptor.address) else {
+            throw SmokeError.failed("metal buffer store did not retain raw allocation")
+        }
+        try require(rawAllocation.binCount == 4, "raw allocation should expose one packed bin per sample frame")
+        try require(rawAllocation.byteCount == rawResource.byteCount, "raw allocation byte count did not match resource")
+        store.remove(rawDescriptor.address)
+        try require(store.allocation(for: rawDescriptor.address) == nil, "address removal did not clear raw allocation")
     }
 
     private struct Fixture {

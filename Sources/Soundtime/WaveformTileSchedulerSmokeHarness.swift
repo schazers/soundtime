@@ -20,6 +20,8 @@ enum WaveformTileSchedulerSmokeHarness {
         try verifyRawSampleSchedulingAtExtremeZoom()
         try verifyTimelineViewportConversion()
         try verifySourceBoundsClamping()
+        try verifySegmentRemapsVisibleViewportToSourceTiles()
+        try verifyRippleDeleteSegmentsRequestShiftedSourceTiles()
 
         let checks = [
             "visible tile priority",
@@ -27,6 +29,8 @@ enum WaveformTileSchedulerSmokeHarness {
             "raw sample scheduling at extreme zoom",
             "timeline viewport conversion",
             "source bounds clamping",
+            "segment remaps visible viewport to source tiles",
+            "ripple delete segments request shifted source tiles",
         ]
         if let reportURL = StabilityReportWriter.writePassedSuite(
             name: "waveform-tile-scheduler-smoke",
@@ -60,6 +64,10 @@ enum WaveformTileSchedulerSmokeHarness {
         try require(
             visible.allSatisfy { $0.descriptor.framesPerBin == 32 },
             "normal zoom picked unexpected framesPerBin: \(visible.map { $0.descriptor.framesPerBin })"
+        )
+        try require(
+            visible.first?.descriptor.binRange == WaveformBinRange(startBin: 15_000, endBin: 15_150),
+            "visible tile did not expose expected global bin range: \(String(describing: visible.first?.descriptor.binRange))"
         )
     }
 
@@ -119,6 +127,11 @@ enum WaveformTileSchedulerSmokeHarness {
             requests.allSatisfy { $0.purpose != .background },
             "extreme zoom should not ask for full-file raw background work"
         )
+        let visible = requests.filter { $0.purpose == .visible }
+        try require(
+            visible.allSatisfy { $0.descriptor.binRange.binCount == $0.descriptor.frameRange.frameCount },
+            "raw-sample tiles should expose one bin per source frame"
+        )
     }
 
     private static func verifyTimelineViewportConversion() throws {
@@ -157,6 +170,78 @@ enum WaveformTileSchedulerSmokeHarness {
         try require(
             requests.contains { $0.purpose == .visible && $0.descriptor.frameRange.contains(frame: source.frameCount - 1) },
             "visible end-of-file request did not include final source frame"
+        )
+    }
+
+    private static func verifySegmentRemapsVisibleViewportToSourceTiles() throws {
+        let source = sourceMetadata()
+        let requests = WaveformTileScheduler.requests(
+            for: source,
+            viewport: WaveformTileSchedulerViewport(
+                startTime: 12,
+                endTime: 12.5,
+                widthPixels: 1_000
+            ),
+            segments: [
+                WaveformTileSchedulerSegment(
+                    outputStartTime: 10,
+                    outputEndTime: 20,
+                    sourceStartTime: 40,
+                    sourceEndTime: 50
+                ),
+            ],
+            config: schedulerConfig()
+        )
+        let visibleTileIndexes = requests
+            .filter { $0.purpose == .visible }
+            .map { $0.descriptor.address.tileIndex }
+
+        try require(
+            visibleTileIndexes == Array(420...424),
+            "segment request did not map output viewport onto source tiles: \(visibleTileIndexes)"
+        )
+        try require(
+            !visibleTileIndexes.contains(120),
+            "segment request incorrectly used output-time tile coordinates"
+        )
+    }
+
+    private static func verifyRippleDeleteSegmentsRequestShiftedSourceTiles() throws {
+        let source = sourceMetadata()
+        let requests = WaveformTileScheduler.requests(
+            for: source,
+            viewport: WaveformTileSchedulerViewport(
+                startTime: 10.25,
+                endTime: 10.75,
+                widthPixels: 1_000
+            ),
+            segments: [
+                WaveformTileSchedulerSegment(
+                    outputStartTime: 0,
+                    outputEndTime: 10,
+                    sourceStartTime: 0,
+                    sourceEndTime: 10
+                ),
+                WaveformTileSchedulerSegment(
+                    outputStartTime: 10,
+                    outputEndTime: 20,
+                    sourceStartTime: 12,
+                    sourceEndTime: 22
+                ),
+            ],
+            config: schedulerConfig()
+        )
+        let visibleTileIndexes = requests
+            .filter { $0.purpose == .visible }
+            .map { $0.descriptor.address.tileIndex }
+
+        try require(
+            visibleTileIndexes == Array(122...127),
+            "ripple delete segment should request post-delete source tiles, got \(visibleTileIndexes)"
+        )
+        try require(
+            !visibleTileIndexes.contains(102),
+            "ripple delete segment incorrectly requested output-time tile coordinates"
         )
     }
 
