@@ -12,15 +12,60 @@ struct TimelineFrameStats: Equatable, Sendable {
     let cpuWaveformVertexCount: Int
     let gpuWaveformDrawCount: Int
     let shaderBufferUploadCount: Int
+    let shaderBufferUploadByteCount: Int
     let shaderBufferCount: Int
     let shaderBufferByteCount: Int
     let shaderBufferUploadInFlightCount: Int
     let waveformMipCacheCount: Int
+    let waveformFallbackDrawCount: Int
+    let waveformLastGoodHoldCount: Int
+    let waveformResidentMissCount: Int
+    let waveformHotPathViolationCount: Int
+    let waveformHotPathReason: String
+    let gpuResidentWaveformMode: String
+    let gpuResidentShadowSourceCount: Int
+    let gpuResidentShadowRequestCount: Int
+    let gpuResidentShadowVisibleTileCount: Int
+    let gpuResidentShadowDrawBatchCount: Int
+    let gpuResidentShadowDrawInstanceCount: Int
     let effectVertexCount: Int
     let effectDroppedVertexCount: Int
     let transientParticleCount: Int
     let deletionEffectCount: Int
     let playheadContactEventCount: Int
+}
+
+struct SelectionDragWaveformTuning: Equatable, Sendable {
+    static let defaultValue = SelectionDragWaveformTuning()
+
+    var minimumSpeedPixelsPerSecond: Float = 120
+    var fullSpeedPixelsPerSecond: Float = 1_800
+    var contactLifetime: CFTimeInterval = 0.174
+    var frontRadiusPixels: Float = 10
+    var backRadiusPixels: Float = 38
+    var contactCoreRadiusPixels: Float = 3
+    var maximumExpansion: Float = 0.38
+    var maximumWhitening: Float = 0.65
+    var maximumContactCount: Int = 8
+    var particleLimit: Int = 56
+
+    var sanitized: SelectionDragWaveformTuning {
+        var tuning = self
+        tuning.minimumSpeedPixelsPerSecond = min(max(tuning.minimumSpeedPixelsPerSecond, 0), 2_400)
+        tuning.fullSpeedPixelsPerSecond = min(
+            max(tuning.fullSpeedPixelsPerSecond, tuning.minimumSpeedPixelsPerSecond + 1),
+            4_800
+        )
+        tuning.contactLifetime = min(max(tuning.contactLifetime, 0.08), 0.24)
+        tuning.frontRadiusPixels = min(max(tuning.frontRadiusPixels, 1), 80)
+        tuning.backRadiusPixels = min(max(tuning.backRadiusPixels, 1), 140)
+        tuning.contactCoreRadiusPixels = min(max(tuning.contactCoreRadiusPixels, 1), 24)
+        tuning.maximumExpansion = min(max(tuning.maximumExpansion, 0), 1.4)
+        tuning.maximumWhitening = min(max(tuning.maximumWhitening, 0), 1)
+        tuning.maximumContactCount = min(max(tuning.maximumContactCount, 0), 8)
+        tuning.particleLimit = min(max(tuning.particleLimit, 0), 160)
+        return tuning
+    }
 }
 
 struct TimelineRenderTarget: @unchecked Sendable {
@@ -74,6 +119,16 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         var touch: SIMD4<Float>
         var touch2: SIMD4<Float>
         var touch3: SIMD4<Float>
+        var selectionDrag: SIMD4<Float>
+        var selectionDrag2: SIMD4<Float>
+        var selectionDragContact0: SIMD4<Float>
+        var selectionDragContact1: SIMD4<Float>
+        var selectionDragContact2: SIMD4<Float>
+        var selectionDragContact3: SIMD4<Float>
+        var selectionDragContact4: SIMD4<Float>
+        var selectionDragContact5: SIMD4<Float>
+        var selectionDragContact6: SIMD4<Float>
+        var selectionDragContact7: SIMD4<Float>
         var deletionWarp: SIMD4<Float>
     }
 
@@ -228,6 +283,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         private var accessTick = 0
         private var preparingKeys: Set<WaveformMipCacheKey> = []
         private var publishedBufferCount = 0
+        private var publishedBufferByteCount = 0
 
         init(device: MTLDevice, preferredSlabBinCapacity: Int) {
             self.device = device
@@ -324,6 +380,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             )
             allocations[key] = allocation
             slabs[slabIndex].usedBins += binCount
+            publishedBufferCount += 1
+            publishedBufferByteCount += byteCount
             markAccessed(key)
         }
 
@@ -368,17 +426,20 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 allocations[key] = allocation
                 markAccessed(key)
                 publishedBufferCount += 1
+                publishedBufferByteCount += buffer.length
             }
             preparingKeys.remove(key)
             lock.unlock()
         }
 
-        func drainPublishedBufferCount() -> Int {
+        func drainPublishedBufferStats() -> (count: Int, byteCount: Int) {
             lock.lock()
             let count = publishedBufferCount
+            let byteCount = publishedBufferByteCount
             publishedBufferCount = 0
+            publishedBufferByteCount = 0
             lock.unlock()
-            return count
+            return (count, byteCount)
         }
 
         func diagnostics() -> (bufferCount: Int, byteCount: Int, inFlightCount: Int) {
@@ -555,6 +616,44 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let timestamp: CFTimeInterval
     }
 
+    private struct SelectionDragWaveformContact: Sendable {
+        let trackID: UUID?
+        let progress: Float
+        let direction: Float
+        let strength: Float
+        let birthTimestamp: CFTimeInterval
+    }
+
+    private struct SelectionDragWaveformContactVectors {
+        var contact0 = SIMD4<Float>.zero
+        var contact1 = SIMD4<Float>.zero
+        var contact2 = SIMD4<Float>.zero
+        var contact3 = SIMD4<Float>.zero
+        var contact4 = SIMD4<Float>.zero
+        var contact5 = SIMD4<Float>.zero
+        var contact6 = SIMD4<Float>.zero
+        var contact7 = SIMD4<Float>.zero
+        var activeCount: Int = 0
+
+        static let empty = SelectionDragWaveformContactVectors()
+
+        init(_ contacts: [SIMD4<Float>] = []) {
+            activeCount = min(max(contacts.count, 0), 8)
+            var padded = contacts
+            if padded.count < 8 {
+                padded.append(contentsOf: Array(repeating: .zero, count: 8 - padded.count))
+            }
+            contact0 = padded[0]
+            contact1 = padded[1]
+            contact2 = padded[2]
+            contact3 = padded[3]
+            contact4 = padded[4]
+            contact5 = padded[5]
+            contact6 = padded[6]
+            contact7 = padded[7]
+        }
+    }
+
     private struct ProcessingSelectionProgress {
         let selection: TimelineSelection
         let startFraction: Float?
@@ -640,6 +739,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         private var viewport: TimelineViewport?
         private var selection: TimelineSelection?
         private var selectionDragEffect: SelectionDragEffect?
+        private var selectionDragWaveformContacts: [SelectionDragWaveformContact] = []
         private var hoverProgress: Float?
         private var isHoverArmed = false
 
@@ -659,12 +759,43 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             self.selection = selection
         }
 
-        func publishSelectionDragEffect(_ effect: SelectionDragEffect?) {
+        func publishSelectionDragEffect(
+            _ effect: SelectionDragEffect?,
+            contact: SelectionDragWaveformContact?,
+            displayTimestamp: CFTimeInterval,
+            lifetime: CFTimeInterval,
+            maximumCount: Int
+        ) {
             lock.lock()
             defer {
                 lock.unlock()
             }
             selectionDragEffect = effect
+            pruneSelectionDragWaveformContacts(
+                displayTimestamp: displayTimestamp,
+                lifetime: lifetime,
+                maximumCount: maximumCount
+            )
+            guard maximumCount > 0, let contact else {
+                return
+            }
+
+            let minimumContactInterval = maximumCount > 1 ?
+                min(max(lifetime / Double(maximumCount) * 0.28, 1.0 / 144.0), 1.0 / 28.0) :
+                0
+            if
+                let lastContact = selectionDragWaveformContacts.last,
+                displayTimestamp - lastContact.birthTimestamp < minimumContactInterval
+            {
+                selectionDragWaveformContacts[selectionDragWaveformContacts.count - 1] = contact
+            } else {
+                selectionDragWaveformContacts.append(contact)
+            }
+            pruneSelectionDragWaveformContacts(
+                displayTimestamp: displayTimestamp,
+                lifetime: lifetime,
+                maximumCount: maximumCount
+            )
         }
 
         func publishHover(progress: Float?, isArmed: Bool) {
@@ -696,6 +827,41 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 lock.unlock()
             }
             return selectionDragEffect
+        }
+
+        func selectionDragWaveformContactsSnapshot(
+            displayTimestamp: CFTimeInterval,
+            lifetime: CFTimeInterval,
+            maximumCount: Int
+        ) -> [SelectionDragWaveformContact] {
+            lock.lock()
+            defer {
+                lock.unlock()
+            }
+            pruneSelectionDragWaveformContacts(
+                displayTimestamp: displayTimestamp,
+                lifetime: lifetime,
+                maximumCount: maximumCount
+            )
+            return selectionDragWaveformContacts
+        }
+
+        private func pruneSelectionDragWaveformContacts(
+            displayTimestamp: CFTimeInterval,
+            lifetime: CFTimeInterval,
+            maximumCount: Int
+        ) {
+            let clampedLifetime = max(lifetime, 0.001)
+            selectionDragWaveformContacts.removeAll {
+                displayTimestamp - $0.birthTimestamp > clampedLifetime
+            }
+            let clampedMaximumCount = max(maximumCount, 0)
+            let storageMaximumCount = min(max(clampedMaximumCount * 6, clampedMaximumCount), 64)
+            if selectionDragWaveformContacts.count > storageMaximumCount {
+                selectionDragWaveformContacts.removeFirst(
+                    selectionDragWaveformContacts.count - storageMaximumCount
+                )
+            }
         }
     }
 
@@ -933,6 +1099,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let renderStateStore = TimelineRenderStateStore(initialState: .empty)
     private let interactionStateStore = TimelineInteractionStateStore()
     private let tiledWaveformPipeline: WaveformTiledRenderPipeline?
+    private let tiledWaveformMetalBufferStore: WaveformTileMetalBufferStore?
     private var renderState = TimelineRenderState.empty {
         didSet {
             renderStateStore.publish(renderState)
@@ -1011,11 +1178,24 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var frameStatsCPUWaveformVertexCount = 0
     private var frameStatsGPUWaveformDrawCount = 0
     private var frameStatsShaderBufferUploadCount = 0
+    private var frameStatsShaderBufferUploadByteCount = 0
+    private var frameStatsWaveformFallbackDrawCount = 0
+    private var frameStatsWaveformLastGoodHoldCount = 0
+    private var frameStatsWaveformResidentMissCount = 0
+    private var frameStatsWaveformHotPathViolationCount = 0
+    private var frameStatsWaveformHotPathReason = ""
+    private var frameStatsGPUResidentWaveformMode = WaveformGPUResidentWaveformsFeatureFlags.modeDescription
+    private var frameStatsGPUResidentShadowSourceCount = 0
+    private var frameStatsGPUResidentShadowRequestCount = 0
+    private var frameStatsGPUResidentShadowVisibleTileCount = 0
+    private var frameStatsGPUResidentShadowDrawBatchCount = 0
+    private var frameStatsGPUResidentShadowDrawInstanceCount = 0
     private var frameStatsEffectVertexCount = 0
     private var frameStatsEffectDroppedVertexCount = 0
     private var frameStatsTransientParticleCount = 0
     private var frameStatsDeletionEffectCount = 0
     private var frameStatsPlayheadContactEventCount = 0
+    private var lastWaveformPerformanceContractEventTime: CFTimeInterval = -Double.infinity
     private var lastFrameStats: TimelineFrameStats?
     private var lastRenderViewportSize = CGSize(width: 1600, height: 900)
     private var lastRenderBackingScale: Float = 1
@@ -1037,10 +1217,22 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             cpuWaveformVertexCount: frameStatsCPUWaveformVertexCount,
             gpuWaveformDrawCount: frameStatsGPUWaveformDrawCount,
             shaderBufferUploadCount: frameStatsShaderBufferUploadCount,
+            shaderBufferUploadByteCount: frameStatsShaderBufferUploadByteCount,
             shaderBufferCount: waveformBufferDiagnostics.bufferCount,
             shaderBufferByteCount: waveformBufferDiagnostics.byteCount,
             shaderBufferUploadInFlightCount: waveformBufferDiagnostics.inFlightCount,
             waveformMipCacheCount: waveformMipCacheDiagnostics().cacheCount,
+            waveformFallbackDrawCount: frameStatsWaveformFallbackDrawCount,
+            waveformLastGoodHoldCount: frameStatsWaveformLastGoodHoldCount,
+            waveformResidentMissCount: frameStatsWaveformResidentMissCount,
+            waveformHotPathViolationCount: frameStatsWaveformHotPathViolationCount,
+            waveformHotPathReason: frameStatsWaveformHotPathReason,
+            gpuResidentWaveformMode: frameStatsGPUResidentWaveformMode,
+            gpuResidentShadowSourceCount: frameStatsGPUResidentShadowSourceCount,
+            gpuResidentShadowRequestCount: frameStatsGPUResidentShadowRequestCount,
+            gpuResidentShadowVisibleTileCount: frameStatsGPUResidentShadowVisibleTileCount,
+            gpuResidentShadowDrawBatchCount: frameStatsGPUResidentShadowDrawBatchCount,
+            gpuResidentShadowDrawInstanceCount: frameStatsGPUResidentShadowDrawInstanceCount,
             effectVertexCount: frameStatsEffectVertexCount,
             effectDroppedVertexCount: frameStatsEffectDroppedVertexCount,
             transientParticleCount: frameStatsTransientParticleCount,
@@ -1084,11 +1276,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let playheadContactMinimumSpawnInterval: CFTimeInterval = 1.0 / 90.0
     private let transientParticleMaximumCount = 260
     private let maximumTransientParticleVerticesPerFrame = 10_000
-    private let selectionDragParticleMaximumCount = 56
+    private var selectionDragWaveformTuning = SelectionDragWaveformTuning.defaultValue
     private let maximumSelectionDragParticleVerticesPerFrame = 1_008
-    private let selectionDragMinimumEffectSpeed: Float = 70
-    private let selectionDragFullEffectSpeed: Float = 1_700
     private let selectionDragEffectFadeDuration: CFTimeInterval = 0.22
+    private let selectionDragWaveformContactMinimumStrength: Float = 0.001
+    private let selectionDragSlowContactStrengthFloor: Float = 0.20
+    private let selectionDragMotionEpsilonPixelsPerSecond: Float = 2.0
     private let deletionEffectDuration: CFTimeInterval = 2.0
     private let deletionEffectLifetimePadding: CFTimeInterval = 0.08
     private let deletionEffectMaximumCount = 8
@@ -1256,8 +1449,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             device: device,
             preferredSlabBinCapacity: 262_144
         )
-        tiledWaveformPipeline = WaveformTiledRendererFeatureFlags.isEnabled ?
+        let isTiledWaveformPipelineEnabled = WaveformTiledRendererFeatureFlags.isEnabled
+        tiledWaveformPipeline = isTiledWaveformPipelineEnabled ?
             WaveformTiledRenderPipeline() :
+            nil
+        tiledWaveformMetalBufferStore = isTiledWaveformPipelineEnabled ?
+            WaveformTileMetalBufferStore(device: device) :
             nil
         pipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
         waveformPipelineState = try device.makeRenderPipelineState(descriptor: waveformDescriptor)
@@ -1288,7 +1485,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     func displayTracks(_ tracks: [TimelineRenderState.Track], animateWaveformTransition: Bool = true) {
         let previousTracks = renderState.tracks
-        tiledWaveformPipeline?.registerSources(tracks.compactMap(\.waveformTileSource))
+        let staleTiledSourceIDs = tiledWaveformPipeline?.registerSources(tracks.compactMap(\.waveformTileSource)) ?? []
+        for sourceID in staleTiledSourceIDs {
+            tiledWaveformMetalBufferStore?.removeAll(for: sourceID)
+        }
         updateWaveformSourceTracks(from: tracks)
         let currentTracksByID = Dictionary(uniqueKeysWithValues: previousTracks.map { ($0.id, $0) })
         let renderTracks = tracks.map { lightweightRenderTrack(from: $0, currentTrack: currentTracksByID[$0.id]) }
@@ -1529,6 +1729,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         waveformFisheyeActivationDuration = min(max(activationDuration, 0.04), 1.2)
     }
 
+    func updateSelectionDragWaveformTuning(_ tuning: SelectionDragWaveformTuning) {
+        selectionDragWaveformTuning = tuning.sanitized
+    }
+
     func displayPlayheadProgress(
         _ progress: Float,
         force: Bool = true,
@@ -1715,7 +1919,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     func displaySelection(_ selection: TimelineSelection?) {
         markWaveformHotInteraction()
         interactionStateStore.publishSelection(selection)
-        interactionStateStore.publishSelectionDragEffect(nil)
+        let tuning = selectionDragWaveformTuning
+        interactionStateStore.publishSelectionDragEffect(
+            nil,
+            contact: nil,
+            displayTimestamp: CACurrentMediaTime(),
+            lifetime: tuning.contactLifetime,
+            maximumCount: tuning.maximumContactCount
+        )
         renderState = renderState.withSelection(selection)
     }
 
@@ -1782,17 +1993,51 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             let selection,
             selection.durationProgress > 0
         else {
-            interactionStateStore.publishSelectionDragEffect(nil)
+            let tuning = selectionDragWaveformTuning
+            interactionStateStore.publishSelectionDragEffect(
+                nil,
+                contact: nil,
+                displayTimestamp: timestamp,
+                lifetime: tuning.contactLifetime,
+                maximumCount: tuning.maximumContactCount
+            )
             return
         }
 
-        interactionStateStore.publishSelectionDragEffect(SelectionDragEffect(
+        let clampedLeadingProgress = min(max(leadingProgress, 0), 1)
+        let clampedVelocity = max(velocityPixelsPerSecond, 0)
+        let normalizedDirection: Float = direction == 0 ? 0 : (direction > 0 ? 1 : -1)
+        let effect = SelectionDragEffect(
             selection: selection,
-            leadingProgress: min(max(leadingProgress, 0), 1),
-            velocityPixelsPerSecond: max(velocityPixelsPerSecond, 0),
-            direction: direction == 0 ? 0 : (direction > 0 ? 1 : -1),
+            leadingProgress: clampedLeadingProgress,
+            velocityPixelsPerSecond: clampedVelocity,
+            direction: normalizedDirection,
             timestamp: timestamp
-        ))
+        )
+        let tuning = selectionDragWaveformTuning
+        let contactStrength = selectionDragStrength(for: clampedVelocity)
+        let contact: SelectionDragWaveformContact?
+        if
+            normalizedDirection != 0,
+            contactStrength > selectionDragWaveformContactMinimumStrength
+        {
+            contact = SelectionDragWaveformContact(
+                trackID: selection.trackID,
+                progress: clampedLeadingProgress,
+                direction: normalizedDirection,
+                strength: min(max(contactStrength, 0), 1),
+                birthTimestamp: timestamp
+            )
+        } else {
+            contact = nil
+        }
+        interactionStateStore.publishSelectionDragEffect(
+            effect,
+            contact: contact,
+            displayTimestamp: timestamp,
+            lifetime: tuning.contactLifetime,
+            maximumCount: tuning.maximumContactCount
+        )
     }
 
     func publishInteractionHover(progress: Float?, isArmed: Bool = false) {
@@ -2199,6 +2444,16 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             displayTimestamp: displayTimestamp
         )
         let selectionDragEffect = interactionStateStore.selectionDragEffectSnapshot()
+        let selectionDragTuning = selectionDragWaveformTuning
+        let selectionDragWaveformContacts = interactionStateStore.selectionDragWaveformContactsSnapshot(
+            displayTimestamp: displayTimestamp,
+            lifetime: selectionDragTuning.contactLifetime,
+            maximumCount: selectionDragTuning.maximumContactCount
+        )
+        let isSelectionDragFrame = isSelectionDragEffectActive(
+            selectionDragEffect,
+            displayTimestamp: displayTimestamp
+        ) || !selectionDragWaveformContacts.isEmpty
         let selectionDragEffectUniform = makeSelectionDragEffectUniform(
             effect: selectionDragEffect,
             drawableSize: viewportSize,
@@ -2218,9 +2473,24 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             drawableSize: viewportSize,
             renderState: renderState
         )
+        updateGPUResidentWaveformShadowFrameStats(
+            renderState: renderState,
+            drawableSize: viewportSize,
+            backingScale: backingScale,
+            displayTimestamp: displayTimestamp
+        )
         let hasWaveformTransition = hasPreviousWaveformTransition
+        let waveformHotPathReason = waveformPerformanceContractHotPathReason(
+            renderState: renderState,
+            hasActiveDeletionEffect: hasActiveDeletionEffect,
+            isSelectionDragFrame: isSelectionDragFrame,
+            hasWaveformTransition: hasWaveformTransition,
+            displayTimestamp: displayTimestamp
+        )
+        frameStatsWaveformHotPathReason = waveformHotPathReason ?? ""
+        let isWaveformHotPath = waveformHotPathReason != nil
         let allowsCPUWaveformFallback =
-            !hasActiveDeletionEffect &&
+            !isWaveformHotPath &&
             isWaveformCPUFallbackAllowed(
                 renderState: renderState,
                 hasWaveformTransition: hasWaveformTransition,
@@ -2276,6 +2546,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             canHoldPreviousWaveform &&
             canUseWaveformShader &&
             !usesWaveformShader
+        if isHoldingPreviousUntilPreferredWaveformIsReady {
+            frameStatsWaveformLastGoodHoldCount += 1
+            frameStatsWaveformResidentMissCount += 1
+        } else if canUseWaveformShader && !usesWaveformShader {
+            frameStatsWaveformResidentMissCount += 1
+        }
         let waveformVertices = usesWaveformShader || isHoldingPreviousUntilPreferredWaveformIsReady ?
             nil :
             allowsCPUWaveformFallback ? cachedWaveformVertices(
@@ -2316,19 +2592,18 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 mipLevelSnapshot: mipLevelSnapshot,
                 displayTimestamp: displayTimestamp
             )
-        updateTransientParticles(
-            drawableSize: viewportSize,
-            playheadProgress: renderedPlayheadProgress,
-            renderState: renderState,
-            mipLevelSnapshot: mipLevelSnapshot,
-            displayTimestamp: displayTimestamp
-        )
-        updateSelectionDragParticles(
-            effect: selectionDragEffect,
-            drawableSize: viewportSize,
-            renderState: renderState,
-            displayTimestamp: displayTimestamp
-        )
+        if !isSelectionDragFrame {
+            updateTransientParticles(
+                drawableSize: viewportSize,
+                playheadProgress: renderedPlayheadProgress,
+                renderState: renderState,
+                mipLevelSnapshot: mipLevelSnapshot,
+                displayTimestamp: displayTimestamp
+            )
+        }
+        selectionDragParticles.removeAll(keepingCapacity: true)
+        selectionDragParticleEmissionTimestamp = nil
+        selectionDragParticleEmissionDebt = 0
         let transientParticleVertices = makeTransientParticleVertices(
             drawableSize: viewportSize,
             renderState: renderState,
@@ -2336,12 +2611,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             maximumVertexCount: maximumTransientParticleVerticesPerFrame
         )
         frameStatsEffectVertexCount += transientParticleVertices.count
-        let selectionDragParticleVertices = makeSelectionDragParticleVertices(
-            drawableSize: viewportSize,
-            renderState: renderState,
-            displayTimestamp: displayTimestamp,
-            maximumVertexCount: maximumSelectionDragParticleVerticesPerFrame
-        )
+        let selectionDragParticleVertices: [TimelineVertex] = []
         frameStatsEffectVertexCount += selectionDragParticleVertices.count + (selectionDragEffectUniform == nil ? 0 : 6)
         let hoverGuideVertices = makeHoverGuideVertices(
             drawableSize: viewportSize,
@@ -2390,6 +2660,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 opacity: waveformTransitionOpacities.previous,
                 displayTimestamp: displayTimestamp,
                 fallbackPolicy: .allowFallbacks,
+                selectionDragWaveformContacts: selectionDragWaveformContacts,
                 deletionWarpEffects: deletionEffectsForFrame,
                 encoder: encoder
             )
@@ -2397,6 +2668,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         } else if let previousWaveformVertices {
             frameStatsWaveformRenderer = "cpu"
             frameStatsCPUWaveformVertexCount += previousWaveformVertices.vertices.vertexCount
+            frameStatsWaveformFallbackDrawCount += 1
             let previousFisheye = cpuFallbackWaveformFisheye(
                 waveformFisheye,
                 renderState: previousShaderRenderState ?? renderState,
@@ -2424,6 +2696,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 opacity: waveformTransitionOpacities.current,
                 displayTimestamp: displayTimestamp,
                 fallbackPolicy: currentWaveformFallbackPolicy,
+                selectionDragWaveformContacts: selectionDragWaveformContacts,
                 deletionWarpEffects: deletionEffectsForFrame,
                 encoder: encoder
             )
@@ -2431,6 +2704,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         } else if let waveformVertices, !suppressCurrentWaveformForDeletion {
             frameStatsWaveformRenderer = "cpu"
             frameStatsCPUWaveformVertexCount += waveformVertices.vertices.vertexCount
+            frameStatsWaveformFallbackDrawCount += 1
             let fallbackFisheye = cpuFallbackWaveformFisheye(
                 waveformFisheye,
                 renderState: renderState,
@@ -2472,6 +2746,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         draw(vertices: trimPreviewVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: hoverGuideVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: playheadVertices, primitiveType: .triangle, encoder: encoder)
+        recordWaveformPerformanceContract(
+            hotPathReason: waveformHotPathReason,
+            displayTimestamp: displayTimestamp
+        )
         if publishesFrameStats {
             recordFrameRate()
         }
@@ -2560,6 +2838,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         opacity: Float,
         displayTimestamp: CFTimeInterval,
         fallbackPolicy: WaveformShaderFallbackPolicy,
+        selectionDragWaveformContacts: [SelectionDragWaveformContact],
         deletionWarpEffects: [DeletionEffect] = [],
         encoder: MTLRenderCommandEncoder
     ) {
@@ -2611,6 +2890,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             } else {
                 shaderDrawable = nil
             }
+            if let shaderDrawable, !shaderDrawable.isPreferred {
+                frameStatsWaveformResidentMissCount += 1
+                frameStatsWaveformFallbackDrawCount += 1
+            }
 
             let trackDurationProgress = min(max(Float(trackDuration / projectDuration), 0), 1)
             guard trackDurationProgress > 0 else {
@@ -2636,6 +2919,34 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                     touchParameters.touch.z,
                     0
                 )
+            let selectionDragTuningVectors = selectionDragWaveformTuningVectors(
+                drawableSize: drawableSize,
+                renderState: renderState
+            )
+            let selectionDragContacts = selectionDragWaveformContactVectors(
+                selectionDragWaveformContacts,
+                trackID: track.id,
+                displayTimestamp: displayTimestamp
+            )
+            let trackSelectionDragTuning = SIMD4<Float>(
+                selectionDragTuningVectors.primary.x,
+                selectionDragTuningVectors.primary.y,
+                selectionDragTuningVectors.primary.z,
+                Float(selectionDragContacts.activeCount)
+            )
+            var trackSelectionDragVisuals = selectionDragTuningVectors.secondary
+            if let dragBounds = selectionDragWaveformEffectBounds(
+                selection: renderState.selection,
+                contacts: selectionDragWaveformContacts,
+                trackID: track.id,
+                displayTimestamp: displayTimestamp
+            ) {
+                trackSelectionDragVisuals.z = dragBounds.x
+                trackSelectionDragVisuals.w = dragBounds.y
+            } else {
+                trackSelectionDragVisuals.z = 1
+                trackSelectionDragVisuals.w = 0
+            }
             let trackFisheye = fisheye.w > 0.000_1 ?
                 scaledWaveformFisheye(
                     fisheye,
@@ -2674,6 +2985,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                     touch: trackTouch,
                     touch2: touchParameters.touch2,
                     touch3: touchParameters.touch3,
+                    selectionDrag: trackSelectionDragTuning,
+                    selectionDrag2: trackSelectionDragVisuals,
+                    selectionDragContacts: selectionDragContacts,
                     deletionWarp: waveformDeletionWarp(
                         for: track,
                         effects: deletionWarpEffects,
@@ -2704,6 +3018,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                             touch: trackTouch,
                             touch2: touchParameters.touch2,
                             touch3: touchParameters.touch3,
+                            selectionDrag: trackSelectionDragTuning,
+                            selectionDrag2: trackSelectionDragVisuals,
+                            selectionDragContacts: selectionDragContacts,
                             deletionWarp: waveformDeletionWarp(
                                 for: track,
                                 effects: deletionWarpEffects,
@@ -2763,11 +3080,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 let existing = waveformShaderPromotionRecordsByTrackID[track.id],
                 waveformShaderPromotionRecordCanBeHeld(existing, for: track)
             {
+                frameStatsWaveformLastGoodHoldCount += 1
+                frameStatsWaveformResidentMissCount += 1
                 return activeWaveformShaderPromotionLayers(
                     from: existing,
                     displayTimestamp: displayTimestamp
                 )
             }
+            frameStatsWaveformResidentMissCount += 1
             return []
         }
 
@@ -2776,6 +3096,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             let existing = waveformShaderPromotionRecordsByTrackID[track.id],
             waveformShaderPromotionRecordCanBeHeld(existing, for: track)
         {
+            frameStatsWaveformLastGoodHoldCount += 1
             return activeWaveformShaderPromotionLayers(
                 from: existing,
                 displayTimestamp: displayTimestamp
@@ -2911,6 +3232,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         touch: SIMD4<Float>,
         touch2: SIMD4<Float>,
         touch3: SIMD4<Float>,
+        selectionDrag: SIMD4<Float>,
+        selectionDrag2: SIMD4<Float>,
+        selectionDragContacts: SelectionDragWaveformContactVectors,
         deletionWarp: SIMD4<Float> = .zero,
         segment: TimelineRenderState.Track.WaveformSegment?,
         trackID: UUID,
@@ -2994,6 +3318,16 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             touch: touch,
             touch2: touch2,
             touch3: touch3,
+            selectionDrag: selectionDrag,
+            selectionDrag2: selectionDrag2,
+            selectionDragContact0: selectionDragContacts.contact0,
+            selectionDragContact1: selectionDragContacts.contact1,
+            selectionDragContact2: selectionDragContacts.contact2,
+            selectionDragContact3: selectionDragContacts.contact3,
+            selectionDragContact4: selectionDragContacts.contact4,
+            selectionDragContact5: selectionDragContacts.contact5,
+            selectionDragContact6: selectionDragContacts.contact6,
+            selectionDragContact7: selectionDragContacts.contact7,
             deletionWarp: deletionWarp
         )
     }
@@ -4451,6 +4785,225 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         waveformHotPathLock.unlock()
     }
 
+    private func updateGPUResidentWaveformShadowFrameStats(
+        renderState: TimelineRenderState,
+        drawableSize: CGSize,
+        backingScale: Float,
+        displayTimestamp: CFTimeInterval
+    ) {
+        frameStatsGPUResidentWaveformMode = WaveformGPUResidentWaveformsFeatureFlags.modeDescription
+        frameStatsGPUResidentShadowSourceCount = 0
+        frameStatsGPUResidentShadowRequestCount = 0
+        frameStatsGPUResidentShadowVisibleTileCount = 0
+        frameStatsGPUResidentShadowDrawBatchCount = 0
+        frameStatsGPUResidentShadowDrawInstanceCount = 0
+
+        guard
+            WaveformGPUResidentWaveformsFeatureFlags.isShadowModeEnabled,
+            let tiledWaveformPipeline,
+            let tiledWaveformMetalBufferStore
+        else {
+            return
+        }
+
+        let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
+        let widthPixels = Double(max(drawableSize.width, 1)) * Double(max(backingScale, 1))
+        let projectDuration = max(renderState.duration ?? 0, 0)
+        guard projectDuration > 0 else {
+            return
+        }
+
+        var sourceIDs = Set<WaveformSourceID>()
+        var requestedTileCount = 0
+        var selectedResidentTileCount = 0
+        var shadowDrawBatchPlan = WaveformTileDrawBatchPlan.empty
+        let completedWork = tiledWaveformPipeline.drainCompletedAsyncWork()
+        frameStatsShaderBufferUploadCount += completedWork.uploadSummary.uploadedCount
+        frameStatsShaderBufferUploadByteCount += completedWork.uploadSummary.uploadedBytes
+
+        for trackIndex in trackLayout.visibleRange(overscan: 1) {
+            guard
+                renderState.tracks.indices.contains(trackIndex),
+                let source = renderState.tracks[trackIndex].waveformTileSource
+            else {
+                continue
+            }
+
+            let track = renderState.tracks[trackIndex]
+            sourceIDs.insert(source.sourceID)
+            let viewport = WaveformTileSchedulerViewport(
+                timelineViewport: renderState.viewport,
+                duration: projectDuration,
+                widthPixels: widthPixels
+            )
+            let segments = waveformTileSchedulerSegments(
+                for: track,
+                source: source,
+                projectDuration: projectDuration
+            )
+            let frame = tiledWaveformPipeline.prepareResidentFrame(
+                source: source.metadata,
+                viewport: viewport,
+                segments: segments,
+                timestamp: displayTimestamp,
+                buildBatchLimit: 2,
+                uploadBudget: WaveformTileUploadBudget(
+                    maximumBytesPerBatch: 512 * 1_024,
+                    maximumTilesPerBatch: 4
+                ),
+                discardUpload: { _, resource in
+                    tiledWaveformMetalBufferStore.remove(resourceID: resource.id)
+                },
+                evictUpload: { addresses in
+                    tiledWaveformMetalBufferStore.remove(addresses: addresses)
+                },
+                upload: { payload in
+                    try tiledWaveformMetalBufferStore.upload(payload)
+                },
+                onWorkCompleted: onRenderDataPrepared
+            )
+            requestedTileCount += frame.renderSelection.requestedCount
+            selectedResidentTileCount += frame.renderSelection.selectedCount
+            if let laneFrame = trackLayout.laneFrame(forTrackIndex: trackIndex), laneFrame.isVisible {
+                shadowDrawBatchPlan.append(WaveformTileDrawBatchPlanner.plan(
+                    trackID: track.id,
+                    trackIndex: trackIndex,
+                    laneFrame: laneFrame,
+                    source: source.metadata,
+                    segments: segments,
+                    promotionPlan: frame.promotionPlan
+                ))
+            }
+        }
+
+        frameStatsGPUResidentShadowSourceCount = sourceIDs.count
+        frameStatsGPUResidentShadowRequestCount = requestedTileCount
+        frameStatsGPUResidentShadowVisibleTileCount = selectedResidentTileCount
+        frameStatsGPUResidentShadowDrawBatchCount = shadowDrawBatchPlan.batchCount
+        frameStatsGPUResidentShadowDrawInstanceCount = shadowDrawBatchPlan.instanceCount
+    }
+
+    private func waveformTileSchedulerSegments(
+        for track: TimelineRenderState.Track,
+        source: WaveformTileBuildSource,
+        projectDuration: TimeInterval
+    ) -> [WaveformTileSchedulerSegment] {
+        let outputDuration = min(
+            max(track.durationHint ?? source.duration, 0),
+            max(projectDuration, 0)
+        )
+        guard outputDuration > 0, source.duration > 0 else {
+            return []
+        }
+
+        if track.waveformSegments.isEmpty {
+            return [
+                WaveformTileSchedulerSegment(
+                    outputStartTime: 0,
+                    outputEndTime: outputDuration,
+                    sourceStartTime: 0,
+                    sourceEndTime: source.duration
+                )
+            ]
+        }
+
+        return track.waveformSegments.map { segment in
+            WaveformTileSchedulerSegment(
+                outputStartProgress: segment.outputStartProgress,
+                outputEndProgress: segment.outputEndProgress,
+                sourceStartProgress: segment.sourceStartProgress,
+                sourceEndProgress: segment.sourceEndProgress,
+                outputDuration: outputDuration,
+                sourceDuration: source.duration
+            )
+        }
+    }
+
+    private func waveformPerformanceContractHotPathReason(
+        renderState: TimelineRenderState,
+        hasActiveDeletionEffect: Bool,
+        isSelectionDragFrame: Bool,
+        hasWaveformTransition: Bool,
+        displayTimestamp: CFTimeInterval
+    ) -> String? {
+        if renderState.isPlaybackActive {
+            return "playback"
+        }
+        if renderState.isRecordingActive {
+            return "recording"
+        }
+        if hasActiveDeletionEffect {
+            return "delete-animation"
+        }
+        if isSelectionDragFrame {
+            return "selection-drag"
+        }
+        if hasWaveformTransition {
+            return "waveform-transition"
+        }
+        if renderState.trimPreview != nil {
+            return "trim-preview"
+        }
+        if renderState.gainPreview != nil {
+            return "gain-preview"
+        }
+        if renderState.hoverProgress != nil || renderState.isHoverGuideArmed {
+            return "hover"
+        }
+
+        waveformHotPathLock.lock()
+        let lastInteractionTimestamp = lastWaveformHotInteractionTimestamp
+        waveformHotPathLock.unlock()
+        if displayTimestamp - lastInteractionTimestamp < waveformCPUFallbackInteractionCooldown {
+            return "viewport-interaction"
+        }
+
+        return nil
+    }
+
+    private func recordWaveformPerformanceContract(
+        hotPathReason: String?,
+        displayTimestamp: CFTimeInterval
+    ) {
+        guard let hotPathReason else {
+            frameStatsWaveformHotPathViolationCount = 0
+            return
+        }
+
+        var violationCount = 0
+        if frameStatsCPUWaveformVertexCount > 0 {
+            violationCount += 1
+        }
+        if frameStatsShaderBufferUploadByteCount > 0 {
+            violationCount += 1
+        }
+
+        frameStatsWaveformHotPathViolationCount = violationCount
+        guard
+            violationCount > 0,
+            displayTimestamp - lastWaveformPerformanceContractEventTime >= 1
+        else {
+            return
+        }
+
+        lastWaveformPerformanceContractEventTime = displayTimestamp
+        SoundtimeDiagnostics.shared.record(
+            category: .render,
+            severity: .warning,
+            name: "waveform-hot-path-contract-violation",
+            message: "Waveform renderer did CPU or upload work during a hot interaction.",
+            fields: [
+                "reason": hotPathReason,
+                "cpuVertices": "\(frameStatsCPUWaveformVertexCount)",
+                "uploadCount": "\(frameStatsShaderBufferUploadCount)",
+                "uploadBytes": "\(frameStatsShaderBufferUploadByteCount)",
+                "fallbackDraws": "\(frameStatsWaveformFallbackDrawCount)",
+                "residentMisses": "\(frameStatsWaveformResidentMissCount)",
+                "lastGoodHolds": "\(frameStatsWaveformLastGoodHoldCount)",
+            ]
+        )
+    }
+
     private func isWaveformCPUFallbackAllowed(
         renderState: TimelineRenderState,
         hasWaveformTransition: Bool,
@@ -4636,10 +5189,22 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             cpuWaveformVertexCount: frameStatsCPUWaveformVertexCount,
             gpuWaveformDrawCount: frameStatsGPUWaveformDrawCount,
             shaderBufferUploadCount: frameStatsShaderBufferUploadCount,
+            shaderBufferUploadByteCount: frameStatsShaderBufferUploadByteCount,
             shaderBufferCount: waveformBufferDiagnostics.bufferCount,
             shaderBufferByteCount: waveformBufferDiagnostics.byteCount,
             shaderBufferUploadInFlightCount: waveformBufferDiagnostics.inFlightCount,
             waveformMipCacheCount: waveformMipCacheDiagnostics().cacheCount,
+            waveformFallbackDrawCount: frameStatsWaveformFallbackDrawCount,
+            waveformLastGoodHoldCount: frameStatsWaveformLastGoodHoldCount,
+            waveformResidentMissCount: frameStatsWaveformResidentMissCount,
+            waveformHotPathViolationCount: frameStatsWaveformHotPathViolationCount,
+            waveformHotPathReason: frameStatsWaveformHotPathReason,
+            gpuResidentWaveformMode: frameStatsGPUResidentWaveformMode,
+            gpuResidentShadowSourceCount: frameStatsGPUResidentShadowSourceCount,
+            gpuResidentShadowRequestCount: frameStatsGPUResidentShadowRequestCount,
+            gpuResidentShadowVisibleTileCount: frameStatsGPUResidentShadowVisibleTileCount,
+            gpuResidentShadowDrawBatchCount: frameStatsGPUResidentShadowDrawBatchCount,
+            gpuResidentShadowDrawInstanceCount: frameStatsGPUResidentShadowDrawInstanceCount,
             effectVertexCount: frameStatsEffectVertexCount,
             effectDroppedVertexCount: frameStatsEffectDroppedVertexCount,
             transientParticleCount: frameStatsTransientParticleCount,
@@ -4670,7 +5235,20 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         frameStatsWaveformRenderer = "gpu"
         frameStatsCPUWaveformVertexCount = 0
         frameStatsGPUWaveformDrawCount = 0
-        frameStatsShaderBufferUploadCount = waveformShaderBufferStore.drainPublishedBufferCount()
+        let publishedBufferStats = waveformShaderBufferStore.drainPublishedBufferStats()
+        frameStatsShaderBufferUploadCount = publishedBufferStats.count
+        frameStatsShaderBufferUploadByteCount = publishedBufferStats.byteCount
+        frameStatsWaveformFallbackDrawCount = 0
+        frameStatsWaveformLastGoodHoldCount = 0
+        frameStatsWaveformResidentMissCount = 0
+        frameStatsWaveformHotPathViolationCount = 0
+        frameStatsWaveformHotPathReason = ""
+        frameStatsGPUResidentWaveformMode = WaveformGPUResidentWaveformsFeatureFlags.modeDescription
+        frameStatsGPUResidentShadowSourceCount = 0
+        frameStatsGPUResidentShadowRequestCount = 0
+        frameStatsGPUResidentShadowVisibleTileCount = 0
+        frameStatsGPUResidentShadowDrawBatchCount = 0
+        frameStatsGPUResidentShadowDrawInstanceCount = 0
         frameStatsEffectVertexCount = 0
         frameStatsEffectDroppedVertexCount = 0
         frameStatsTransientParticleCount = transientParticles.count
@@ -5222,8 +5800,161 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
 
     private func selectionDragStrength(for velocityPixelsPerSecond: Float) -> Float {
-        let range = max(selectionDragFullEffectSpeed - selectionDragMinimumEffectSpeed, 1)
-        return smoothStep((velocityPixelsPerSecond - selectionDragMinimumEffectSpeed) / range)
+        let tuning = selectionDragWaveformTuning
+        guard velocityPixelsPerSecond > selectionDragMotionEpsilonPixelsPerSecond else {
+            return 0
+        }
+
+        let range = max(tuning.fullSpeedPixelsPerSecond - tuning.minimumSpeedPixelsPerSecond, 1)
+        let speedEnergy = smoothStep((velocityPixelsPerSecond - tuning.minimumSpeedPixelsPerSecond) / range)
+        return min(max(selectionDragSlowContactStrengthFloor + (1 - selectionDragSlowContactStrengthFloor) * speedEnergy, 0), 1)
+    }
+
+    private func isSelectionDragEffectActive(
+        _ effect: SelectionDragEffect?,
+        displayTimestamp: CFTimeInterval
+    ) -> Bool {
+        guard let effect else {
+            return false
+        }
+
+        return effect.selection.durationProgress > 0 &&
+            displayTimestamp - effect.timestamp <= max(
+                selectionDragEffectFadeDuration,
+                selectionDragWaveformTuning.contactLifetime
+            )
+    }
+
+    private func selectionDragWaveformTuningVectors(
+        drawableSize: CGSize,
+        renderState: TimelineRenderState
+    ) -> (primary: SIMD4<Float>, secondary: SIMD4<Float>) {
+        let tuning = selectionDragWaveformTuning
+        let width = Float(max(drawableSize.width, 1))
+        let viewportDuration = renderState.viewport.durationProgress
+        let frontRadiusProgress = max(tuning.frontRadiusPixels / width * viewportDuration, 0.000_001)
+        let backRadiusProgress = max(tuning.backRadiusPixels / width * viewportDuration, 0.000_001)
+        let coreRadiusProgress = max(
+            tuning.contactCoreRadiusPixels / width * viewportDuration,
+            0.000_001
+        )
+        return (
+            SIMD4<Float>(
+                frontRadiusProgress,
+                backRadiusProgress,
+                coreRadiusProgress,
+                Float(tuning.maximumContactCount)
+            ),
+            SIMD4<Float>(
+                tuning.maximumExpansion,
+                tuning.maximumWhitening,
+                0,
+                0
+            )
+        )
+    }
+
+    private func selectionDragWaveformContactVectors(
+        _ contacts: [SelectionDragWaveformContact],
+        trackID: UUID,
+        displayTimestamp: CFTimeInterval
+    ) -> SelectionDragWaveformContactVectors {
+        let tuning = selectionDragWaveformTuning
+        let maximumCount = min(max(tuning.maximumContactCount, 0), 8)
+        guard maximumCount > 0, !contacts.isEmpty else {
+            return .empty
+        }
+
+        var eligibleVectors: [SIMD4<Float>] = []
+        eligibleVectors.reserveCapacity(min(contacts.count, 64))
+        for contact in contacts {
+            guard contact.trackID == nil || contact.trackID == trackID else {
+                continue
+            }
+
+            let age = max(displayTimestamp - contact.birthTimestamp, 0)
+            guard age <= tuning.contactLifetime else {
+                continue
+            }
+
+            let lifetimeProgress = min(max(Float(age / tuning.contactLifetime), 0), 1)
+            let inverseLifetimeProgress = max(1 - lifetimeProgress, 0)
+            let timeFade = inverseLifetimeProgress * inverseLifetimeProgress * (3 - 2 * inverseLifetimeProgress)
+            let strength = min(max(contact.strength * timeFade, 0), 1)
+            guard strength > selectionDragWaveformContactMinimumStrength else {
+                continue
+            }
+
+            eligibleVectors.append(SIMD4<Float>(
+                min(max(contact.progress, 0), 1),
+                strength,
+                contact.direction >= 0 ? 1 : -1,
+                1
+            ))
+        }
+
+        guard !eligibleVectors.isEmpty else {
+            return .empty
+        }
+
+        if eligibleVectors.count <= maximumCount {
+            return SelectionDragWaveformContactVectors(eligibleVectors)
+        }
+
+        var selectedVectors: [SIMD4<Float>] = []
+        selectedVectors.reserveCapacity(maximumCount)
+        let lastIndex = eligibleVectors.count - 1
+        for slot in 0..<maximumCount {
+            let position = maximumCount == 1 ?
+                Double(lastIndex) :
+                Double(slot) / Double(maximumCount - 1) * Double(lastIndex)
+            selectedVectors.append(eligibleVectors[min(max(Int(position.rounded()), 0), lastIndex)])
+        }
+
+        return SelectionDragWaveformContactVectors(selectedVectors)
+    }
+
+    private func selectionDragWaveformEffectBounds(
+        selection: TimelineSelection?,
+        contacts: [SelectionDragWaveformContact],
+        trackID: UUID,
+        displayTimestamp: CFTimeInterval
+    ) -> SIMD2<Float>? {
+        guard
+            let selection,
+            selection.durationProgress > 0,
+            selection.trackID == nil || selection.trackID == trackID
+        else {
+            return nil
+        }
+
+        let tuning = selectionDragWaveformTuning
+        var lower = selection.startProgressFloat
+        var upper = selection.endProgressFloat
+        for contact in contacts where contact.trackID == nil || contact.trackID == trackID {
+            let age = max(displayTimestamp - contact.birthTimestamp, 0)
+            guard age <= tuning.contactLifetime else {
+                continue
+            }
+
+            let lifetimeProgress = min(max(Float(age / tuning.contactLifetime), 0), 1)
+            let inverseLifetimeProgress = max(1 - lifetimeProgress, 0)
+            let timeFade = inverseLifetimeProgress * inverseLifetimeProgress * (3 - 2 * inverseLifetimeProgress)
+            let strength = min(max(contact.strength * timeFade, 0), 1)
+            guard strength > selectionDragWaveformContactMinimumStrength else {
+                continue
+            }
+
+            let progress = min(max(contact.progress, 0), 1)
+            lower = min(lower, progress)
+            upper = max(upper, progress)
+        }
+
+        guard upper > lower else {
+            return nil
+        }
+
+        return SIMD2<Float>(lower, upper)
     }
 
     private func makeSelectionDragEffectUniform(
@@ -5255,7 +5986,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let freshness = 1 - smoothStep(fadeProgress)
         let speedStrength = selectionDragStrength(for: effect.velocityPixelsPerSecond)
         let strength = speedStrength * freshness
-        guard strength > 0.015 else {
+        guard strength > 0.001 else {
             return nil
         }
 
@@ -5563,8 +6294,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             ))
         }
 
-        if selectionDragParticles.count > selectionDragParticleMaximumCount {
-            selectionDragParticles.removeFirst(selectionDragParticles.count - selectionDragParticleMaximumCount)
+        let particleMaximumCount = selectionDragWaveformTuning.particleLimit
+        if selectionDragParticles.count > particleMaximumCount {
+            selectionDragParticles.removeFirst(selectionDragParticles.count - particleMaximumCount)
         }
     }
 
@@ -9945,6 +10677,16 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float4 touch;
         float4 touch2;
         float4 touch3;
+        float4 selectionDrag;
+        float4 selectionDrag2;
+        float4 selectionDragContact0;
+        float4 selectionDragContact1;
+        float4 selectionDragContact2;
+        float4 selectionDragContact3;
+        float4 selectionDragContact4;
+        float4 selectionDragContact5;
+        float4 selectionDragContact6;
+        float4 selectionDragContact7;
         float4 deletionWarp;
     };
 
@@ -10011,6 +10753,16 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float4 touch;
         float4 touch2;
         float4 touch3;
+        float4 selectionDrag;
+        float4 selectionDrag2;
+        float4 selectionDragContact0;
+        float4 selectionDragContact1;
+        float4 selectionDragContact2;
+        float4 selectionDragContact3;
+        float4 selectionDragContact4;
+        float4 selectionDragContact5;
+        float4 selectionDragContact6;
+        float4 selectionDragContact7;
         float4 deletionWarp;
     };
 
@@ -10184,6 +10936,16 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         out.touch = uniform.touch;
         out.touch2 = uniform.touch2;
         out.touch3 = uniform.touch3;
+        out.selectionDrag = uniform.selectionDrag;
+        out.selectionDrag2 = uniform.selectionDrag2;
+        out.selectionDragContact0 = uniform.selectionDragContact0;
+        out.selectionDragContact1 = uniform.selectionDragContact1;
+        out.selectionDragContact2 = uniform.selectionDragContact2;
+        out.selectionDragContact3 = uniform.selectionDragContact3;
+        out.selectionDragContact4 = uniform.selectionDragContact4;
+        out.selectionDragContact5 = uniform.selectionDragContact5;
+        out.selectionDragContact6 = uniform.selectionDragContact6;
+        out.selectionDragContact7 = uniform.selectionDragContact7;
         out.deletionWarp = uniform.deletionWarp;
         return out;
     }
@@ -10572,28 +11334,21 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float clampedY = clamp(pixel.y, segmentTop, segmentBottom);
         float capsuleDistance = length(pixel - float2(edgeX, clampedY));
 
-        float coreWidth = 0.85 + 1.35 * strength;
         float glowWidth = 6.0 + 14.0 * strength;
-        float aa = 1.15;
-        float core = 1.0 - smoothstep(coreWidth, coreWidth + aa, capsuleDistance);
         float glow = exp(-(capsuleDistance * capsuleDistance) / max(glowWidth * glowWidth, 0.001));
         float aura = exp(-(capsuleDistance * capsuleDistance) / max(pow(glowWidth * 1.85, 2.0), 0.001));
 
-        float trailingSide = direction > 0.0 ? step(pixel.x, edgeX + 1.0) : step(edgeX - 1.0, pixel.x);
+        float trailingSide = direction > 0.0 ? step(pixel.x, edgeX) : step(edgeX, pixel.x);
+        float outsideDistance = direction > 0.0 ? max(pixel.x - edgeX, 0.0) : max(edgeX - pixel.x, 0.0);
+        float outsideWidth = 2.2 + 1.3 * strength;
+        float outsideLimiter = mix(
+            exp(-(outsideDistance * outsideDistance) / max(outsideWidth * outsideWidth, 0.001)),
+            1.0,
+            trailingSide
+        );
         float trailDistance = direction > 0.0 ? max(edgeX - pixel.x, 0.0) : max(pixel.x - edgeX, 0.0);
-        float particleWindow = trailingSide * smoothstep(halfWidthPixels, 0.0, trailDistance);
-        float2 cell = floor(float2(trailDistance / 7.0, pixel.y / 9.0));
-        float cellNoise = hash21(cell + float2(seed * 0.013, floor(age * 48.0)));
-        float sparkleMask = step(0.86 - strength * 0.10, cellNoise);
-        float2 cellCenter = (cell + float2(0.5, 0.5)) * float2(7.0, 9.0);
-        float cellDistance = length(float2(trailDistance, pixel.y) - cellCenter);
-        float sparkle = sparkleMask *
-            (1.0 - smoothstep(0.0, 2.2 + 1.4 * strength, cellDistance)) *
-            particleWindow *
-            (0.10 + 0.30 * strength);
-
-        float alpha = in.color.a * strength * (core * 0.95 + glow * 0.35 + aura * 0.10 + sparkle);
-        float3 glowColor = mix(float3(0.22, 0.86, 1.0), float3(1.0), min(core * 0.75 + sparkle, 1.0));
+        float alpha = in.color.a * strength * outsideLimiter * (glow * 0.32 + aura * 0.12);
+        float3 glowColor = mix(float3(0.22, 0.86, 1.0), float3(1.0), min(glow * 0.18, 1.0));
         float3 color = mix(in.color.rgb, glowColor, 0.42 + 0.36 * strength);
         return float4(color, clamp(alpha, 0.0, 1.0));
     }
@@ -10823,6 +11578,117 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         return x + width * slide;
     }
 
+    static float2 selection_drag_contact_influence(
+        float timelineProgress,
+        float4 contact,
+        float4 tuning
+    ) {
+        if (contact.w <= 0.0 || contact.y <= 0.0001 || abs(contact.z) < 0.5) {
+            return float2(0.0);
+        }
+
+        float offset = timelineProgress - contact.x;
+        float signedOffset = offset * contact.z;
+        float frontSide = step(0.0, signedOffset);
+        float radius = mix(max(tuning.y, 0.0000001), max(tuning.x, 0.0000001), frontSide);
+        float sideScale = mix(0.95, 0.28, frontSide);
+        float lightScale = mix(0.78, 0.20, frontSide);
+        float exponent = mix(1.58, 2.90, frontSide);
+        float sideRatio = abs(offset) / radius;
+        float sideContact = exp(-pow(sideRatio, exponent));
+
+        float coreRadius = max(tuning.z, 0.0000001);
+        float coreRatio = abs(offset) / coreRadius;
+        float coreContact = exp(-pow(coreRatio, 2.0));
+        float strength = clamp(contact.y, 0.0, 1.0);
+        float geometry = max(sideContact * sideScale, coreContact) * strength;
+        float light = max(sideContact * lightScale, coreContact * 0.92) * strength;
+        return clamp(float2(geometry, light), float2(0.0), float2(1.0));
+    }
+
+    static float2 selection_drag_segment_influence(
+        float timelineProgress,
+        float4 previousContact,
+        float4 contact,
+        float4 tuning
+    ) {
+        if (previousContact.w <= 0.0 ||
+            contact.w <= 0.0 ||
+            previousContact.y <= 0.0001 ||
+            contact.y <= 0.0001) {
+            return float2(0.0);
+        }
+
+        float span = contact.x - previousContact.x;
+        if (abs(span) <= 0.0000001) {
+            return float2(0.0);
+        }
+
+        float segmentStart = min(previousContact.x, contact.x);
+        float segmentEnd = max(previousContact.x, contact.x);
+        float edgeSoftness = max(min(tuning.x, tuning.y) * 0.45, 0.0000001);
+        float coverage =
+            smoothstep(segmentStart, segmentStart + edgeSoftness, timelineProgress) *
+            (1.0 - smoothstep(segmentEnd - edgeSoftness, segmentEnd, timelineProgress));
+        if (coverage <= 0.0001) {
+            return float2(0.0);
+        }
+
+        float segmentT = clamp((timelineProgress - previousContact.x) / span, 0.0, 1.0);
+        float strength = mix(previousContact.y, contact.y, segmentT);
+        float geometry = strength * coverage * 0.58;
+        float light = strength * coverage * 0.42;
+        return clamp(float2(geometry, light), float2(0.0), float2(1.0));
+    }
+
+    static float2 selection_drag_waveform_influence(
+        float timelineProgress,
+        WaveformRasterizedVertex vertexIn
+    ) {
+        float selectionStart = min(vertexIn.selectionDrag2.z, vertexIn.selectionDrag2.w);
+        float selectionEnd = max(vertexIn.selectionDrag2.z, vertexIn.selectionDrag2.w);
+        if (selectionEnd <= selectionStart ||
+            timelineProgress < selectionStart ||
+            timelineProgress > selectionEnd) {
+            return float2(0.0);
+        }
+
+        float2 influence = float2(0.0);
+        float count = clamp(vertexIn.selectionDrag.w, 0.0, 8.0);
+        if (count > 0.5) {
+            influence = max(influence, selection_drag_contact_influence(timelineProgress, vertexIn.selectionDragContact0, vertexIn.selectionDrag));
+        }
+        if (count > 1.5) {
+            influence = max(influence, selection_drag_contact_influence(timelineProgress, vertexIn.selectionDragContact1, vertexIn.selectionDrag));
+            influence = max(influence, selection_drag_segment_influence(timelineProgress, vertexIn.selectionDragContact0, vertexIn.selectionDragContact1, vertexIn.selectionDrag));
+        }
+        if (count > 2.5) {
+            influence = max(influence, selection_drag_contact_influence(timelineProgress, vertexIn.selectionDragContact2, vertexIn.selectionDrag));
+            influence = max(influence, selection_drag_segment_influence(timelineProgress, vertexIn.selectionDragContact1, vertexIn.selectionDragContact2, vertexIn.selectionDrag));
+        }
+        if (count > 3.5) {
+            influence = max(influence, selection_drag_contact_influence(timelineProgress, vertexIn.selectionDragContact3, vertexIn.selectionDrag));
+            influence = max(influence, selection_drag_segment_influence(timelineProgress, vertexIn.selectionDragContact2, vertexIn.selectionDragContact3, vertexIn.selectionDrag));
+        }
+        if (count > 4.5) {
+            influence = max(influence, selection_drag_contact_influence(timelineProgress, vertexIn.selectionDragContact4, vertexIn.selectionDrag));
+            influence = max(influence, selection_drag_segment_influence(timelineProgress, vertexIn.selectionDragContact3, vertexIn.selectionDragContact4, vertexIn.selectionDrag));
+        }
+        if (count > 5.5) {
+            influence = max(influence, selection_drag_contact_influence(timelineProgress, vertexIn.selectionDragContact5, vertexIn.selectionDrag));
+            influence = max(influence, selection_drag_segment_influence(timelineProgress, vertexIn.selectionDragContact4, vertexIn.selectionDragContact5, vertexIn.selectionDrag));
+        }
+        if (count > 6.5) {
+            influence = max(influence, selection_drag_contact_influence(timelineProgress, vertexIn.selectionDragContact6, vertexIn.selectionDrag));
+            influence = max(influence, selection_drag_segment_influence(timelineProgress, vertexIn.selectionDragContact5, vertexIn.selectionDragContact6, vertexIn.selectionDrag));
+        }
+        if (count > 7.5) {
+            influence = max(influence, selection_drag_contact_influence(timelineProgress, vertexIn.selectionDragContact7, vertexIn.selectionDrag));
+            influence = max(influence, selection_drag_segment_influence(timelineProgress, vertexIn.selectionDragContact6, vertexIn.selectionDragContact7, vertexIn.selectionDrag));
+        }
+        return clamp(influence, float2(0.0), float2(1.0));
+    }
+
     fragment float4 waveform_fragment(
         WaveformRasterizedVertex in [[stage_in]],
         constant WaveformShaderBin *bins [[buffer(1)]],
@@ -10891,9 +11757,18 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 in.touch2.w
             ) * touchEnergy;
         }
-        geometryInfluence *= touchSignalEnergy;
-        lightInfluence *= touchSignalEnergy;
-        float expansion = 1.0 + 0.30 * geometryInfluence;
+        float playheadGeometryInfluence = geometryInfluence * touchSignalEnergy;
+        float playheadLightInfluence = lightInfluence * touchSignalEnergy;
+
+        float2 dragInfluence = selection_drag_waveform_influence(timelineProgress, in);
+        float dragGeometryInfluence = dragInfluence.x * touchSignalEnergy;
+        float dragLightInfluence = dragInfluence.y * touchSignalEnergy;
+
+        geometryInfluence = max(playheadGeometryInfluence, dragGeometryInfluence);
+        lightInfluence = max(playheadLightInfluence, dragLightInfluence);
+        float expansion = 1.0 +
+            0.30 * playheadGeometryInfluence +
+            in.selectionDrag2.x * dragGeometryInfluence;
 
         float peakTop = centerY - maximumSample * amplitudeHeight * expansion;
         float peakBottom = centerY - minimumSample * amplitudeHeight * expansion;
@@ -10914,7 +11789,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float alphaScale = clamp(in.baseColor.a * opacity, 0.0, 1.0);
         float4 baseColor = waveform_base_color(bin, in.baseColor.r, alphaScale, in.style.x);
         if (lightInfluence > 0.001) {
-            baseColor = lightened_color(baseColor, min(lightInfluence * 0.72, 1.0), alphaScale);
+            float dragLightScale = mix(0.72, clamp(in.selectionDrag2.y, 0.0, 1.0), step(0.001, dragLightInfluence));
+            baseColor = lightened_color(baseColor, min(lightInfluence * dragLightScale, 1.0), alphaScale);
         }
         float4 color = float4(0.0);
 

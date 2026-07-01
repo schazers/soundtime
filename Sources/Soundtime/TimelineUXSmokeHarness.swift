@@ -238,7 +238,7 @@ enum TimelineUXSmokeHarness {
             backingScale: backingScale,
             frameStatsBox: frameStatsBox
         )
-        complete("render-loop frame stats publish during interaction/playback")
+        complete("render-loop hot frames publish without CPU waveform fallback")
 
         try MainActor.assumeIsolated {
             try verifyMainFPSGraphPixels()
@@ -1309,6 +1309,15 @@ enum TimelineUXSmokeHarness {
         renderer.displaySelection(nil)
         try require(!frameStatsBox.samples.isEmpty, "renderer never published frame stats during liveness smoke")
         try require((frameStatsBox.samples.last?.framesPerSecond ?? 0) > 0, "renderer published non-positive FPS")
+        let hotSamples = frameStatsBox.samples.filter { !$0.waveformHotPathReason.isEmpty }
+        try require(!hotSamples.isEmpty, "renderer never marked playback/interaction frames as hot")
+        let cpuFallbackSamples = hotSamples.filter {
+            $0.cpuWaveformVertexCount > 0 || $0.waveformFallbackDrawCount > 0
+        }
+        try require(
+            cpuFallbackSamples.isEmpty,
+            "hot render loop used CPU waveform fallback in \(cpuFallbackSamples.count) frames"
+        )
     }
 
     @MainActor
