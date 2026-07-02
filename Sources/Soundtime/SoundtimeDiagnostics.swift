@@ -112,6 +112,7 @@ final class SoundtimeDiagnostics: @unchecked Sendable {
                 "shaderUploads": "\(stats.shaderBufferUploadCount)",
                 "shaderUploadBytes": "\(stats.shaderBufferUploadByteCount)",
                 "shaderMB": "\(stats.shaderBufferByteCount / 1_048_576)",
+                "cpuFallbackDraws": "\(stats.cpuWaveformFallbackDrawCount)",
                 "fallbackDraws": "\(stats.waveformFallbackDrawCount)",
                 "lastGoodHolds": "\(stats.waveformLastGoodHoldCount)",
                 "residentMisses": "\(stats.waveformResidentMissCount)",

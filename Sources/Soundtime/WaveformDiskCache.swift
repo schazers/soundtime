@@ -374,7 +374,7 @@ private struct EditedWaveformOverviewDiskCacheManifest: Codable, Equatable, Send
 }
 
 final class WaveformOverviewDiskCacheStore: @unchecked Sendable {
-    static let maximumCachedBinCount = 262_144
+    static let maximumCachedBinCount = 4_194_304
 
     private let rootDirectory: URL
     private let fileManager: FileManager
@@ -456,16 +456,23 @@ final class WaveformOverviewDiskCacheStore: @unchecked Sendable {
         maximumBinCount: Int? = maximumCachedBinCount
     ) throws -> WaveformOverviewDiskCacheEntry? {
         let fingerprint = try WaveformFileFingerprint(url: url, wavFileInfo: fileInfo)
+        let manifest: WaveformOverviewDiskCacheManifest
+        let level: WaveformOverviewDiskCacheManifest.Level
         lock.lock()
-        defer {
+        do {
+            guard
+                let loadedManifest = try loadManifestLocked(for: fingerprint),
+                let selectedLevel = loadedManifest.bestLevel(maximumBinCount: maximumBinCount)
+            else {
+                lock.unlock()
+                return nil
+            }
+            manifest = loadedManifest
+            level = selectedLevel
             lock.unlock()
-        }
-
-        guard
-            let manifest = try loadManifestLocked(for: fingerprint),
-            let level = manifest.bestLevel(maximumBinCount: maximumBinCount)
-        else {
-            return nil
+        } catch {
+            lock.unlock()
+            throw error
         }
 
         let overview = try loadOverviewLocked(
@@ -562,11 +569,6 @@ final class WaveformOverviewDiskCacheStore: @unchecked Sendable {
             fileName: "overview-\(targetBinCount)-\(overview.bins.count).bin"
         )
 
-        lock.lock()
-        defer {
-            lock.unlock()
-        }
-
         let directory = cacheDirectory(for: fingerprint)
         try fileManager.createDirectory(
             at: directory,
@@ -574,6 +576,11 @@ final class WaveformOverviewDiskCacheStore: @unchecked Sendable {
         )
         let payload = WaveformOverviewBinaryCodec.encode(overview)
         try payload.write(to: overviewLevelURL(for: fingerprint, level: level), options: [.atomic])
+
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
 
         let existingLevels = (try? loadManifestLocked(for: fingerprint))?.levels ?? []
         let mergedLevels = (existingLevels.filter {

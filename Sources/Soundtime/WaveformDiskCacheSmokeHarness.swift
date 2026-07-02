@@ -139,6 +139,7 @@ enum WaveformDiskCacheSmokeHarness {
         let store = WaveformOverviewDiskCacheStore(rootDirectory: rootDirectory)
         let coarseOverview = makeOverview(duration: fileInfo.duration, binCount: 64)
         let fineOverview = makeOverview(duration: fileInfo.duration, binCount: 128)
+        let highResolutionOverview = makeOverview(duration: fileInfo.duration, binCount: 300_000)
 
         try store.saveOverview(
             coarseOverview,
@@ -152,13 +153,19 @@ enum WaveformDiskCacheSmokeHarness {
             samplesPerBin: 4,
             fileInfo: fileInfo
         )
+        try store.saveOverview(
+            highResolutionOverview,
+            targetBinCount: 300_000,
+            samplesPerBin: 2,
+            fileInfo: fileInfo
+        )
 
         let loaded = try requireValue(
             store.loadBestOverview(for: wavURL, fileInfo: fileInfo),
             "overview cache did not load"
         )
-        try require(loaded.level.actualBinCount == 128, "overview cache did not choose the finest level")
-        try requireOverviewsMatch(loaded.overview, fineOverview)
+        try require(loaded.level.actualBinCount == 300_000, "overview cache did not choose the high-resolution level")
+        try requireOverviewsMatch(loaded.overview, highResolutionOverview)
 
         let loadedCoarse = try requireValue(
             store.loadBestOverview(for: wavURL, fileInfo: fileInfo, maximumBinCount: 64),

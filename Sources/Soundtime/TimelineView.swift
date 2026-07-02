@@ -78,6 +78,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onTrimRequested: ((TimelineTrimRange) -> Void)?
     var onClipBoundaryTrimRequested: ((TimelineClipBoundaryTrim) -> Void)?
     var onFrameStatsChanged: ((TimelineFrameStats) -> Void)?
+    var onViewportChanged: ((TimelineViewport) -> Void)?
     var onTimelineInteractionBegan: (() -> Void)?
     var onTrackLaneLayoutChanged: ((ResolvedTimelineTrackLayout) -> Void)?
     var onLoopRangeChanged: ((TimelineLoopRange) -> Void)?
@@ -312,7 +313,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
     }
 
-    func displayTracks(_ tracks: [TimelineRenderState.Track], animateWaveformTransition: Bool = true) {
+    func displayTracks(
+        _ tracks: [TimelineRenderState.Track],
+        animateWaveformTransition: Bool = true,
+        allowImmediateWaveformPrewarm: Bool = true
+    ) {
         let previousTimelineDuration = timelineDuration
         let previousViewport = viewport
         currentTrackIDs = tracks.map(\.id)
@@ -340,7 +345,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
         updateTrackLayoutForCurrentBounds(requestRender: false)
         updateTimelineRenderer { renderer in
-            renderer.displayTracks(tracks, animateWaveformTransition: animateWaveformTransition)
+            renderer.displayTracks(
+                tracks,
+                animateWaveformTransition: animateWaveformTransition,
+                allowImmediateWaveformPrewarm: allowImmediateWaveformPrewarm
+            )
         }
         requestTimelineRender()
         displayTrimPreview(nil)
@@ -2553,6 +2562,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         viewport = nextViewport
+        onViewportChanged?(nextViewport)
         timelineRenderer?.publishInteractionViewport(nextViewport)
         window?.invalidateCursorRects(for: self)
         if kicksImmediateRender {

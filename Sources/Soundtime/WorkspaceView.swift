@@ -206,7 +206,6 @@ final class WorkspaceView: NSView {
                     "deltaMs": String(format: "%.3f", deltaMilliseconds),
                 ].merging(fields) { _, new in new }
             )
-            refreshDevelopmentConsoleSoon()
         }
 
         func markAfterRenderSubmitted(
@@ -226,13 +225,6 @@ final class WorkspaceView: NSView {
                     "elapsedMs": String(format: "%.3f", (submittedAt - startedAt) * 1_000),
                 ].merging(fields) { _, new in new }
             )
-            refreshDevelopmentConsoleSoon()
-        }
-
-        private func refreshDevelopmentConsoleSoon() {
-            DispatchQueue.main.async {
-                PerformanceDashboardWindowController.refreshIfVisible()
-            }
         }
     }
 
@@ -732,7 +724,7 @@ final class WorkspaceView: NSView {
     private let selectionDragParticleLimitControl = TimelineTuningSliderView(
         title: "Contacts",
         value: Double(SelectionDragTuningDefaults.value.maximumContactCount),
-        range: 0...8,
+        range: 0...4,
         valueFormat: "%.0f"
     )
     private let selectionDragTuningPanel = DebugTuningPanelView()
@@ -779,6 +771,9 @@ final class WorkspaceView: NSView {
     private let autosaveDelay: TimeInterval = 1.5
     private var autosaveWorkItem: DispatchWorkItem?
     private var autosaveGeneration = 0
+    private let viewportPersistenceDelay: TimeInterval = 0.2
+    private var viewportPersistenceWorkItem: DispatchWorkItem?
+    private var latestTimelineViewportForPersistence: SoundtimeProject.TimelineViewport?
     private var projectSaveGeneration = 0
     private var isAutosaveSuppressed = false
     private let cpuUsageSampler = ProcessCPUUsageSampler()
@@ -1114,6 +1109,9 @@ final class WorkspaceView: NSView {
         timelineSurface.onFrameStatsChanged = { [weak self] frameStats in
             self?.updateFrameStats(frameStats)
         }
+        timelineSurface.onViewportChanged = { [weak self] viewport in
+            self?.timelineViewportDidChange(viewport)
+        }
         timelineSurface.onTimelineInteractionBegan = { [weak self] in
             self?.clearSelectedTrack()
         }
@@ -1399,6 +1397,7 @@ final class WorkspaceView: NSView {
     }
 
     private func tearDownRuntimeState() {
+        persistLatestTimelineViewport(flushImmediately: true)
         PerformanceDashboardWindowController.closeIfLoaded()
         if let keyDownMonitor {
             NSEvent.removeMonitor(keyDownMonitor)
@@ -1890,14 +1889,16 @@ final class WorkspaceView: NSView {
 
     private func refreshProjectTimelineDisplay(
         rebuildControls: Bool = true,
-        animateWaveformTransition: Bool = true
+        animateWaveformTransition: Bool = true,
+        allowImmediateWaveformPrewarm: Bool = true
     ) {
         if !isDenoiseModalInteractionLocked, activeDenoiseRequestID == nil, pendingDenoiseReview == nil {
             timelineSurface.setInteractionSuppressed(false)
         }
         timelineSurface.displayTracks(
             timelineRenderTracks(),
-            animateWaveformTransition: animateWaveformTransition
+            animateWaveformTransition: animateWaveformTransition,
+            allowImmediateWaveformPrewarm: allowImmediateWaveformPrewarm
         )
         publishSelectedTracksToTimeline()
         if rebuildControls {
@@ -3516,7 +3517,7 @@ final class WorkspaceView: NSView {
         } else {
             persistedFileTimeline = nil
         }
-        let shouldCheckLaunchCacheSynchronously = !isLoadingProject && settings == nil
+        let shouldCheckLaunchCacheSynchronously = settings == nil || isLoadingProject
         let cachedLaunchEntry = shouldCheckLaunchCacheSynchronously ? fileInfo.flatMap { fileInfo in
             cachedWaveformOverviewForLaunch(
                 at: url,
@@ -4804,6 +4805,35 @@ final class WorkspaceView: NSView {
         return projectTracks.reduce(TimeInterval(0)) { result, track in
             max(result, trackDuration(for: track))
         }
+    }
+
+    private func playbackProgress(forTimelineTime timelineTime: TimeInterval) -> Float {
+        guard displayedDuration > 0 else {
+            return 0
+        }
+
+        let clampedTime = min(max(timelineTime, 0), displayedDuration)
+        return min(max(Float(clampedTime / displayedDuration), 0), 1)
+    }
+
+    private func snapPlayheadVisuals(
+        toTimelineTime timelineTime: TimeInterval,
+        isPlaying: Bool,
+        synchronizesRenderer: Bool
+    ) {
+        let progress = playbackProgress(forTimelineTime: timelineTime)
+        currentPlayheadFrame = Int(
+            (Double(progress) * Double(max(displayedFrameCount, 0))).rounded(.down)
+        )
+        previousLoopPlaybackProgress = nil
+        displayPlaybackVisuals(
+            progress: progress,
+            isPlaying: isPlaying,
+            syncPlayhead: true,
+            anchorTimestamp: CACurrentMediaTime(),
+            synchronizesRenderer: synchronizesRenderer
+        )
+        updateTimeReadout()
     }
 
     private func fullTrackDisplaySelection(for trackID: UUID) -> TimelineSelection {
@@ -8659,6 +8689,28 @@ final class WorkspaceView: NSView {
             return
         }
 
+        let immediatePlaybackProgress = displaySelectionToDelete.startProgressFloat
+        let wasPlayingAtDelete = playbackController.isPlaying
+        currentPlayheadFrame = Int(
+            (Double(immediatePlaybackProgress) * Double(max(displayedFrameCount, 0))).rounded(.down)
+        )
+        previousLoopPlaybackProgress = nil
+        displayPlaybackVisuals(
+            progress: immediatePlaybackProgress,
+            isPlaying: wasPlayingAtDelete,
+            syncPlayhead: true,
+            anchorTimestamp: CACurrentMediaTime(),
+            synchronizesRenderer: true
+        )
+        trace.mark(
+            "playhead-snapped-to-delete-start",
+            message: "Snapped the visible playhead to the delete start before running the delete animation.",
+            fields: [
+                "startProgress": String(format: "%.9f", immediatePlaybackProgress),
+                "currentPlayheadFrame": "\(currentPlayheadFrame)",
+            ]
+        )
+
         SoundtimeDiagnostics.shared.record(
             category: .edit,
             severity: .info,
@@ -8858,7 +8910,20 @@ final class WorkspaceView: NSView {
                 }
                 self.postDeleteRefreshWorkItem = nil
                 self.timelineSurface.clearDeletionEffects()
-                self.refreshProjectTimelineDisplay(rebuildControls: false, animateWaveformTransition: false)
+                self.refreshProjectTimelineDisplay(
+                    rebuildControls: false,
+                    animateWaveformTransition: false,
+                    allowImmediateWaveformPrewarm: false
+                )
+                if wasPlayingAtDelete {
+                    self.refreshPlaybackProgress(syncPlayheadWhenPlaying: true)
+                } else {
+                    self.snapPlayheadVisuals(
+                        toTimelineTime: targetPlaybackTime,
+                        isPlaying: false,
+                        synchronizesRenderer: true
+                    )
+                }
             }
             self.postDeleteRefreshWorkItem?.cancel()
             self.postDeleteRefreshWorkItem = workItem
@@ -8905,7 +8970,6 @@ final class WorkspaceView: NSView {
                 "resumeIfPlaying": "\(playbackController.isPlaying)",
             ]
         )
-        let wasPlayingAtDelete = playbackController.isPlaying
         if wasPlayingAtDelete {
             reloadPlaybackFromProjectTracks(
                 preserveProgress: false,
@@ -11157,6 +11221,18 @@ final class WorkspaceView: NSView {
 
     private func beginDeleteAnimationCriticalSection() -> Int {
         cancelPendingPostDeleteRefresh()
+        scheduledPlaybackReloadWorkItem?.cancel()
+        scheduledPlaybackReloadWorkItem = nil
+        for task in editMaterializationTasks.values {
+            task.cancel()
+        }
+        editMaterializationTasks.removeAll()
+        editMaterializationRequestIDs.removeAll()
+        for task in editWaveformRefinementTasks.values {
+            task.cancel()
+        }
+        editWaveformRefinementTasks.removeAll()
+        editWaveformRefinementRequestIDs.removeAll()
         for task in optimisticDeleteWaveformTasks.values {
             task.cancel()
         }
@@ -11165,7 +11241,7 @@ final class WorkspaceView: NSView {
         deleteAnimationGeneration += 1
         deleteAutosaveProtectedUntil = max(
             deleteAutosaveProtectedUntil,
-            CACurrentMediaTime() + deletePostAnimationDisplayRefreshDelay + 0.20
+            CACurrentMediaTime() + max(deletePostAnimationDisplayRefreshDelay, deleteMaterializationDelay) + 0.25
         )
         if autosaveWorkItem != nil {
             scheduleAutosaveIfNeeded()
@@ -11573,6 +11649,7 @@ final class WorkspaceView: NSView {
     }
 
     func persistCurrentProjectWindowLayout() {
+        persistLatestTimelineViewport(flushImmediately: true)
         guard
             let currentProjectURL,
             let layout = currentWindowLayout()
@@ -11581,6 +11658,50 @@ final class WorkspaceView: NSView {
         }
 
         SoundtimeProjectStore.rememberWindowLayout(layout, for: currentProjectURL)
+    }
+
+    private func timelineViewportDidChange(_ viewport: TimelineViewport) {
+        guard
+            !isAutosaveSuppressed,
+            !isLoadingProject,
+            !projectTracks.isEmpty,
+            let projectViewport = projectTimelineViewport(for: viewport)
+        else {
+            return
+        }
+
+        latestTimelineViewportForPersistence = projectViewport
+        scheduleTimelineViewportPersistence()
+        scheduleAutosaveIfNeeded()
+    }
+
+    private func scheduleTimelineViewportPersistence() {
+        viewportPersistenceWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.persistLatestTimelineViewport()
+        }
+        viewportPersistenceWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + viewportPersistenceDelay, execute: workItem)
+    }
+
+    private func persistLatestTimelineViewport(flushImmediately: Bool = false) {
+        viewportPersistenceWorkItem?.cancel()
+        viewportPersistenceWorkItem = nil
+
+        guard let currentProjectURL else {
+            return
+        }
+
+        let viewport = latestTimelineViewportForPersistence ?? currentTimelineViewport()
+        guard let viewport else {
+            return
+        }
+
+        latestTimelineViewportForPersistence = viewport
+        SoundtimeProjectStore.rememberTimelineViewport(viewport, for: currentProjectURL)
+        if flushImmediately {
+            UserDefaults.standard.synchronize()
+        }
     }
 
     private func scheduleAutosaveIfNeeded() {
@@ -11708,7 +11829,9 @@ final class WorkspaceView: NSView {
             SoundtimeProjectStore.rememberLastProjectURL(url)
             applyWindowLayout(SoundtimeProjectStore.rememberedWindowLayout(for: url) ?? project.windowLayout)
             applyProjectMasterVolume(project.masterVolume)
-            applyProjectTimelineViewport(project.timelineViewport)
+            applyProjectTimelineViewport(
+                SoundtimeProjectStore.rememberedTimelineViewport(for: url) ?? project.timelineViewport
+            )
             resetWaveformFisheyeTuningToDefaults()
             isLoadingProject = true
             for track in project.tracks {
@@ -11760,6 +11883,9 @@ final class WorkspaceView: NSView {
     }
 
     private func clearProjectForLoad() {
+        viewportPersistenceWorkItem?.cancel()
+        viewportPersistenceWorkItem = nil
+        latestTimelineViewportForPersistence = nil
         deleteAllOwnedSourceFiles()
         playbackController.clear()
         projectTracks.removeAll()
@@ -11896,7 +12022,10 @@ final class WorkspaceView: NSView {
     }
 
     private func currentTimelineViewport() -> SoundtimeProject.TimelineViewport? {
-        let viewport = timelineSurface.currentViewport
+        projectTimelineViewport(for: timelineSurface.currentViewport)
+    }
+
+    private func projectTimelineViewport(for viewport: TimelineViewport) -> SoundtimeProject.TimelineViewport? {
         guard
             viewport.startProgress.isFinite,
             viewport.durationProgress.isFinite,

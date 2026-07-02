@@ -145,6 +145,7 @@ enum ProjectEditRoundTripSmokeHarness {
                 abs((decodedProject.timelineViewport?.durationProgress ?? -1) - 0.23) < 0.000_001,
             "timeline viewport did not persist"
         )
+        try requireRememberedTimelineViewportRoundTrip()
 
         let decodedState = try requireValue(decodedTrack.editTimeline, "project dropped edit timeline")
         try requirePersistentStatesMatch(originalState, decodedState)
@@ -184,6 +185,7 @@ enum ProjectEditRoundTripSmokeHarness {
                 "restored timeline renders audio identical to original edits",
                 "legacy projects migrate and decode",
                 "autosave recovery preserves saved launch waveform previews",
+                "remembered timeline viewport round-trips",
                 "multi-track edit graph stress round-trips",
             ],
             metadata: [
@@ -297,6 +299,25 @@ enum ProjectEditRoundTripSmokeHarness {
         try require(
             recoveredPreview.displayOverview.bins.count == waveformPreview.displayOverview.bins.count,
             "autosave recovery preview bin count mismatch"
+        )
+    }
+
+    private static func requireRememberedTimelineViewportRoundTrip() throws {
+        let projectURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SoundtimeRememberedViewport-\(UUID().uuidString)")
+            .appendingPathExtension(SoundtimeProjectStore.fileExtension)
+        let viewport = SoundtimeProject.TimelineViewport(startProgress: 0.42, durationProgress: 0.18)
+
+        SoundtimeProjectStore.rememberTimelineViewport(viewport, for: projectURL)
+        let restored = try requireValue(
+            SoundtimeProjectStore.rememberedTimelineViewport(for: projectURL),
+            "remembered timeline viewport was not found"
+        )
+
+        try require(
+            abs(restored.startProgress - viewport.startProgress) < 0.000_001 &&
+                abs(restored.durationProgress - viewport.durationProgress) < 0.000_001,
+            "remembered timeline viewport did not round-trip"
         )
     }
 

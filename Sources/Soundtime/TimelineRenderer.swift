@@ -17,6 +17,7 @@ struct TimelineFrameStats: Equatable, Sendable {
     let shaderBufferByteCount: Int
     let shaderBufferUploadInFlightCount: Int
     let waveformMipCacheCount: Int
+    let cpuWaveformFallbackDrawCount: Int
     let waveformFallbackDrawCount: Int
     let waveformLastGoodHoldCount: Int
     let waveformResidentMissCount: Int
@@ -46,7 +47,7 @@ struct SelectionDragWaveformTuning: Equatable, Sendable {
     var contactCoreRadiusPixels: Float = 3
     var maximumExpansion: Float = 0.38
     var maximumWhitening: Float = 0.65
-    var maximumContactCount: Int = 8
+    var maximumContactCount: Int = 4
     var particleLimit: Int = 56
 
     var sanitized: SelectionDragWaveformTuning {
@@ -62,7 +63,7 @@ struct SelectionDragWaveformTuning: Equatable, Sendable {
         tuning.contactCoreRadiusPixels = min(max(tuning.contactCoreRadiusPixels, 1), 24)
         tuning.maximumExpansion = min(max(tuning.maximumExpansion, 0), 1.4)
         tuning.maximumWhitening = min(max(tuning.maximumWhitening, 0), 1)
-        tuning.maximumContactCount = min(max(tuning.maximumContactCount, 0), 8)
+        tuning.maximumContactCount = min(max(tuning.maximumContactCount, 0), 4)
         tuning.particleLimit = min(max(tuning.particleLimit, 0), 160)
         return tuning
     }
@@ -247,6 +248,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         var current: WaveformShaderDrawable
         var previous: WaveformShaderDrawable?
         var startedAt: CFTimeInterval
+    }
+
+    private struct PendingWaveformShaderBinPublish {
+        let bins: [WaveformShaderBin]
+        let generation: Int?
+        let byteCount: Int
     }
 
     private struct WaveformShaderBufferAllocation {
@@ -681,6 +688,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let visualAnchor: SIMD4<Float>
         let capturedBinBuffer: MTLBuffer?
         let capturedBinCount: Int
+        let capturedEnergySamples: [Float]
         var birthTimestamp: CFTimeInterval
         let seed: UInt64
     }
@@ -1087,7 +1095,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let additivePipelineState: MTLRenderPipelineState
     private let selectionDragEffectPipelineState: MTLRenderPipelineState
     private let deletionEffectPipelineState: MTLRenderPipelineState
-    private let deletionParticlePipelineState: MTLRenderPipelineState
     private let dynamicVertexBufferRing: DynamicVertexBufferRing
     private let waveformQuadVertexBuffer: MTLBuffer
     private let waveformGeometryQueue = DispatchQueue(
@@ -1111,6 +1118,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var previousTrackWaveformMipLevels: [UUID: [WaveformMipLevel]] = [:]
     private let waveformMipLevelStateLock = NSLock()
     private let waveformCPUFallbackInteractionCooldown: CFTimeInterval = 0.35
+    private let gpuResidentShadowInteractionCooldown: CFTimeInterval = 0.45
     private let processingSelectionProgressSmoothingDuration: CFTimeInterval = 0.42
     private var lastWaveformHotInteractionTimestamp: CFTimeInterval = -Double.infinity
     private var waveformSourceTracksByID: [UUID: TimelineRenderState.Track] = [:]
@@ -1124,6 +1132,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var pendingCompleteWaveformMipLevels: [WaveformMipCacheKey: [WaveformMipLevel]] = [:]
     private let waveformMipLevelCacheLock = NSLock()
     private let waveformShaderBufferStore: WaveformShaderBufferStore
+    private let deferredWaveformShaderPublishLock = NSLock()
+    private var deferredWaveformShaderBinPublishes: [WaveformMipCacheKey: PendingWaveformShaderBinPublish] = [:]
+    private var deferredWaveformShaderPublishWakeupScheduled = false
     private var waveformShaderBatchScratch: [WaveformShaderBatch] = []
     private var waveformShaderPromotionRecordsByTrackID: [UUID: WaveformShaderPromotionRecord] = [:]
     private let waveformShaderPromotionDuration: CFTimeInterval = 0.12
@@ -1161,6 +1172,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var selectionDragParticleEmissionTimestamp: CFTimeInterval?
     private var selectionDragParticleSeed: UInt64 = 0
     private var deletionEffects: [DeletionEffect] = []
+    private var lastDeletionEffectsClearedTimestamp: CFTimeInterval = -Double.infinity
     private let deletionEffectLock = NSLock()
     private var previousTransientScanProgress: Float?
     private var lastTransientParticleBins: [UUID: Int] = [:]
@@ -1179,6 +1191,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var frameStatsGPUWaveformDrawCount = 0
     private var frameStatsShaderBufferUploadCount = 0
     private var frameStatsShaderBufferUploadByteCount = 0
+    private var frameStatsCPUWaveformFallbackDrawCount = 0
     private var frameStatsWaveformFallbackDrawCount = 0
     private var frameStatsWaveformLastGoodHoldCount = 0
     private var frameStatsWaveformResidentMissCount = 0
@@ -1222,6 +1235,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             shaderBufferByteCount: waveformBufferDiagnostics.byteCount,
             shaderBufferUploadInFlightCount: waveformBufferDiagnostics.inFlightCount,
             waveformMipCacheCount: waveformMipCacheDiagnostics().cacheCount,
+            cpuWaveformFallbackDrawCount: frameStatsCPUWaveformFallbackDrawCount,
             waveformFallbackDrawCount: frameStatsWaveformFallbackDrawCount,
             waveformLastGoodHoldCount: frameStatsWaveformLastGoodHoldCount,
             waveformResidentMissCount: frameStatsWaveformResidentMissCount,
@@ -1277,6 +1291,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let transientParticleMaximumCount = 260
     private let maximumTransientParticleVerticesPerFrame = 10_000
     private var selectionDragWaveformTuning = SelectionDragWaveformTuning.defaultValue
+    private let maximumSelectionDragShaderContactCount = 4
     private let maximumSelectionDragParticleVerticesPerFrame = 1_008
     private let selectionDragEffectFadeDuration: CFTimeInterval = 0.22
     private let selectionDragWaveformContactMinimumStrength: Float = 0.001
@@ -1284,6 +1299,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let selectionDragMotionEpsilonPixelsPerSecond: Float = 2.0
     private let deletionEffectDuration: CFTimeInterval = 2.0
     private let deletionEffectLifetimePadding: CFTimeInterval = 0.08
+    private let deletionHandoffWaveformDemotionHoldDuration: CFTimeInterval = 1.25
     private let deletionEffectMaximumCount = 8
     private let deletionEffectMaximumCapturedBins = 512
     private let transientParticleScorePercentile: Float = 0.997
@@ -1296,14 +1312,20 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let maximumGeneratedWaveformMipBins = 2_097_152
     private let generatedWaveformMipSamplesPerBin = 4
     private let highResolutionWaveformVisibleDurationThreshold: TimeInterval = 120
-    private let waveformMipTargetBinsPerPoint: Float = 96
-    private let minimumWaveformMipTargetVisibleBins: Float = 8_192
+    private let overviewWaveformMipTargetBinsPerPixel: Float = 12.0
+    private let mediumWaveformMipTargetBinsPerPixel: Float = 24.0
+    private let detailWaveformMipTargetBinsPerPixel: Float = 64.0
+    private let detailWaveformMipVisibleDuration: TimeInterval = 12
+    private let mediumWaveformMipVisibleDuration: TimeInterval = 120
+    private let overviewWaveformMipVisibleDuration: TimeInterval = 240
+    private let minimumWaveformMipTargetVisibleBins: Float = 32_768
     private let maximumCachedWaveformMipPyramids = 512
     private let maximumCachedWaveformShaderBinBuffers = 2_048
     private let maximumCachedWaveformShaderBinBufferBytes = 1_024 * 1_024 * 1_024
     private let maximumBackgroundPrewarmedWaveformShaderBins = 16_384
     private let maximumViewportPrewarmedWaveformShaderBins = WaveformOverviewBuilder.defaultTargetBinCount
-    private let minimumDisplayableWaveformBinsPerPixel: Float = 1.65
+    private let detailMinimumDisplayableWaveformBinsPerPixel: Float = 1.65
+    private let overviewMinimumDisplayableWaveformBinsPerPixel: Float = 0.72
     private let minimumDisplayableWaveformDurationThreshold: TimeInterval = 30
     private let maximumViewportPrewarmTrackCount = 32
     private let maximumHighResolutionPrewarmTrackCount = 8
@@ -1312,8 +1334,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let waveformPrewarmJobBatchSize = 8
     private let maximumInFlightWaveformShaderBufferUploads = 8
     private let maximumSynchronousWaveformShaderBinBufferBins = 16_384
-    private let maximumSynchronousDeletionWaveformShaderBinBufferBins = 32_768
     private let maximumSynchronousInteractiveWaveformShaderUploads = 2
+    private let maximumDeferredWaveformShaderPublishCountPerFrame = 8
+    private let maximumDeferredWaveformShaderPublishByteCountPerFrame = 4 * 1_024 * 1_024
+    private let maximumLowCostContinuityWaveformShaderBins = 16_384
     private let maximumCachedTransientParticleScoreProfiles = 512
 
     init(device: MTLDevice, pixelFormat: MTLPixelFormat) throws {
@@ -1356,9 +1380,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             let selectionDragEffectVertexFunction = library.makeFunction(name: "selection_drag_effect_vertex"),
             let selectionDragEffectFragmentFunction = library.makeFunction(name: "selection_drag_effect_fragment"),
             let deletionEffectVertexFunction = library.makeFunction(name: "deletion_effect_vertex"),
-            let deletionEffectFragmentFunction = library.makeFunction(name: "deletion_effect_fragment"),
-            let deletionParticleVertexFunction = library.makeFunction(name: "deletion_particle_vertex"),
-            let deletionParticleFragmentFunction = library.makeFunction(name: "deletion_particle_fragment")
+            let deletionEffectFragmentFunction = library.makeFunction(name: "deletion_effect_fragment")
         else {
             throw RendererError.shaderFunctionUnavailable
         }
@@ -1429,17 +1451,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         deletionEffectDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
         deletionEffectDescriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
         deletionEffectDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
-        let deletionParticleDescriptor = MTLRenderPipelineDescriptor()
-        deletionParticleDescriptor.vertexFunction = deletionParticleVertexFunction
-        deletionParticleDescriptor.fragmentFunction = deletionParticleFragmentFunction
-        deletionParticleDescriptor.colorAttachments[0].pixelFormat = pixelFormat
-        deletionParticleDescriptor.colorAttachments[0].isBlendingEnabled = true
-        deletionParticleDescriptor.colorAttachments[0].rgbBlendOperation = .add
-        deletionParticleDescriptor.colorAttachments[0].alphaBlendOperation = .add
-        deletionParticleDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
-        deletionParticleDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
-        deletionParticleDescriptor.colorAttachments[0].destinationRGBBlendFactor = .one
-        deletionParticleDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .one
 
         self.device = device
         self.commandQueue = commandQueue
@@ -1462,7 +1473,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         additivePipelineState = try device.makeRenderPipelineState(descriptor: additiveDescriptor)
         selectionDragEffectPipelineState = try device.makeRenderPipelineState(descriptor: selectionDragEffectDescriptor)
         deletionEffectPipelineState = try device.makeRenderPipelineState(descriptor: deletionEffectDescriptor)
-        deletionParticlePipelineState = try device.makeRenderPipelineState(descriptor: deletionParticleDescriptor)
 
         super.init()
     }
@@ -1483,7 +1493,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         displayTracks(tracks)
     }
 
-    func displayTracks(_ tracks: [TimelineRenderState.Track], animateWaveformTransition: Bool = true) {
+    func displayTracks(
+        _ tracks: [TimelineRenderState.Track],
+        animateWaveformTransition: Bool = true,
+        allowImmediateWaveformPrewarm: Bool = true
+    ) {
         let previousTracks = renderState.tracks
         let staleTiledSourceIDs = tiledWaveformPipeline?.registerSources(tracks.compactMap(\.waveformTileSource)) ?? []
         for sourceID in staleTiledSourceIDs {
@@ -1501,7 +1515,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         if !defersWaveformResolutionForDeletion {
             for track in tracks {
                 let sourceTrack = waveformSourceTrack(for: track)
-                let mipLevels = cachedWaveformMipLevels(for: sourceTrack)
+                let mipLevels = cachedWaveformMipLevels(
+                    for: sourceTrack,
+                    priorityRenderState: nextRenderState
+                )
                 nextTrackWaveformMipLevels[track.id] = mipLevels
                 if let key = waveformMipCacheKey(for: sourceTrack) {
                     nextTrackWaveformMipKeys[track.id] = key
@@ -1514,6 +1531,17 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let previousTrackIDs = Set(previousTrackIDsInOrder)
         let nextTrackIDs = Set(renderTracks.map(\.id))
         let hasSharedTransitionTracks = !previousTrackIDs.isDisjoint(with: nextTrackIDs)
+        let hasActiveDeletionEffects = hasDeletionEffectsInFlight()
+        let canReuseResidentWaveformsForDeletion =
+            hasActiveDeletionEffects &&
+            previousTrackIDsInOrder == nextTrackIDsInOrder &&
+            renderTracks.allSatisfy { nextTrack in
+                guard let previousTrack = currentTracksByID[nextTrack.id] else {
+                    return false
+                }
+
+                return previousTrack.waveformVersion == nextTrack.waveformVersion
+            }
         let preservesEffectContinuity = previousTrackIDsInOrder == nextTrackIDsInOrder &&
             renderState.hasWaveforms &&
             hasNextWaveforms
@@ -1536,14 +1564,22 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         waveformMipLevelStateLock.lock()
-        waveformMipLevels = nextWaveformMipLevels
-        trackWaveformMipLevels = nextTrackWaveformMipLevels
-        currentTrackWaveformMipKeys = nextTrackWaveformMipKeys
+        if canReuseResidentWaveformsForDeletion {
+            let existingTrackWaveformMipLevels = trackWaveformMipLevels
+            let existingTrackWaveformMipKeys = currentTrackWaveformMipKeys
+            trackWaveformMipLevels = existingTrackWaveformMipLevels.filter { nextTrackIDs.contains($0.key) }
+            currentTrackWaveformMipKeys = existingTrackWaveformMipKeys.filter { nextTrackIDs.contains($0.key) }
+            waveformMipLevels = renderTracks.first.flatMap { trackWaveformMipLevels[$0.id] } ?? []
+        } else {
+            waveformMipLevels = nextWaveformMipLevels
+            trackWaveformMipLevels = nextTrackWaveformMipLevels
+            currentTrackWaveformMipKeys = nextTrackWaveformMipKeys
+        }
         currentPrimaryWaveformTrackID = renderTracks.first?.id
         waveformMipLevelStateLock.unlock()
         lastInteractiveWaveformPrewarmKeys.removeAll()
         waveformShaderPrewarmGeneration += 1
-        if !defersWaveformResolutionForDeletion {
+        if allowImmediateWaveformPrewarm && !canReuseResidentWaveformsForDeletion && !defersWaveformResolutionForDeletion {
             prewarmInitialWaveformShaderBuffers(
                 tracks: renderTracks,
                 trackWaveformMipLevels: nextTrackWaveformMipLevels,
@@ -1649,6 +1685,29 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             waveformSegments: track.waveformSegments.isEmpty ? sourceTrack.waveformSegments : track.waveformSegments,
             waveformTileSource: track.waveformTileSource ?? sourceTrack.waveformTileSource
         )
+    }
+
+    private func waveformDrawableDurationHint(for track: TimelineRenderState.Track) -> TimeInterval? {
+        let sourceTrack = waveformSourceTrack(for: track)
+        if let sourceDuration = sourceTrack.waveformOverview?.duration,
+           sourceDuration.isFinite,
+           sourceDuration > 0 {
+            return sourceDuration
+        }
+
+        if let cachedSourceDuration = waveformSourceTracksByID[track.id]?.waveformOverview?.duration,
+           cachedSourceDuration.isFinite,
+           cachedSourceDuration > 0 {
+            return cachedSourceDuration
+        }
+
+        if let trackDuration = track.durationHint,
+           trackDuration.isFinite,
+           trackDuration > 0 {
+            return trackDuration
+        }
+
+        return nil
     }
 
     private func ensureWaveformMipLevelsExist(for tracks: [TimelineRenderState.Track]) {
@@ -2182,6 +2241,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             visualAnchor: visualAnchor,
             capturedBinBuffer: capturedBinBuffer,
             capturedBinCount: capturedBins.count,
+            capturedEnergySamples: deletionWallEnergySamples(from: capturedBins),
             birthTimestamp: -1,
             seed: seed
         )
@@ -2196,7 +2256,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     func clearDeletionEffects() {
         deletionEffectLock.lock()
+        let hadEffects = !deletionEffects.isEmpty
         deletionEffects.removeAll()
+        if hadEffects {
+            lastDeletionEffectsClearedTimestamp = CACurrentMediaTime()
+        }
         frameStatsDeletionEffectCount = 0
         deletionEffectLock.unlock()
     }
@@ -2314,6 +2378,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         return capturedBins
+    }
+
+    private func deletionWallEnergySamples(from bins: [WaveformOverview.Bin]) -> [Float] {
+        bins.map { bin in
+            let peak = max(abs(bin.minimumSample), abs(bin.maximumSample))
+            let energy = min(max(peak * 0.82 + bin.rmsSample * 0.72, 0), 1)
+            return smoothStep(edge0: 0.012, edge1: 0.38, value: energy)
+        }
     }
 
     private func makeDeletionWaveformBinBuffer(from bins: [WaveformOverview.Bin]) -> MTLBuffer? {
@@ -2489,15 +2561,45 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         )
         frameStatsWaveformHotPathReason = waveformHotPathReason ?? ""
         let isWaveformHotPath = waveformHotPathReason != nil
+        let hoverNeedsInitialPrewarm =
+            waveformHotPathReason == "hover" &&
+            canUseWaveformShader &&
+            !shaderWaveformsAreDrawable(
+                drawableSize: viewportSize,
+                backingScale: backingScale,
+                renderState: renderState,
+                trackWaveformMipLevels: mipLevelSnapshot.currentByTrack,
+                fallbackPolicy: .allowFallbacks
+            )
+        if waveformHotPathReason == nil ||
+            waveformHotPathReason == "viewport-interaction" ||
+            hoverNeedsInitialPrewarm {
+            prewarmCurrentInteractiveWaveformShaderBuffers(
+                drawableSize: viewportSize,
+                backingScale: backingScale
+            )
+        }
+        flushDeferredWaveformShaderBinPublishesIfAllowed(
+            renderState: renderState,
+            drawableSize: viewportSize,
+            backingScale: backingScale,
+            trackWaveformMipLevels: mipLevelSnapshot.currentByTrack,
+            displayTimestamp: displayTimestamp,
+            waveformHotPathReason: waveformHotPathReason
+        )
         let allowsCPUWaveformFallback =
             !isWaveformHotPath &&
-            isWaveformCPUFallbackAllowed(
+            isColdStaticCPUWaveformFallbackAllowed(
                 renderState: renderState,
                 hasWaveformTransition: hasWaveformTransition,
                 displayTimestamp: displayTimestamp
             )
         let previousShaderRenderState = hasWaveformTransition ?
-            previousTransitionRenderState(withCurrentState: renderState) :
+            previousTransitionRenderState(
+                withCurrentState: renderState,
+                displayTimestamp: displayTimestamp,
+                followsLiveViewport: !hasActiveDeletionEffect
+            ) :
             nil
         let canUsePreviousWaveformShader = previousShaderRenderState.map {
             shouldRenderShaderWaveforms(
@@ -2520,6 +2622,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 drawableSize: viewportSize,
                 renderState: renderState,
                 mipLevelSnapshot: mipLevelSnapshot,
+                displayTimestamp: displayTimestamp,
+                followsLiveViewport: !hasActiveDeletionEffect,
                 allowsPreparation: !hasActiveDeletionEffect
             ) :
             nil
@@ -2668,6 +2772,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         } else if let previousWaveformVertices {
             frameStatsWaveformRenderer = "cpu"
             frameStatsCPUWaveformVertexCount += previousWaveformVertices.vertices.vertexCount
+            frameStatsCPUWaveformFallbackDrawCount += 1
             frameStatsWaveformFallbackDrawCount += 1
             let previousFisheye = cpuFallbackWaveformFisheye(
                 waveformFisheye,
@@ -2704,6 +2809,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         } else if let waveformVertices, !suppressCurrentWaveformForDeletion {
             frameStatsWaveformRenderer = "cpu"
             frameStatsCPUWaveformVertexCount += waveformVertices.vertices.vertexCount
+            frameStatsCPUWaveformFallbackDrawCount += 1
             frameStatsWaveformFallbackDrawCount += 1
             let fallbackFisheye = cpuFallbackWaveformFisheye(
                 waveformFisheye,
@@ -3103,6 +3209,19 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             )
         }
 
+        if
+            deletionHandoffWaveformDemotionProtectionIsActive(at: displayTimestamp),
+            let existing = waveformShaderPromotionRecordsByTrackID[track.id],
+            waveformShaderPromotionRecordCanBeHeld(existing, for: track),
+            existing.current.mipLevel.binCount > candidate.mipLevel.binCount
+        {
+            frameStatsWaveformLastGoodHoldCount += 1
+            return activeWaveformShaderPromotionLayers(
+                from: existing,
+                displayTimestamp: displayTimestamp
+            )
+        }
+
         if var existing = waveformShaderPromotionRecordsByTrackID[track.id],
            existing.waveformVersion == track.waveformVersion {
             if waveformShaderDrawableIdentity(existing.current) == waveformShaderDrawableIdentity(candidate) {
@@ -3144,7 +3263,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         _ record: WaveformShaderPromotionRecord,
         for track: TimelineRenderState.Track
     ) -> Bool {
-        guard let durationHint = track.durationHint, durationHint.isFinite, durationHint > 0 else {
+        guard let durationHint = waveformDrawableDurationHint(for: track) else {
             return true
         }
 
@@ -3262,17 +3381,18 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             gainPreview = SIMD4<Float>(-1, -1, 1, 0)
         }
         let commonLane = SIMD4<Float>(laneTop, laneBottom, centerY, max(amplitudeHeight, 0))
+        let sampleSmoothing = waveformSampleSmoothingAmount(
+            drawableSize: drawableSize,
+            backingScale: backingScale,
+            binCount: binCount,
+            trackDurationProgress: trackDurationProgress,
+            renderState: renderState
+        )
         let commonTrack = SIMD4<Float>(
             trackDurationProgress,
             Float(max(binCount, 1)),
             Float(max(binOffset, 0)),
-            waveformSampleSmoothingAmount(
-                drawableSize: drawableSize,
-                backingScale: backingScale,
-                binCount: binCount,
-                trackDurationProgress: trackDurationProgress,
-                renderState: renderState
-            )
+            sampleSmoothing
         )
         let waveformSegment = segment ?? TimelineRenderState.Track.WaveformSegment(
             outputStartProgress: 0,
@@ -3584,7 +3704,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private func prepareWaveformShaderBinBuffer(
         track: TimelineRenderState.Track,
         mipLevel: WaveformMipLevel,
-        allowsSynchronousUpload: Bool,
+        allowsSynchronousUpload: Bool = false,
         generation: Int? = nil,
         maximumInFlightCount: Int? = nil,
         synchronousUploadBinLimit: Int? = nil,
@@ -3604,6 +3724,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             {
                 let shaderBins = makeWaveformShaderBins(from: mipLevel.overview.bins)
                 waveformShaderBufferStore.publishPreservingPreparation(shaderBins, for: key)
+                onRenderDataPrepared?()
             }
             return
         }
@@ -3620,6 +3741,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 maximumByteCount: maximumCachedWaveformShaderBinBufferBytes,
                 protecting: protectedWaveformShaderKeys()
             )
+            onRenderDataPrepared?()
             return
         }
 
@@ -3643,13 +3765,183 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 self?.waveformShaderBufferStore.publish(Optional<[WaveformShaderBin]>.none, for: key)
                 return
             }
-            self?.waveformShaderBufferStore.publish(shaderBins, for: key)
-            self?.waveformShaderBufferStore.trim(
-                toMaximumCount: self?.maximumCachedWaveformShaderBinBuffers ?? 2_048,
-                maximumByteCount: self?.maximumCachedWaveformShaderBinBufferBytes ?? 512 * 1_024 * 1_024,
-                protecting: self?.protectedWaveformShaderKeys() ?? []
+            self?.deferWaveformShaderBinPublish(shaderBins, for: key, generation: generation)
+        }
+    }
+
+    private func deferWaveformShaderBinPublish(
+        _ bins: [WaveformShaderBin]?,
+        for key: WaveformMipCacheKey,
+        generation: Int?
+    ) {
+        guard
+            generation == nil ||
+                generation == waveformShaderPrewarmGeneration
+        else {
+            waveformShaderBufferStore.publish(Optional<[WaveformShaderBin]>.none, for: key)
+            return
+        }
+
+        guard let bins, !bins.isEmpty else {
+            waveformShaderBufferStore.publish(Optional<[WaveformShaderBin]>.none, for: key)
+            return
+        }
+
+        let byteCount = bins.count * MemoryLayout<WaveformShaderBin>.stride
+        deferredWaveformShaderPublishLock.lock()
+        deferredWaveformShaderBinPublishes[key] = PendingWaveformShaderBinPublish(
+            bins: bins,
+            generation: generation,
+            byteCount: byteCount
+        )
+        let shouldScheduleWakeup = !deferredWaveformShaderPublishWakeupScheduled
+        if shouldScheduleWakeup {
+            deferredWaveformShaderPublishWakeupScheduled = true
+        }
+        deferredWaveformShaderPublishLock.unlock()
+
+        if shouldScheduleWakeup {
+            onRenderDataPrepared?()
+            scheduleDeferredWaveformShaderPublishWakeup()
+        }
+    }
+
+    private func scheduleDeferredWaveformShaderPublishWakeup() {
+        waveformGeometryQueue.asyncAfter(deadline: .now() + gpuResidentShadowInteractionCooldown) { [weak self] in
+            guard let self else {
+                return
+            }
+            self.deferredWaveformShaderPublishLock.lock()
+            self.deferredWaveformShaderPublishWakeupScheduled = false
+            let hasPendingPublishes = !self.deferredWaveformShaderBinPublishes.isEmpty
+            self.deferredWaveformShaderPublishLock.unlock()
+            if hasPendingPublishes {
+                self.onRenderDataPrepared?()
+            }
+        }
+    }
+
+    private func hasDeferredWaveformShaderBinPublishes() -> Bool {
+        deferredWaveformShaderPublishLock.lock()
+        let hasPendingPublishes = !deferredWaveformShaderBinPublishes.isEmpty
+        deferredWaveformShaderPublishLock.unlock()
+        return hasPendingPublishes
+    }
+
+    private func flushDeferredWaveformShaderBinPublishesIfAllowed(
+        renderState: TimelineRenderState,
+        drawableSize: CGSize,
+        backingScale: Float,
+        trackWaveformMipLevels: [UUID: [WaveformMipLevel]],
+        displayTimestamp: CFTimeInterval,
+        waveformHotPathReason: String?
+    ) {
+        guard hasDeferredWaveformShaderBinPublishes() else {
+            return
+        }
+
+        let hoverNeedsInitialDrawableWaveform =
+            waveformHotPathReason == "hover" &&
+            !shaderWaveformsAreDrawable(
+                drawableSize: drawableSize,
+                backingScale: backingScale,
+                renderState: renderState,
+                trackWaveformMipLevels: trackWaveformMipLevels,
+                fallbackPolicy: .allowFallbacks
             )
-            self?.onRenderDataPrepared?()
+        let allowsBudgetedPublish =
+            waveformHotPathReason == nil ||
+            waveformHotPathReason == "viewport-interaction" ||
+            waveformHotPathReason == "waveform-transition" ||
+            waveformHotPathReason == "hover" ||
+            hoverNeedsInitialDrawableWaveform
+        guard
+            allowsBudgetedPublish,
+            !renderState.isPlaybackActive,
+            !renderState.isRecordingActive,
+            !hasDeletionEffectsInFlight()
+        else {
+            scheduleDeferredWaveformShaderPublishWakeupIfNeeded()
+            return
+        }
+
+        var selectedPublishes: [(WaveformMipCacheKey, PendingWaveformShaderBinPublish)] = []
+        var staleKeys: [WaveformMipCacheKey] = []
+        var selectedByteCount = 0
+
+        deferredWaveformShaderPublishLock.lock()
+        for (key, pending) in deferredWaveformShaderBinPublishes {
+            if
+                let generation = pending.generation,
+                generation != waveformShaderPrewarmGeneration
+            {
+                staleKeys.append(key)
+                continue
+            }
+
+            let projectedByteCount = selectedByteCount + pending.byteCount
+            guard
+                selectedPublishes.count < maximumDeferredWaveformShaderPublishCountPerFrame,
+                projectedByteCount <= maximumDeferredWaveformShaderPublishByteCountPerFrame ||
+                    selectedPublishes.isEmpty
+            else {
+                continue
+            }
+
+            selectedPublishes.append((key, pending))
+            selectedByteCount = projectedByteCount
+        }
+
+        for key in staleKeys {
+            deferredWaveformShaderBinPublishes.removeValue(forKey: key)
+        }
+        for (key, _) in selectedPublishes {
+            deferredWaveformShaderBinPublishes.removeValue(forKey: key)
+        }
+        let hasRemainingPublishes = !deferredWaveformShaderBinPublishes.isEmpty
+        deferredWaveformShaderPublishLock.unlock()
+
+        for key in staleKeys {
+            waveformShaderBufferStore.publish(Optional<[WaveformShaderBin]>.none, for: key)
+        }
+        guard !selectedPublishes.isEmpty else {
+            if hasRemainingPublishes {
+                scheduleDeferredWaveformShaderPublishWakeupIfNeeded()
+            }
+            return
+        }
+
+        for (key, pending) in selectedPublishes {
+            waveformShaderBufferStore.publish(pending.bins, for: key)
+        }
+        waveformShaderBufferStore.trim(
+            toMaximumCount: maximumCachedWaveformShaderBinBuffers,
+            maximumByteCount: maximumCachedWaveformShaderBinBufferBytes,
+            protecting: protectedWaveformShaderKeys()
+        )
+        let publishedBufferStats = waveformShaderBufferStore.drainPublishedBufferStats()
+        frameStatsShaderBufferUploadCount += publishedBufferStats.count
+        frameStatsShaderBufferUploadByteCount += publishedBufferStats.byteCount
+
+        onRenderDataPrepared?()
+
+        if hasRemainingPublishes {
+            scheduleDeferredWaveformShaderPublishWakeupIfNeeded()
+        }
+    }
+
+    private func scheduleDeferredWaveformShaderPublishWakeupIfNeeded() {
+        deferredWaveformShaderPublishLock.lock()
+        let shouldScheduleWakeup =
+            !deferredWaveformShaderBinPublishes.isEmpty &&
+            !deferredWaveformShaderPublishWakeupScheduled
+        if shouldScheduleWakeup {
+            deferredWaveformShaderPublishWakeupScheduled = true
+        }
+        deferredWaveformShaderPublishLock.unlock()
+
+        if shouldScheduleWakeup {
+            scheduleDeferredWaveformShaderPublishWakeup()
         }
     }
 
@@ -3696,8 +3988,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     private func prewarmCurrentInteractiveWaveformShaderBuffers(
         drawableSize: CGSize,
-        backingScale: Float,
-        allowsSynchronousUploads: Bool = true
+        backingScale: Float
     ) {
         guard drawableSize.width > 0, drawableSize.height > 0, !renderState.tracks.isEmpty else {
             return
@@ -3714,8 +4005,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             trackWaveformMipLevels: mipLevels,
             renderState: renderState,
             drawableSize: drawableSize,
-            backingScale: backingScale,
-            allowsSynchronousUploads: allowsSynchronousUploads
+            backingScale: backingScale
         )
     }
 
@@ -3745,7 +4035,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             drawableSize: drawableSize,
             backingScale: backingScale
         )
-        let synchronousLimit = maximumSynchronousDeletionWaveformShaderBinBufferBins
 
         for track in visibleTracks where track.hasWaveform {
             guard let trackMipLevels = mipLevels[track.id], !trackMipLevels.isEmpty else {
@@ -3758,35 +4047,20 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 drawableSize: drawableSize,
                 backingScale: backingScale,
                 renderState: state,
-                fallbackBinLimit: max(viewportBinLimit, synchronousLimit)
+                fallbackBinLimit: viewportBinLimit
             )
 
             if let preferredMipLevel {
                 let preferredKey = waveformShaderBufferKey(track: track, mipLevel: preferredMipLevel)
-                if waveformShaderBufferStore.allocation(for: preferredKey) != nil {
-                    continue
-                }
-
-                if preferredMipLevel.binCount <= synchronousLimit {
+                if waveformShaderBufferStore.allocation(for: preferredKey) == nil {
                     prepareWaveformShaderBinBuffer(
                         track: track,
                         mipLevel: preferredMipLevel,
-                        allowsSynchronousUpload: true,
+                        allowsSynchronousUpload: preferredMipLevel.binCount <= maximumLowCostContinuityWaveformShaderBins,
                         generation: waveformShaderPrewarmGeneration,
                         maximumInFlightCount: Int.max,
-                        synchronousUploadBinLimit: synchronousLimit,
+                        synchronousUploadBinLimit: maximumLowCostContinuityWaveformShaderBins,
                         allowsSynchronousInFlightOverride: true
-                    )
-                    if waveformShaderBufferStore.allocation(for: preferredKey) != nil {
-                        continue
-                    }
-                } else {
-                    prepareWaveformShaderBinBuffer(
-                        track: track,
-                        mipLevel: preferredMipLevel,
-                        allowsSynchronousUpload: false,
-                        generation: waveformShaderPrewarmGeneration,
-                        maximumInFlightCount: Int.max
                     )
                 }
             }
@@ -3797,7 +4071,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 drawableSize: drawableSize,
                 backingScale: backingScale,
                 renderState: state,
-                requiresSynchronousUpload: true
+                prefersLowCostContinuity: true
             ) else {
                 continue
             }
@@ -3812,7 +4086,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 allowsSynchronousUpload: true,
                 generation: waveformShaderPrewarmGeneration,
                 maximumInFlightCount: Int.max,
-                synchronousUploadBinLimit: synchronousLimit,
+                synchronousUploadBinLimit: maximumLowCostContinuityWaveformShaderBins,
                 allowsSynchronousInFlightOverride: true
             )
         }
@@ -3823,8 +4097,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         trackWaveformMipLevels: [UUID: [WaveformMipLevel]],
         renderState: TimelineRenderState,
         drawableSize: CGSize,
-        backingScale: Float,
-        allowsSynchronousUploads: Bool = true
+        backingScale: Float
     ) {
         let prefersExactMip = prefersExactWaveformMip(renderState: renderState)
         let visibleTracks = visiblePrewarmTracks(
@@ -3857,7 +4130,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 drawableSize: drawableSize,
                 backingScale: backingScale,
                 renderState: renderState,
-                requiresSynchronousUpload: true
+                prefersLowCostContinuity: true
             ) {
                 let key = waveformShaderBufferKey(track: track, mipLevel: continuityMipLevel)
                 if !visibleJobKeys.contains(key) {
@@ -3889,22 +4162,21 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
         if
             jobKeys == lastInteractiveWaveformPrewarmKeys,
-            waveformShaderBufferStore.containsAllAllocatedOrInFlight(jobKeys)
+            waveformShaderBufferStore.containsAllAllocated(jobKeys)
         {
             return
         }
         lastInteractiveWaveformPrewarmKeys = jobKeys
 
         var deferredJobs: [(TimelineRenderState.Track, WaveformMipLevel)] = []
-        deferredJobs.reserveCapacity(visibleJobs.count)
         var synchronousUploadCount = 0
+        deferredJobs.reserveCapacity(visibleJobs.count)
         for (track, mipLevel) in visibleJobs {
             let key = waveformShaderBufferKey(track: track, mipLevel: mipLevel)
             if waveformShaderBufferStore.allocation(for: key) != nil {
                 continue
             }
             if
-                allowsSynchronousUploads,
                 mipLevel.binCount <= maximumSynchronousWaveformShaderBinBufferBins,
                 synchronousUploadCount < maximumSynchronousInteractiveWaveformShaderUploads
             {
@@ -3913,10 +4185,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                     mipLevel: mipLevel,
                     allowsSynchronousUpload: true,
                     generation: waveformShaderPrewarmGeneration,
-                    maximumInFlightCount: Int.max
+                    maximumInFlightCount: Int.max,
+                    synchronousUploadBinLimit: maximumSynchronousWaveformShaderBinBufferBins,
+                    allowsSynchronousInFlightOverride: true
                 )
                 synchronousUploadCount += 1
-                continue
+                if waveformShaderBufferStore.allocation(for: key) != nil {
+                    continue
+                }
             }
             deferredJobs.append((track, mipLevel))
         }
@@ -3955,6 +4231,44 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             backingScale: lastRenderBackingScale
         )
         return waveformShaderBufferStore.containsAllAllocated(keys)
+    }
+
+    func visibleWaveformDrawableBinCounts(
+        drawableSize: CGSize,
+        backingScale: Float
+    ) -> [Int] {
+        guard drawableSize.width > 0, drawableSize.height > 0 else {
+            return []
+        }
+
+        let state = renderStateStore.snapshot()
+        guard !state.tracks.isEmpty else {
+            return []
+        }
+
+        waveformMipLevelStateLock.lock()
+        let mipLevelsByTrack = trackWaveformMipLevels
+        waveformMipLevelStateLock.unlock()
+
+        let visibleTracks = visiblePrewarmTracks(
+            tracks: state.tracks,
+            renderState: state,
+            drawableSize: drawableSize
+        )
+        return visibleTracks.compactMap { track -> Int? in
+            guard let mipLevels = mipLevelsByTrack[track.id] else {
+                return nil
+            }
+
+            return waveformShaderDrawable(
+                track: track,
+                mipLevels: mipLevels,
+                drawableSize: drawableSize,
+                backingScale: backingScale,
+                renderState: state,
+                fallbackPolicy: .allowFallbacks
+            )?.mipLevel.binCount
+        }
     }
 
     private func visibleInteractiveWaveformShaderKeys(
@@ -4079,7 +4393,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         drawableSize: CGSize,
         backingScale: Float,
         renderState: TimelineRenderState,
-        requiresSynchronousUpload: Bool = false
+        prefersLowCostContinuity: Bool = false
     ) -> WaveformMipLevel? {
         guard !mipLevels.isEmpty else {
             return nil
@@ -4095,24 +4409,24 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             )
         }
 
-        if requiresSynchronousUpload,
-           let syncDisplayableMipLevel = displayableMipLevels.first(where: {
-               $0.binCount <= maximumSynchronousWaveformShaderBinBufferBins
+        if prefersLowCostContinuity,
+           let lowCostDisplayableMipLevel = displayableMipLevels.first(where: {
+               $0.binCount <= maximumLowCostContinuityWaveformShaderBins
            })
         {
-            return syncDisplayableMipLevel
+            return lowCostDisplayableMipLevel
         }
 
         if let displayableMipLevel = displayableMipLevels.first {
             return displayableMipLevel
         }
 
-        if requiresSynchronousUpload,
-           let syncMipLevel = mipLevels.reversed().first(where: {
-               $0.binCount <= maximumSynchronousWaveformShaderBinBufferBins
+        if prefersLowCostContinuity,
+           let lowCostMipLevel = mipLevels.reversed().first(where: {
+               $0.binCount <= maximumLowCostContinuityWaveformShaderBins
            })
         {
-            return syncMipLevel
+            return lowCostMipLevel
         }
 
         return mipLevels.last ?? mipLevels.first
@@ -4136,7 +4450,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 drawableSize: drawableSize,
                 backingScale: backingScale,
                 renderState: renderState,
-                requiresSynchronousUpload: true
+                prefersLowCostContinuity: true
             )
         else {
             return false
@@ -4152,7 +4466,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             mipLevel: continuityMipLevel,
             allowsSynchronousUpload: true,
             generation: waveformShaderPrewarmGeneration,
-            maximumInFlightCount: Int.max
+            maximumInFlightCount: Int.max,
+            synchronousUploadBinLimit: maximumLowCostContinuityWaveformShaderBins,
+            allowsSynchronousInFlightOverride: true
         )
         return waveformShaderBufferStore.allocation(for: key) != nil
     }
@@ -4197,9 +4513,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         prepareWaveformShaderBinBuffer(
             track: track,
             mipLevel: preferredMipLevel,
-            allowsSynchronousUpload: true,
+            allowsSynchronousUpload: preferredMipLevel.binCount <= maximumLowCostContinuityWaveformShaderBins,
             generation: waveformShaderPrewarmGeneration,
-            maximumInFlightCount: Int.max
+            maximumInFlightCount: Int.max,
+            synchronousUploadBinLimit: maximumLowCostContinuityWaveformShaderBins,
+            allowsSynchronousInFlightOverride: true
         )
         return waveformShaderBufferStore.allocation(for: key) != nil
     }
@@ -4376,7 +4694,34 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let visiblePixelWidth = max(drawablePixelWidth * visibleTrackProgress / viewportDuration, 1)
         let visibleBinCount = Float(mipLevel.binCount) * visibleTrackProgress / trackDurationProgress
         let binsPerPixel = visibleBinCount / visiblePixelWidth
-        return binsPerPixel >= minimumDisplayableWaveformBinsPerPixel
+        return binsPerPixel >= minimumDisplayableWaveformBinsPerPixel(renderState: renderState)
+    }
+
+    private func minimumDisplayableWaveformBinsPerPixel(renderState: TimelineRenderState) -> Float {
+        guard
+            let duration = renderState.duration,
+            duration.isFinite,
+            duration > 0
+        else {
+            return detailMinimumDisplayableWaveformBinsPerPixel
+        }
+
+        let visibleDuration = duration * Double(max(renderState.viewport.durationProgress, 0))
+        guard visibleDuration.isFinite, visibleDuration > highResolutionWaveformVisibleDurationThreshold else {
+            return detailMinimumDisplayableWaveformBinsPerPixel
+        }
+
+        let progress = smoothStep(
+            Float(
+                (visibleDuration - highResolutionWaveformVisibleDurationThreshold) /
+                max(overviewWaveformMipVisibleDuration - highResolutionWaveformVisibleDurationThreshold, 0.000_001)
+            )
+        )
+        return mix(
+            detailMinimumDisplayableWaveformBinsPerPixel,
+            overviewMinimumDisplayableWaveformBinsPerPixel,
+            progress
+        )
     }
 
     private func visiblePrewarmTracks(
@@ -4458,7 +4803,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 return
             }
 
-            var publishedCount = 0
             let endIndex = min(startIndex + self.waveformPrewarmJobBatchSize, jobs.count)
             for jobIndex in startIndex..<endIndex {
                 guard generation == self.waveformShaderPrewarmGeneration else {
@@ -4486,26 +4830,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                     self.waveformShaderBufferStore.publish(Optional<[WaveformShaderBin]>.none, for: key)
                     return
                 }
-                self.waveformShaderBufferStore.publish(shaderBins, for: key)
-                publishedCount += 1
-
-                if publishedCount.isMultiple(of: self.waveformPrewarmJobBatchSize) {
-                    self.waveformShaderBufferStore.trim(
-                        toMaximumCount: self.maximumCachedWaveformShaderBinBuffers,
-                        maximumByteCount: self.maximumCachedWaveformShaderBinBufferBytes,
-                        protecting: self.protectedWaveformShaderKeys()
-                    )
-                    self.onRenderDataPrepared?()
-                }
-            }
-
-            if publishedCount > 0 {
-                self.waveformShaderBufferStore.trim(
-                    toMaximumCount: self.maximumCachedWaveformShaderBinBuffers,
-                    maximumByteCount: self.maximumCachedWaveformShaderBinBufferBytes,
-                    protecting: self.protectedWaveformShaderKeys()
-                )
-                self.onRenderDataPrepared?()
+                self.deferWaveformShaderBinPublish(shaderBins, for: key, generation: generation)
             }
 
             if endIndex < jobs.count {
@@ -4785,6 +5110,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         waveformHotPathLock.unlock()
     }
 
+    private func isViewportInteractionHot(at timestamp: CFTimeInterval) -> Bool {
+        waveformHotPathLock.lock()
+        let lastInteractionTimestamp = lastWaveformHotInteractionTimestamp
+        waveformHotPathLock.unlock()
+        return timestamp - lastInteractionTimestamp < gpuResidentShadowInteractionCooldown
+    }
+
     private func updateGPUResidentWaveformShadowFrameStats(
         renderState: TimelineRenderState,
         drawableSize: CGSize,
@@ -4820,6 +5152,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let completedWork = tiledWaveformPipeline.drainCompletedAsyncWork()
         frameStatsShaderBufferUploadCount += completedWork.uploadSummary.uploadedCount
         frameStatsShaderBufferUploadByteCount += completedWork.uploadSummary.uploadedBytes
+
+        guard
+            !renderState.isPlaybackActive,
+            !renderState.isRecordingActive,
+            !hasDeletionEffectsInFlight(),
+            !isViewportInteractionHot(at: displayTimestamp)
+        else {
+            return
+        }
 
         for trackIndex in trackLayout.visibleRange(overscan: 1) {
             guard
@@ -4974,7 +5315,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         if frameStatsCPUWaveformVertexCount > 0 {
             violationCount += 1
         }
-        if frameStatsShaderBufferUploadByteCount > 0 {
+        if frameStatsCPUWaveformFallbackDrawCount > 0 {
+            violationCount += 1
+        }
+        let uploadIsViolation = hotPathReason != "viewport-interaction" &&
+            frameStatsShaderBufferUploadByteCount > 0
+        if uploadIsViolation {
             violationCount += 1
         }
 
@@ -4995,6 +5341,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             fields: [
                 "reason": hotPathReason,
                 "cpuVertices": "\(frameStatsCPUWaveformVertexCount)",
+                "cpuFallbackDraws": "\(frameStatsCPUWaveformFallbackDrawCount)",
                 "uploadCount": "\(frameStatsShaderBufferUploadCount)",
                 "uploadBytes": "\(frameStatsShaderBufferUploadByteCount)",
                 "fallbackDraws": "\(frameStatsWaveformFallbackDrawCount)",
@@ -5004,11 +5351,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         )
     }
 
-    private func isWaveformCPUFallbackAllowed(
+    private func isColdStaticCPUWaveformFallbackAllowed(
         renderState: TimelineRenderState,
         hasWaveformTransition: Bool,
         displayTimestamp: CFTimeInterval
     ) -> Bool {
+        // CPU waveform geometry is only a cold, static-frame escape hatch. Any
+        // interactive frame must hold resident GPU data or skip waveform drawing
+        // for that frame instead of rebuilding geometry on the render path.
         if renderState.isPlaybackActive ||
             renderState.isRecordingActive ||
             hasWaveformTransition ||
@@ -5194,6 +5544,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             shaderBufferByteCount: waveformBufferDiagnostics.byteCount,
             shaderBufferUploadInFlightCount: waveformBufferDiagnostics.inFlightCount,
             waveformMipCacheCount: waveformMipCacheDiagnostics().cacheCount,
+            cpuWaveformFallbackDrawCount: frameStatsCPUWaveformFallbackDrawCount,
             waveformFallbackDrawCount: frameStatsWaveformFallbackDrawCount,
             waveformLastGoodHoldCount: frameStatsWaveformLastGoodHoldCount,
             waveformResidentMissCount: frameStatsWaveformResidentMissCount,
@@ -5238,6 +5589,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let publishedBufferStats = waveformShaderBufferStore.drainPublishedBufferStats()
         frameStatsShaderBufferUploadCount = publishedBufferStats.count
         frameStatsShaderBufferUploadByteCount = publishedBufferStats.byteCount
+        frameStatsCPUWaveformFallbackDrawCount = 0
         frameStatsWaveformFallbackDrawCount = 0
         frameStatsWaveformLastGoodHoldCount = 0
         frameStatsWaveformResidentMissCount = 0
@@ -5433,9 +5785,17 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         drawableSize: CGSize,
         renderState: TimelineRenderState,
         mipLevelSnapshot: WaveformMipLevelSnapshot,
+        displayTimestamp: CFTimeInterval,
+        followsLiveViewport: Bool,
         allowsPreparation: Bool = true
     ) -> WaveformDrawCache? {
-        guard let previousRenderState = previousTransitionRenderState(withCurrentState: renderState) else {
+        guard
+            let previousRenderState = previousTransitionRenderState(
+                withCurrentState: renderState,
+                displayTimestamp: displayTimestamp,
+                followsLiveViewport: followsLiveViewport
+            )
+        else {
             return nil
         }
 
@@ -5451,7 +5811,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
 
     private func previousTransitionRenderState(
-        withCurrentState renderState: TimelineRenderState
+        withCurrentState renderState: TimelineRenderState,
+        displayTimestamp: CFTimeInterval,
+        followsLiveViewport: Bool
     ) -> TimelineRenderState? {
         let previousTracks = previousTransitionTracks(withCurrentMixFrom: renderState.tracks)
         guard !previousTracks.isEmpty else {
@@ -5459,10 +5821,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         let previousRenderState = renderState.replacingTracks(previousTracks)
-        guard let previousTransitionViewport else {
-            return previousRenderState
+        if followsLiveViewport, isViewportInteractionHot(at: displayTimestamp) {
+            return previousRenderState.withViewport(renderState.viewport)
         }
-        return previousRenderState.withViewport(previousTransitionViewport)
+
+        return previousRenderState.withViewport(previousTransitionViewport ?? renderState.viewport)
     }
 
     private func previousTransitionTracks(
@@ -5860,7 +6223,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         displayTimestamp: CFTimeInterval
     ) -> SelectionDragWaveformContactVectors {
         let tuning = selectionDragWaveformTuning
-        let maximumCount = min(max(tuning.maximumContactCount, 0), 8)
+        let maximumCount = min(
+            max(tuning.maximumContactCount, 0),
+            maximumSelectionDragShaderContactCount,
+            8
+        )
         guard maximumCount > 0, !contacts.isEmpty else {
             return .empty
         }
@@ -6827,14 +7194,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 displayTimestamp - effect.birthTimestamp >= deletionEffectDuration + deletionEffectLifetimePadding
         }
         let effects = deletionEffects
-        deletionEffectLock.unlock()
         if hadEffects, effects.isEmpty {
-            prewarmCurrentInteractiveWaveformShaderBuffers(
-                drawableSize: lastRenderViewportSize,
-                backingScale: lastRenderBackingScale,
-                allowsSynchronousUploads: false
-            )
+            lastDeletionEffectsClearedTimestamp = displayTimestamp
         }
+        deletionEffectLock.unlock()
         frameStatsDeletionEffectCount = effects.count
         return effects
     }
@@ -6844,6 +7207,19 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let hasEffects = !deletionEffects.isEmpty
         deletionEffectLock.unlock()
         return hasEffects
+    }
+
+    private func deletionHandoffWaveformDemotionProtectionIsActive(at displayTimestamp: CFTimeInterval) -> Bool {
+        deletionEffectLock.lock()
+        let hasEffects = !deletionEffects.isEmpty
+        let clearedAt = lastDeletionEffectsClearedTimestamp
+        deletionEffectLock.unlock()
+        if hasEffects {
+            return true
+        }
+        return clearedAt.isFinite &&
+            displayTimestamp - clearedAt >= 0 &&
+            displayTimestamp - clearedAt <= deletionHandoffWaveformDemotionHoldDuration
     }
 
     private func drawDeletionEffects(
@@ -6863,6 +7239,17 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         guard !effects.isEmpty else {
             return
+        }
+
+        let wallVertices = deletionWallVertices(
+            drawableSize: drawableSize,
+            renderState: renderState,
+            displayTimestamp: displayTimestamp,
+            effects: effects
+        )
+        if !wallVertices.isEmpty {
+            encoder.setRenderPipelineState(pipelineState)
+            draw(vertices: wallVertices, primitiveType: .triangle, encoder: encoder)
         }
 
         encoder.setRenderPipelineState(deletionEffectPipelineState)
@@ -6895,6 +7282,140 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             )
             encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
         }
+    }
+
+    private func deletionWallVertices(
+        drawableSize: CGSize,
+        renderState: TimelineRenderState,
+        displayTimestamp: CFTimeInterval,
+        effects: [DeletionEffect]
+    ) -> [TimelineVertex] {
+        let width = Float(drawableSize.width)
+        let height = Float(drawableSize.height)
+        guard
+            width > 0,
+            height > 0,
+            let verticalSpan = visibleTimelineTrackSpan(renderState: renderState, drawableSize: drawableSize)
+        else {
+            return []
+        }
+
+        var weightedLineX: Float = 0
+        var totalLineWeight: Float = 0
+        var activeEnergy: Float = 0
+        var activeCount: Float = 0
+
+        for effect in effects {
+            let birthTimestamp = effect.birthTimestamp >= 0 ? effect.birthTimestamp : displayTimestamp
+            let age = max(displayTimestamp - birthTimestamp, 0)
+            let progress = min(max(Float(age / deletionEffectDuration), 0), 1)
+            let window = smoothStep(edge0: 0.006, edge1: 0.055, value: progress) *
+                (1 - smoothStep(edge0: 0.965, edge1: 1, value: progress))
+            guard window > 0.0001 else {
+                continue
+            }
+
+            var left = effect.visualAnchor.x
+            var right = effect.visualAnchor.y
+            if right < left {
+                swap(&left, &right)
+            }
+
+            let lineX = min(max(left * width, 0), width)
+            weightedLineX += lineX * window
+            totalLineWeight += window
+
+            let slideProgress = deletionSlideProgress(progress)
+            let energy = deletionWallEnergy(for: effect, slideProgress: slideProgress)
+            activeEnergy += (0.10 + energy * 0.90) * window
+            activeCount += 1
+        }
+
+        guard totalLineWeight > 0, activeCount > 0 else {
+            return []
+        }
+
+        let lineX = weightedLineX / totalLineWeight
+        let wallWidthPixels: Float = 20
+        let leftX = min(max(lineX, 0), width)
+        let rightX = min(max(leftX + wallWidthPixels, leftX), width)
+        guard rightX - leftX > 0.5 else {
+            return []
+        }
+
+        let normalizedEnergy = min(max(activeEnergy / activeCount, 0), 1)
+        let alpha = min(max(pow(normalizedEnergy, 0.72) * 0.68, 0), 0.68)
+        let top = min(max(verticalSpan.top, 0), 1)
+        let bottom = min(max(verticalSpan.bottom, top), 1)
+        guard bottom > top else {
+            return []
+        }
+
+        var vertices: [TimelineVertex] = []
+        vertices.reserveCapacity(6)
+        appendHorizontalGradientRectangle(
+            to: &vertices,
+            left: leftX / width,
+            right: rightX / width,
+            top: top,
+            bottom: bottom,
+            leftColor: SIMD4<Float>(0.88, 0.98, 1.0, alpha),
+            rightColor: SIMD4<Float>(0.88, 0.98, 1.0, 0)
+        )
+        return vertices
+    }
+
+    private func visibleTimelineTrackSpan(
+        renderState: TimelineRenderState,
+        drawableSize: CGSize
+    ) -> (top: Float, bottom: Float)? {
+        let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
+        let visibleRange = trackLayout.visibleRange(overscan: 0)
+        guard !visibleRange.isEmpty else {
+            return nil
+        }
+
+        var top: Float = 1
+        var bottom: Float = 0
+        var hasVisibleLane = false
+        for trackIndex in visibleRange {
+            guard let laneFrame = trackLayout.laneFrame(forTrackIndex: trackIndex), laneFrame.isVisible else {
+                continue
+            }
+            top = min(top, laneFrame.top)
+            bottom = max(bottom, laneFrame.bottom)
+            hasVisibleLane = true
+        }
+
+        guard hasVisibleLane, bottom > top else {
+            return nil
+        }
+
+        return (top, bottom)
+    }
+
+    private func deletionWallEnergy(for effect: DeletionEffect, slideProgress: Float) -> Float {
+        let samples = effect.capturedEnergySamples
+        guard !samples.isEmpty else {
+            return 0
+        }
+        guard samples.count > 1 else {
+            return samples[0]
+        }
+
+        let samplePosition = min(max(slideProgress, 0), 1) * Float(samples.count - 1)
+        let centerIndex = Int(samplePosition.rounded())
+        var weightedEnergy: Float = 0
+        var totalWeight: Float = 0
+        for offset in -3...3 {
+            let index = min(max(centerIndex + offset, 0), samples.count - 1)
+            let distance = Float(abs(offset))
+            let weight = exp(-(distance * distance) / 5.5)
+            weightedEnergy += samples[index] * weight
+            totalWeight += weight
+        }
+
+        return min(max(weightedEnergy / max(totalWeight, 0.000_001), 0), 1)
     }
 
     private func deletionEffectUniform(
@@ -6949,12 +7470,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let selectionWidth = max(rightX - leftX, 1)
         let slideProgress = deletionSlideProgress(progress)
         let laneHeight = max(bottomY - topY, 1)
-        let shardMarginX = min(max(selectionWidth * 0.20, 64), 140)
-        let shardMarginY = min(max(laneHeight * 0.12, 10), 26)
-        let overlayRightX = rightX
-        let overlayLeftX = max(leftX - shardMarginX, 0)
-        let overlayTopY = max(topY - shardMarginY, 0)
-        let overlayBottomY = min(bottomY + shardMarginY, height)
+        let overlayLeftX = min(max(leftX, 0), width)
+        let overlayRightX = min(max(rightX, overlayLeftX), width)
+        let overlayTopY = min(max(topY, 0), height)
+        let overlayBottomY = min(max(bottomY, overlayTopY), height)
         let seed = Float(UInt32(truncatingIfNeeded: effect.seed & 0x00FF_FFFF))
         return DeletionEffectUniform(
             rect: SIMD4<Float>(
@@ -7803,7 +8322,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return WaveformVisualStyle(
                 spectralAmount: 0.34,
                 peakAlpha: 0.42,
-                rmsAlpha: 0.72,
+                rmsAlpha: 0,
                 glowAlpha: 0.055,
                 transientAlpha: 0.08,
                 transientThreshold: 0.46,
@@ -7816,7 +8335,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return WaveformVisualStyle(
                 spectralAmount: 0.26,
                 peakAlpha: 0.46,
-                rmsAlpha: 0.76,
+                rmsAlpha: 0,
                 glowAlpha: 0.038,
                 transientAlpha: 0.13,
                 transientThreshold: 0.42,
@@ -7829,7 +8348,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return WaveformVisualStyle(
                 spectralAmount: 0.16,
                 peakAlpha: 0.52,
-                rmsAlpha: 0.82,
+                rmsAlpha: 0,
                 glowAlpha: 0.022,
                 transientAlpha: 0.19,
                 transientThreshold: 0.36,
@@ -7841,7 +8360,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         return WaveformVisualStyle(
             spectralAmount: 0.08,
             peakAlpha: 0.58,
-            rmsAlpha: 0.86,
+            rmsAlpha: 0,
             glowAlpha: 0.012,
             transientAlpha: 0.26,
             transientThreshold: 0.30,
@@ -8074,6 +8593,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         return clampedProgress * clampedProgress * (3 - 2 * clampedProgress)
     }
 
+    private func smoothStep(edge0: Float, edge1: Float, value: Float) -> Float {
+        guard edge1 != edge0 else {
+            return value >= edge1 ? 1 : 0
+        }
+        return smoothStep((value - edge0) / (edge1 - edge0))
+    }
+
     private func deletionSlideProgress(_ progress: Float) -> Float {
         let clampedProgress = min(max(progress, 0), 1)
         if clampedProgress < 0.5 {
@@ -8186,7 +8712,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let rmsVisualHeight = max(rmsSample * amplitudeHeight, minimumVisualHeight * 0.7)
         let rmsTop = max(centerY - rmsVisualHeight, laneTop)
         let rmsBottom = min(centerY + rmsVisualHeight, laneBottom)
-        if rmsBottom > rmsTop {
+        if style.rmsAlpha > 0.001, rmsBottom > rmsTop {
             let rmsColor = lightened(baseColor, amount: 0.22, alpha: style.rmsAlpha * alpha)
             appendCenterWeightedWaveformBand(
                 to: &vertices,
@@ -9550,7 +10076,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         return WaveformOverview(duration: waveformOverview.duration, bins: bins)
     }
 
-    private func cachedWaveformMipLevels(for track: TimelineRenderState.Track) -> [WaveformMipLevel] {
+    private func cachedWaveformMipLevels(
+        for track: TimelineRenderState.Track,
+        priorityRenderState: TimelineRenderState? = nil
+    ) -> [WaveformMipLevel] {
         let sourceTrack = waveformSourceTrack(for: track)
         guard let waveformOverview = sourceTrack.waveformOverview, !waveformOverview.isEmpty else {
             return []
@@ -9571,7 +10100,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         let initialLevels = makeInitialWaveformMipLevels(from: waveformOverview)
         publishWaveformMipLevelsToCache(initialLevels, for: key)
-        scheduleCompleteWaveformMipLevelBuild(for: key, waveformOverview: waveformOverview)
+        scheduleCompleteWaveformMipLevelBuild(
+            for: key,
+            waveformOverview: waveformOverview,
+            priorityRenderState: priorityRenderState
+        )
 
         return initialLevels
     }
@@ -9592,11 +10125,18 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     private func scheduleCompleteWaveformMipLevelBuild(
         for key: WaveformMipCacheKey,
-        waveformOverview: WaveformOverview
+        waveformOverview: WaveformOverview,
+        priorityRenderState: TimelineRenderState? = nil
     ) {
         guard waveformOverview.bins.count > maximumSynchronousGeneratedWaveformMipBins else {
             return
         }
+
+        let priorityTargetBinCount = preferredProgressiveWaveformMipTargetBinCount(
+            for: key,
+            waveformOverview: waveformOverview,
+            renderState: priorityRenderState ?? renderState
+        )
 
         waveformMipLevelCacheLock.lock()
         guard
@@ -9614,17 +10154,94 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 return
             }
 
+            if let priorityTargetBinCount {
+                let priorityOverview = self.sampledWaveformOverview(
+                    from: waveformOverview,
+                    targetBinCount: priorityTargetBinCount,
+                    samplesPerBin: self.generatedWaveformMipSamplesPerBin,
+                    shouldYieldForPlayback: true
+                )
+                let priorityLevels = self.mergedWaveformMipLevels(
+                    self.cachedWaveformMipLevelsForBackgroundPublish(for: key) ??
+                        self.makeInitialWaveformMipLevels(from: waveformOverview),
+                    adding: WaveformMipLevel(
+                        overview: priorityOverview,
+                        binCount: priorityOverview.bins.count
+                    )
+                )
+                self.publishWaveformMipLevels(priorityLevels, for: key, isFinalBuild: false)
+            }
+
             let levels = self.makeWaveformMipLevels(
                 from: waveformOverview,
                 shouldYieldForPlayback: true
             )
-            self.publishCompleteWaveformMipLevels(levels, for: key)
+            self.publishWaveformMipLevels(levels, for: key, isFinalBuild: true)
         }
     }
 
-    private func publishCompleteWaveformMipLevels(
-        _ levels: [WaveformMipLevel],
+    private func cachedWaveformMipLevelsForBackgroundPublish(
         for key: WaveformMipCacheKey
+    ) -> [WaveformMipLevel]? {
+        waveformMipLevelCacheLock.lock()
+        let levels = waveformMipLevelCache[key]
+        waveformMipLevelCacheLock.unlock()
+        return levels
+    }
+
+    private func mergedWaveformMipLevels(
+        _ levels: [WaveformMipLevel],
+        adding level: WaveformMipLevel
+    ) -> [WaveformMipLevel] {
+        guard level.binCount > 0 else {
+            return levels
+        }
+
+        var byBinCount = Dictionary(uniqueKeysWithValues: levels.map { ($0.binCount, $0) })
+        byBinCount[level.binCount] = level
+        return byBinCount.values.sorted { $0.binCount > $1.binCount }
+    }
+
+    private func preferredProgressiveWaveformMipTargetBinCount(
+        for key: WaveformMipCacheKey,
+        waveformOverview: WaveformOverview,
+        renderState state: TimelineRenderState
+    ) -> Int? {
+        let sourceBinCount = waveformOverview.bins.count
+        guard sourceBinCount > maximumSynchronousGeneratedWaveformMipBins else {
+            return nil
+        }
+
+        guard
+            lastRenderViewportSize.width > 0,
+            lastRenderViewportSize.height > 0,
+            state.tracks.contains(where: { $0.id == key.trackID })
+        else {
+            return nil
+        }
+
+        let targetVisibleBins = waveformMipTargetVisibleBins(
+            drawableSize: lastRenderViewportSize,
+            backingScale: lastRenderBackingScale,
+            renderState: state
+        )
+        let viewportDurationProgress = max(state.viewport.durationProgress, 0.000_001)
+        var targetBinCount = min(sourceBinCount / 2, maximumGeneratedWaveformMipBins)
+        while targetBinCount >= 256 {
+            let visibleBins = Float(targetBinCount) * viewportDurationProgress
+            if visibleBins <= targetVisibleBins {
+                return targetBinCount > maximumSynchronousGeneratedWaveformMipBins ? targetBinCount : nil
+            }
+            targetBinCount /= 2
+        }
+
+        return nil
+    }
+
+    private func publishWaveformMipLevels(
+        _ levels: [WaveformMipLevel],
+        for key: WaveformMipCacheKey,
+        isFinalBuild: Bool
     ) {
         publishWaveformMipLevelsToCache(levels, for: key)
 
@@ -9655,9 +10272,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             _ = commitVisibleWaveformMipLevels(levels, for: key, renderState: continuityRenderState)
         }
 
-        waveformMipLevelCacheLock.lock()
-        waveformMipLevelBuildsInFlight.remove(key)
-        waveformMipLevelCacheLock.unlock()
+        if isFinalBuild {
+            waveformMipLevelCacheLock.lock()
+            waveformMipLevelBuildsInFlight.remove(key)
+            waveformMipLevelCacheLock.unlock()
+        }
 
         if didPublishVisibleLevels {
             prewarmCurrentInteractiveWaveformShaderBuffers(
@@ -9747,8 +10366,61 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         renderState: TimelineRenderState
     ) -> Float {
         let width = max(Float(drawableSize.width) * max(backingScale, 1), 1)
-        let binsPerPoint = waveformMipTargetBinsPerPoint
-        return max(width * binsPerPoint, minimumWaveformMipTargetVisibleBins)
+        let binsPerPixel = waveformMipTargetBinsPerPixel(renderState: renderState)
+        return max(width * binsPerPixel, minimumWaveformMipTargetVisibleBins)
+    }
+
+    private func waveformMipTargetBinsPerPixel(renderState: TimelineRenderState) -> Float {
+        guard
+            let duration = renderState.duration,
+            duration.isFinite,
+            duration > 0
+        else {
+            return mediumWaveformMipTargetBinsPerPixel
+        }
+
+        let visibleDuration = duration * Double(max(renderState.viewport.durationProgress, 0))
+        guard visibleDuration.isFinite, visibleDuration > 0 else {
+            return mediumWaveformMipTargetBinsPerPixel
+        }
+
+        if visibleDuration <= detailWaveformMipVisibleDuration {
+            return detailWaveformMipTargetBinsPerPixel
+        }
+
+        if visibleDuration <= mediumWaveformMipVisibleDuration {
+            let progress = smoothStep(
+                Float(
+                    (visibleDuration - detailWaveformMipVisibleDuration) /
+                    max(mediumWaveformMipVisibleDuration - detailWaveformMipVisibleDuration, 0.000_001)
+                )
+            )
+            return mix(
+                detailWaveformMipTargetBinsPerPixel,
+                mediumWaveformMipTargetBinsPerPixel,
+                progress
+            )
+        }
+
+        if visibleDuration <= overviewWaveformMipVisibleDuration {
+            let progress = smoothStep(
+                Float(
+                    (visibleDuration - mediumWaveformMipVisibleDuration) /
+                    max(overviewWaveformMipVisibleDuration - mediumWaveformMipVisibleDuration, 0.000_001)
+                )
+            )
+            return mix(
+                mediumWaveformMipTargetBinsPerPixel,
+                overviewWaveformMipTargetBinsPerPixel,
+                progress
+            )
+        }
+
+        return overviewWaveformMipTargetBinsPerPixel
+    }
+
+    private func mix(_ start: Float, _ end: Float, _ progress: Float) -> Float {
+        start + (end - start) * min(max(progress, 0), 1)
     }
 
     private func appendRectangle(
@@ -9812,6 +10484,44 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let bottomRight = makeVertex(
             normalizedPosition: SIMD2<Float>(right, bottom),
             color: bottomColor
+        )
+
+        vertices.append(topLeft)
+        vertices.append(topRight)
+        vertices.append(bottomLeft)
+        vertices.append(topRight)
+        vertices.append(bottomRight)
+        vertices.append(bottomLeft)
+    }
+
+    private func appendHorizontalGradientRectangle(
+        to vertices: inout [TimelineVertex],
+        left: Float,
+        right: Float,
+        top: Float,
+        bottom: Float,
+        leftColor: SIMD4<Float>,
+        rightColor: SIMD4<Float>
+    ) {
+        guard right > left, bottom > top else {
+            return
+        }
+
+        let topLeft = makeVertex(
+            normalizedPosition: SIMD2<Float>(left, top),
+            color: leftColor
+        )
+        let topRight = makeVertex(
+            normalizedPosition: SIMD2<Float>(right, top),
+            color: rightColor
+        )
+        let bottomLeft = makeVertex(
+            normalizedPosition: SIMD2<Float>(left, bottom),
+            color: leftColor
+        )
+        let bottomRight = makeVertex(
+            normalizedPosition: SIMD2<Float>(right, bottom),
+            color: rightColor
         )
 
         vertices.append(topLeft)
@@ -10776,12 +11486,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float4 metrics;
     };
 
-    struct DeletionParticleRasterizedVertex {
-        float4 position [[position]];
-        float2 localPosition;
-        float4 color;
-    };
-
     struct SelectionDragEffectRasterizedVertex {
         float4 position [[position]];
         float2 localPosition;
@@ -11353,14 +12057,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         return float4(color, clamp(alpha, 0.0, 1.0));
     }
 
-    static float deletion_line_coverage(float2 point, float2 start, float2 end, float halfWidth, float aa) {
-        float2 segment = end - start;
-        float lengthSquared = max(dot(segment, segment), 0.000001);
-        float t = clamp(dot(point - start, segment) / lengthSquared, 0.0, 1.0);
-        float distance = length(point - (start + segment * t));
-        return 1.0 - smoothstep(halfWidth, halfWidth + aa, distance);
-    }
-
     vertex DeletionEffectRasterizedVertex deletion_effect_vertex(
         uint vertexID [[vertex_id]],
         constant WaveformShaderQuadVertex *vertices [[buffer(0)]],
@@ -11395,16 +12091,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     ) {
         float width = max(effect.metrics.x, 1.0);
         float height = max(effect.metrics.y, 1.0);
-        float laneHeightPixels = max(effect.metrics.z, 1.0);
         float progress = clamp(effect.timing.x, 0.0, 1.0);
-        float seed = effect.timing.z;
-        uint selectedBinCount = uint(max(effect.timing.w, 0.0));
         float left = effect.rect.x;
         float right = effect.rect.y;
         float top = effect.rect.z;
         float bottom = effect.rect.w;
         float slide = clamp(effect.ripple.y, 0.0, 1.0);
-        float deletionWidth = max(effect.ripple.w, max(right - left, 0.000001));
         float shiftedRight = mix(right, left, slide);
         float selectionRight = max(left + 1.0 / width, shiftedRight);
         float2 point = in.normalizedPosition;
@@ -11437,126 +12129,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             }
         }
 
-        float2 pixelPoint = point * float2(width, height);
-        float leftX = left * width;
-        float edgeDistance = abs(pixelPoint.x - leftX);
-        float particleWindow = smoothstep(0.012, 0.075, progress) *
-            (1.0 - smoothstep(0.982, 1.0, progress));
-        if (selectedBinCount > 0 &&
-            particleWindow > 0.0 &&
-            edgeDistance < 140.0 &&
-            point.y >= effect.overlayRect.z &&
-            point.y <= effect.overlayRect.w) {
-            float selectedBinsF = max(float(selectedBinCount), 1.0);
-            float baseBin = clamp(slide * (selectedBinsF - 1.0), 0.0, selectedBinsF - 1.0);
-            float centerY = (top + bottom) * 0.5;
-            float amplitudeHeight = (bottom - top) * 0.43;
-            float dynamicRate = max(selectedBinsF * 0.135, 1.0);
-
-            for (int shardIndex = 0; shardIndex < 28; shardIndex += 1) {
-                float shardSeed = seed + float(shardIndex) * 131.731;
-                float binOffset = (hash11(shardSeed + 11.0) - 0.5) * 7.0;
-                uint binIndex = uint(clamp(floor(baseBin + binOffset), 0.0, selectedBinsF - 1.0));
-                WaveformShaderBin bin = bins[binIndex];
-                float peak = max(abs(bin.minimumSample), abs(bin.maximumSample));
-                float impact = clamp(peak * 1.25 + bin.rmsSample * 0.45, 0.0, 1.0);
-                float audible = smoothstep(0.018, 0.15, impact);
-                if (audible <= 0.0) {
-                    continue;
-                }
-
-                float useMaximum = step(0.5, hash11(shardSeed + 23.0));
-                float sample = mix(bin.minimumSample, bin.maximumSample, useMaximum);
-                sample += (hash11(shardSeed + 29.0) - 0.5) * max(peak, 0.04) * 0.22;
-                float sourceYPixels = (centerY - clamp(sample, -1.0, 1.0) * amplitudeHeight) * height;
-                float age = fract(slide * dynamicRate + hash11(shardSeed + 37.0));
-                float angle = hash11(shardSeed + 41.0) * 6.28318530718;
-                float2 direction = float2(cos(angle), sin(angle));
-                float speed = mix(8.0, 68.0, hash11(shardSeed + 53.0)) * (0.64 + impact * 0.86);
-                float2 shardCenter = float2(leftX, sourceYPixels) + direction * speed * age;
-                float spin = (hash11(shardSeed + 67.0) - 0.5) * 10.5 * age;
-                float tangentAngle = angle + 1.57079632679 + spin;
-                float2 tangent = float2(cos(tangentAngle), sin(tangentAngle));
-                float shardLength = mix(3.4, 12.4, hash11(shardSeed + 79.0)) * (1.0 - age * 0.36);
-                float shardHalfWidth = mix(0.58, 1.08, hash11(shardSeed + 83.0));
-                float shardCoverage = deletion_line_coverage(
-                    pixelPoint,
-                    shardCenter - tangent * shardLength * 0.5,
-                    shardCenter + tangent * shardLength * 0.5,
-                    shardHalfWidth,
-                    1.05
-                );
-                float shardFade = pow(max(1.0 - age, 0.0), 1.28);
-                float alpha = shardCoverage * particleWindow * audible * impact * shardFade * 0.58;
-                color = source_over(color, float4(float3(0.93, 0.98, 1.0), alpha));
-            }
-        }
-
         return float4(clamp(color.rgb, float3(0.0), float3(1.0)), clamp(color.a, 0.0, 1.0));
-    }
-
-    vertex DeletionParticleRasterizedVertex deletion_particle_vertex(
-        uint vertexID [[vertex_id]],
-        uint instanceID [[instance_id]],
-        constant WaveformShaderQuadVertex *vertices [[buffer(0)]],
-        constant DeletionEffectUniform &effect [[buffer(1)]]
-    ) {
-        float2 unit = vertices[vertexID].position.xy;
-        float2 corner = unit * 2.0 - 1.0;
-        float width = max(effect.metrics.x, 1.0);
-        float height = max(effect.metrics.y, 1.0);
-        float laneHeightPixels = max(effect.metrics.z, 1.0);
-        float duration = max(effect.metrics.w, 0.000001);
-        float progress = clamp(effect.timing.x, 0.0, 1.0);
-        float blast = clamp(effect.timing.y, 0.0, 1.0);
-        float seed = effect.timing.z + float(instanceID) * 917.37;
-        float leftX = effect.rect.x * width;
-        float rightX = effect.rect.y * width;
-        float topY = effect.rect.z * height;
-        float bottomY = effect.rect.w * height;
-        float centerY = (topY + bottomY) * 0.5;
-        float sourceX = mix(leftX, rightX, hash11(seed + 17.0));
-        float yBias = pow(hash11(seed + 31.0), 1.7);
-        float sourceY = centerY + (yBias * 2.0 - 1.0) * laneHeightPixels * 0.39;
-        float angle = hash11(seed + 47.0) * 6.2831853;
-        float2 direction = float2(cos(angle), sin(angle));
-        float speed = 32.0 + 172.0 * hash11(seed + 71.0);
-        float ageSeconds = progress * duration;
-        float2 center = float2(sourceX, sourceY) +
-            direction * speed * ageSeconds * (0.35 + blast * 1.25);
-        float radius = 0.10 + 0.32 * hash11(seed + 89.0);
-        float dissolve = 1.0 - smoothstep(0.0, 1.0, progress);
-        float alpha = progress < 0.78 ?
-            dissolve * dissolve * (0.08 + 0.045 * hash11(seed + 167.0)) :
-            0.0;
-        float3 color = float3(
-            0.70 + 0.30 * hash11(seed + 131.0),
-            0.91 + 0.09 * hash11(seed + 137.0),
-            0.92 + 0.08 * hash11(seed + 149.0)
-        );
-
-        float2 normalizedPosition = (center + corner * radius) / float2(width, height);
-        DeletionParticleRasterizedVertex out;
-        out.position = float4(
-            normalizedPosition.x * 2.0 - 1.0,
-            1.0 - normalizedPosition.y * 2.0,
-            0.0,
-            1.0
-        );
-        out.localPosition = corner;
-        out.color = float4(color, alpha);
-        return out;
-    }
-
-    fragment float4 deletion_particle_fragment(
-        DeletionParticleRasterizedVertex in [[stage_in]],
-        constant DeletionEffectUniform &effect [[buffer(1)]]
-    ) {
-        float distance = length(in.localPosition);
-        float coverage = 1.0 - smoothstep(0.15, 1.0, distance);
-        float softCore = 1.0 - smoothstep(0.0, 0.38, distance);
-        float alpha = in.color.a * max(coverage, 0.0) * (0.72 + 0.28 * max(softCore, 0.0));
-        return float4(in.color.rgb, alpha);
     }
 
     static float deletion_warp_source_x(float x, float4 warp) {
@@ -11606,41 +12179,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         return clamp(float2(geometry, light), float2(0.0), float2(1.0));
     }
 
-    static float2 selection_drag_segment_influence(
-        float timelineProgress,
-        float4 previousContact,
-        float4 contact,
-        float4 tuning
-    ) {
-        if (previousContact.w <= 0.0 ||
-            contact.w <= 0.0 ||
-            previousContact.y <= 0.0001 ||
-            contact.y <= 0.0001) {
-            return float2(0.0);
-        }
-
-        float span = contact.x - previousContact.x;
-        if (abs(span) <= 0.0000001) {
-            return float2(0.0);
-        }
-
-        float segmentStart = min(previousContact.x, contact.x);
-        float segmentEnd = max(previousContact.x, contact.x);
-        float edgeSoftness = max(min(tuning.x, tuning.y) * 0.45, 0.0000001);
-        float coverage =
-            smoothstep(segmentStart, segmentStart + edgeSoftness, timelineProgress) *
-            (1.0 - smoothstep(segmentEnd - edgeSoftness, segmentEnd, timelineProgress));
-        if (coverage <= 0.0001) {
-            return float2(0.0);
-        }
-
-        float segmentT = clamp((timelineProgress - previousContact.x) / span, 0.0, 1.0);
-        float strength = mix(previousContact.y, contact.y, segmentT);
-        float geometry = strength * coverage * 0.58;
-        float light = strength * coverage * 0.42;
-        return clamp(float2(geometry, light), float2(0.0), float2(1.0));
-    }
-
     static float2 selection_drag_waveform_influence(
         float timelineProgress,
         WaveformRasterizedVertex vertexIn
@@ -11660,31 +12198,24 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
         if (count > 1.5) {
             influence = max(influence, selection_drag_contact_influence(timelineProgress, vertexIn.selectionDragContact1, vertexIn.selectionDrag));
-            influence = max(influence, selection_drag_segment_influence(timelineProgress, vertexIn.selectionDragContact0, vertexIn.selectionDragContact1, vertexIn.selectionDrag));
         }
         if (count > 2.5) {
             influence = max(influence, selection_drag_contact_influence(timelineProgress, vertexIn.selectionDragContact2, vertexIn.selectionDrag));
-            influence = max(influence, selection_drag_segment_influence(timelineProgress, vertexIn.selectionDragContact1, vertexIn.selectionDragContact2, vertexIn.selectionDrag));
         }
         if (count > 3.5) {
             influence = max(influence, selection_drag_contact_influence(timelineProgress, vertexIn.selectionDragContact3, vertexIn.selectionDrag));
-            influence = max(influence, selection_drag_segment_influence(timelineProgress, vertexIn.selectionDragContact2, vertexIn.selectionDragContact3, vertexIn.selectionDrag));
         }
         if (count > 4.5) {
             influence = max(influence, selection_drag_contact_influence(timelineProgress, vertexIn.selectionDragContact4, vertexIn.selectionDrag));
-            influence = max(influence, selection_drag_segment_influence(timelineProgress, vertexIn.selectionDragContact3, vertexIn.selectionDragContact4, vertexIn.selectionDrag));
         }
         if (count > 5.5) {
             influence = max(influence, selection_drag_contact_influence(timelineProgress, vertexIn.selectionDragContact5, vertexIn.selectionDrag));
-            influence = max(influence, selection_drag_segment_influence(timelineProgress, vertexIn.selectionDragContact4, vertexIn.selectionDragContact5, vertexIn.selectionDrag));
         }
         if (count > 6.5) {
             influence = max(influence, selection_drag_contact_influence(timelineProgress, vertexIn.selectionDragContact6, vertexIn.selectionDrag));
-            influence = max(influence, selection_drag_segment_influence(timelineProgress, vertexIn.selectionDragContact5, vertexIn.selectionDragContact6, vertexIn.selectionDrag));
         }
         if (count > 7.5) {
             influence = max(influence, selection_drag_contact_influence(timelineProgress, vertexIn.selectionDragContact7, vertexIn.selectionDrag));
-            influence = max(influence, selection_drag_segment_influence(timelineProgress, vertexIn.selectionDragContact6, vertexIn.selectionDragContact7, vertexIn.selectionDrag));
         }
         return clamp(influence, float2(0.0), float2(1.0));
     }
@@ -11819,7 +12350,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             )
         );
 
-        if (rmsBottom > rmsTop) {
+        if (in.style.z > 0.001 && rmsBottom > rmsTop) {
             float4 rmsColor = lightened_color(baseColor, 0.22, in.style.z * alphaScale);
             color = source_over(
                 color,

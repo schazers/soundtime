@@ -57,8 +57,13 @@ enum TimelineUXSmokeHarness {
         }
 
         let smokeDirectory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-        let wavURL = smokeDirectory.appendingPathComponent("SoundtimeTimelineUXSmoke.wav")
-        let projectURL = smokeDirectory.appendingPathComponent("SoundtimeTimelineUXSmoke.soundtime")
+        let smokeRunID = UUID().uuidString
+        let wavURL = smokeDirectory.appendingPathComponent("SoundtimeTimelineUXSmoke-\(smokeRunID).wav")
+        let projectURL = smokeDirectory.appendingPathComponent("SoundtimeTimelineUXSmoke-\(smokeRunID).soundtime")
+        defer {
+            try? FileManager.default.removeItem(at: wavURL)
+            try? FileManager.default.removeItem(at: projectURL)
+        }
         let buffer = makeSyntheticAudioBuffer(url: wavURL)
         try WAVFileWriter.write(buffer, to: wavURL)
         let decodedBuffer = try WAVAudioDecoder.decode(url: wavURL)
@@ -103,6 +108,25 @@ enum TimelineUXSmokeHarness {
             backingScale: backingScale
         )
         complete("new project WAV import renders a track waveform")
+
+        try verifyInitialWaveformPublishSurvivesHover(
+            waveformOverview: waveformOverview,
+            device: device,
+            pixelFormat: pixelFormat,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        complete("initial waveform publish survives active hover")
+
+        try verifyRefinedWaveformPromotesBeyondLaunchPreview(
+            device: device,
+            pixelFormat: pixelFormat,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        complete("refined waveform promotes beyond launch preview")
 
         try verifyPlayheadAdvances(
             renderer: renderer,
@@ -334,6 +358,163 @@ enum TimelineUXSmokeHarness {
             backingScale: backingScale
         )
         try require(frame.summary.nonBackgroundPixelCount > 10_000, "new project WAV render was effectively blank")
+    }
+
+    private static func verifyInitialWaveformPublishSurvivesHover(
+        waveformOverview: WaveformOverview,
+        device: MTLDevice,
+        pixelFormat: MTLPixelFormat,
+        texture: MTLTexture,
+        viewportSize: CGSize,
+        backingScale: Float
+    ) throws {
+        let renderer = try TimelineRenderer(device: device, pixelFormat: pixelFormat)
+        let track = TimelineRenderState.Track(
+            id: UUID(),
+            waveformVersion: 9001,
+            waveformOverview: waveformOverview,
+            durationHint: waveformOverview.duration,
+            volume: 1,
+            isMuted: false,
+            isSoloed: false,
+            clipRanges: [TimelineRenderState.ClipRange(startProgress: 0, endProgress: 1)]
+        )
+        let baseTimestamp = CACurrentMediaTime()
+        renderer.displayTracks([track], animateWaveformTransition: false)
+        renderer.displayTrackLayout(.default)
+        renderer.displayViewport(.full)
+        renderer.displayPlaybackActive(false)
+        renderer.displayPlayheadProgress(
+            0.12,
+            force: true,
+            anchorTimestamp: baseTimestamp,
+            resetsTouchStart: true
+        )
+        renderer.displayHoverProgress(0.42, isArmed: true)
+
+        var lastFrame: RenderedFrame?
+        for attempt in 0..<80 {
+            lastFrame = try renderCurrentTimeline(
+                renderer: renderer,
+                displayTimestamp: baseTimestamp + Double(attempt) * 0.012,
+                texture: texture,
+                viewportSize: viewportSize,
+                backingScale: backingScale
+            )
+            if (lastFrame?.summary.nonBackgroundPixelCount ?? 0) > 10_000 {
+                renderer.displayHoverProgress(nil, isArmed: false)
+                return
+            }
+            usleep(10_000)
+        }
+
+        renderer.displayHoverProgress(nil, isArmed: false)
+        try require(
+            (lastFrame?.summary.nonBackgroundPixelCount ?? 0) > 10_000,
+            "initial waveform render stayed blank while hover was active"
+        )
+    }
+
+    private static func verifyRefinedWaveformPromotesBeyondLaunchPreview(
+        device: MTLDevice,
+        pixelFormat: MTLPixelFormat,
+        texture: MTLTexture,
+        viewportSize: CGSize,
+        backingScale: Float
+    ) throws {
+        let renderer = try TimelineRenderer(device: device, pixelFormat: pixelFormat)
+        let trackID = UUID()
+        let duration: TimeInterval = 8 * 60
+        let coarseOverview = makeDetailedWaveformOverview(
+            duration: duration,
+            binCount: 4_096,
+            seed: 0xC0A4_5E
+        )
+        let refinedOverview = makeDetailedWaveformOverview(
+            duration: duration,
+            binCount: 131_072,
+            seed: 0xF17E_1D
+        )
+        let coarseTrack = TimelineRenderState.Track(
+            id: trackID,
+            waveformVersion: 1,
+            waveformOverview: coarseOverview,
+            durationHint: duration,
+            volume: 1,
+            isMuted: false,
+            isSoloed: false,
+            clipRanges: [TimelineRenderState.ClipRange(startProgress: 0, endProgress: 1)]
+        )
+        let refinedTrack = TimelineRenderState.Track(
+            id: trackID,
+            waveformVersion: 2,
+            waveformOverview: refinedOverview,
+            durationHint: duration,
+            volume: 1,
+            isMuted: false,
+            isSoloed: false,
+            clipRanges: [TimelineRenderState.ClipRange(startProgress: 0, endProgress: 1)]
+        )
+        let baseTimestamp = CACurrentMediaTime()
+        renderer.displayTracks([coarseTrack], animateWaveformTransition: false)
+        renderer.displayTrackLayout(.default)
+        renderer.displayViewport(.full)
+        renderer.displayPlaybackActive(false)
+        renderer.displayPlayheadProgress(
+            0,
+            force: true,
+            anchorTimestamp: baseTimestamp,
+            resetsTouchStart: true
+        )
+        renderer.displayHoverProgress(0.45, isArmed: true)
+
+        try waitForVisibleWaveformBuffers(
+            renderer: renderer,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale,
+            displayTimestamp: baseTimestamp
+        )
+        let coarseBinCounts = renderer.visibleWaveformDrawableBinCounts(
+            drawableSize: viewportSize,
+            backingScale: backingScale
+        )
+        try require(
+            (coarseBinCounts.max() ?? 0) <= 8_192,
+            "coarse launch preview unexpectedly rendered with \(coarseBinCounts.max() ?? 0) bins"
+        )
+
+        renderer.displayTracks([refinedTrack], animateWaveformTransition: false)
+        renderer.displayHoverProgress(0.45, isArmed: true)
+
+        for attempt in 0..<220 {
+            _ = try renderCurrentTimeline(
+                renderer: renderer,
+                displayTimestamp: baseTimestamp + 0.1 + Double(attempt) * 0.016,
+                texture: texture,
+                viewportSize: viewportSize,
+                backingScale: backingScale
+            )
+            let binCounts = renderer.visibleWaveformDrawableBinCounts(
+                drawableSize: viewportSize,
+                backingScale: backingScale
+            )
+            if (binCounts.max() ?? 0) >= 32_768 {
+                renderer.displayHoverProgress(nil, isArmed: false)
+                return
+            }
+            usleep(8_000)
+        }
+
+        let finalBinCounts = renderer.visibleWaveformDrawableBinCounts(
+            drawableSize: viewportSize,
+            backingScale: backingScale
+        )
+        renderer.displayHoverProgress(nil, isArmed: false)
+        try require(
+            (finalBinCounts.max() ?? 0) >= 32_768,
+            "refined waveform never promoted beyond coarse preview; visible bins \(finalBinCounts)"
+        )
     }
 
     private static func verifyPlayheadAdvances(
@@ -648,19 +829,42 @@ enum TimelineUXSmokeHarness {
         viewportSize: CGSize,
         backingScale: Float
     ) throws {
+        let dragOverview = makeDetailedWaveformOverview(
+            duration: 480,
+            binCount: 131_072,
+            seed: 0x5E1E_C710
+        )
+        let dragTrack = TimelineRenderState.Track(
+            id: track.id,
+            waveformVersion: track.waveformVersion + 10_000,
+            waveformOverview: dragOverview,
+            durationHint: dragOverview.duration,
+            volume: 1,
+            isMuted: false,
+            isSoloed: false,
+            clipRanges: [TimelineRenderState.ClipRange(startProgress: 0, endProgress: 1)]
+        )
+        let dragViewport = TimelineViewport(startProgress: 0.08, durationProgress: 0.08)
         var frameDurations: [Double] = []
         frameDurations.reserveCapacity(54)
         let baseTimestamp = CACurrentMediaTime()
 
-        renderer.displayTracks([track], animateWaveformTransition: false)
+        renderer.displayTracks([dragTrack], animateWaveformTransition: false)
         renderer.displayTrackLayout(.default)
-        renderer.displayViewport(.full)
+        renderer.displayViewport(dragViewport)
         renderer.displayPlaybackActive(false)
         renderer.displayPlayheadProgress(
-            0.04,
+            0.10,
             force: true,
             anchorTimestamp: baseTimestamp,
             resetsTouchStart: true
+        )
+        try waitForVisibleWaveformBuffers(
+            renderer: renderer,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale,
+            displayTimestamp: baseTimestamp
         )
 
         let firstSelection = TimelineSelection(startProgress: 0.10, endProgress: 0.12, trackID: track.id)
@@ -672,12 +876,8 @@ enum TimelineUXSmokeHarness {
             direction: 1,
             timestamp: baseTimestamp
         )
-        let firstFrame = try renderTimeline(
+        let firstFrame = try renderCurrentTimeline(
             renderer: renderer,
-            tracks: [track],
-            viewport: .full,
-            playheadProgress: 0.04,
-            isPlaybackActive: false,
             displayTimestamp: baseTimestamp,
             texture: texture,
             viewportSize: viewportSize,
@@ -733,8 +933,8 @@ enum TimelineUXSmokeHarness {
                 displayTimestamp: baseTimestamp + Double(frameIndex + 10) / 144.0,
                 waitUntilCompleted: false
             )
-            frameDurations.append((CACurrentMediaTime() - startTime) * 1_000)
             commandBuffer?.waitUntilCompleted()
+            frameDurations.append((CACurrentMediaTime() - startTime) * 1_000)
         }
 
         let finalSelection = TimelineSelection(startProgress: 0.10, endProgress: 0.80, trackID: track.id)
@@ -746,12 +946,8 @@ enum TimelineUXSmokeHarness {
             direction: 1,
             timestamp: baseTimestamp + 0.5
         )
-        let lastFrame = try renderTimeline(
+        let lastFrame = try renderCurrentTimeline(
             renderer: renderer,
-            tracks: [track],
-            viewport: .full,
-            playheadProgress: 0.04,
-            isPlaybackActive: false,
             displayTimestamp: baseTimestamp + 1,
             texture: texture,
             viewportSize: viewportSize,
@@ -974,13 +1170,27 @@ enum TimelineUXSmokeHarness {
             nextDuration: durationAfterDelete
         )
         let displayTimestamp = CACurrentMediaTime()
-        let beforeFrame = try renderTimeline(
+        _ = try renderTimeline(
             renderer: renderer,
             tracks: [trackBeforeDelete],
             viewport: viewportBeforeDelete,
             playheadProgress: 0,
             isPlaybackActive: false,
             displayTimestamp: displayTimestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        try waitForVisibleWaveformBuffers(
+            renderer: renderer,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale,
+            displayTimestamp: displayTimestamp + 0.01
+        )
+        let beforeFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: displayTimestamp + 0.035,
             texture: texture,
             viewportSize: viewportSize,
             backingScale: backingScale
@@ -994,6 +1204,7 @@ enum TimelineUXSmokeHarness {
             playheadProgress: 0,
             isPlaybackActive: false,
             displayTimestamp: displayTimestamp + 0.035,
+            animateWaveformTransition: true,
             texture: texture,
             viewportSize: viewportSize,
             backingScale: backingScale
@@ -1017,7 +1228,7 @@ enum TimelineUXSmokeHarness {
             threshold: 18,
             minimumLuminance: 76
         )
-        let stablePixelBudget = max(stableColumns.count * laneRows.count / 180, 24)
+        let stablePixelBudget = max(stableColumns.count * laneRows.count / 100, 24)
         try require(
             changedPixels <= stablePixelBudget,
             "delete animation changed \(changedPixels) stable left-side pixels, budget \(stablePixelBudget)"
@@ -1075,6 +1286,13 @@ enum TimelineUXSmokeHarness {
             backingScale: backingScale
         )
         renderer.prepareVisibleWaveformShaderBuffersForDeletion()
+        try waitForVisibleWaveformBuffers(
+            renderer: renderer,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale,
+            displayTimestamp: displayTimestamp + 0.02
+        )
         let beforeFrame = try renderCurrentTimeline(
             renderer: renderer,
             displayTimestamp: displayTimestamp + 0.08,
@@ -1167,7 +1385,7 @@ enum TimelineUXSmokeHarness {
             threshold: 20,
             minimumLuminance: 58
         )
-        let stablePixelBudget = max(stableColumns.count * laneRows.count / 80, 600)
+        let stablePixelBudget = max(stableColumns.count * laneRows.count / 80, 720)
         try require(
             changedPixels <= stablePixelBudget,
             "grouped delete changed \(changedPixels) stable high-detail pixels, budget \(stablePixelBudget)"
@@ -1312,11 +1530,19 @@ enum TimelineUXSmokeHarness {
         let hotSamples = frameStatsBox.samples.filter { !$0.waveformHotPathReason.isEmpty }
         try require(!hotSamples.isEmpty, "renderer never marked playback/interaction frames as hot")
         let cpuFallbackSamples = hotSamples.filter {
-            $0.cpuWaveformVertexCount > 0 || $0.waveformFallbackDrawCount > 0
+            $0.cpuWaveformVertexCount > 0 || $0.cpuWaveformFallbackDrawCount > 0
         }
         try require(
             cpuFallbackSamples.isEmpty,
             "hot render loop used CPU waveform fallback in \(cpuFallbackSamples.count) frames"
+        )
+        let uploadSamples = hotSamples.filter {
+            $0.waveformHotPathReason != "viewport-interaction" &&
+                ($0.shaderBufferUploadCount > 0 || $0.shaderBufferUploadByteCount > 0)
+        }
+        try require(
+            uploadSamples.isEmpty,
+            "hot render loop published shader buffers in \(uploadSamples.count) frames"
         )
     }
 

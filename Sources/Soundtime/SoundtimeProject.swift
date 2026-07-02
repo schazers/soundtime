@@ -308,6 +308,7 @@ enum SoundtimeProjectStore {
     private static let lastProjectURLKey = "Soundtime.lastProjectURL"
     private static let recentProjectURLPathsKey = "Soundtime.recentProjectURLPaths"
     private static let projectWindowLayoutKeyPrefix = "Soundtime.projectWindowLayout."
+    private static let projectTimelineViewportKeyPrefix = "Soundtime.projectTimelineViewport."
 
     static func load(from url: URL) throws -> SoundtimeProject {
         let data = try Data(contentsOf: url)
@@ -451,6 +452,25 @@ enum SoundtimeProjectStore {
         return try? JSONDecoder().decode(SoundtimeProject.WindowLayout.self, from: data)
     }
 
+    static func rememberTimelineViewport(
+        _ viewport: SoundtimeProject.TimelineViewport,
+        for projectURL: URL
+    ) {
+        guard let data = try? JSONEncoder().encode(viewport) else {
+            return
+        }
+
+        UserDefaults.standard.set(data, forKey: projectTimelineViewportKey(for: projectURL))
+    }
+
+    static func rememberedTimelineViewport(for projectURL: URL) -> SoundtimeProject.TimelineViewport? {
+        guard let data = UserDefaults.standard.data(forKey: projectTimelineViewportKey(for: projectURL)) else {
+            return nil
+        }
+
+        return try? JSONDecoder().decode(SoundtimeProject.TimelineViewport.self, from: data)
+    }
+
     private static func recentProjectURLPaths() -> [String] {
         (UserDefaults.standard.stringArray(forKey: recentProjectURLPathsKey) ?? [])
             .filter { !$0.isEmpty }
@@ -458,6 +478,10 @@ enum SoundtimeProjectStore {
 
     private static func projectWindowLayoutKey(for projectURL: URL) -> String {
         projectWindowLayoutKeyPrefix + stablePathHash(projectURL.standardizedFileURL.path)
+    }
+
+    private static func projectTimelineViewportKey(for projectURL: URL) -> String {
+        projectTimelineViewportKeyPrefix + stablePathHash(projectURL.standardizedFileURL.path)
     }
 
     private static func autosaveURL(projectURL: URL?, autosaveID: UUID) -> URL {
