@@ -199,12 +199,14 @@ enum ProductionReadinessHarness {
                 work: [
                     "Measure process entry, window visible, visual skeleton, first waveform, and playback prime milestones.",
                     "Keep first-paint snapshot loading bounded by byte and time budgets.",
+                    "Defer per-track source validation until full restore so cached previews never blank the first frame.",
                     "Hydrate audio and waveform refinement after the first usable frame.",
                     "Never present blank cached tracks unless the source is truly stale or missing.",
                 ],
                 qualityGate: [
                     "Cached multitrack projects show tracks and previews on first paint.",
                     "No project decode, waveform refinement, or zero-crossing work blocks first window display.",
+                    "Source changes are detected by full restore without blocking first-paint visuals.",
                     "Missing/stale source state is diagnostic, not a normal visual blank.",
                 ],
                 manualChecks: [

@@ -112,7 +112,11 @@ struct ProjectLaunchSnapshot: Codable, Sendable {
             return sourceMetadata.isCompatible(with: ProjectFileMetadata(fileURL: sourceURL))
         }
 
-        func validatedForLaunch() -> Track {
+        func validatedForLaunch(validatesSourceFile: Bool = true) -> Track {
+            guard validatesSourceFile else {
+                return self
+            }
+
             guard !hasCompatibleSourceFile else {
                 return self
             }
@@ -232,9 +236,12 @@ struct ProjectLaunchSnapshot: Codable, Sendable {
         return projectMetadata.isCompatible(with: ProjectFileMetadata(projectURL: projectURL))
     }
 
-    func validatedForLaunch(projectURL: URL) -> ProjectLaunchSnapshot {
+    func validatedForLaunch(
+        projectURL: URL,
+        validatesTrackSources: Bool = true
+    ) -> ProjectLaunchSnapshot {
         var snapshot = self
-        snapshot.tracks = tracks.map { $0.validatedForLaunch() }
+        snapshot.tracks = tracks.map { $0.validatedForLaunch(validatesSourceFile: validatesTrackSources) }
         return snapshot
     }
 }
@@ -276,7 +283,10 @@ enum ProjectLaunchSnapshotStore {
             return nil
         }
 
-        return snapshot.validatedForLaunch(projectURL: projectURL)
+        return snapshot.validatedForLaunch(
+            projectURL: projectURL,
+            validatesTrackSources: false
+        )
     }
 
     static func save(_ snapshot: ProjectLaunchSnapshot, for projectURL: URL) throws {

@@ -262,6 +262,36 @@ enum LaunchPerformanceSmokeHarness {
         try ProjectLaunchSnapshotStore.save(snapshot, for: projectURL)
         let firstSourceURL = URL(fileURLWithPath: tracks[0].filePath)
         try Data("stale source".utf8).write(to: firstSourceURL, options: [.atomic])
+        let firstPaintBlankTracksAfterStaleSource: String
+        if binaryData.count <= ProjectLaunchSnapshotStore.firstPaintSynchronousByteLimit {
+            let staleFirstPaintSnapshot = try requireValue(
+                ProjectLaunchSnapshotStore.loadForFirstPaintIfAvailable(for: projectURL),
+                "stale-source snapshot should still be available for first paint"
+            )
+            let staleFirstPaintTrack = try requireValue(
+                staleFirstPaintSnapshot.tracks.first,
+                "stale-source first-paint snapshot dropped first track"
+            )
+            try require(
+                staleFirstPaintTrack.displayOverview != nil || staleFirstPaintTrack.sourceOverview != nil,
+                "stale-source first-paint path stripped cached waveform previews"
+            )
+            let staleFirstPaintReadiness = ProjectLaunchReadinessClassifier.summarize(
+                snapshot: staleFirstPaintSnapshot
+            )
+            try require(
+                staleFirstPaintReadiness.isFirstFrameUsable,
+                "stale-source first-paint path should preserve a usable visual shell"
+            )
+            firstPaintBlankTracksAfterStaleSource = "\(staleFirstPaintReadiness.blankTrackCount)"
+        } else {
+            try require(
+                ProjectLaunchSnapshotStore.loadForFirstPaintIfAvailable(for: projectURL) == nil,
+                "oversized stale-source snapshot should remain outside first-paint loading"
+            )
+            firstPaintBlankTracksAfterStaleSource = "skipped-oversized"
+        }
+
         let staleLoaded = try ProjectLaunchSnapshotStore.load(for: projectURL)
         let staleTrack = try requireValue(staleLoaded.tracks.first, "stale-source snapshot dropped first track")
         try require(staleTrack.sourceOverview == nil, "stale source overview was not stripped")
@@ -307,6 +337,7 @@ enum LaunchPerformanceSmokeHarness {
                 "playback prime restores file-backed audio without waveform or zero-crossing work",
                 "launch startup trace records ordered first-frame milestones",
                 "snapshot load time remains inside startup budget",
+                "first-paint launch snapshots preserve cached previews while deferring per-track source validation",
             ],
             metadata: [
                 "tracks": "\(trackCount)",
@@ -318,6 +349,7 @@ enum LaunchPerformanceSmokeHarness {
                 "durationOnlyTracks": "\(durationOnlyReadiness.durationOnlyTrackCount)",
                 "playbackPrimeMs": String(format: "%.2f", playbackPrime.elapsedMilliseconds),
                 "playbackPrimeTracks": "\(playbackPrime.tracks.count)",
+                "firstPaintBlankTracksAfterStaleSource": firstPaintBlankTracksAfterStaleSource,
                 "blankTracksAfterStaleValidation": "\(staleReadiness.blankTrackCount)",
                 "averageLoadMs": String(format: "%.2f", averageLoadMilliseconds),
                 "worstLoadMs": String(format: "%.2f", worstLoadMilliseconds),
