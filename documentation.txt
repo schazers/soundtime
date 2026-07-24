@@ -82,6 +82,8 @@ main.swift:
     swift run Soundtime --edit-preview-smoke
     swift run Soundtime --realtime-graph-publish-smoke
     swift run Soundtime --timeline-ux-smoke
+    swift run Soundtime --transcription-smoke
+    swift run Soundtime --deepgram-transcription-smoke /path/to/short-audio.wav
     swift run Soundtime --timeline-perf-baseline --quick --ci
 
 scripts/perf-gate.sh runs the core unit tests and all smoke/perf harnesses. If
@@ -762,6 +764,126 @@ WorkspaceView dead-air flow
 This is still heuristic, not a speech-aware editor. A future podcast-grade
 version should combine signal analysis, transcript boundaries, speaker context,
 and user-adjustable review confidence.
+
+
+Transcription And Text Editing
+------------------------------
+
+The transcription system is built around a provider-neutral pipeline:
+
+    selected track or scope
+        -> ResolvedTranscriptionScope
+        -> TranscriptionController
+        -> TranscriptionProvider
+        -> TranscriptDocument
+        -> timeline overlay, sidecar persistence, and edit commands
+
+TranscriptionProvider.swift
+    Defines the provider protocol, TranscriptionRequest, TranscriptionResult,
+    and TranscriptionProgress. Progress carries a stage, optional fraction,
+    user-facing message, and small metadata dictionary for provider request IDs,
+    chunk counts, resume hints, and error/debug context.
+
+DeepgramTranscriptionProvider.swift
+    Implements the first real speech-to-text provider, Deepgram Nova-3. Short
+    files are sent as one prerecorded transcription request. Longer files are
+    chunked with overlap, uploaded with conservative concurrency, parsed, then
+    stitched back together with timestamp offsets and overlap deduplication.
+    The provider records Development Console events for start, upload, chunk
+    completion, retries, failures, cancellation, and completed transcript
+    attachment. It also keeps active URLSession tasks in a registry so canceling
+    from the app cancels the in-flight provider work. Successful chunks are
+    written to the transcription chunk recovery cache, so a repeated long-form
+    attempt can reuse completed chunks instead of re-uploading everything.
+
+TranscriptDocument.swift
+    Stores timed transcript segments and words. Each word can preserve raw text,
+    punctuated text, start/end time, confidence, speaker ID/confidence, and
+    channel. A transcript also stores provider/model metadata, source revision,
+    validity, source duration, optional source fingerprint, optional time map,
+    and optional storage reference.
+
+TranscriptSourceTimeMap.swift
+    Maps transcript source time to project/timeline time. This is the important
+    bridge between "the provider transcribed the original source" and "the user
+    is editing an arranged/ripple-deleted timeline." Transcript words should be
+    rendered and edited through this map, not by assuming source time and
+    timeline time are always identical.
+
+TranscriptLayoutEngine.swift
+    Converts visible tracks, viewport, track layout, and transcript documents
+    into bounded visible text runs. It virtualizes transcript drawing by emitting
+    either word runs or segment runs depending on zoom level, capped by maximum
+    visible-run counts. The layout output also preserves metadata needed for
+    hit testing: track ID, word ID, segment ID, source range, project range,
+    confidence, and speaker ID.
+
+TimelineTranscriptOverlayView.swift
+    AppKit overlay that draws cached transcript backgrounds and text runs above
+    the Metal timeline. Its layout cache key includes viewport, bounds, track
+    layout, transcript IDs, segment counts, and waveform segment fingerprints.
+    Interaction-only changes such as hover, active word, selection, and
+    alignment-debug state redraw the cached runs without rebuilding layout.
+    The view returns nil from hitTest; TimelineView owns input routing so the
+    overlay cannot steal timeline gestures.
+
+TranscriptInteraction.swift
+    Contains the view-level transcript interaction model. It turns hovered text
+    runs and drag ranges into TranscriptTokenSelection values, including mapped
+    audio time ranges. It is intentionally small and side-effect-free so text
+    hover/click/drag can remain cheap and testable.
+
+TranscriptEditing.swift
+    Defines typed transcript edit commands. Delete and clear use the normal
+    audio edit paths by mirroring transcript selections into timeline selections.
+    Split, boundary nudge, text correction, speaker rename, and pause shortening
+    are represented as command kinds so future agent actions and UI controls can
+    call the same validated command API.
+
+TranscriptSidecarStore.swift
+    Writes full transcript documents into project-relative JSON sidecars under
+    Transcripts/. Project JSON stores metadata-only transcript references, then
+    SoundtimeProjectStore resolves sidecars during load. This keeps large
+    one-hour podcast transcripts from bloating the main project file and gives
+    us a natural place for future transcript versioning and repair tools.
+
+TranscriptionChunkRecoveryStore.swift
+    Caches completed provider chunk transcripts under Application Support using
+    a deterministic provider/model/source/chunk key. This is a first production
+    recovery layer for long podcasts: transient failures or repeated attempts
+    can reuse matching chunks, while source revision/fingerprint checks prevent
+    stale transcript chunks from being applied to changed audio.
+
+WorkspaceView transcription flow
+    WorkspaceView owns the product behavior:
+
+    - Transcribe Selected Track creates a TranscriptionJob and progress overlay.
+    - Provider progress updates the overlay and active job snapshot.
+    - Completed transcripts attach to the target track only if the editRevision
+      has not changed.
+    - The transcript layer is shown automatically after completion.
+    - Transcript clicks seek the timeline and select words.
+    - Transcript drags select text and mirror that selection into audio.
+    - Normal waveform selections mirror back into transcript words when a
+      transcript is visible.
+    - Delete/clear/split transcript commands use the existing undoable edit
+      graph paths instead of mutating audio from the overlay.
+    - Active word highlighting updates from the visual playhead.
+
+Menu commands
+    The Effects menu contains Transcribe Selected Track, Show Transcript Layer,
+    Show Transcript Alignment Debug, Delete Transcript Text, Clear Transcript
+    Text, and Split At Transcript Word. The debug command overlays word boundary
+    markers so waveform/transcript alignment problems can be seen directly.
+
+Current limitations and next work
+    The transcript overlay is still an AppKit text-run renderer rather than a
+    GPU text atlas. It is bounded and cached, but very dense transcript-only
+    editing will eventually need a richer virtualized text editor layer. Text
+    correction and speaker rename are functional command paths, not polished UI
+    flows. Chunk-level recovery now persists completed provider chunk artifacts,
+    but the UI still needs a full "Resume Previous Transcription" workflow after
+    app restart and a cleanup policy for old cached chunks.
 
 
 Agent Command Bar
