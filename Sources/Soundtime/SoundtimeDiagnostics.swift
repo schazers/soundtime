@@ -47,6 +47,7 @@ final class SoundtimeDiagnostics: @unchecked Sendable {
     private let maximumEventCount = 2_048
     private let traceWriteQueue = DispatchQueue(label: "Soundtime.diagnostics.trace", qos: .utility)
     private let severeTraceWriteThrottle: TimeInterval = 3
+    private let frameDropEventThrottle: TimeInterval = 2
     private var events: [SoundtimeDiagnosticEvent] = []
     private var latestFrameStats: TimelineFrameStats?
     private var latestAudioSnapshot: RealtimeAudioCoreSnapshot?
@@ -54,6 +55,9 @@ final class SoundtimeDiagnostics: @unchecked Sendable {
     private var lastDroppedCommandCount = 0
     private var lastRenderDeadlineMissCount = 0
     private var lastTraceWriteByName: [String: TimeInterval] = [:]
+    private var lastFrameDropEventTime: TimeInterval = -Double.infinity
+    private var lastFrameDropEventSeverity: SoundtimeDiagnosticSeverity?
+    private var suppressedFrameDropEventCount = 0
     private var mainThreadStallCount = 0
     private var lastMainThreadStallMilliseconds: Double = 0
     private var severeEventCount = 0
@@ -88,11 +92,35 @@ final class SoundtimeDiagnostics: @unchecked Sendable {
         lock.unlock()
 
         let severity: SoundtimeDiagnosticSeverity
-        if stats.framesPerSecond <= 60 || stats.worstFrameTimeMilliseconds >= 32 {
+        if stats.framesPerSecond <= 60 ||
+            stats.averageFrameTimeMilliseconds >= 16 ||
+            stats.worstFrameTimeMilliseconds >= 48
+        {
             severity = .severe
-        } else if stats.framesPerSecond < 100 || stats.worstFrameTimeMilliseconds >= 16 {
+        } else if stats.framesPerSecond < 100 ||
+            stats.averageFrameTimeMilliseconds >= 10.5 ||
+            stats.worstFrameTimeMilliseconds >= 24
+        {
             severity = .warning
         } else {
+            return
+        }
+
+        let now = CACurrentMediaTime()
+        lock.lock()
+        let severityEscalated = severity == .severe && lastFrameDropEventSeverity != .severe
+        let shouldRecord = now - lastFrameDropEventTime >= frameDropEventThrottle || severityEscalated
+        let suppressedCount = suppressedFrameDropEventCount
+        if shouldRecord {
+            lastFrameDropEventTime = now
+            lastFrameDropEventSeverity = severity
+            suppressedFrameDropEventCount = 0
+        } else {
+            suppressedFrameDropEventCount += 1
+        }
+        lock.unlock()
+
+        guard shouldRecord else {
             return
         }
 
@@ -125,6 +153,7 @@ final class SoundtimeDiagnostics: @unchecked Sendable {
                 "gpuResidentShadowInstances": "\(stats.gpuResidentShadowDrawInstanceCount)",
                 "effects": "\(stats.effectVertexCount)",
                 "deletes": "\(stats.deletionEffectCount)",
+                "suppressedSimilarEvents": "\(suppressedCount)",
             ]
         )
     }
@@ -288,6 +317,9 @@ final class SoundtimeDiagnostics: @unchecked Sendable {
         lastDroppedCommandCount = 0
         lastRenderDeadlineMissCount = 0
         lastTraceWriteByName.removeAll(keepingCapacity: true)
+        lastFrameDropEventTime = -Double.infinity
+        lastFrameDropEventSeverity = nil
+        suppressedFrameDropEventCount = 0
         mainThreadStallCount = 0
         lastMainThreadStallMilliseconds = 0
         severeEventCount = 0

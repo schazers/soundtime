@@ -5,6 +5,9 @@ enum AudioProcessingCredentials {
     private static let audioShakeEnvironmentKey = "SOUNDTIME_AUDIOSHAKE_API_KEY"
     private static let audioShakeKeychainService = "com.soundtime.audioshake"
     private static let audioShakeKeychainAccount = "api-key"
+    private static let deepgramEnvironmentKey = "DEEPGRAM_API_KEY"
+    private static let deepgramKeychainService = "com.soundtime.deepgram"
+    private static let deepgramKeychainAccount = "api-key"
 
     enum CredentialError: LocalizedError {
         case keychainReadFailed(OSStatus)
@@ -14,11 +17,11 @@ enum AudioProcessingCredentials {
         var errorDescription: String? {
             switch self {
             case let .keychainReadFailed(status):
-                "Could not read the AudioShake API key from Keychain (\(status))."
+                "Could not read the API key from Keychain (\(status))."
             case let .keychainWriteFailed(status):
-                "Could not save the AudioShake API key to Keychain (\(status))."
+                "Could not save the API key to Keychain (\(status))."
             case let .keychainDeleteFailed(status):
-                "Could not remove the AudioShake API key from Keychain (\(status))."
+                "Could not remove the API key from Keychain (\(status))."
             }
         }
     }
@@ -32,10 +35,62 @@ enum AudioProcessingCredentials {
     }
 
     static func storedAudioShakeAPIKey() throws -> String? {
+        try storedAPIKey(
+            service: audioShakeKeychainService,
+            account: audioShakeKeychainAccount
+        )
+    }
+
+    static func setStoredAudioShakeAPIKey(_ apiKey: String?) throws {
+        try setStoredAPIKey(
+            apiKey,
+            service: audioShakeKeychainService,
+            account: audioShakeKeychainAccount
+        )
+    }
+
+    static func deleteStoredAudioShakeAPIKey() throws {
+        try deleteStoredAPIKey(
+            service: audioShakeKeychainService,
+            account: audioShakeKeychainAccount
+        )
+    }
+
+    static func deepgramAPIKey() -> String? {
+        if let environmentKey = normalizedAPIKey(ProcessInfo.processInfo.environment[deepgramEnvironmentKey]) {
+            return environmentKey
+        }
+
+        return try? storedDeepgramAPIKey()
+    }
+
+    static func storedDeepgramAPIKey() throws -> String? {
+        try storedAPIKey(
+            service: deepgramKeychainService,
+            account: deepgramKeychainAccount
+        )
+    }
+
+    static func setStoredDeepgramAPIKey(_ apiKey: String?) throws {
+        try setStoredAPIKey(
+            apiKey,
+            service: deepgramKeychainService,
+            account: deepgramKeychainAccount
+        )
+    }
+
+    static func deleteStoredDeepgramAPIKey() throws {
+        try deleteStoredAPIKey(
+            service: deepgramKeychainService,
+            account: deepgramKeychainAccount
+        )
+    }
+
+    private static func storedAPIKey(service: String, account: String) throws -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: audioShakeKeychainService,
-            kSecAttrAccount as String: audioShakeKeychainAccount,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
@@ -58,16 +113,16 @@ enum AudioProcessingCredentials {
         return normalizedAPIKey(value)
     }
 
-    static func setStoredAudioShakeAPIKey(_ apiKey: String?) throws {
+    private static func setStoredAPIKey(_ apiKey: String?, service: String, account: String) throws {
         guard let normalizedKey = normalizedAPIKey(apiKey) else {
-            try deleteStoredAudioShakeAPIKey()
+            try deleteStoredAPIKey(service: service, account: account)
             return
         }
 
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: audioShakeKeychainService,
-            kSecAttrAccount as String: audioShakeKeychainAccount,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
         ]
         let attributes: [String: Any] = [
             kSecValueData as String: Data(normalizedKey.utf8),
@@ -89,11 +144,11 @@ enum AudioProcessingCredentials {
         }
     }
 
-    static func deleteStoredAudioShakeAPIKey() throws {
+    private static func deleteStoredAPIKey(service: String, account: String) throws {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: audioShakeKeychainService,
-            kSecAttrAccount as String: audioShakeKeychainAccount,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
         ]
         let status = SecItemDelete(query as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {

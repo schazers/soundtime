@@ -11,6 +11,18 @@ if CommandLine.arguments.contains("--timeline-perf-baseline") {
     }
 }
 
+if CommandLine.arguments.contains("--launch-performance-smoke") ||
+    CommandLine.arguments.contains("--launch-performance-smoke-full")
+{
+    do {
+        try LaunchPerformanceSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        exit(0)
+    } catch {
+        fputs("Soundtime launch performance smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
 if CommandLine.arguments.contains("--timeline-ux-smoke") {
     do {
         try TimelineUXSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
@@ -173,6 +185,26 @@ if CommandLine.arguments.contains("--audio-processing-smoke") {
     }
 }
 
+if CommandLine.arguments.contains("--transcription-smoke") {
+    do {
+        try TranscriptionSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        exit(0)
+    } catch {
+        fputs("Soundtime transcription smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
+if CommandLine.arguments.contains("--deepgram-transcription-smoke") {
+    do {
+        try TranscriptionSmokeHarness.runDeepgramLiveSmokeFromCommandLine(arguments: CommandLine.arguments)
+        exit(0)
+    } catch {
+        fputs("Soundtime Deepgram transcription smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
 if CommandLine.arguments.contains("--performance-dashboard-lifecycle-smoke") {
     do {
         try MainActor.assumeIsolated {
@@ -228,6 +260,8 @@ if CommandLine.arguments.contains("--realtime-graph-publish-smoke") {
         exit(1)
     }
 }
+
+LaunchStartupTrace.shared.mark(.processEntry)
 
 let app = NSApplication.shared
 let delegate = AppDelegate()

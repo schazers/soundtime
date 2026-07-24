@@ -54,6 +54,7 @@ struct TimelineRenderState: Sendable {
         let clipRanges: [ClipRange]
         let waveformSegments: [WaveformSegment]
         let waveformTileSource: WaveformTileBuildSource?
+        let transcript: TranscriptDocument?
 
         init(
             id: UUID,
@@ -66,7 +67,8 @@ struct TimelineRenderState: Sendable {
             hasWaveform: Bool? = nil,
             clipRanges: [ClipRange] = [],
             waveformSegments: [WaveformSegment] = [],
-            waveformTileSource: WaveformTileBuildSource? = nil
+            waveformTileSource: WaveformTileBuildSource? = nil,
+            transcript: TranscriptDocument? = nil
         ) {
             self.id = id
             self.waveformVersion = waveformVersion
@@ -79,6 +81,7 @@ struct TimelineRenderState: Sendable {
             self.clipRanges = clipRanges.filter { $0.durationProgress > 0 }
             self.waveformSegments = waveformSegments.filter { $0.outputEndProgress > $0.outputStartProgress }
             self.waveformTileSource = waveformTileSource
+            self.transcript = transcript
         }
     }
 

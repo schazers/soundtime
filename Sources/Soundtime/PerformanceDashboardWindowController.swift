@@ -41,6 +41,14 @@ final class PerformanceDashboardWindowController: NSWindowController, NSWindowDe
         controller.display(frameStats: frameStats)
     }
 
+    static func displayIfVisible(performanceSnapshot snapshot: PerformanceMetricsSnapshot) {
+        guard let controller = sharedController, controller.window?.isVisible == true else {
+            return
+        }
+
+        controller.display(performanceSnapshot: snapshot)
+    }
+
     static func refreshIfVisible() {
         guard let controller = sharedController, controller.window?.isVisible == true else {
             return
@@ -66,7 +74,7 @@ final class PerformanceDashboardWindowController: NSWindowController, NSWindowDe
             name: "performance-dashboard-event-smoke",
             message: "Performance dashboard event log smoke event."
         )
-        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1))
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.35))
 
         if !controller.dashboardView.displayedEventLogText.contains("performance-dashboard-event-smoke") {
             throw LifecycleSmokeError.eventLogDidNotRender
@@ -79,7 +87,7 @@ final class PerformanceDashboardWindowController: NSWindowController, NSWindowDe
                 message: "Performance dashboard event log scroll smoke event \(index)."
             )
         }
-        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1))
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.35))
         if controller.dashboardView.eventLogBottomDistanceForSmoke > 8 {
             throw LifecycleSmokeError.eventLogDidNotFollowBottom
         }
@@ -140,6 +148,8 @@ final class PerformanceDashboardWindowController: NSWindowController, NSWindowDe
             defer: false
         )
         window.title = "Soundtime Development Console"
+        window.isOpaque = true
+        window.backgroundColor = NSColor(calibratedWhite: 0.045, alpha: 1)
         window.minSize = NSSize(width: 620, height: 720)
         window.isReleasedWhenClosed = false
         window.contentView = dashboardView
@@ -177,8 +187,12 @@ final class PerformanceDashboardWindowController: NSWindowController, NSWindowDe
         dashboardView.display(frameStats: frameStats)
     }
 
+    func display(performanceSnapshot snapshot: PerformanceMetricsSnapshot) {
+        dashboardView.display(performanceSnapshot: snapshot)
+    }
+
     func refresh() {
-        dashboardView.refresh()
+        dashboardView.requestRefresh()
     }
 
     func closeIfVisible() {
@@ -235,20 +249,25 @@ private final class PerformanceDashboardView: NSView {
         accent: NSColor(calibratedRed: 0.10, green: 0.86, blue: 0.96, alpha: 1),
         usesLowValueDangerColor: true
     )
-    private let cpuCard = PerformanceMetricCardView(title: "CPU", accent: NSColor(calibratedRed: 0.95, green: 0.98, blue: 1.00, alpha: 1))
+    private let cpuCard = PerformanceMetricCardView(
+        title: "CPU",
+        accent: NSColor(calibratedRed: 0.95, green: 0.98, blue: 1.00, alpha: 1),
+        usesHighValueDangerColor: true
+    )
     private let audioCard = PerformanceInfoCardView(title: "Audio Realtime")
     private let renderCard = PerformanceInfoCardView(title: "Render / GPU")
     private let threadCard = PerformanceInfoCardView(title: "Threading")
     private let traceCard = PerformanceInfoCardView(title: "Trace Capture")
     private let eventsView = PerformanceEventLogView()
     private let exportButton = PerformanceActionButton(title: "Export Trace")
-    private let cpuSampler = ProcessCPUUsageSampler()
-    private let dashboardRefreshInterval: TimeInterval = 0.5
-    private let graphSampleInterval: TimeInterval = 1.0 / 15.0
+    private let dashboardRefreshInterval: TimeInterval = 0.75
+    private let dashboardRefreshCoalesceInterval: TimeInterval = 0.25
     private var timer: Timer?
     private var latestFrameStats: TimelineFrameStats?
+    private var latestPerformanceSnapshot: PerformanceMetricsSnapshot?
     private var lastRenderedFrameStats: TimelineFrameStats?
-    private var lastFPSGraphSampleTime: CFTimeInterval = 0
+    private var lastDashboardUpdateTime = CACurrentMediaTime()
+    private var isDashboardRefreshPending = false
     private var diagnosticsEventObserver: NSObjectProtocol?
 
     override init(frame frameRect: NSRect) {
@@ -271,13 +290,14 @@ private final class PerformanceDashboardView: NSView {
 
     func display(frameStats: TimelineFrameStats) {
         latestFrameStats = frameStats
-        let now = CACurrentMediaTime()
-        guard now - lastFPSGraphSampleTime >= graphSampleInterval else {
-            return
-        }
+    }
 
-        lastFPSGraphSampleTime = now
-        fpsCard.record(sample: CGFloat(frameStats.framesPerSecond))
+    func display(performanceSnapshot snapshot: PerformanceMetricsSnapshot) {
+        latestPerformanceSnapshot = snapshot
+    }
+
+    func requestRefresh() {
+        scheduleDashboardRefresh()
     }
 
     func refresh() {
@@ -295,7 +315,7 @@ private final class PerformanceDashboardView: NSView {
     func resume() {
         installDiagnosticsEventObserverIfNeeded()
         guard timer == nil else {
-            updateDashboard()
+            scheduleDashboardRefresh(immediate: true)
             return
         }
 
@@ -307,7 +327,7 @@ private final class PerformanceDashboardView: NSView {
         timer.tolerance = dashboardRefreshInterval * 0.25
         self.timer = timer
         RunLoop.main.add(timer, forMode: .common)
-        updateDashboard()
+        scheduleDashboardRefresh(immediate: true)
     }
 
     func pause() {
@@ -317,6 +337,7 @@ private final class PerformanceDashboardView: NSView {
             NotificationCenter.default.removeObserver(diagnosticsEventObserver)
             self.diagnosticsEventObserver = nil
         }
+        isDashboardRefreshPending = false
     }
 
     private func installDiagnosticsEventObserverIfNeeded() {
@@ -329,8 +350,40 @@ private final class PerformanceDashboardView: NSView {
             object: SoundtimeDiagnostics.shared,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.updateDashboard()
+            MainActor.assumeIsolated {
+                self?.scheduleDashboardRefresh()
+            }
+        }
+    }
+
+    private func scheduleDashboardRefresh(immediate: Bool = false) {
+        guard window != nil else {
+            return
+        }
+
+        if immediate {
+            isDashboardRefreshPending = false
+            updateDashboard()
+            return
+        }
+
+        guard !isDashboardRefreshPending else {
+            return
+        }
+
+        let now = CACurrentMediaTime()
+        let delay = max(0, dashboardRefreshCoalesceInterval - (now - lastDashboardUpdateTime))
+        isDashboardRefreshPending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else {
+                return
+            }
+            MainActor.assumeIsolated {
+                guard self.isDashboardRefreshPending else {
+                    return
+                }
+                self.isDashboardRefreshPending = false
+                self.updateDashboard()
             }
         }
     }
@@ -405,7 +458,7 @@ private final class PerformanceDashboardView: NSView {
             threadCard.topAnchor.constraint(equalTo: audioCard.bottomAnchor, constant: 16),
             threadCard.leadingAnchor.constraint(equalTo: audioCard.leadingAnchor),
             threadCard.widthAnchor.constraint(equalTo: audioCard.widthAnchor),
-            threadCard.heightAnchor.constraint(equalToConstant: 118),
+            threadCard.heightAnchor.constraint(equalToConstant: 138),
 
             traceCard.topAnchor.constraint(equalTo: threadCard.topAnchor),
             traceCard.leadingAnchor.constraint(equalTo: threadCard.trailingAnchor, constant: 16),
@@ -420,20 +473,14 @@ private final class PerformanceDashboardView: NSView {
     }
 
     private func updateDashboard() {
+        lastDashboardUpdateTime = CACurrentMediaTime()
         let diagnostics = SoundtimeDiagnostics.shared.snapshot(limit: 240)
         let importBudget = ImportWorkBudget.shared.snapshot()
         let frameStats = latestFrameStats ?? diagnostics.frameStats
-        let cpuPercent = cpuSampler.samplePercent()
+        let performanceSnapshot = latestPerformanceSnapshot ?? PerformanceSampler.shared.snapshot()
 
         if let frameStats {
             if frameStats != lastRenderedFrameStats {
-                fpsCard.update(
-                    value: "\(frameStats.framesPerSecond)",
-                    unit: "fps",
-                    subtitle: String(format: "avg %.1f ms  worst %.1f ms", frameStats.averageFrameTimeMilliseconds, frameStats.worstFrameTimeMilliseconds),
-                    sample: nil,
-                    maximum: 144
-                )
                 renderCard.update(lines: [
                     "Mode          \(frameStats.gpuResidentWaveformMode)",
                     "Renderer      \(frameStats.waveformRenderer.uppercased())  draws \(frameStats.gpuWaveformDrawCount)",
@@ -449,16 +496,44 @@ private final class PerformanceDashboardView: NSView {
                 lastRenderedFrameStats = frameStats
             }
         } else {
-            fpsCard.update(value: "0", unit: "fps", subtitle: "waiting for renderer", sample: 0, maximum: 144)
             renderCard.update(lines: ["Renderer      waiting", "GPU draws     0", "Uploads       0", "GPU cache     0 MB"])
         }
 
+        let fpsValue: String
+        let fpsUnit: String
+        let fpsSubtitle: String
+        if performanceSnapshot.timelineGraphIsIdle {
+            fpsValue = "idle"
+            fpsUnit = ""
+            fpsSubtitle = String(
+                format: "last %.0f fps  meter %.0f fps",
+                performanceSnapshot.lastActiveTimelineFramesPerSecond,
+                performanceSnapshot.meterFramesPerSecond
+            )
+        } else {
+            fpsValue = "\(Int(performanceSnapshot.timelineFramesPerSecond.rounded()))"
+            fpsUnit = "fps"
+            fpsSubtitle = String(
+                format: "%@  gpu done %.0f fps  meter %.0f fps",
+                performanceSnapshot.renderDemand.rawValue,
+                performanceSnapshot.timelineCompletedFramesPerSecond,
+                performanceSnapshot.meterFramesPerSecond
+            )
+        }
+        fpsCard.update(
+            value: fpsValue,
+            unit: fpsUnit,
+            subtitle: fpsSubtitle,
+            sample: CGFloat(performanceSnapshot.timelineGraphFramesPerSecond),
+            maximum: 144
+        )
+
         cpuCard.update(
-            value: "\(Int(cpuPercent.rounded()))",
+            value: "\(Int(performanceSnapshot.cpuPercent.rounded()))",
             unit: "% CPU",
-            subtitle: "process CPU across all cores",
-            sample: CGFloat(cpuPercent),
-            maximum: 400
+            subtitle: "normalized process CPU",
+            sample: CGFloat(performanceSnapshot.cpuPercent),
+            maximum: 100
         )
 
         if let audio = diagnostics.audioSnapshot {
@@ -477,11 +552,23 @@ private final class PerformanceDashboardView: NSView {
             audioCard.update(lines: ["State         waiting", "Underruns     0", "Dropped cmds  0", "Deadline miss 0"])
         }
 
+        let inputAgeText: String
+        if let age = performanceSnapshot.lastTimelineInputEventAge {
+            inputAgeText = String(format: "%.0f ms", age * 1_000)
+        } else {
+            inputAgeText = "-"
+        }
         threadCard.update(lines: [
             "Main stalls   \(diagnostics.mainThreadStallCount)",
             String(format: "Last stall    %.1f ms", diagnostics.lastMainThreadStallMilliseconds),
             "Heavy work    \(importBudget.exclusiveWorkInFlight) active",
             "Deferred      \(importBudget.deferredWorkCount)",
+            String(
+                format: "Input         %.0f/s  %@",
+                performanceSnapshot.timelineInputEventsPerSecond,
+                performanceSnapshot.latestTimelineInputEventKind
+            ),
+            "Input age     \(inputAgeText)",
             "Last defer    \(importBudget.lastDeferredWorkClass)",
             "Warnings      \(diagnostics.warningEventCount)",
             "Severe        \(diagnostics.severeEventCount)",
@@ -518,11 +605,20 @@ private final class PerformanceMetricCardView: NSView {
     private let unitLabel = NSTextField(labelWithString: "")
     private let subtitleLabel = NSTextField(labelWithString: "")
     private let sparklineView: PerformanceSparklineView
+    private var renderedValue = ""
+    private var renderedUnit = ""
+    private var renderedSubtitle = ""
 
-    init(title: String, accent: NSColor, usesLowValueDangerColor: Bool = false) {
+    init(
+        title: String,
+        accent: NSColor,
+        usesLowValueDangerColor: Bool = false,
+        usesHighValueDangerColor: Bool = false
+    ) {
         sparklineView = PerformanceSparklineView(
             accentColor: accent,
-            usesLowValueDangerColor: usesLowValueDangerColor
+            usesLowValueDangerColor: usesLowValueDangerColor,
+            usesHighValueDangerColor: usesHighValueDangerColor
         )
         super.init(frame: .zero)
         titleLabel.stringValue = title
@@ -534,9 +630,18 @@ private final class PerformanceMetricCardView: NSView {
     }
 
     func update(value: String, unit: String, subtitle: String, sample: CGFloat?, maximum: CGFloat) {
-        valueLabel.stringValue = value
-        unitLabel.stringValue = unit
-        subtitleLabel.stringValue = subtitle
+        if value != renderedValue {
+            valueLabel.stringValue = value
+            renderedValue = value
+        }
+        if unit != renderedUnit {
+            unitLabel.stringValue = unit
+            renderedUnit = unit
+        }
+        if subtitle != renderedSubtitle {
+            subtitleLabel.stringValue = subtitle
+            renderedSubtitle = subtitle
+        }
         sparklineView.maximumValue = maximum
         if let sample {
             sparklineView.append(sample)
@@ -603,6 +708,7 @@ private final class PerformanceMetricCardView: NSView {
 private final class PerformanceInfoCardView: NSView {
     private let titleLabel = NSTextField(labelWithString: "")
     private let bodyLabel = NSTextField(labelWithString: "")
+    private var renderedBody = ""
 
     init(title: String) {
         super.init(frame: .zero)
@@ -615,7 +721,12 @@ private final class PerformanceInfoCardView: NSView {
     }
 
     func update(lines: [String]) {
-        bodyLabel.stringValue = lines.joined(separator: "\n")
+        let body = lines.joined(separator: "\n")
+        guard body != renderedBody else {
+            return
+        }
+        renderedBody = body
+        bodyLabel.stringValue = body
     }
 
     private func configure() {
@@ -660,6 +771,7 @@ private final class PerformanceEventLogView: NSView {
     private let scrollView = NSScrollView()
     private let jumpToLatestButton = PerformanceEventJumpButton()
     private var displayedEventFingerprint = ""
+    private var displayedEventCount = -1
     private var hasUnseenBottomEvents = false
     private var isFollowingTail = true
     private var isApplyingEventText = false
@@ -691,10 +803,15 @@ private final class PerformanceEventLogView: NSView {
         let shouldFollowTail = isFollowingTail || isPinnedToBottom()
         let previousFingerprint = displayedEventFingerprint
         let nextFingerprint = eventFingerprint(for: events.last)
+        let eventCount = events.count
+        guard nextFingerprint != previousFingerprint || eventCount != displayedEventCount else {
+            return
+        }
         let hasNewTailEvent = !nextFingerprint.isEmpty && nextFingerprint != previousFingerprint
         displayedEventFingerprint = nextFingerprint
+        displayedEventCount = eventCount
 
-        titleLabel.stringValue = "Recent Events (\(events.count))"
+        titleLabel.stringValue = "Recent Events (\(eventCount))"
         let lines = events.suffix(160).map { event -> String in
             let severity = event.severity.rawValue.uppercased()
             let fields = event.fields
@@ -1027,15 +1144,18 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
 
     private let accentColor: SIMD4<Float>
     private let usesLowValueDangerColor: Bool
+    private let usesHighValueDangerColor: Bool
     private let historyDuration: CFTimeInterval = 15
     private let historyExitDuration: CFTimeInterval = 1.25
     private let staleSampleHoldDuration: Float = 0.75
-    private let maximumSampleCount = 160
-    private let renderRefreshRate: TimeInterval = 30
+    private let maximumSampleCount = 96
+    private let renderRefreshRate: TimeInterval = 15
     private let timeOrigin = CACurrentMediaTime()
     private let sampleLock = NSLock()
     private var samples: [SparkSample] = []
     private var displayTimer: Timer?
+    private var lastRenderTime: CFTimeInterval = -Double.infinity
+    private var isRenderRequestPending = false
     private var commandQueue: MTLCommandQueue?
     private var pipelineState: MTLRenderPipelineState?
     private var isLiveResizePaused = false
@@ -1052,9 +1172,14 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
         false
     }
 
-    init(accentColor: NSColor, usesLowValueDangerColor: Bool = false) {
+    init(
+        accentColor: NSColor,
+        usesLowValueDangerColor: Bool = false,
+        usesHighValueDangerColor: Bool = false
+    ) {
         self.accentColor = Self.colorVector(from: accentColor)
         self.usesLowValueDangerColor = usesLowValueDangerColor
+        self.usesHighValueDangerColor = usesHighValueDangerColor
         super.init(frame: .zero, device: MTLCreateSystemDefaultDevice())
         drawableBackingScaleOverride = 1
         configureSparklineRenderer()
@@ -1063,6 +1188,7 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
     required init?(coder: NSCoder) {
         self.accentColor = SIMD4<Float>(0.10, 0.86, 0.96, 1)
         self.usesLowValueDangerColor = false
+        self.usesHighValueDangerColor = false
         super.init(coder: coder)
         drawableBackingScaleOverride = 1
         configureSparklineRenderer()
@@ -1173,6 +1299,7 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
             return
         }
 
+        lastRenderTime = CACurrentMediaTime()
         let now = relativeTimestamp()
         let renderSamples = currentRenderSamples(now: now)
         var uniforms = SparkUniforms(
@@ -1189,7 +1316,12 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
                 0
             ),
             accentColor: accentColor,
-            style: SIMD4<Float>(0.070, usesLowValueDangerColor ? 1.0 : 0.0, 0.0, 0.0)
+            style: SIMD4<Float>(
+                0.070,
+                usesLowValueDangerColor ? 1.0 : 0.0,
+                usesHighValueDangerColor ? 1.0 : 0.0,
+                0.0
+            )
         )
 
         encoder.setRenderPipelineState(pipelineState)
@@ -1256,7 +1388,7 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
                 self?.render()
             }
         }
-        timer.tolerance = 1 / 120
+        timer.tolerance = 1 / 30
         displayTimer = timer
         RunLoop.main.add(timer, forMode: .common)
     }
@@ -1264,6 +1396,7 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
     private func stopDisplayTimer() {
         displayTimer?.invalidate()
         displayTimer = nil
+        isRenderRequestPending = false
     }
 
     private func requestRender() {
@@ -1271,7 +1404,27 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
             return
         }
 
-        render()
+        let now = CACurrentMediaTime()
+        let minimumInterval = 1 / max(renderRefreshRate, 1)
+        guard now - lastRenderTime < minimumInterval else {
+            render()
+            return
+        }
+
+        guard !isRenderRequestPending else {
+            return
+        }
+
+        isRenderRequestPending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + minimumInterval) { [weak self] in
+            guard let self else {
+                return
+            }
+            MainActor.assumeIsolated {
+                self.isRenderRequestPending = false
+                self.render()
+            }
+        }
     }
 
     private func trimSamples(now: Float) {
@@ -1472,6 +1625,14 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
         return 1.0 - smoothstep(60.0, 80.0, sample.value);
     }
 
+    static float high_value_danger(SparkSample sample, float enabled) {
+        if (enabled < 0.5) {
+            return 0.0;
+        }
+
+        return smoothstep(80.0, 100.0, sample.value);
+    }
+
     fragment float4 performance_sparkline_fragment(
         RasterizedVertex in [[stage_in]],
         constant SparkSample *samples [[buffer(0)]],
@@ -1506,7 +1667,8 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
         float edgeFadeWidth = max(uniforms.style.x, 0.001);
         float edgeFade = smoothstep(left, left + edgeFadeWidth, uv.x) *
             (1.0 - smoothstep(right - edgeFadeWidth, right, uv.x));
-        float dangerEnabled = uniforms.style.y;
+        float lowDangerEnabled = uniforms.style.y;
+        float highDangerEnabled = uniforms.style.z;
         float line = 0.0;
         float glow = 0.0;
         float lineDanger = 0.0;
@@ -1533,8 +1695,14 @@ private final class PerformanceSparklineView: TimelineMetalLayerView {
                 float segmentLine = (1.0 - smoothstep(lineWidth, lineWidth + 1.3 / height, distance)) * edgeFade;
                 float segmentGlow = (1.0 - smoothstep(lineWidth, glowWidth, distance)) * edgeFade;
                 float danger = max(
-                    low_value_danger(previousSample, dangerEnabled),
-                    low_value_danger(currentSample, dangerEnabled)
+                    max(
+                        low_value_danger(previousSample, lowDangerEnabled),
+                        high_value_danger(previousSample, highDangerEnabled)
+                    ),
+                    max(
+                        low_value_danger(currentSample, lowDangerEnabled),
+                        high_value_danger(currentSample, highDangerEnabled)
+                    )
                 );
                 line = max(line, segmentLine);
                 glow = max(glow, segmentGlow);

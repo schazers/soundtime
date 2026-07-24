@@ -196,6 +196,22 @@ enum AudioAssetImporterSmokeHarness {
         )
         try require(proxyResult.decodedAudioBuffer.url == proxyResult.proxyURL, "native import proxy buffer URL mismatch")
         try require(proxyResult.decodedAudioBuffer.frameCount > 0, "native import proxy buffer was empty")
+        var proxyTimeline = AudioFileEditTimeline(fileInfo: proxyResult.proxyFileInfo)
+        let proxyFrameCount = proxyResult.proxyFileInfo.frameCount
+        let framesToDelete = max(proxyFrameCount / 4, 1)
+        let beginningSelection = TimelineSelection(
+            startProgress: 0,
+            endProgress: Double(framesToDelete) / Double(max(proxyFrameCount, 1))
+        )
+        let deletedFrames = proxyTimeline.delete(beginningSelection)
+        try require(
+            deletedFrames == framesToDelete,
+            "native import proxy delete removed \(deletedFrames) frames, expected \(framesToDelete)"
+        )
+        try require(
+            proxyTimeline.frameCount == proxyFrameCount - framesToDelete,
+            "native import proxy delete left \(proxyTimeline.frameCount) frames, expected \(proxyFrameCount - framesToDelete)"
+        )
     }
 
     private static func makeSyntheticBuffer(

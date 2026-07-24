@@ -8,6 +8,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     var onWindowWillClose: ((MainWindowController) -> Void)?
 
     convenience init(restoresLastProject: Bool = true) {
+        LaunchStartupTrace.shared.mark(
+            .mainWindowControllerInitStart,
+            fields: ["restoresLastProject": "\(restoresLastProject)"]
+        )
         let contentViewController = WorkspaceViewController(restoresLastProject: restoresLastProject)
         let window = NSWindow(
             contentRect: NSRect(origin: .zero, size: Self.fallbackContentSize),
@@ -36,6 +40,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
         self.init(window: window)
         window.delegate = self
+        LaunchStartupTrace.shared.mark(
+            .mainWindowCreated,
+            fields: [
+                "restoresLastProject": "\(restoresLastProject)",
+                "width": String(format: "%.0f", window.frame.width),
+                "height": String(format: "%.0f", window.frame.height),
+            ]
+        )
     }
 
     func persistOpenProjectWindowLayout() {
@@ -44,6 +56,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     func restoreLastProjectIfNeeded() {
         (window?.contentViewController?.view as? WorkspaceView)?.restoreLastProjectIfNeeded()
+    }
+
+    func restoreLastProjectAfterLaunchPreviewRender() {
+        (window?.contentViewController?.view as? WorkspaceView)?.restoreLastProjectAfterLaunchPreviewRender()
+    }
+
+    func prepareForDeferredProjectRestore() {
+        if applyDeferredProjectWindowLayoutIfAvailable() {
+            LaunchStartupTrace.shared.mark(.deferredWindowLayoutApplied)
+        }
+        (window?.contentViewController?.view as? WorkspaceView)?.prepareForDeferredProjectRestore()
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -106,6 +129,82 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             width: launchSize.width,
             height: launchSize.height
         )
+    }
+
+    @discardableResult
+    private func applyDeferredProjectWindowLayoutIfAvailable() -> Bool {
+        guard let layout = Self.deferredProjectWindowLayout() else {
+            return false
+        }
+
+        applyWindowLayout(layout)
+        return true
+    }
+
+    private static func deferredProjectWindowLayout() -> SoundtimeProject.WindowLayout? {
+        if
+            let lastProjectURL = SoundtimeProjectStore.lastProjectURL(),
+            FileManager.default.fileExists(atPath: lastProjectURL.path)
+        {
+            return SoundtimeProjectStore.rememberedWindowLayout(for: lastProjectURL)
+        }
+
+        return nil
+    }
+
+    private func applyWindowLayout(_ layout: SoundtimeProject.WindowLayout) {
+        guard
+            let window,
+            layout.x.isFinite,
+            layout.y.isFinite,
+            layout.width.isFinite,
+            layout.height.isFinite,
+            layout.width > 0,
+            layout.height > 0
+        else {
+            return
+        }
+
+        var frame = NSRect(
+            x: CGFloat(layout.x),
+            y: CGFloat(layout.y),
+            width: CGFloat(layout.width),
+            height: CGFloat(layout.height)
+        )
+        frame.size.width = max(frame.width, window.minSize.width)
+        frame.size.height = max(frame.height, window.minSize.height)
+
+        if let visibleFrame = Self.bestVisibleFrame(for: frame, window: window) {
+            if frame.width <= visibleFrame.width {
+                frame.origin.x = min(max(frame.origin.x, visibleFrame.minX), visibleFrame.maxX - frame.width)
+            } else {
+                frame.origin.x = visibleFrame.minX
+            }
+
+            if frame.height <= visibleFrame.height {
+                frame.origin.y = min(max(frame.origin.y, visibleFrame.minY), visibleFrame.maxY - frame.height)
+            } else {
+                frame.origin.y = visibleFrame.maxY - frame.height
+            }
+        }
+
+        window.setFrame(frame, display: false, animate: false)
+    }
+
+    private static func bestVisibleFrame(for frame: NSRect, window: NSWindow) -> NSRect? {
+        let intersectingScreen = NSScreen.screens.max { lhs, rhs in
+            intersectionArea(lhs.visibleFrame, frame) < intersectionArea(rhs.visibleFrame, frame)
+        }
+        if let intersectingScreen, intersectingScreen.visibleFrame.intersects(frame) {
+            return intersectingScreen.visibleFrame
+        }
+
+        return window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame
+    }
+
+    private static func intersectionArea(_ lhs: NSRect, _ rhs: NSRect) -> CGFloat {
+        let intersection = lhs.intersection(rhs)
+        return max(intersection.width, 0) * max(intersection.height, 0)
     }
 
     private static var windowMinWidth: CGFloat {

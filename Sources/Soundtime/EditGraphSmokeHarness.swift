@@ -110,6 +110,9 @@ enum EditGraphSmokeHarness {
         )
         try requirePerOperationBudgets(operationDurationsByName)
         try runFileClipPasteSmoke(fileInfo: fileInfo)
+        try runNormalizedAudioSourceEquivalenceSmoke(fileInfo: fileInfo)
+        try runEditGraphArrangementMutationSmoke(fileInfo: fileInfo)
+        try runCurrentEditGroupModelSmoke()
         try runLinkedRippleDeleteSmoke(fileInfo: fileInfo)
         try runSplitPersistenceSmoke(fileInfo: fileInfo)
         try runSilenceAnalyzerSmoke()
@@ -122,6 +125,9 @@ enum EditGraphSmokeHarness {
                 "mixed edit operations stay below latency budget",
                 "edit graph segment count stays bounded",
                 "file clip paste preserves edit timelines",
+                "WAV originals and MP3 proxies normalize to the same edit graph shape",
+                "edit graph mutations keep source identity stable while arrangements change",
+                "loaded project edit groups normalize to one linked ripple group",
                 "linked ripple delete preserves grouped track timing",
                 "split persistence survives project state round-trip",
                 "silence analyzer and podcast export processors smoke-test",
@@ -218,6 +224,227 @@ enum EditGraphSmokeHarness {
         try require(
             restoredTimeline.frameCount == timeline.frameCount,
             "file clip smoke persisted the wrong frame count"
+        )
+    }
+
+    private static func runNormalizedAudioSourceEquivalenceSmoke(fileInfo: WAVFileInfo) throws {
+        let wavTrackID = UUID()
+        let mp3TrackID = UUID()
+        let originalMP3URL = URL(fileURLWithPath: "/tmp/SoundtimeNormalizedSourceSmoke.mp3")
+        let proxyURL = URL(fileURLWithPath: "/tmp/SoundtimeNormalizedSourceSmoke.proxy.wav")
+        let proxyFileInfo = WAVFileInfo(
+            url: proxyURL,
+            formatTag: fileInfo.formatTag,
+            channelCount: fileInfo.channelCount,
+            sampleRate: fileInfo.sampleRate,
+            blockAlign: fileInfo.blockAlign,
+            bitsPerSample: fileInfo.bitsPerSample,
+            dataRange: fileInfo.dataRange
+        )
+
+        let wavSource = EditableAudioSource(
+            originalURL: fileInfo.url,
+            editableURL: fileInfo.url,
+            formatOrigin: .wav,
+            fileInfo: fileInfo,
+            ownsEditableFile: false
+        )
+        let mp3ProxySource = EditableAudioSource(
+            originalURL: originalMP3URL,
+            editableURL: proxyURL,
+            formatOrigin: .mp3,
+            fileInfo: proxyFileInfo,
+            ownsEditableFile: true
+        )
+
+        try require(wavSource.isUsableForEditing, "WAV source was not usable for editing")
+        try require(mp3ProxySource.isUsableForEditing, "MP3 proxy source was not usable for editing")
+
+        var wavArrangement = TrackArrangement(
+            trackID: wavTrackID,
+            sourceID: wavSource.id,
+            timeline: AudioFileEditTimeline(fileInfo: fileInfo)
+        )
+        var mp3Arrangement = TrackArrangement(
+            trackID: mp3TrackID,
+            sourceID: mp3ProxySource.id,
+            timeline: AudioFileEditTimeline(fileInfo: proxyFileInfo)
+        )
+
+        try require(wavSource.isCompatible(with: wavArrangement.timeline), "WAV source did not match its timeline")
+        try require(
+            mp3ProxySource.isCompatible(with: mp3Arrangement.timeline),
+            "MP3 proxy source did not match its timeline"
+        )
+        try require(
+            wavArrangement.clipSegments.map(\.frameCount) == mp3Arrangement.clipSegments.map(\.frameCount),
+            "normalized arrangements did not start with equivalent segment shapes"
+        )
+
+        let selection = TimelineSelection(startProgress: 0.0125, endProgress: 0.01875)
+        let wavDelete = wavArrangement.deleting(selection)
+        let mp3Delete = mp3Arrangement.deleting(selection)
+        wavArrangement = wavDelete.arrangement
+        mp3Arrangement = mp3Delete.arrangement
+
+        try require(wavDelete.deletedFrameCount > 0, "WAV normalized delete removed no frames")
+        try require(mp3Delete.deletedFrameCount > 0, "MP3 proxy normalized delete removed no frames")
+        try require(
+            wavDelete.deletedFrameCount == mp3Delete.deletedFrameCount,
+            "WAV and MP3 proxy deletes removed different frame counts"
+        )
+        try require(
+            wavArrangement.frameCount == mp3Arrangement.frameCount,
+            "WAV and MP3 proxy arrangements diverged after equivalent delete"
+        )
+        try require(
+            !wavArrangement.clipSegments.isEmpty && !mp3Arrangement.clipSegments.isEmpty,
+            "normalized delete removed all arrangement segments unexpectedly"
+        )
+
+        let graph = EditGraph(
+            sources: [wavSource, mp3ProxySource],
+            arrangements: [wavArrangement, mp3Arrangement]
+        )
+        try require(graph.sources[wavSource.id] != nil, "edit graph lost WAV editable source")
+        try require(graph.sources[mp3ProxySource.id] != nil, "edit graph lost MP3 proxy editable source")
+        try require(graph.arrangement(for: wavTrackID)?.frameCount == wavArrangement.frameCount, "edit graph lost WAV arrangement")
+        try require(
+            graph.arrangement(for: mp3TrackID)?.frameCount == mp3Arrangement.frameCount,
+            "edit graph lost MP3 proxy arrangement"
+        )
+
+        let repeatedMP3ProxySource = EditableAudioSource(
+            originalURL: originalMP3URL,
+            editableURL: proxyURL,
+            formatOrigin: .mp3,
+            fileInfo: proxyFileInfo,
+            ownsEditableFile: true
+        )
+        try require(
+            repeatedMP3ProxySource.id == mp3ProxySource.id,
+            "editable source ID was not stable for the same normalized proxy"
+        )
+    }
+
+    private static func runEditGraphArrangementMutationSmoke(fileInfo: WAVFileInfo) throws {
+        let trackID = UUID()
+        let removedTrackID = UUID()
+        let source = EditableAudioSource(
+            originalURL: fileInfo.url,
+            editableURL: fileInfo.url,
+            formatOrigin: .wav,
+            fileInfo: fileInfo,
+            ownsEditableFile: false
+        )
+        let removableSource = EditableAudioSource(
+            originalURL: URL(fileURLWithPath: "/tmp/SoundtimeEditGraphRemoved.mp3"),
+            editableURL: URL(fileURLWithPath: "/tmp/SoundtimeEditGraphRemoved.proxy.wav"),
+            formatOrigin: .mp3,
+            fileInfo: fileInfo,
+            ownsEditableFile: true
+        )
+        var timeline = AudioFileEditTimeline(fileInfo: fileInfo)
+        let originalFrameCount = timeline.frameCount
+        let sourceID = source.id
+        var graph = EditGraph(
+            sources: [source, removableSource],
+            arrangements: [
+                TrackArrangement(trackID: trackID, sourceID: sourceID, timeline: timeline),
+                TrackArrangement(trackID: removedTrackID, sourceID: removableSource.id, timeline: AudioFileEditTimeline(fileInfo: fileInfo)),
+            ]
+        )
+
+        let deleteSelection = TimelineSelection(startProgress: 0.10, endProgress: 0.12)
+        let deleted = try requireValue(
+            graph.arrangement(for: trackID)?.deleting(deleteSelection),
+            "edit graph mutation smoke could not prepare delete"
+        )
+        try require(deleted.deletedFrameCount > 0, "edit graph mutation smoke delete removed no frames")
+        _ = graph.updateArrangement(trackID: trackID, timeline: deleted.arrangement.timeline)
+        let afterDelete = try requireValue(
+            graph.arrangement(for: trackID),
+            "edit graph mutation smoke lost arrangement after delete"
+        )
+        try require(afterDelete.sourceID == sourceID, "delete changed source identity")
+        try require(
+            afterDelete.frameCount == originalFrameCount - deleted.deletedFrameCount,
+            "delete changed arrangement frame count incorrectly"
+        )
+        try require(graph.source(for: trackID)?.id == sourceID, "delete lost editable source")
+
+        timeline = afterDelete.timeline
+        let duplicateClip = try requireValue(
+            timeline.clip(for: TimelineSelection(startProgress: 0.20, endProgress: 0.215)),
+            "edit graph mutation smoke could not copy duplicate clip"
+        )
+        let frameCountBeforePaste = timeline.frameCount
+        let insertedFrameCount = try requireValue(
+            timeline.replace(TimelineSelection(startProgress: 0.50, endProgress: 0.50), with: duplicateClip),
+            "edit graph mutation smoke could not insert duplicate clip"
+        )
+        _ = graph.updateArrangement(trackID: trackID, timeline: timeline)
+        let afterPaste = try requireValue(
+            graph.arrangement(for: trackID),
+            "edit graph mutation smoke lost arrangement after paste"
+        )
+        try require(afterPaste.sourceID == sourceID, "paste changed source identity")
+        try require(insertedFrameCount == duplicateClip.frameCount, "paste inserted unexpected frame count")
+        try require(
+            afterPaste.frameCount == frameCountBeforePaste + duplicateClip.frameCount,
+            "paste did not grow arrangement by inserted clip length"
+        )
+
+        graph.keepOnlyArrangements(for: [trackID])
+        try require(graph.arrangement(for: trackID) != nil, "prune removed the kept arrangement")
+        try require(graph.arrangement(for: removedTrackID) == nil, "prune kept a removed arrangement")
+        try require(graph.source(for: trackID)?.id == sourceID, "prune removed the live source")
+        try require(
+            graph.sources[removableSource.id] == nil,
+            "prune kept an unreferenced editable source"
+        )
+    }
+
+    private static func runCurrentEditGroupModelSmoke() throws {
+        let projectGroup = UUID(uuidString: "4D329E50-D23F-4763-B378-189A1922841C") ?? UUID()
+        let accidentalLoadGroup = UUID(uuidString: "6AC9C187-433B-4B3E-BA91-5AC6A1B3ABDB") ?? UUID()
+        let freshDefaultGroup = UUID(uuidString: "99999999-aaaa-bbbb-cccc-dddddddddddd") ?? UUID()
+
+        let splitGroups: [UUID?] = [
+            projectGroup,
+            projectGroup,
+            accidentalLoadGroup,
+        ]
+        let primaryGroupID = EditGroupModel.primaryGroupID(
+            from: splitGroups,
+            fallback: freshDefaultGroup
+        )
+        try require(
+            primaryGroupID == projectGroup,
+            "current edit group model did not choose the loaded project's dominant group"
+        )
+        try require(
+            EditGroupModel.needsNormalization(splitGroups, fallback: freshDefaultGroup),
+            "current edit group model did not detect split loaded groups"
+        )
+        let normalizedGroups = EditGroupModel.normalizedGroupIDs(
+            from: splitGroups,
+            fallback: freshDefaultGroup
+        )
+        try require(
+            normalizedGroups == [projectGroup, projectGroup, projectGroup],
+            "current edit group model did not heal accidental split groups"
+        )
+
+        let missingGroups: [UUID?] = [nil, nil]
+        try require(
+            EditGroupModel.primaryGroupID(from: missingGroups, fallback: freshDefaultGroup) == freshDefaultGroup,
+            "current edit group model should use fallback for legacy tracks without groups"
+        )
+        try require(
+            EditGroupModel.normalizedGroupIDs(from: missingGroups, fallback: freshDefaultGroup) ==
+                [freshDefaultGroup, freshDefaultGroup],
+            "current edit group model should normalize legacy tracks to the fallback group"
         )
     }
 

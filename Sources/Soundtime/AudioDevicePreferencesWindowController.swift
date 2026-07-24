@@ -7,11 +7,13 @@ final class AudioDevicePreferencesWindowController: NSWindowController {
     private let outputPopup = NSPopUpButton()
     private let audioShakeAPIKeyField = NSSecureTextField()
     private let audioShakeAPIKeyStatusLabel = NSTextField(labelWithString: "")
+    private let deepgramAPIKeyField = NSSecureTextField()
+    private let deepgramAPIKeyStatusLabel = NSTextField(labelWithString: "")
 
     init() {
         let contentView = NSView()
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 330),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 405),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -31,6 +33,7 @@ final class AudioDevicePreferencesWindowController: NSWindowController {
     override func showWindow(_ sender: Any?) {
         reloadDevices()
         reloadAudioShakeAPIKey()
+        reloadDeepgramAPIKey()
         super.showWindow(sender)
         window?.makeKeyAndOrderFront(sender)
     }
@@ -91,6 +94,32 @@ final class AudioDevicePreferencesWindowController: NSWindowController {
             saveButton: saveAPIKeyButton,
             clearButton: clearAPIKeyButton
         )
+        deepgramAPIKeyField.placeholderString = "Deepgram API key"
+        deepgramAPIKeyField.target = self
+        deepgramAPIKeyField.action = #selector(saveDeepgramAPIKey(_:))
+        deepgramAPIKeyField.translatesAutoresizingMaskIntoConstraints = false
+
+        let saveDeepgramAPIKeyButton = NSButton(title: "Save", target: self, action: #selector(saveDeepgramAPIKey(_:)))
+        saveDeepgramAPIKeyButton.bezelStyle = .rounded
+        saveDeepgramAPIKeyButton.translatesAutoresizingMaskIntoConstraints = false
+
+        let clearDeepgramAPIKeyButton = NSButton(title: "Clear", target: self, action: #selector(clearDeepgramAPIKey(_:)))
+        clearDeepgramAPIKeyButton.bezelStyle = .rounded
+        clearDeepgramAPIKeyButton.translatesAutoresizingMaskIntoConstraints = false
+
+        deepgramAPIKeyStatusLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        deepgramAPIKeyStatusLabel.textColor = NSColor(white: 0.58, alpha: 1)
+        deepgramAPIKeyStatusLabel.lineBreakMode = .byWordWrapping
+        deepgramAPIKeyStatusLabel.maximumNumberOfLines = 2
+        deepgramAPIKeyStatusLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let deepgramAPIKeyLabel = makeLabel("Deepgram")
+        let deepgramAPIKeyRow = makeAPIKeyRow(
+            label: deepgramAPIKeyLabel,
+            field: deepgramAPIKeyField,
+            saveButton: saveDeepgramAPIKeyButton,
+            clearButton: clearDeepgramAPIKeyButton
+        )
 
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(titleLabel)
@@ -98,6 +127,8 @@ final class AudioDevicePreferencesWindowController: NSWindowController {
         contentView.addSubview(apiTitleLabel)
         contentView.addSubview(apiKeyRow)
         contentView.addSubview(audioShakeAPIKeyStatusLabel)
+        contentView.addSubview(deepgramAPIKeyRow)
+        contentView.addSubview(deepgramAPIKeyStatusLabel)
 
         NSLayoutConstraint.activate([
             titleLabel.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 24),
@@ -119,6 +150,14 @@ final class AudioDevicePreferencesWindowController: NSWindowController {
             audioShakeAPIKeyStatusLabel.topAnchor.constraint(equalTo: apiKeyRow.bottomAnchor, constant: 8),
             audioShakeAPIKeyStatusLabel.leadingAnchor.constraint(equalTo: audioShakeAPIKeyField.leadingAnchor),
             audioShakeAPIKeyStatusLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -28),
+
+            deepgramAPIKeyRow.topAnchor.constraint(equalTo: audioShakeAPIKeyStatusLabel.bottomAnchor, constant: 16),
+            deepgramAPIKeyRow.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 28),
+            deepgramAPIKeyRow.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -28),
+
+            deepgramAPIKeyStatusLabel.topAnchor.constraint(equalTo: deepgramAPIKeyRow.bottomAnchor, constant: 8),
+            deepgramAPIKeyStatusLabel.leadingAnchor.constraint(equalTo: deepgramAPIKeyField.leadingAnchor),
+            deepgramAPIKeyStatusLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -28),
         ])
     }
 
@@ -217,6 +256,23 @@ final class AudioDevicePreferencesWindowController: NSWindowController {
         }
     }
 
+    private func reloadDeepgramAPIKey() {
+        do {
+            if let apiKey = try AudioProcessingCredentials.storedDeepgramAPIKey() {
+                deepgramAPIKeyField.stringValue = apiKey
+                deepgramAPIKeyStatusLabel.stringValue = "Deepgram transcription is enabled."
+            } else if AudioProcessingCredentials.deepgramAPIKey() != nil {
+                deepgramAPIKeyField.stringValue = ""
+                deepgramAPIKeyStatusLabel.stringValue = "Deepgram transcription is enabled from DEEPGRAM_API_KEY."
+            } else {
+                deepgramAPIKeyField.stringValue = ""
+                deepgramAPIKeyStatusLabel.stringValue = "No Deepgram key saved. Transcription will use the local placeholder provider."
+            }
+        } catch {
+            deepgramAPIKeyStatusLabel.stringValue = error.localizedDescription
+        }
+    }
+
     private func reload(
         popup: NSPopUpButton,
         devices: [AudioDeviceInfo],
@@ -262,6 +318,24 @@ final class AudioDevicePreferencesWindowController: NSWindowController {
             reloadAudioShakeAPIKey()
         } catch {
             audioShakeAPIKeyStatusLabel.stringValue = error.localizedDescription
+        }
+    }
+
+    @objc private func saveDeepgramAPIKey(_ sender: Any?) {
+        do {
+            try AudioProcessingCredentials.setStoredDeepgramAPIKey(deepgramAPIKeyField.stringValue)
+            reloadDeepgramAPIKey()
+        } catch {
+            deepgramAPIKeyStatusLabel.stringValue = error.localizedDescription
+        }
+    }
+
+    @objc private func clearDeepgramAPIKey(_ sender: Any?) {
+        do {
+            try AudioProcessingCredentials.deleteStoredDeepgramAPIKey()
+            reloadDeepgramAPIKey()
+        } catch {
+            deepgramAPIKeyStatusLabel.stringValue = error.localizedDescription
         }
     }
 

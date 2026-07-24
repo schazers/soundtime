@@ -139,6 +139,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         var timing: SIMD4<Float>
         var metrics: SIMD4<Float>
         var ripple: SIMD4<Float>
+        var waveformStyle: SIMD4<Float>
+        var waveformStyle2: SIMD4<Float>
     }
 
     private struct SelectionDragEffectUniform {
@@ -146,6 +148,28 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         var metrics: SIMD4<Float>
         var effect: SIMD4<Float>
         var color: SIMD4<Float>
+        var mask: SIMD4<Float>
+    }
+
+    private struct SelectionOverlayUniform {
+        var rect: SIMD4<Float>
+        var metrics: SIMD4<Float>
+        var style: SIMD4<Float>
+        var pulse: SIMD4<Float>
+        var baseColor: SIMD4<Float>
+        var progressColor: SIMD4<Float>
+        var fisheye: SIMD4<Float>
+    }
+
+    private struct LoopRegionUniform {
+        var rect: SIMD4<Float>
+        var metrics: SIMD4<Float>
+        var style: SIMD4<Float>
+        var edgeHighlight: SIMD4<Float>
+        var fillColor: SIMD4<Float>
+        var topColor: SIMD4<Float>
+        var bottomColor: SIMD4<Float>
+        var edgeColor: SIMD4<Float>
     }
 
     private struct WaveformShaderBin {
@@ -615,14 +639,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let color: SIMD3<Float>
     }
 
-    private struct SelectionDragEffect: Sendable {
-        let selection: TimelineSelection
-        let leadingProgress: Float
-        let velocityPixelsPerSecond: Float
-        let direction: Float
-        let timestamp: CFTimeInterval
-    }
-
     private struct SelectionDragWaveformContact: Sendable {
         let trackID: UUID?
         let progress: Float
@@ -669,18 +685,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let pulseStartTimestamp: CFTimeInterval
     }
 
-    private struct SelectionDragParticle {
-        let originProgress: Float
-        let originY: Float
-        let velocity: SIMD2<Float>
-        let perpendicular: SIMD2<Float>
-        let birthTimestamp: CFTimeInterval
-        let lifeDuration: CFTimeInterval
-        let radius: Float
-        let strength: Float
-        let spinPhase: Float
-        let spinRate: Float
-        let color: SIMD3<Float>
+    private enum TimelineEditEffectKind {
+        case deletion
+        case insertion
     }
 
     private struct DeletionEffect {
@@ -691,6 +698,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let capturedEnergySamples: [Float]
         var birthTimestamp: CFTimeInterval
         let seed: UInt64
+        let kind: TimelineEditEffectKind
     }
 
     private struct TransientParticleScoreProfile {
@@ -701,7 +709,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private struct WaveformVisualStyle {
         let spectralAmount: Float
         let peakAlpha: Float
-        let rmsAlpha: Float
+        let bodyAlpha: Float
         let glowAlpha: Float
         let transientAlpha: Float
         let transientThreshold: Float
@@ -746,7 +754,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         private let lock = NSLock()
         private var viewport: TimelineViewport?
         private var selection: TimelineSelection?
-        private var selectionDragEffect: SelectionDragEffect?
+        private var selectionDragSnapshot: TimelineSelectionDragSnapshot?
         private var selectionDragWaveformContacts: [SelectionDragWaveformContact] = []
         private var hoverProgress: Float?
         private var isHoverArmed = false
@@ -767,8 +775,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             self.selection = selection
         }
 
-        func publishSelectionDragEffect(
-            _ effect: SelectionDragEffect?,
+        func publishSelectionDragSnapshot(
+            _ snapshot: TimelineSelectionDragSnapshot?,
             contact: SelectionDragWaveformContact?,
             displayTimestamp: CFTimeInterval,
             lifetime: CFTimeInterval,
@@ -778,7 +786,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             defer {
                 lock.unlock()
             }
-            selectionDragEffect = effect
+            selectionDragSnapshot = snapshot
             pruneSelectionDragWaveformContacts(
                 displayTimestamp: displayTimestamp,
                 lifetime: lifetime,
@@ -829,12 +837,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 .withHover(progress: hoverProgress, isArmed: isHoverArmed)
         }
 
-        func selectionDragEffectSnapshot() -> SelectionDragEffect? {
+        func currentSelectionDragSnapshot() -> TimelineSelectionDragSnapshot? {
             lock.lock()
             defer {
                 lock.unlock()
             }
-            return selectionDragEffect
+            return selectionDragSnapshot
         }
 
         func selectionDragWaveformContactsSnapshot(
@@ -1093,10 +1101,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let waveformPipelineState: MTLRenderPipelineState
     private let rulerPipelineState: MTLRenderPipelineState
     private let additivePipelineState: MTLRenderPipelineState
+    private let selectionOverlayPipelineState: MTLRenderPipelineState
+    private let loopRegionPipelineState: MTLRenderPipelineState
     private let selectionDragEffectPipelineState: MTLRenderPipelineState
     private let deletionEffectPipelineState: MTLRenderPipelineState
     private let dynamicVertexBufferRing: DynamicVertexBufferRing
     private let waveformQuadVertexBuffer: MTLBuffer
+    private let deletionPlaceholderBinBuffer: MTLBuffer
     private let waveformGeometryQueue = DispatchQueue(
         label: "Soundtime.timeline.waveform.geometry",
         qos: .userInitiated
@@ -1146,9 +1157,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var selectionVertexScratch: [TimelineVertex] = []
     private var processingSelectionProgress: ProcessingSelectionProgress?
     private var selectionDragGlowVertexScratch: [TimelineVertex] = []
-    private var selectionDragParticleVertexScratch: [TimelineVertex] = []
     private var clipBoundaryVertexScratch: [TimelineVertex] = []
     private var loopRange = TimelineLoopRange.default
+    private var isLoopRangeEnabled = true
+    private var isLoopRegionHighlighted = false
+    private var loopRangeFlashStartTime: CFTimeInterval?
     private var highlightedLoopEndpoint: TimelineLoopEndpoint?
     private var gridCache: GridCache?
     private var waveformTransitionStartTime: CFTimeInterval?
@@ -1167,13 +1180,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var lastPlayheadContactEventTimestamp: CFTimeInterval?
     private var isModalBackdropActive = false
     private var transientParticles: [TransientParticle] = []
-    private var selectionDragParticles: [SelectionDragParticle] = []
-    private var selectionDragParticleEmissionDebt: Float = 0
-    private var selectionDragParticleEmissionTimestamp: CFTimeInterval?
-    private var selectionDragParticleSeed: UInt64 = 0
     private var deletionEffects: [DeletionEffect] = []
     private var lastDeletionEffectsClearedTimestamp: CFTimeInterval = -Double.infinity
     private let deletionEffectLock = NSLock()
+    private var selectionCopyFlashStartTime: CFTimeInterval?
     private var previousTransientScanProgress: Float?
     private var lastTransientParticleBins: [UUID: Int] = [:]
     private var transientParticleScoreProfiles: [WaveformMipCacheKey: TransientParticleScoreProfile] = [:]
@@ -1209,6 +1219,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var frameStatsDeletionEffectCount = 0
     private var frameStatsPlayheadContactEventCount = 0
     private var lastWaveformPerformanceContractEventTime: CFTimeInterval = -Double.infinity
+    private var lastImmediateHotPathFrameStatsPublishTime: CFTimeInterval = -Double.infinity
     private var lastFrameStats: TimelineFrameStats?
     private var lastRenderViewportSize = CGSize(width: 1600, height: 900)
     private var lastRenderBackingScale: Float = 1
@@ -1220,38 +1231,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return lastFrameStats
         }
 
-        let waveformBufferDiagnostics = waveformShaderBufferStore.diagnostics()
-        return TimelineFrameStats(
+        return makeFrameStats(
             framesPerSecond: 0,
             averageFrameTimeMilliseconds: 0,
             frameTimeJitterMilliseconds: 0,
-            worstFrameTimeMilliseconds: 0,
-            waveformRenderer: frameStatsWaveformRenderer,
-            cpuWaveformVertexCount: frameStatsCPUWaveformVertexCount,
-            gpuWaveformDrawCount: frameStatsGPUWaveformDrawCount,
-            shaderBufferUploadCount: frameStatsShaderBufferUploadCount,
-            shaderBufferUploadByteCount: frameStatsShaderBufferUploadByteCount,
-            shaderBufferCount: waveformBufferDiagnostics.bufferCount,
-            shaderBufferByteCount: waveformBufferDiagnostics.byteCount,
-            shaderBufferUploadInFlightCount: waveformBufferDiagnostics.inFlightCount,
-            waveformMipCacheCount: waveformMipCacheDiagnostics().cacheCount,
-            cpuWaveformFallbackDrawCount: frameStatsCPUWaveformFallbackDrawCount,
-            waveformFallbackDrawCount: frameStatsWaveformFallbackDrawCount,
-            waveformLastGoodHoldCount: frameStatsWaveformLastGoodHoldCount,
-            waveformResidentMissCount: frameStatsWaveformResidentMissCount,
-            waveformHotPathViolationCount: frameStatsWaveformHotPathViolationCount,
-            waveformHotPathReason: frameStatsWaveformHotPathReason,
-            gpuResidentWaveformMode: frameStatsGPUResidentWaveformMode,
-            gpuResidentShadowSourceCount: frameStatsGPUResidentShadowSourceCount,
-            gpuResidentShadowRequestCount: frameStatsGPUResidentShadowRequestCount,
-            gpuResidentShadowVisibleTileCount: frameStatsGPUResidentShadowVisibleTileCount,
-            gpuResidentShadowDrawBatchCount: frameStatsGPUResidentShadowDrawBatchCount,
-            gpuResidentShadowDrawInstanceCount: frameStatsGPUResidentShadowDrawInstanceCount,
-            effectVertexCount: frameStatsEffectVertexCount,
-            effectDroppedVertexCount: frameStatsEffectDroppedVertexCount,
-            transientParticleCount: frameStatsTransientParticleCount,
-            deletionEffectCount: frameStatsDeletionEffectCount,
-            playheadContactEventCount: frameStatsPlayheadContactEventCount
+            worstFrameTimeMilliseconds: 0
         )
     }
 
@@ -1259,7 +1243,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let playheadTouchLightAheadDuration: TimeInterval = 0.08
     private var playheadTouchTrailDuration: TimeInterval = 0.56
     private var playheadTouchTrailFalloffSteepness: Float = 1.30
-    private var waveformBaseGray: Float = 0.88
+    private var waveformBaseGray: Float = 0.92
     private let waveformTransitionDuration: CFTimeInterval = 0.2
     private let playheadTouchDecayDuration: CFTimeInterval = 0.046
     private let playheadTouchPauseFadeDuration: CFTimeInterval = 0.20
@@ -1292,16 +1276,17 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let maximumTransientParticleVerticesPerFrame = 10_000
     private var selectionDragWaveformTuning = SelectionDragWaveformTuning.defaultValue
     private let maximumSelectionDragShaderContactCount = 4
-    private let maximumSelectionDragParticleVerticesPerFrame = 1_008
     private let selectionDragEffectFadeDuration: CFTimeInterval = 0.22
     private let selectionDragWaveformContactMinimumStrength: Float = 0.001
     private let selectionDragSlowContactStrengthFloor: Float = 0.20
     private let selectionDragMotionEpsilonPixelsPerSecond: Float = 2.0
-    private let deletionEffectDuration: CFTimeInterval = 2.0
-    private let deletionEffectLifetimePadding: CFTimeInterval = 0.08
-    private let deletionHandoffWaveformDemotionHoldDuration: CFTimeInterval = 1.25
+    private let deletionEffectDuration: CFTimeInterval = 0.14
+    private let deletionEffectLifetimePadding: CFTimeInterval = 0.04
+    private let deletionHandoffWaveformDemotionHoldDuration: CFTimeInterval = 0.18
     private let deletionEffectMaximumCount = 8
     private let deletionEffectMaximumCapturedBins = 512
+    private let selectionCopyFlashDuration: CFTimeInterval = 0.20
+    private let loopRangeFlashDuration: CFTimeInterval = 0.35
     private let transientParticleScorePercentile: Float = 0.997
     private let transientParticleProfileSampleLimit = 2_048
     private let transientParticleMinimumSpacing: TimeInterval = 0.32
@@ -1368,6 +1353,24 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             throw RendererError.waveformQuadBufferUnavailable
         }
         waveformQuadVertexBuffer.label = "Timeline waveform static quad"
+        var deletionPlaceholderBin = WaveformShaderBin(
+            minimumSample: 0,
+            maximumSample: 0,
+            rmsSample: 0,
+            lowEnergy: 0,
+            midEnergy: 0,
+            highEnergy: 0,
+            peakMagnitude: 0,
+            reserved: 0
+        )
+        guard let deletionPlaceholderBinBuffer = device.makeBuffer(
+            bytes: &deletionPlaceholderBin,
+            length: MemoryLayout<WaveformShaderBin>.stride,
+            options: [.storageModeShared]
+        ) else {
+            throw RendererError.waveformQuadBufferUnavailable
+        }
+        deletionPlaceholderBinBuffer.label = "Timeline deletion placeholder bin"
 
         let library = try device.makeLibrary(source: Self.shaderSource, options: nil)
         guard
@@ -1377,6 +1380,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             let waveformFragmentFunction = library.makeFunction(name: "waveform_fragment"),
             let rulerVertexFunction = library.makeFunction(name: "timeline_ruler_vertex"),
             let rulerFragmentFunction = library.makeFunction(name: "timeline_ruler_fragment"),
+            let selectionOverlayVertexFunction = library.makeFunction(name: "selection_overlay_vertex"),
+            let selectionOverlayFragmentFunction = library.makeFunction(name: "selection_overlay_fragment"),
+            let loopRegionVertexFunction = library.makeFunction(name: "loop_region_vertex"),
+            let loopRegionFragmentFunction = library.makeFunction(name: "loop_region_fragment"),
             let selectionDragEffectVertexFunction = library.makeFunction(name: "selection_drag_effect_vertex"),
             let selectionDragEffectFragmentFunction = library.makeFunction(name: "selection_drag_effect_fragment"),
             let deletionEffectVertexFunction = library.makeFunction(name: "deletion_effect_vertex"),
@@ -1429,6 +1436,28 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         additiveDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
         additiveDescriptor.colorAttachments[0].destinationRGBBlendFactor = .one
         additiveDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .one
+        let selectionOverlayDescriptor = MTLRenderPipelineDescriptor()
+        selectionOverlayDescriptor.vertexFunction = selectionOverlayVertexFunction
+        selectionOverlayDescriptor.fragmentFunction = selectionOverlayFragmentFunction
+        selectionOverlayDescriptor.colorAttachments[0].pixelFormat = pixelFormat
+        selectionOverlayDescriptor.colorAttachments[0].isBlendingEnabled = true
+        selectionOverlayDescriptor.colorAttachments[0].rgbBlendOperation = .add
+        selectionOverlayDescriptor.colorAttachments[0].alphaBlendOperation = .add
+        selectionOverlayDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        selectionOverlayDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+        selectionOverlayDescriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        selectionOverlayDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        let loopRegionDescriptor = MTLRenderPipelineDescriptor()
+        loopRegionDescriptor.vertexFunction = loopRegionVertexFunction
+        loopRegionDescriptor.fragmentFunction = loopRegionFragmentFunction
+        loopRegionDescriptor.colorAttachments[0].pixelFormat = pixelFormat
+        loopRegionDescriptor.colorAttachments[0].isBlendingEnabled = true
+        loopRegionDescriptor.colorAttachments[0].rgbBlendOperation = .add
+        loopRegionDescriptor.colorAttachments[0].alphaBlendOperation = .add
+        loopRegionDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        loopRegionDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+        loopRegionDescriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        loopRegionDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
         let selectionDragEffectDescriptor = MTLRenderPipelineDescriptor()
         selectionDragEffectDescriptor.vertexFunction = selectionDragEffectVertexFunction
         selectionDragEffectDescriptor.fragmentFunction = selectionDragEffectFragmentFunction
@@ -1456,6 +1485,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         self.commandQueue = commandQueue
         self.dynamicVertexBufferRing = dynamicVertexBufferRing
         self.waveformQuadVertexBuffer = waveformQuadVertexBuffer
+        self.deletionPlaceholderBinBuffer = deletionPlaceholderBinBuffer
         waveformShaderBufferStore = WaveformShaderBufferStore(
             device: device,
             preferredSlabBinCapacity: 262_144
@@ -1471,6 +1501,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         waveformPipelineState = try device.makeRenderPipelineState(descriptor: waveformDescriptor)
         rulerPipelineState = try device.makeRenderPipelineState(descriptor: rulerDescriptor)
         additivePipelineState = try device.makeRenderPipelineState(descriptor: additiveDescriptor)
+        selectionOverlayPipelineState = try device.makeRenderPipelineState(descriptor: selectionOverlayDescriptor)
+        loopRegionPipelineState = try device.makeRenderPipelineState(descriptor: loopRegionDescriptor)
         selectionDragEffectPipelineState = try device.makeRenderPipelineState(descriptor: selectionDragEffectDescriptor)
         deletionEffectPipelineState = try device.makeRenderPipelineState(descriptor: deletionEffectDescriptor)
 
@@ -1496,7 +1528,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     func displayTracks(
         _ tracks: [TimelineRenderState.Track],
         animateWaveformTransition: Bool = true,
-        allowImmediateWaveformPrewarm: Bool = true
+        allowImmediateWaveformPrewarm: Bool = true,
+        allowImmediateInteractiveWaveformPrewarm: Bool = true
     ) {
         let previousTracks = renderState.tracks
         let staleTiledSourceIDs = tiledWaveformPipeline?.registerSources(tracks.compactMap(\.waveformTileSource)) ?? []
@@ -1532,6 +1565,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let nextTrackIDs = Set(renderTracks.map(\.id))
         let hasSharedTransitionTracks = !previousTrackIDs.isDisjoint(with: nextTrackIDs)
         let hasActiveDeletionEffects = hasDeletionEffectsInFlight()
+        let canAnimateWaveformTransition =
+            animateWaveformTransition &&
+            !renderState.isPlaybackActive &&
+            !nextRenderState.isPlaybackActive
         let canReuseResidentWaveformsForDeletion =
             hasActiveDeletionEffects &&
             previousTrackIDsInOrder == nextTrackIDsInOrder &&
@@ -1545,7 +1582,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let preservesEffectContinuity = previousTrackIDsInOrder == nextTrackIDsInOrder &&
             renderState.hasWaveforms &&
             hasNextWaveforms
-        if animateWaveformTransition, renderState.hasWaveforms, hasNextWaveforms, hasSharedTransitionTracks {
+        if canAnimateWaveformTransition, renderState.hasWaveforms, hasNextWaveforms, hasSharedTransitionTracks {
             waveformMipLevelStateLock.lock()
             previousTrackWaveformMipLevels = trackWaveformMipLevels
             waveformMipLevelStateLock.unlock()
@@ -1587,13 +1624,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 drawableSize: lastRenderViewportSize,
                 backingScale: lastRenderBackingScale
             )
-            prewarmInteractiveWaveformShaderBuffers(
-                tracks: renderTracks,
-                trackWaveformMipLevels: nextTrackWaveformMipLevels,
-                renderState: nextRenderState,
-                drawableSize: lastRenderViewportSize,
-                backingScale: lastRenderBackingScale
-            )
+            if allowImmediateInteractiveWaveformPrewarm {
+                prewarmInteractiveWaveformShaderBuffers(
+                    tracks: renderTracks,
+                    trackWaveformMipLevels: nextTrackWaveformMipLevels,
+                    renderState: nextRenderState,
+                    drawableSize: lastRenderViewportSize,
+                    backingScale: lastRenderBackingScale
+                )
+            }
         }
         gridCache = nil
         if hasNextWaveforms {
@@ -1642,6 +1681,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let waveformVersion = sourceOverview == nil ?
             (sourceTrack?.waveformVersion ?? currentTrack?.waveformVersion ?? track.waveformVersion) :
             track.waveformVersion
+        let shouldPreserveCurrentSegments = track.waveformSegments.isEmpty &&
+            track.waveformOverview == nil &&
+            track.waveformTileSource == nil
+        let waveformSegments = shouldPreserveCurrentSegments ?
+            (currentTrack?.waveformSegments ?? sourceTrack?.waveformSegments ?? []) :
+            track.waveformSegments
         return TimelineRenderState.Track(
             id: track.id,
             waveformVersion: waveformVersion,
@@ -1652,7 +1697,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             isSoloed: track.isSoloed,
             hasWaveform: hasWaveform,
             clipRanges: track.clipRanges.isEmpty ? (currentTrack?.clipRanges ?? []) : track.clipRanges,
-            waveformSegments: track.waveformSegments.isEmpty ? (currentTrack?.waveformSegments ?? []) : track.waveformSegments,
+            waveformSegments: waveformSegments,
             waveformTileSource: track.waveformTileSource ??
                 currentTrack?.waveformTileSource ??
                 sourceTrack?.waveformTileSource
@@ -1979,7 +2024,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         markWaveformHotInteraction()
         interactionStateStore.publishSelection(selection)
         let tuning = selectionDragWaveformTuning
-        interactionStateStore.publishSelectionDragEffect(
+        interactionStateStore.publishSelectionDragSnapshot(
             nil,
             contact: nil,
             displayTimestamp: CACurrentMediaTime(),
@@ -2022,6 +2067,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
     }
 
+    func triggerSelectionCopyFlash(at timestamp: CFTimeInterval = CACurrentMediaTime()) {
+        guard renderState.selection?.durationProgress ?? 0 > 0 else {
+            return
+        }
+
+        markWaveformHotInteraction(at: timestamp)
+        selectionCopyFlashStartTime = timestamp
+    }
+
     func displayModalBackdropActive(_ isActive: Bool) {
         guard isModalBackdropActive != isActive else {
             return
@@ -2040,20 +2094,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         interactionStateStore.publishSelection(selection)
     }
 
-    func publishInteractionSelectionDrag(
-        _ selection: TimelineSelection?,
-        leadingProgress: Float = 0,
-        velocityPixelsPerSecond: Float = 0,
-        direction: Float = 0,
-        timestamp: CFTimeInterval = CACurrentMediaTime()
-    ) {
-        markWaveformHotInteraction(at: timestamp)
+    func publishInteractionSelectionDragSnapshot(_ snapshot: TimelineSelectionDragSnapshot?) {
+        let timestamp = snapshot?.timestamp ?? CACurrentMediaTime()
         guard
-            let selection,
-            selection.durationProgress > 0
+            let snapshot,
+            snapshot.selection.durationProgress > 0
         else {
             let tuning = selectionDragWaveformTuning
-            interactionStateStore.publishSelectionDragEffect(
+            interactionStateStore.publishSelectionDragSnapshot(
                 nil,
                 contact: nil,
                 displayTimestamp: timestamp,
@@ -2063,35 +2111,26 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return
         }
 
-        let clampedLeadingProgress = min(max(leadingProgress, 0), 1)
-        let clampedVelocity = max(velocityPixelsPerSecond, 0)
-        let normalizedDirection: Float = direction == 0 ? 0 : (direction > 0 ? 1 : -1)
-        let effect = SelectionDragEffect(
-            selection: selection,
-            leadingProgress: clampedLeadingProgress,
-            velocityPixelsPerSecond: clampedVelocity,
-            direction: normalizedDirection,
-            timestamp: timestamp
-        )
+        interactionStateStore.publishSelection(snapshot.selection)
         let tuning = selectionDragWaveformTuning
-        let contactStrength = selectionDragStrength(for: clampedVelocity)
+        let contactStrength = selectionDragStrength(for: snapshot.velocityPixelsPerSecond)
         let contact: SelectionDragWaveformContact?
         if
-            normalizedDirection != 0,
+            snapshot.direction != 0,
             contactStrength > selectionDragWaveformContactMinimumStrength
         {
             contact = SelectionDragWaveformContact(
-                trackID: selection.trackID,
-                progress: clampedLeadingProgress,
-                direction: normalizedDirection,
+                trackID: snapshot.selection.trackID,
+                progress: snapshot.leadingProgress,
+                direction: snapshot.direction,
                 strength: min(max(contactStrength, 0), 1),
                 birthTimestamp: timestamp
             )
         } else {
             contact = nil
         }
-        interactionStateStore.publishSelectionDragEffect(
-            effect,
+        interactionStateStore.publishSelectionDragSnapshot(
+            snapshot,
             contact: contact,
             displayTimestamp: timestamp,
             lifetime: tuning.contactLifetime,
@@ -2131,12 +2170,38 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         self.loopRange = loopRange
     }
 
+    func displayLoopRangeEnabled(_ isEnabled: Bool) {
+        guard isLoopRangeEnabled != isEnabled else {
+            return
+        }
+
+        markWaveformHotInteraction()
+        isLoopRangeEnabled = isEnabled
+    }
+
     func displayHighlightedLoopEndpoint(_ endpoint: TimelineLoopEndpoint?) {
         guard highlightedLoopEndpoint != endpoint else {
             return
         }
 
         highlightedLoopEndpoint = endpoint
+    }
+
+    func displayHighlightedLoopRegion(_ isHighlighted: Bool) {
+        guard isLoopRegionHighlighted != isHighlighted else {
+            return
+        }
+
+        isLoopRegionHighlighted = isHighlighted
+    }
+
+    func triggerLoopRangeFlash(at timestamp: CFTimeInterval = CACurrentMediaTime()) {
+        guard isLoopRangeEnabled, loopRange.durationProgress > 0.0001, loopRange.durationProgress < 0.999 else {
+            return
+        }
+
+        markWaveformHotInteraction()
+        loopRangeFlashStartTime = timestamp
     }
 
     func displayGainPreview(selection: TimelineSelection?, gain: Float) {
@@ -2234,16 +2299,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             for: selection,
             displayTimestamp: displayTimestamp
         )
-        let capturedBins = capturedDeletionBins(for: capturedSelection)
-        let capturedBinBuffer = makeDeletionWaveformBinBuffer(from: capturedBins)
         let effect = DeletionEffect(
             selection: selection,
             visualAnchor: visualAnchor,
-            capturedBinBuffer: capturedBinBuffer,
-            capturedBinCount: capturedBins.count,
-            capturedEnergySamples: deletionWallEnergySamples(from: capturedBins),
+            capturedBinBuffer: deletionPlaceholderBinBuffer,
+            capturedBinCount: 1,
+            capturedEnergySamples: [],
             birthTimestamp: -1,
-            seed: seed
+            seed: seed,
+            kind: .deletion
         )
 
         deletionEffectLock.lock()
@@ -2252,6 +2316,55 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             deletionEffects.removeFirst(deletionEffects.count - deletionEffectMaximumCount)
         }
         deletionEffectLock.unlock()
+    }
+
+    func triggerPasteEffect(
+        selection: TimelineSelection,
+        waveformOverview: WaveformOverview?,
+        at timestamp: CFTimeInterval = CACurrentMediaTime()
+    ) {
+        guard selection.durationProgress > 0 else {
+            return
+        }
+
+        var seed = UInt64(bitPattern: Int64(selection.trackID?.hashValue ?? 0))
+        seed &+= UInt64((selection.startProgress * 1_000_000).rounded(.down))
+        seed &*= 0xD6E8_FD9D_50B9_1D35
+        seed &+= UInt64((selection.endProgress * 1_000_000).rounded(.down))
+        let visualAnchor = deletionEffectVisualAnchor(
+            for: selection,
+            displayTimestamp: timestamp
+        )
+        let capturedBins: [WaveformOverview.Bin]
+        if let waveformOverview {
+            capturedBins = capturedDeletionBins(
+                in: waveformOverview,
+                startProgress: 0,
+                endProgress: 1,
+                maximumBinCount: deletionEffectMaximumCapturedBins
+            )
+        } else {
+            capturedBins = []
+        }
+        let capturedBinBuffer = makeDeletionWaveformBinBuffer(from: capturedBins)
+        let effect = DeletionEffect(
+            selection: selection,
+            visualAnchor: visualAnchor,
+            capturedBinBuffer: capturedBinBuffer ?? deletionPlaceholderBinBuffer,
+            capturedBinCount: max(capturedBins.count, 1),
+            capturedEnergySamples: deletionWallEnergySamples(from: capturedBins),
+            birthTimestamp: -1,
+            seed: seed,
+            kind: .insertion
+        )
+
+        deletionEffectLock.lock()
+        deletionEffects.append(effect)
+        if deletionEffects.count > deletionEffectMaximumCount {
+            deletionEffects.removeFirst(deletionEffects.count - deletionEffectMaximumCount)
+        }
+        deletionEffectLock.unlock()
+        markWaveformHotInteraction(at: timestamp)
     }
 
     func clearDeletionEffects() {
@@ -2432,6 +2545,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         encoder.endEncoding()
 
         commandBuffer.present(target.drawable)
+        PerformanceSampler.shared.recordTimelineFramePresented()
+        commandBuffer.addCompletedHandler { _ in
+            PerformanceSampler.shared.recordTimelineFrameCompleted()
+        }
         commandBuffer.commit()
     }
 
@@ -2478,11 +2595,27 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     ) {
         resetFrameDiagnosticsForNextFrame()
         let renderState = interactionStateStore.applying(to: renderStateStore.snapshot())
-        promoteReadyPendingWaveformMipLevelPublications(
-            renderState: renderState,
-            drawableSize: viewportSize,
-            backingScale: backingScale
+        let selectionDragSnapshot = interactionStateStore.currentSelectionDragSnapshot()
+        let selectionDragTuning = selectionDragWaveformTuning
+        let selectionDragWaveformContacts = interactionStateStore.selectionDragWaveformContactsSnapshot(
+            displayTimestamp: displayTimestamp,
+            lifetime: selectionDragTuning.contactLifetime,
+            maximumCount: selectionDragTuning.maximumContactCount
         )
+        let isSelectionDragFrame = isSelectionDragEffectActive(
+            selectionDragSnapshot,
+            displayTimestamp: displayTimestamp
+        ) || !selectionDragWaveformContacts.isEmpty
+        if isSelectionDragFrame {
+            markWaveformHotInteraction(at: displayTimestamp)
+        }
+        if !isSelectionDragFrame {
+            promoteReadyPendingWaveformMipLevelPublications(
+                renderState: renderState,
+                drawableSize: viewportSize,
+                backingScale: backingScale
+            )
+        }
         let mipLevelSnapshot = waveformMipLevelSnapshot()
         let renderedPlayheadProgress = currentPlayheadProgress(
             renderState: renderState,
@@ -2510,24 +2643,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             drawableSize: viewportSize,
             renderState: renderState
         )
-        let selectionVertices = makeSelectionVertices(
+        let selectionOverlayUniform = makeSelectionOverlayUniform(
             drawableSize: viewportSize,
             renderState: renderState,
-            displayTimestamp: displayTimestamp
-        )
-        let selectionDragEffect = interactionStateStore.selectionDragEffectSnapshot()
-        let selectionDragTuning = selectionDragWaveformTuning
-        let selectionDragWaveformContacts = interactionStateStore.selectionDragWaveformContactsSnapshot(
             displayTimestamp: displayTimestamp,
-            lifetime: selectionDragTuning.contactLifetime,
-            maximumCount: selectionDragTuning.maximumContactCount
+            fisheye: selectionFisheye,
+            dragSnapshot: selectionDragSnapshot
         )
-        let isSelectionDragFrame = isSelectionDragEffectActive(
-            selectionDragEffect,
-            displayTimestamp: displayTimestamp
-        ) || !selectionDragWaveformContacts.isEmpty
         let selectionDragEffectUniform = makeSelectionDragEffectUniform(
-            effect: selectionDragEffect,
+            snapshot: selectionDragSnapshot,
             drawableSize: viewportSize,
             renderState: renderState,
             displayTimestamp: displayTimestamp
@@ -2551,7 +2675,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             backingScale: backingScale,
             displayTimestamp: displayTimestamp
         )
-        let hasWaveformTransition = hasPreviousWaveformTransition
+        let existingWaveformTransition = hasPreviousWaveformTransition
+        if renderState.isPlaybackActive, existingWaveformTransition {
+            clearPreviousWaveformTransition()
+        }
+        let hasWaveformTransition = !renderState.isPlaybackActive && existingWaveformTransition
         let waveformHotPathReason = waveformPerformanceContractHotPathReason(
             renderState: renderState,
             hasActiveDeletionEffect: hasActiveDeletionEffect,
@@ -2678,10 +2806,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             backingScale: backingScale,
             renderState: renderState
         )
-        let loopRangeVertices = makeLoopRangeVertices(
+        let loopRangeUniform = makeLoopRangeUniform(
             drawableSize: viewportSize,
             backingScale: backingScale,
-            renderState: renderState
+            renderState: renderState,
+            displayTimestamp: displayTimestamp
         )
         let trimPreviewVertices = makeTrimPreviewVertices(
             drawableSize: viewportSize,
@@ -2705,9 +2834,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 displayTimestamp: displayTimestamp
             )
         }
-        selectionDragParticles.removeAll(keepingCapacity: true)
-        selectionDragParticleEmissionTimestamp = nil
-        selectionDragParticleEmissionDebt = 0
         let transientParticleVertices = makeTransientParticleVertices(
             drawableSize: viewportSize,
             renderState: renderState,
@@ -2715,8 +2841,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             maximumVertexCount: maximumTransientParticleVerticesPerFrame
         )
         frameStatsEffectVertexCount += transientParticleVertices.count
-        let selectionDragParticleVertices: [TimelineVertex] = []
-        frameStatsEffectVertexCount += selectionDragParticleVertices.count + (selectionDragEffectUniform == nil ? 0 : 6)
+        frameStatsEffectVertexCount += selectionDragEffectUniform == nil ? 0 : 6
         let hoverGuideVertices = makeHoverGuideVertices(
             drawableSize: viewportSize,
             backingScale: backingScale,
@@ -2746,12 +2871,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             renderState: renderState,
             encoder: encoder
         )
+        drawLoopRange(uniform: loopRangeUniform, encoder: encoder)
         encoder.setRenderPipelineState(pipelineState)
-        draw(vertices: loopRangeVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: selectedTrackVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: processingTrackVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: candidateRegionVertices, primitiveType: .triangle, encoder: encoder)
-        draw(vertices: selectionVertices, primitiveType: .triangle, encoder: encoder, fisheye: selectionFisheye)
+        drawSelectionOverlay(uniform: selectionOverlayUniform, encoder: encoder)
+        encoder.setRenderPipelineState(pipelineState)
         if let previousShaderRenderState, usesPreviousWaveformShader {
             encoder.setRenderPipelineState(waveformPipelineState)
             drawShaderWaveforms(
@@ -2826,13 +2952,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             )
         }
         draw(vertices: playheadTouchVertices, primitiveType: .triangle, encoder: encoder)
-        if selectionDragEffectUniform != nil || !selectionDragParticleVertices.isEmpty {
+        if selectionDragEffectUniform != nil {
             drawSelectionDragEffect(uniform: selectionDragEffectUniform, encoder: encoder)
-            if !selectionDragParticleVertices.isEmpty {
-                encoder.setRenderPipelineState(additivePipelineState)
-                draw(vertices: selectionDragParticleVertices, primitiveType: .triangle, encoder: encoder)
-                encoder.setRenderPipelineState(pipelineState)
-            }
         }
         if !transientParticleVertices.isEmpty {
             encoder.setRenderPipelineState(additivePipelineState)
@@ -3045,6 +3166,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 selection: renderState.selection,
                 contacts: selectionDragWaveformContacts,
                 trackID: track.id,
+                drawableSize: drawableSize,
+                renderState: renderState,
                 displayTimestamp: displayTimestamp
             ) {
                 trackSelectionDragVisuals.z = dragBounds.x
@@ -3414,7 +3537,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let commonStyle = SIMD4<Float>(
             style.spectralAmount,
             style.peakAlpha,
-            style.rmsAlpha,
+            style.bodyAlpha,
             style.glowAlpha
         )
         let commonStyle2 = SIMD4<Float>(
@@ -4583,11 +4706,19 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
            !currentLevels.isEmpty,
            waveformMipLevelBinSignature(currentLevels) != waveformMipLevelBinSignature(levels)
         {
-            previousTrackWaveformMipLevels = trackWaveformMipLevels
-            previousTransitionTracks = renderState.tracks
-            previousTransitionViewport = renderState.viewport
-            waveformGeometryStore.promoteCurrentToPrevious()
-            waveformTransitionStartTime = nil
+            if renderState.isPlaybackActive {
+                previousTrackWaveformMipLevels = [:]
+                previousTransitionTracks = []
+                previousTransitionViewport = nil
+                waveformGeometryStore.clearPrevious()
+                waveformTransitionStartTime = nil
+            } else {
+                previousTrackWaveformMipLevels = trackWaveformMipLevels
+                previousTransitionTracks = renderState.tracks
+                previousTransitionViewport = renderState.viewport
+                waveformGeometryStore.promoteCurrentToPrevious()
+                waveformTransitionStartTime = nil
+            }
         }
         trackWaveformMipLevels[key.trackID] = levels
         if currentPrimaryWaveformTrackID == key.trackID {
@@ -5028,58 +5159,142 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         return vertices
     }
 
-    private func makeLoopRangeVertices(
+    private func makeLoopRangeUniform(
         drawableSize: CGSize,
         backingScale: Float,
-        renderState: TimelineRenderState
-    ) -> [TimelineVertex] {
+        renderState: TimelineRenderState,
+        displayTimestamp: CFTimeInterval
+    ) -> LoopRegionUniform? {
         guard
             renderState.duration != nil,
             !renderState.tracks.isEmpty
         else {
-            return []
+            return nil
         }
 
         let width = Float(drawableSize.width)
         let height = Float(drawableSize.height)
         guard width > 0, height > 0 else {
-            return []
+            return nil
         }
 
         let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
         let rulerHeight = min(max(trackLayout.rulerLaneHeight, 0), height)
         guard rulerHeight > 8 else {
-            return []
+            return nil
         }
 
-        let size = SIMD2<Float>(width, height)
-        var vertices: [TimelineVertex] = []
-        vertices.reserveCapacity(96)
-        appendLoopHandle(
-            to: &vertices,
-            label: "L",
-            endpoint: .start,
-            progress: loopRange.startProgress,
-            color: SIMD4<Float>(0.78, 0.82, 0.84, 0.88),
-            isHighlighted: highlightedLoopEndpoint == .start,
-            drawableSize: size,
-            rulerHeight: rulerHeight,
-            backingScale: backingScale,
-            renderState: renderState
+        guard loopRange.durationProgress < 0.999 else {
+            return nil
+        }
+
+        let startViewportProgress = renderState.viewport.viewportProgress(
+            forTimelineProgress: loopRange.startProgress
         )
-        appendLoopHandle(
-            to: &vertices,
-            label: "R",
-            endpoint: .end,
-            progress: loopRange.endProgress,
-            color: SIMD4<Float>(0.78, 0.82, 0.84, 0.88),
-            isHighlighted: highlightedLoopEndpoint == .end,
-            drawableSize: size,
-            rulerHeight: rulerHeight,
-            backingScale: backingScale,
-            renderState: renderState
+        let endViewportProgress = renderState.viewport.viewportProgress(
+            forTimelineProgress: loopRange.endProgress
         )
-        return vertices
+        let rawLeft = min(startViewportProgress, endViewportProgress) * width
+        let rawRight = max(startViewportProgress, endViewportProgress) * width
+        let left = min(max(rawLeft, 0), width)
+        let right = min(max(rawRight, 0), width)
+        guard right - left > pixelLength(backingScale: backingScale) else {
+            return nil
+        }
+
+        let lineWidth = pixelLength(backingScale: backingScale)
+        let top = max(pixelLength(2, backingScale: backingScale), 1)
+        let bottom = max(rulerHeight, top + 1)
+        let radius = min(max((bottom - top) * 0.34, 4), 8)
+        let hoverBoost: Float = isLoopRegionHighlighted ? 1 : 0
+        let flashBoost = currentLoopRangeFlashBoost(displayTimestamp: displayTimestamp)
+        let activeAlpha: Float = isLoopRangeEnabled ? 0.30 : 0.15
+        let fillAlpha = activeAlpha + hoverBoost * 0.08
+        let edgeAlpha = (isLoopRangeEnabled ? 0.72 : 0.36) + hoverBoost * 0.12
+        let fillRGB = isLoopRangeEnabled ?
+            mix(SIMD3<Float>(0.10, 0.78, 0.86), SIMD3<Float>(0.92, 1.0, 1.0), flashBoost * 0.38) :
+            SIMD3<Float>(0.46 + hoverBoost * 0.06, 0.47 + hoverBoost * 0.06, 0.48 + hoverBoost * 0.06)
+        let topRGB = isLoopRangeEnabled ?
+            mix(SIMD3<Float>(0.92, 1.0, 1.0), SIMD3<Float>(1.0, 1.0, 1.0), flashBoost * 0.55) :
+            SIMD3<Float>(0.82, 0.83, 0.84)
+        let bottomRGB = isLoopRangeEnabled ?
+            mix(SIMD3<Float>(0.00, 0.20, 0.23), SIMD3<Float>(0.58, 0.68, 0.70), flashBoost * 0.42) :
+            SIMD3<Float>(0.16, 0.16, 0.17)
+        let edgeRGB = isLoopRangeEnabled ?
+            mix(SIMD3<Float>(0.86, 0.98, 1.0), SIMD3<Float>(1.0, 1.0, 1.0), flashBoost * 0.65) :
+            SIMD3<Float>(0.78, 0.79, 0.80)
+        let flashedFillAlpha = min(fillAlpha + flashBoost * 0.10, 0.55)
+        let flashedEdgeAlpha = min(edgeAlpha + flashBoost * 0.16, 0.96)
+        let endpointHighlight: Float
+        switch highlightedLoopEndpoint {
+        case .start:
+            endpointHighlight = -1
+        case .end:
+            endpointHighlight = 1
+        case nil:
+            endpointHighlight = 0
+        }
+
+        return LoopRegionUniform(
+            rect: SIMD4<Float>(
+                left / width,
+                right / width,
+                top / height,
+                bottom / height
+            ),
+            metrics: SIMD4<Float>(
+                max(right - left, 1),
+                max(bottom - top, 1),
+                radius,
+                max(lineWidth, 1)
+            ),
+            style: SIMD4<Float>(
+                isLoopRangeEnabled ? 1 : 0,
+                hoverBoost,
+                flashBoost,
+                Float(displayTimestamp.truncatingRemainder(dividingBy: 8192))
+            ),
+            edgeHighlight: SIMD4<Float>(
+                endpointHighlight,
+                abs(endpointHighlight),
+                max(lineWidth, 1),
+                0
+            ),
+            fillColor: SIMD4<Float>(fillRGB.x, fillRGB.y, fillRGB.z, flashedFillAlpha),
+            topColor: SIMD4<Float>(
+                topRGB.x,
+                topRGB.y,
+                topRGB.z,
+                isLoopRangeEnabled ? 0.13 + hoverBoost * 0.05 + flashBoost * 0.08 : 0.07 + hoverBoost * 0.03
+            ),
+            bottomColor: SIMD4<Float>(
+                bottomRGB.x,
+                bottomRGB.y,
+                bottomRGB.z,
+                isLoopRangeEnabled ? 0.18 + flashBoost * 0.06 : 0.10
+            ),
+            edgeColor: SIMD4<Float>(edgeRGB.x, edgeRGB.y, edgeRGB.z, flashedEdgeAlpha)
+        )
+    }
+
+    private func currentLoopRangeFlashBoost(displayTimestamp: CFTimeInterval) -> Float {
+        guard isLoopRangeEnabled, let loopRangeFlashStartTime else {
+            return 0
+        }
+
+        let elapsed = displayTimestamp - loopRangeFlashStartTime
+        guard elapsed >= 0 else {
+            return 1
+        }
+
+        guard elapsed < loopRangeFlashDuration else {
+            self.loopRangeFlashStartTime = nil
+            return 0
+        }
+
+        let progress = min(max(Float(elapsed / loopRangeFlashDuration), 0), 1)
+        let remaining = 1 - smoothStep(progress)
+        return remaining * 0.72
     }
 
     private func waveformMipLevelSnapshot() -> WaveformMipLevelSnapshot {
@@ -5102,6 +5317,16 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         return !previousTrackWaveformMipLevels.isEmpty && !previousTransitionTracks.isEmpty
+    }
+
+    private func clearPreviousWaveformTransition() {
+        waveformMipLevelStateLock.lock()
+        previousTrackWaveformMipLevels = [:]
+        waveformMipLevelStateLock.unlock()
+        previousTransitionTracks = []
+        previousTransitionViewport = nil
+        waveformGeometryStore.clearPrevious()
+        waveformTransitionStartTime = nil
     }
 
     private func markWaveformHotInteraction(at timestamp: CFTimeInterval = CACurrentMediaTime()) {
@@ -5147,12 +5372,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         var sourceIDs = Set<WaveformSourceID>()
         var requestedTileCount = 0
-        var selectedResidentTileCount = 0
-        var shadowDrawBatchPlan = WaveformTileDrawBatchPlan.empty
-        let completedWork = tiledWaveformPipeline.drainCompletedAsyncWork()
-        frameStatsShaderBufferUploadCount += completedWork.uploadSummary.uploadedCount
-        frameStatsShaderBufferUploadByteCount += completedWork.uploadSummary.uploadedBytes
-
         guard
             !renderState.isPlaybackActive,
             !renderState.isRecordingActive,
@@ -5161,6 +5380,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         else {
             return
         }
+
+        var selectedResidentTileCount = 0
+        var shadowDrawBatchPlan = WaveformTileDrawBatchPlan.empty
+        let completedWork = tiledWaveformPipeline.drainCompletedAsyncWork()
+        frameStatsShaderBufferUploadCount += completedWork.uploadSummary.uploadedCount
+        frameStatsShaderBufferUploadByteCount += completedWork.uploadSummary.uploadedBytes
 
         for trackIndex in trackLayout.visibleRange(overscan: 1) {
             guard
@@ -5512,6 +5737,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         self.previousFrameTime = currentTime
         frameRateFrameCount += 1
+        publishImmediateHotPathFrameStatsIfNeeded(currentTime: currentTime)
 
         let elapsedTime = currentTime - frameRateWindowStartTime
         guard elapsedTime >= 0.5 else {
@@ -5529,12 +5755,68 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             averageSquareFrameInterval - averageFrameInterval * averageFrameInterval,
             0
         )
-        let waveformBufferDiagnostics = waveformShaderBufferStore.diagnostics()
-        let frameStats = TimelineFrameStats(
+        let frameStats = makeFrameStats(
             framesPerSecond: framesPerSecond,
             averageFrameTimeMilliseconds: averageFrameInterval * 1_000,
             frameTimeJitterMilliseconds: sqrt(frameIntervalVariance) * 1_000,
-            worstFrameTimeMilliseconds: worstFrameInterval * 1_000,
+            worstFrameTimeMilliseconds: worstFrameInterval * 1_000
+        )
+
+        frameRateWindowStartTime = currentTime
+        frameRateFrameCount = 0
+        frameIntervalCount = 0
+        frameIntervalSum = 0
+        frameIntervalSquareSum = 0
+        worstFrameInterval = 0
+        lastFrameStats = frameStats
+        onFrameStatsChanged?(frameStats)
+    }
+
+    private func publishImmediateHotPathFrameStatsIfNeeded(currentTime: CFTimeInterval) {
+        guard !frameStatsWaveformHotPathReason.isEmpty else {
+            return
+        }
+
+        let reasonChanged = lastFrameStats?.waveformHotPathReason != frameStatsWaveformHotPathReason
+        guard reasonChanged || currentTime - lastImmediateHotPathFrameStatsPublishTime >= 0.10 else {
+            return
+        }
+
+        lastImmediateHotPathFrameStatsPublishTime = currentTime
+        let elapsed = max(currentTime - frameRateWindowStartTime, 0.000_001)
+        let estimatedFramesPerSecond = max(Int((Double(max(frameRateFrameCount, 1)) / elapsed).rounded()), 0)
+        let averageFrameInterval = frameIntervalCount > 0 ?
+            frameIntervalSum / Double(frameIntervalCount) :
+            0
+        let averageSquareFrameInterval = frameIntervalCount > 0 ?
+            frameIntervalSquareSum / Double(frameIntervalCount) :
+            0
+        let frameIntervalVariance = max(
+            averageSquareFrameInterval - averageFrameInterval * averageFrameInterval,
+            0
+        )
+        let frameStats = makeFrameStats(
+            framesPerSecond: estimatedFramesPerSecond,
+            averageFrameTimeMilliseconds: averageFrameInterval * 1_000,
+            frameTimeJitterMilliseconds: sqrt(frameIntervalVariance) * 1_000,
+            worstFrameTimeMilliseconds: worstFrameInterval * 1_000
+        )
+        lastFrameStats = frameStats
+        onFrameStatsChanged?(frameStats)
+    }
+
+    private func makeFrameStats(
+        framesPerSecond: Int,
+        averageFrameTimeMilliseconds: Double,
+        frameTimeJitterMilliseconds: Double,
+        worstFrameTimeMilliseconds: Double
+    ) -> TimelineFrameStats {
+        let waveformBufferDiagnostics = waveformShaderBufferStore.diagnostics()
+        return TimelineFrameStats(
+            framesPerSecond: framesPerSecond,
+            averageFrameTimeMilliseconds: averageFrameTimeMilliseconds,
+            frameTimeJitterMilliseconds: frameTimeJitterMilliseconds,
+            worstFrameTimeMilliseconds: worstFrameTimeMilliseconds,
             waveformRenderer: frameStatsWaveformRenderer,
             cpuWaveformVertexCount: frameStatsCPUWaveformVertexCount,
             gpuWaveformDrawCount: frameStatsGPUWaveformDrawCount,
@@ -5562,15 +5844,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             deletionEffectCount: frameStatsDeletionEffectCount,
             playheadContactEventCount: frameStatsPlayheadContactEventCount
         )
-
-        frameRateWindowStartTime = currentTime
-        frameRateFrameCount = 0
-        frameIntervalCount = 0
-        frameIntervalSum = 0
-        frameIntervalSquareSum = 0
-        worstFrameInterval = 0
-        lastFrameStats = frameStats
-        onFrameStatsChanged?(frameStats)
     }
 
     private func waveformMipCacheDiagnostics() -> (cacheCount: Int, inFlightCount: Int) {
@@ -5586,9 +5859,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         frameStatsWaveformRenderer = "gpu"
         frameStatsCPUWaveformVertexCount = 0
         frameStatsGPUWaveformDrawCount = 0
-        let publishedBufferStats = waveformShaderBufferStore.drainPublishedBufferStats()
-        frameStatsShaderBufferUploadCount = publishedBufferStats.count
-        frameStatsShaderBufferUploadByteCount = publishedBufferStats.byteCount
+        _ = waveformShaderBufferStore.drainPublishedBufferStats()
+        frameStatsShaderBufferUploadCount = 0
+        frameStatsShaderBufferUploadByteCount = 0
         frameStatsCPUWaveformFallbackDrawCount = 0
         frameStatsWaveformFallbackDrawCount = 0
         frameStatsWaveformLastGoodHoldCount = 0
@@ -6174,15 +6447,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
 
     private func isSelectionDragEffectActive(
-        _ effect: SelectionDragEffect?,
+        _ snapshot: TimelineSelectionDragSnapshot?,
         displayTimestamp: CFTimeInterval
     ) -> Bool {
-        guard let effect else {
+        guard let snapshot else {
             return false
         }
 
-        return effect.selection.durationProgress > 0 &&
-            displayTimestamp - effect.timestamp <= max(
+        return snapshot.selection.durationProgress > 0 &&
+            displayTimestamp - snapshot.timestamp <= max(
                 selectionDragEffectFadeDuration,
                 selectionDragWaveformTuning.contactLifetime
             )
@@ -6285,19 +6558,33 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         selection: TimelineSelection?,
         contacts: [SelectionDragWaveformContact],
         trackID: UUID,
+        drawableSize: CGSize,
+        renderState: TimelineRenderState,
         displayTimestamp: CFTimeInterval
     ) -> SIMD2<Float>? {
         guard
             let selection,
             selection.durationProgress > 0,
-            selection.trackID == nil || selection.trackID == trackID
+            selection.trackID == nil || selection.trackID == trackID,
+            drawableSize.width > 0
         else {
             return nil
         }
 
         let tuning = selectionDragWaveformTuning
-        var lower = selection.startProgressFloat
-        var upper = selection.endProgressFloat
+        let selectionLower = selection.startProgressFloat
+        let selectionUpper = selection.endProgressFloat
+        let radiusPixels = max(
+            tuning.frontRadiusPixels,
+            tuning.backRadiusPixels,
+            tuning.contactCoreRadiusPixels
+        ) + 2
+        let radiusProgress = max(
+            radiusPixels / Float(drawableSize.width) * renderState.viewport.durationProgress,
+            0.000_001
+        )
+        var lower = Float.greatestFiniteMagnitude
+        var upper = -Float.greatestFiniteMagnitude
         for contact in contacts where contact.trackID == nil || contact.trackID == trackID {
             let age = max(displayTimestamp - contact.birthTimestamp, 0)
             guard age <= tuning.contactLifetime else {
@@ -6313,11 +6600,17 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             }
 
             let progress = min(max(contact.progress, 0), 1)
-            lower = min(lower, progress)
-            upper = max(upper, progress)
+            let contactLower = max(selectionLower, progress - radiusProgress)
+            let contactUpper = min(selectionUpper, progress + radiusProgress)
+            guard contactUpper > contactLower else {
+                continue
+            }
+
+            lower = min(lower, contactLower)
+            upper = max(upper, contactUpper)
         }
 
-        guard upper > lower else {
+        guard lower.isFinite, upper.isFinite, upper > lower else {
             return nil
         }
 
@@ -6325,15 +6618,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
 
     private func makeSelectionDragEffectUniform(
-        effect: SelectionDragEffect?,
+        snapshot: TimelineSelectionDragSnapshot?,
         drawableSize: CGSize,
         renderState: TimelineRenderState,
         displayTimestamp: CFTimeInterval
     ) -> SelectionDragEffectUniform? {
         guard
-            let effect,
+            let snapshot,
             renderState.hasWaveforms,
-            effect.selection.durationProgress > 0
+            snapshot.selection.durationProgress > 0
         else {
             return nil
         }
@@ -6344,26 +6637,26 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return nil
         }
 
-        let age = max(displayTimestamp - effect.timestamp, 0)
+        let age = max(displayTimestamp - snapshot.timestamp, 0)
         guard age <= selectionDragEffectFadeDuration else {
             return nil
         }
 
         let fadeProgress = min(max(Float(age / selectionDragEffectFadeDuration), 0), 1)
         let freshness = 1 - smoothStep(fadeProgress)
-        let speedStrength = selectionDragStrength(for: effect.velocityPixelsPerSecond)
+        let speedStrength = selectionDragStrength(for: snapshot.velocityPixelsPerSecond)
         let strength = speedStrength * freshness
         guard strength > 0.001 else {
             return nil
         }
 
-        let edgeX = renderState.viewport.viewportProgress(forTimelineProgress: effect.leadingProgress)
+        let edgeX = renderState.viewport.viewportProgress(forTimelineProgress: snapshot.leadingProgress)
         guard edgeX > -0.04, edgeX < 1.04 else {
             return nil
         }
 
         guard let verticalRange = selectionVerticalRange(
-            for: effect.selection,
+            for: snapshot.selection,
             renderState: renderState,
             drawableSize: drawableSize
         ) else {
@@ -6387,7 +6680,22 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let clampedLeft = max(effectLeft, 0)
         let clampedRight = min(effectRight, 1)
         let edgeLocalX = min(max((edgeX - clampedLeft) / max(clampedRight - clampedLeft, 0.000_001), 0), 1)
-        let seed = Float(UInt32(truncatingIfNeeded: effect.selection.trackID?.hashValue ?? 0) & 0x00FF_FFFF)
+        let viewport = renderState.viewport
+        let viewportStart = Double(viewport.startProgress)
+        let viewportDuration = max(Double(viewport.durationProgress), 0.000_000_001)
+        let selectionLeft = Float((snapshot.selection.startProgress - viewportStart) / viewportDuration)
+        let selectionRight = Float((snapshot.selection.endProgress - viewportStart) / viewportDuration)
+        let visibleSelectionLeft = max(selectionLeft, 0)
+        let visibleSelectionRight = min(selectionRight, 1)
+        let effectWidthPixels = max((clampedRight - clampedLeft) * width, 1)
+        let selectionLeftLocalPixels = ((visibleSelectionLeft - clampedLeft) / max(clampedRight - clampedLeft, 0.000_001)) * effectWidthPixels
+        let selectionRightLocalPixels = ((visibleSelectionRight - clampedLeft) / max(clampedRight - clampedLeft, 0.000_001)) * effectWidthPixels
+        let visibleSelectionWidthPixels = max((visibleSelectionRight - visibleSelectionLeft) * width, 1)
+        let cornerRadiusPixels = min(
+            max(8, laneHeightPixels * 0.075),
+            min(18, visibleSelectionWidthPixels * 0.5)
+        )
+        let seed = Float(UInt32(truncatingIfNeeded: snapshot.selection.trackID?.hashValue ?? 0) & 0x00FF_FFFF)
         return SelectionDragEffectUniform(
             rect: SIMD4<Float>(
                 clampedLeft,
@@ -6405,15 +6713,214 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 strength,
                 Float(age),
                 seed,
-                effect.direction == 0 ? 1 : effect.direction
+                snapshot.direction == 0 ? 1 : snapshot.direction
             ),
             color: SIMD4<Float>(
                 0.58 + 0.36 * strength,
                 0.96,
                 1.0,
                 0.30 + 0.52 * strength
+            ),
+            mask: SIMD4<Float>(
+                selectionLeftLocalPixels,
+                selectionRightLocalPixels,
+                cornerRadiusPixels,
+                0
             )
         )
+    }
+
+    private func makeSelectionOverlayUniform(
+        drawableSize: CGSize,
+        renderState: TimelineRenderState,
+        displayTimestamp: CFTimeInterval,
+        fisheye: SIMD4<Float>,
+        dragSnapshot: TimelineSelectionDragSnapshot?
+    ) -> SelectionOverlayUniform? {
+        guard
+            let selection = renderState.selection,
+            renderState.hasWaveforms,
+            selection.durationProgress > 0
+        else {
+            return nil
+        }
+
+        let width = Float(drawableSize.width)
+        let height = Float(drawableSize.height)
+        guard width > 0, height > 0 else {
+            return nil
+        }
+
+        let viewport = renderState.viewport
+        let viewportStart = Double(viewport.startProgress)
+        let viewportDuration = max(Double(viewport.durationProgress), 0.000_000_001)
+        let left = Float((selection.startProgress - viewportStart) / viewportDuration)
+        let right = Float((selection.endProgress - viewportStart) / viewportDuration)
+        guard right > 0, left < 1 else {
+            return nil
+        }
+
+        guard let verticalRange = selectionVerticalRange(
+            for: selection,
+            renderState: renderState,
+            drawableSize: drawableSize
+        ) else {
+            return nil
+        }
+
+        let visibleLeft = max(left, 0)
+        let visibleRight = min(right, 1)
+        guard visibleRight > visibleLeft else {
+            return nil
+        }
+
+        let visibleWidthPixels = max((visibleRight - visibleLeft) * width, 1)
+        let visibleHeightPixels = max((verticalRange.bottom - verticalRange.top) * height, 1)
+        let cornerRadiusPixels = min(
+            max(8, visibleHeightPixels * 0.075),
+            min(18, visibleWidthPixels * 0.5)
+        )
+
+        let activeProcessingSelection = processingSelectionProgress.flatMap { progress in
+            progress.selection == selection ? progress : nil
+        }
+        let pulseOpacityMultiplier: Float
+        let progressFraction: Float
+        if let activeProcessingSelection {
+            let elapsed = max(displayTimestamp - activeProcessingSelection.pulseStartTimestamp, 0)
+            let wave = 0.5 + 0.5 * sin(Float(elapsed) * 2 * .pi * 1.15)
+            pulseOpacityMultiplier = 0.76 + wave * 0.24
+            if let fractionCompleted = interpolatedProcessingSelectionFraction(
+                activeProcessingSelection,
+                at: displayTimestamp
+            ) {
+                let fillRight = left + (right - left) * fractionCompleted
+                progressFraction = min(max((fillRight - visibleLeft) / max(visibleRight - visibleLeft, 0.000_001), 0), 1)
+            } else {
+                progressFraction = -1
+            }
+        } else {
+            pulseOpacityMultiplier = 1
+            progressFraction = -1
+        }
+
+        let baseColor = isModalBackdropActive ?
+            SIMD4<Float>(0.74, 0.76, 0.77, 0.16 * pulseOpacityMultiplier) :
+            SIMD4<Float>(0.02, 0.82, 0.88, 0.18 * pulseOpacityMultiplier)
+        let progressColor = isModalBackdropActive ?
+            SIMD4<Float>(0.92, 0.92, 0.92, 0.20 + 0.10 * pulseOpacityMultiplier) :
+            SIMD4<Float>(0.28, 0.96, 1.0, 0.20 + 0.10 * pulseOpacityMultiplier)
+        let copyFlash: Float
+        if let selectionCopyFlashStartTime {
+            let elapsed = displayTimestamp - selectionCopyFlashStartTime
+            if elapsed >= 0, elapsed <= selectionCopyFlashDuration {
+                let progress = min(max(Float(elapsed / selectionCopyFlashDuration), 0), 1)
+                copyFlash = 1 - smoothStep(progress)
+            } else {
+                if elapsed > selectionCopyFlashDuration {
+                    self.selectionCopyFlashStartTime = nil
+                }
+                copyFlash = 0
+            }
+        } else {
+            copyFlash = 0
+        }
+
+        var dragEdgeLocalX: Float = -1
+        var dragStrength: Float = 0
+        var dragDirection: Float = 1
+        if
+            let dragSnapshot,
+            dragSnapshot.selection == selection,
+            dragSnapshot.selection.durationProgress > 0
+        {
+            let age = max(displayTimestamp - dragSnapshot.timestamp, 0)
+            if age <= selectionDragEffectFadeDuration {
+                let fadeProgress = min(max(Float(age / selectionDragEffectFadeDuration), 0), 1)
+                let freshness = 1 - smoothStep(fadeProgress)
+                dragStrength = selectionDragStrength(for: dragSnapshot.velocityPixelsPerSecond) * freshness
+                let edgeX = renderState.viewport.viewportProgress(forTimelineProgress: dragSnapshot.leadingProgress)
+                dragEdgeLocalX = min(max((edgeX - visibleLeft) / max(visibleRight - visibleLeft, 0.000_001), 0), 1)
+                dragDirection = dragSnapshot.direction == 0 ? 1 : dragSnapshot.direction
+            }
+        }
+
+        let seed = Float(UInt32(truncatingIfNeeded: selection.trackID?.hashValue ?? 0) & 0x00FF_FFFF)
+        return SelectionOverlayUniform(
+            rect: SIMD4<Float>(
+                visibleLeft,
+                visibleRight,
+                verticalRange.top,
+                verticalRange.bottom
+            ),
+            metrics: SIMD4<Float>(
+                visibleWidthPixels,
+                visibleHeightPixels,
+                cornerRadiusPixels,
+                progressFraction
+            ),
+            style: SIMD4<Float>(
+                dragEdgeLocalX,
+                dragStrength,
+                dragDirection,
+                seed + Float(displayTimestamp.truncatingRemainder(dividingBy: 2048))
+            ),
+            pulse: SIMD4<Float>(
+                copyFlash,
+                Float(selectionCopyFlashDuration),
+                0,
+                0
+            ),
+            baseColor: baseColor,
+            progressColor: progressColor,
+            fisheye: fisheye
+        )
+    }
+
+    private func drawSelectionOverlay(
+        uniform: SelectionOverlayUniform?,
+        encoder: MTLRenderCommandEncoder
+    ) {
+        guard var uniform else {
+            return
+        }
+
+        encoder.setRenderPipelineState(selectionOverlayPipelineState)
+        encoder.setVertexBuffer(waveformQuadVertexBuffer, offset: 0, index: 0)
+        encoder.setVertexBytes(
+            &uniform,
+            length: MemoryLayout<SelectionOverlayUniform>.stride,
+            index: 1
+        )
+        encoder.setFragmentBytes(
+            &uniform,
+            length: MemoryLayout<SelectionOverlayUniform>.stride,
+            index: 1
+        )
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+    }
+
+    private func drawLoopRange(
+        uniform: LoopRegionUniform?,
+        encoder: MTLRenderCommandEncoder
+    ) {
+        guard var uniform else {
+            return
+        }
+
+        encoder.setRenderPipelineState(loopRegionPipelineState)
+        encoder.setVertexBuffer(waveformQuadVertexBuffer, offset: 0, index: 0)
+        encoder.setVertexBytes(
+            &uniform,
+            length: MemoryLayout<LoopRegionUniform>.stride,
+            index: 1
+        )
+        encoder.setFragmentBytes(
+            &uniform,
+            length: MemoryLayout<LoopRegionUniform>.stride,
+            index: 1
+        )
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
     }
 
     private func drawSelectionDragEffect(
@@ -6554,181 +7061,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         return vertices
     }
 
-    private func updateSelectionDragParticles(
-        effect: SelectionDragEffect?,
-        drawableSize: CGSize,
-        renderState: TimelineRenderState,
-        displayTimestamp: CFTimeInterval
-    ) {
-        selectionDragParticles.removeAll { particle in
-            displayTimestamp - particle.birthTimestamp >= particle.lifeDuration
-        }
-
-        guard
-            let effect,
-            renderState.hasWaveforms,
-            effect.selection.durationProgress > 0,
-            displayTimestamp - effect.timestamp <= selectionDragEffectFadeDuration,
-            drawableSize.width > 0,
-            drawableSize.height > 0,
-            let verticalRange = selectionVerticalRange(
-                for: effect.selection,
-                renderState: renderState,
-                drawableSize: drawableSize
-            )
-        else {
-            selectionDragParticleEmissionTimestamp = nil
-            selectionDragParticleEmissionDebt = 0
-            return
-        }
-
-        let age = max(displayTimestamp - effect.timestamp, 0)
-        let freshness = 1 - smoothStep(Float(age / selectionDragEffectFadeDuration))
-        let strength = selectionDragStrength(for: effect.velocityPixelsPerSecond) * freshness
-        guard strength > 0.045 else {
-            selectionDragParticleEmissionTimestamp = displayTimestamp
-            selectionDragParticleEmissionDebt = 0
-            return
-        }
-
-        let previousTimestamp = selectionDragParticleEmissionTimestamp ?? displayTimestamp
-        let elapsed = min(max(displayTimestamp - previousTimestamp, 0), 1.0 / 30.0)
-        selectionDragParticleEmissionTimestamp = displayTimestamp
-        if previousTimestamp == displayTimestamp {
-            selectionDragParticleEmissionDebt += strength * 0.8
-        }
-
-        let emissionRate = 2.0 + 34.0 * strength
-        selectionDragParticleEmissionDebt += Float(elapsed) * emissionRate
-        let spawnCount = min(Int(selectionDragParticleEmissionDebt), 4)
-        guard spawnCount > 0 else {
-            return
-        }
-
-        selectionDragParticleEmissionDebt -= Float(spawnCount)
-        spawnSelectionDragParticles(
-            count: spawnCount,
-            effect: effect,
-            verticalRange: verticalRange,
-            strength: strength,
-            birthTimestamp: displayTimestamp
-        )
-    }
-
-    private func spawnSelectionDragParticles(
-        count: Int,
-        effect: SelectionDragEffect,
-        verticalRange: (top: Float, bottom: Float),
-        strength: Float,
-        birthTimestamp: CFTimeInterval
-    ) {
-        let direction = effect.direction == 0 ? Float(1) : effect.direction
-        for particleIndex in 0..<count {
-            selectionDragParticleSeed &+= 1
-            let seed = selectionDragParticleSeed &+
-                UInt64(bitPattern: Int64(effect.selection.trackID?.hashValue ?? 0)) &+
-                UInt64(particleIndex) &* 0x9E37_79B9_7F4A_7C15
-            let laneY = verticalRange.top +
-                (verticalRange.bottom - verticalRange.top) *
-                (0.08 + 0.84 * pseudoRandom01(seed &+ 11))
-            let xSpeed = -(18 + 52 * strength + 34 * pseudoRandom01(seed &+ 23)) * direction
-            let ySpeed = (pseudoRandom01(seed &+ 37) - 0.5) * (24 + 94 * strength)
-            let velocity = SIMD2<Float>(xSpeed, ySpeed)
-            let velocityLength = max(length(velocity), 0.001)
-            let perpendicular = SIMD2<Float>(-velocity.y / velocityLength, velocity.x / velocityLength)
-            let radius = 0.24 + 0.34 * strength + 0.14 * pseudoRandom01(seed &+ 41)
-            let lifeDuration = CFTimeInterval(0.12 + 0.13 * Double(pseudoRandom01(seed &+ 53)))
-            let spinPhase = pseudoRandom01(seed &+ 67) * Float.pi * 2
-            let spinRate = 13 + 27 * pseudoRandom01(seed &+ 79)
-            let color = SIMD3<Float>(
-                0.72 + 0.24 * strength,
-                0.98,
-                0.93 + 0.07 * pseudoRandom01(seed &+ 83)
-            )
-
-            selectionDragParticles.append(SelectionDragParticle(
-                originProgress: effect.leadingProgress,
-                originY: laneY,
-                velocity: velocity,
-                perpendicular: perpendicular,
-                birthTimestamp: birthTimestamp,
-                lifeDuration: lifeDuration,
-                radius: radius,
-                strength: 0.10 + 0.18 * strength,
-                spinPhase: spinPhase,
-                spinRate: spinRate,
-                color: color
-            ))
-        }
-
-        let particleMaximumCount = selectionDragWaveformTuning.particleLimit
-        if selectionDragParticles.count > particleMaximumCount {
-            selectionDragParticles.removeFirst(selectionDragParticles.count - particleMaximumCount)
-        }
-    }
-
-    private func makeSelectionDragParticleVertices(
-        drawableSize: CGSize,
-        renderState: TimelineRenderState,
-        displayTimestamp: CFTimeInterval,
-        maximumVertexCount: Int
-    ) -> [TimelineVertex] {
-        selectionDragParticleVertexScratch.removeAll(keepingCapacity: true)
-        let width = Float(drawableSize.width)
-        let height = Float(drawableSize.height)
-        guard width > 0, height > 0, maximumVertexCount >= 3 else {
-            return selectionDragParticleVertexScratch
-        }
-
-        selectionDragParticles.removeAll { particle in
-            displayTimestamp - particle.birthTimestamp >= particle.lifeDuration
-        }
-        guard !selectionDragParticles.isEmpty else {
-            return selectionDragParticleVertexScratch
-        }
-
-        let drawableSize = SIMD2<Float>(width, height)
-        selectionDragParticleVertexScratch.reserveCapacity(min(maximumVertexCount, selectionDragParticles.count * 18))
-
-        for particle in selectionDragParticles {
-            guard selectionDragParticleVertexScratch.count + 18 <= maximumVertexCount else {
-                frameStatsEffectDroppedVertexCount += 18
-                continue
-            }
-
-            let originViewportX = renderState.viewport.viewportProgress(
-                forTimelineProgress: particle.originProgress
-            )
-            let origin = SIMD2<Float>(originViewportX * width, particle.originY * height)
-            let age = max(displayTimestamp - particle.birthTimestamp, 0)
-            let progress = min(max(Float(age / particle.lifeDuration), 0), 1)
-            let fade = 1 - smoothStep(progress)
-            let travel = smoothStep(progress)
-            let swirl = sin(progress * particle.spinRate + particle.spinPhase) *
-                particle.radius * 0.85 * fade
-            let center = origin +
-                particle.velocity * Float(age) * (0.45 + 0.55 * travel) +
-                particle.perpendicular * swirl
-            let radius = particle.radius * (0.75 + progress * 0.8)
-            let alpha = particle.strength * fade * fade
-            guard alpha > 0.002 else {
-                continue
-            }
-
-            appendSoftParticle(
-                to: &selectionDragParticleVertexScratch,
-                center: center,
-                radius: radius,
-                color: particle.color,
-                alpha: alpha,
-                drawableSize: drawableSize,
-                segmentCount: 6
-            )
-        }
-
-        return selectionDragParticleVertexScratch
-    }
-
     private func updateTransientParticles(
         drawableSize: CGSize,
         playheadProgress: Float,
@@ -6814,20 +7146,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 continue
             }
 
-            let scanStart = max(previousProgress, 0)
-            let scanEnd = min(clampedProgress, trackDurationProgress)
-            guard scanStart < scanEnd else {
-                continue
-            }
-
-            let firstIndex = max(Int(floor(scanStart / trackDurationProgress * Float(binCount))) - 1, 0)
-            let lastIndex = min(Int(ceil(scanEnd / trackDurationProgress * Float(binCount))) + 1, binCount - 1)
-            guard firstIndex <= lastIndex else {
-                continue
-            }
-
-            let binsPerSecond = Double(binCount) / trackDuration
-            let minimumSpacingBins = max(Int((binsPerSecond * transientParticleMinimumSpacing).rounded(.up)), 1)
+            let sourceDuration = max(highResolutionMip.overview.duration, trackDuration)
+            let sourceBinsPerSecond = Double(binCount) / max(sourceDuration, 0.000001)
+            let outputBinCount = max(Int((trackDuration * sourceBinsPerSecond).rounded(.up)), 1)
+            let minimumSpacingBins = max(Int((sourceBinsPerSecond * transientParticleMinimumSpacing).rounded(.up)), 1)
             let previousTriggeredBin = lastTransientParticleBins[track.id] ?? -minimumSpacingBins * 2
             var latestTriggeredBin = previousTriggeredBin
 
@@ -6843,90 +7165,150 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             let centerY = laneFrame.center
             let amplitudeHeight = laneFrame.height * 0.39 * min(max(track.volume, 0), 1.8)
             let originEdgePadding = min(max(laneFrame.height * 0.120, 0.022), 0.075)
-            let neighborhoodRadius = max(min(Int((binsPerSecond * 0.035).rounded(.up)), 24), 3)
+            let neighborhoodRadius = max(min(Int((sourceBinsPerSecond * 0.035).rounded(.up)), 24), 3)
+            let waveformSegments = track.waveformSegments.isEmpty ? [
+                TimelineRenderState.Track.WaveformSegment(
+                    outputStartProgress: 0,
+                    outputEndProgress: 1,
+                    sourceStartProgress: 0,
+                    sourceEndProgress: 1
+                )
+            ] : track.waveformSegments
 
-            for index in firstIndex...lastIndex {
-                guard index - latestTriggeredBin >= minimumSpacingBins else {
+            for waveformSegment in waveformSegments {
+                let outputStart = min(max(waveformSegment.outputStartProgress * trackDurationProgress, 0), trackDurationProgress)
+                let outputEnd = min(max(waveformSegment.outputEndProgress * trackDurationProgress, outputStart), trackDurationProgress)
+                let outputWidth = outputEnd - outputStart
+                let sourceStart = min(max(waveformSegment.sourceStartProgress, 0), 1)
+                let sourceEnd = min(max(waveformSegment.sourceEndProgress, sourceStart), 1)
+                let sourceWidth = sourceEnd - sourceStart
+                guard outputWidth > 0.0000001, sourceWidth > 0.0000001 else {
                     continue
                 }
 
-                let bin = bins[index]
-                let score = transientParticleScore(for: bin)
-                guard score >= scoreProfile.threshold else {
+                let scanStart = max(previousProgress, outputStart)
+                let scanEnd = min(clampedProgress, outputEnd)
+                guard scanStart < scanEnd else {
                     continue
                 }
 
-                let relativeRange = max(scoreProfile.loudestScore - scoreProfile.threshold, 0.001)
-                let neighborhoodStart = max(index - neighborhoodRadius, 0)
-                let neighborhoodEnd = min(index + neighborhoodRadius, binCount - 1)
-                var neighboringMaximumScore: Float = 0
-                var neighboringScoreSum: Float = 0
-                var neighboringScoreCount: Float = 0
-                if neighborhoodStart <= neighborhoodEnd {
-                    for neighborIndex in neighborhoodStart...neighborhoodEnd where neighborIndex != index {
-                        let neighborScore = transientParticleScore(for: bins[neighborIndex])
-                        neighboringMaximumScore = max(neighboringMaximumScore, neighborScore)
-                        neighboringScoreSum += neighborScore
-                        neighboringScoreCount += 1
+                let scanStartSegmentProgress = min(max((scanStart - outputStart) / outputWidth, 0), 1)
+                let scanEndSegmentProgress = min(max((scanEnd - outputStart) / outputWidth, 0), 1)
+                let sourceScanStart = sourceStart + sourceWidth * scanStartSegmentProgress
+                let sourceScanEnd = sourceStart + sourceWidth * scanEndSegmentProgress
+                let firstIndex = max(Int(floor(sourceScanStart * Float(binCount))) - 1, 0)
+                let lastIndex = min(Int(ceil(sourceScanEnd * Float(binCount))) + 1, binCount - 1)
+                guard firstIndex <= lastIndex else {
+                    continue
+                }
+
+                for index in firstIndex...lastIndex {
+                    let sourceLocalX = (Float(index) + 0.5) / Float(binCount)
+                    guard sourceLocalX >= sourceStart, sourceLocalX <= sourceEnd else {
+                        continue
                     }
+
+                    let segmentProgress = min(max((sourceLocalX - sourceStart) / sourceWidth, 0), 1)
+                    let timelineProgress = outputStart + outputWidth * segmentProgress
+                    guard timelineProgress >= scanStart, timelineProgress <= scanEnd else {
+                        continue
+                    }
+
+                    let outputTrackProgress = trackDurationProgress > 0 ?
+                        min(max(timelineProgress / trackDurationProgress, 0), 1) :
+                        0
+                    let outputTriggerBin = Int((outputTrackProgress * Float(outputBinCount)).rounded(.down))
+                    guard outputTriggerBin - latestTriggeredBin >= minimumSpacingBins else {
+                        continue
+                    }
+
+                    let bin = bins[index]
+                    let score = transientParticleScore(for: bin)
+                    guard score >= scoreProfile.threshold else {
+                        continue
+                    }
+
+                    let relativeRange = max(scoreProfile.loudestScore - scoreProfile.threshold, 0.001)
+                    let neighborhoodStart = max(index - neighborhoodRadius, 0)
+                    let neighborhoodEnd = min(index + neighborhoodRadius, binCount - 1)
+                    var neighboringMaximumScore: Float = 0
+                    var neighboringScoreSum: Float = 0
+                    var neighboringScoreCount: Float = 0
+                    if neighborhoodStart <= neighborhoodEnd {
+                        for neighborIndex in neighborhoodStart...neighborhoodEnd where neighborIndex != index {
+                            let neighborScore = transientParticleScore(for: bins[neighborIndex])
+                            neighboringMaximumScore = max(neighboringMaximumScore, neighborScore)
+                            neighboringScoreSum += neighborScore
+                            neighboringScoreCount += 1
+                        }
+                    }
+
+                    let neighboringAverageScore = neighboringScoreCount > 0 ?
+                        neighboringScoreSum / neighboringScoreCount :
+                        0
+                    let localPeakProminence = score - neighboringMaximumScore
+                    let localBedProminence = score - neighboringAverageScore
+                    guard
+                        score >= neighboringMaximumScore,
+                        localPeakProminence >= relativeRange * 0.18 ||
+                            localBedProminence >= relativeRange * 0.44
+                    else {
+                        continue
+                    }
+
+                    let viewportX = viewport.viewportProgress(forTimelineProgress: timelineProgress)
+                    guard viewportX >= -0.08, viewportX <= 1.08 else {
+                        continue
+                    }
+
+                    let sourceBinStart = Float(index) / Float(binCount)
+                    let sourceBinEnd = Float(index + 1) / Float(binCount)
+                    let outputBinStartProgress = min(max((sourceBinStart - sourceStart) / sourceWidth, 0), 1)
+                    let outputBinEndProgress = min(max((sourceBinEnd - sourceStart) / sourceWidth, 0), 1)
+                    let outputBinStart = outputStart + outputWidth * outputBinStartProgress
+                    let outputBinEnd = outputStart + outputWidth * outputBinEndProgress
+                    let previewGainAmount = previewGain(
+                        forBinStart: outputBinStart,
+                        end: outputBinEnd,
+                        trackID: track.id,
+                        renderState: renderState
+                    )
+                    let segmentGain = waveformSegment.gainStart +
+                        (waveformSegment.gainEnd - waveformSegment.gainStart) *
+                        smoothStep(segmentProgress)
+                    let gain = previewGainAmount * max(segmentGain, 0)
+                    let maximumSample = clampAudioSample(bin.maximumSample * gain)
+                    let minimumSample = clampAudioSample(bin.minimumSample * gain)
+                    let peakFloor = min(max(bin.peakMagnitude * max(gain, 0) * 0.985, 0), 1)
+                    let topMagnitude = min(max(maximumSample, peakFloor), 1)
+                    let bottomMagnitude = min(max(abs(minimumSample), peakFloor), 1)
+                    let topY = min(max(centerY - topMagnitude * amplitudeHeight - originEdgePadding, laneTop), laneBottom)
+                    let bottomY = min(max(centerY + bottomMagnitude * amplitudeHeight + originEdgePadding, laneTop), laneBottom)
+                    let normalizedScore = min(max((score - scoreProfile.threshold) / relativeRange, 0), 1)
+                    let normalizedProminence = min(max(max(localPeakProminence, localBedProminence) / relativeRange, 0), 1)
+                    let strength = min(max(0.34 + normalizedScore * 0.50 + normalizedProminence * 0.28, 0), 1)
+                    let baseSeed = transientParticleSeed(trackID: track.id, binIndex: index) &+
+                        UInt64(max(outputTriggerBin, 0)) &* 0x9E37_79B9_7F4A_7C15
+
+                    spawnTransientParticleBurst(
+                        originProgress: timelineProgress,
+                        originY: topY,
+                        isTopEdge: true,
+                        strength: strength,
+                        seed: baseSeed,
+                        birthTimestamp: displayTimestamp
+                    )
+                    spawnTransientParticleBurst(
+                        originProgress: timelineProgress,
+                        originY: bottomY,
+                        isTopEdge: false,
+                        strength: strength,
+                        seed: baseSeed &+ 0x9E37_79B9_7F4A_7C15,
+                        birthTimestamp: displayTimestamp
+                    )
+
+                    latestTriggeredBin = outputTriggerBin
                 }
-
-                let neighboringAverageScore = neighboringScoreCount > 0 ?
-                    neighboringScoreSum / neighboringScoreCount :
-                    0
-                let localPeakProminence = score - neighboringMaximumScore
-                let localBedProminence = score - neighboringAverageScore
-                guard
-                    score >= neighboringMaximumScore,
-                    localPeakProminence >= relativeRange * 0.18 ||
-                        localBedProminence >= relativeRange * 0.44
-                else {
-                    continue
-                }
-
-                let localX = (Float(index) + 0.5) / Float(binCount)
-                let timelineProgress = localX * trackDurationProgress
-                let viewportX = viewport.viewportProgress(forTimelineProgress: timelineProgress)
-                guard viewportX >= -0.08, viewportX <= 1.08 else {
-                    continue
-                }
-
-                let gain = previewGain(
-                    forBinStart: Float(index) / Float(binCount) * trackDurationProgress,
-                    end: Float(index + 1) / Float(binCount) * trackDurationProgress,
-                    trackID: track.id,
-                    renderState: renderState
-                )
-                let maximumSample = clampAudioSample(bin.maximumSample * gain)
-                let minimumSample = clampAudioSample(bin.minimumSample * gain)
-                let peakFloor = min(max(bin.peakMagnitude * max(gain, 0) * 0.985, 0), 1)
-                let topMagnitude = min(max(maximumSample, peakFloor), 1)
-                let bottomMagnitude = min(max(abs(minimumSample), peakFloor), 1)
-                let topY = min(max(centerY - topMagnitude * amplitudeHeight - originEdgePadding, laneTop), laneBottom)
-                let bottomY = min(max(centerY + bottomMagnitude * amplitudeHeight + originEdgePadding, laneTop), laneBottom)
-                let normalizedScore = min(max((score - scoreProfile.threshold) / relativeRange, 0), 1)
-                let normalizedProminence = min(max(max(localPeakProminence, localBedProminence) / relativeRange, 0), 1)
-                let strength = min(max(0.34 + normalizedScore * 0.50 + normalizedProminence * 0.28, 0), 1)
-                let baseSeed = transientParticleSeed(trackID: track.id, binIndex: index)
-
-                spawnTransientParticleBurst(
-                    originProgress: timelineProgress,
-                    originY: topY,
-                    isTopEdge: true,
-                    strength: strength,
-                    seed: baseSeed,
-                    birthTimestamp: displayTimestamp
-                )
-                spawnTransientParticleBurst(
-                    originProgress: timelineProgress,
-                    originY: bottomY,
-                    isTopEdge: false,
-                    strength: strength,
-                    seed: baseSeed &+ 0x9E37_79B9_7F4A_7C15,
-                    birthTimestamp: displayTimestamp
-                )
-
-                latestTriggeredBin = index
             }
 
             if latestTriggeredBin != previousTriggeredBin {
@@ -7397,7 +7779,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private func deletionWallEnergy(for effect: DeletionEffect, slideProgress: Float) -> Float {
         let samples = effect.capturedEnergySamples
         guard !samples.isEmpty else {
-            return 0
+            return 0.58
         }
         guard samples.count > 1 else {
             return samples[0]
@@ -7469,7 +7851,21 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         let selectionWidth = max(rightX - leftX, 1)
         let slideProgress = deletionSlideProgress(progress)
+        let effectMode: Float = effect.kind == .insertion ? 2 : 1
         let laneHeight = max(bottomY - topY, 1)
+        let projectDuration = max(renderState.duration ?? 0, 0.000_001)
+        let waveformStyle = waveformVisualStyle(
+            renderState: renderState,
+            projectDuration: projectDuration
+        )
+        let anySolo = renderState.hasSoloedTrack
+        let track = selection.trackID.flatMap { trackID in
+            renderState.tracks.first { $0.id == trackID }
+        }
+        let isAudible = track.map { isTrackAudible($0, anySolo: anySolo) } ?? true
+        let volumeScale = min(max(track?.volume ?? 1, 0), 1.8)
+        let baseGray = waveformBaseGray * (isAudible ? 1.0 : 0.68)
+        let alpha = isAudible ? Float(1) : Float(0.26)
         let overlayLeftX = min(max(leftX, 0), width)
         let overlayRightX = min(max(rightX, overlayLeftX), width)
         let overlayTopY = min(max(topY, 0), height)
@@ -7490,7 +7886,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             ),
             timing: SIMD4<Float>(
                 progress,
-                1 - pow(1 - progress, 2.2),
+                Float(displayTimestamp.truncatingRemainder(dividingBy: 2048)),
                 seed,
                 Float(max(effect.capturedBinCount, 1))
             ),
@@ -7503,8 +7899,20 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             ripple: SIMD4<Float>(
                 rightX / width,
                 slideProgress,
-                0,
+                effectMode,
                 selectionWidth / width
+            ),
+            waveformStyle: SIMD4<Float>(
+                baseGray,
+                alpha,
+                waveformStyle.spectralAmount,
+                volumeScale
+            ),
+            waveformStyle2: SIMD4<Float>(
+                waveformStyle.peakAlpha,
+                waveformStyle.bodyAlpha,
+                waveformStyle.glowAlpha,
+                waveformStyle.glowExpansion
             )
         )
     }
@@ -7541,7 +7949,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             min(max(left, -1), 2),
             min(max(right, -1), 2),
             min(max(slideProgress, 0), 1),
-            1
+            effect.kind == .insertion ? 2 : 1
         )
     }
 
@@ -8321,8 +8729,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         if visibleDuration > 90 {
             return WaveformVisualStyle(
                 spectralAmount: 0.34,
-                peakAlpha: 0.42,
-                rmsAlpha: 0,
+                peakAlpha: 0.48,
+                bodyAlpha: 0.075,
                 glowAlpha: 0.055,
                 transientAlpha: 0.08,
                 transientThreshold: 0.46,
@@ -8334,8 +8742,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         if visibleDuration > 8 {
             return WaveformVisualStyle(
                 spectralAmount: 0.26,
-                peakAlpha: 0.46,
-                rmsAlpha: 0,
+                peakAlpha: 0.52,
+                bodyAlpha: 0.060,
                 glowAlpha: 0.038,
                 transientAlpha: 0.13,
                 transientThreshold: 0.42,
@@ -8347,8 +8755,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         if visibleDuration > 0.6 {
             return WaveformVisualStyle(
                 spectralAmount: 0.16,
-                peakAlpha: 0.52,
-                rmsAlpha: 0,
+                peakAlpha: 0.58,
+                bodyAlpha: 0.038,
                 glowAlpha: 0.022,
                 transientAlpha: 0.19,
                 transientThreshold: 0.36,
@@ -8359,8 +8767,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         return WaveformVisualStyle(
             spectralAmount: 0.08,
-            peakAlpha: 0.58,
-            rmsAlpha: 0,
+            peakAlpha: 0.64,
+            bodyAlpha: 0.020,
             glowAlpha: 0.012,
             transientAlpha: 0.26,
             transientThreshold: 0.30,
@@ -8697,6 +9105,20 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             )
         }
 
+        if style.bodyAlpha > 0.001 {
+            let bodyColor = lightened(baseColor, amount: 0.14, alpha: style.bodyAlpha * alpha)
+            appendCenterWeightedWaveformBand(
+                to: &vertices,
+                left: left,
+                right: right,
+                top: peakTop,
+                bottom: peakBottom,
+                centerY: centerY,
+                centerColor: bodyColor,
+                edgeColor: colorWithAlpha(bodyColor, alpha: bodyColor.w * 0.42)
+            )
+        }
+
         appendCenterWeightedWaveformBand(
             to: &vertices,
             left: left,
@@ -8707,24 +9129,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             centerColor: peakCenterColor,
             edgeColor: peakEdgeColor
         )
-
-        let rmsSample = min(max(bin.rmsSample * max(gain, 0), 0), 1)
-        let rmsVisualHeight = max(rmsSample * amplitudeHeight, minimumVisualHeight * 0.7)
-        let rmsTop = max(centerY - rmsVisualHeight, laneTop)
-        let rmsBottom = min(centerY + rmsVisualHeight, laneBottom)
-        if style.rmsAlpha > 0.001, rmsBottom > rmsTop {
-            let rmsColor = lightened(baseColor, amount: 0.22, alpha: style.rmsAlpha * alpha)
-            appendCenterWeightedWaveformBand(
-                to: &vertices,
-                left: left,
-                right: right,
-                top: rmsTop,
-                bottom: rmsBottom,
-                centerY: centerY,
-                centerColor: rmsColor,
-                edgeColor: colorWithAlpha(rmsColor, alpha: rmsColor.w * 0.50)
-            )
-        }
 
         let transientStrength = max(bin.highEnergy - style.transientThreshold, 0) /
             max(1 - style.transientThreshold, 0.001)
@@ -9244,10 +9648,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     private func loopConstrainedPlaybackProgress(_ progress: Float) -> Float {
         let clampedProgress = min(max(progress, 0), 1)
+        guard isLoopRangeEnabled else {
+            return clampedProgress
+        }
+
         let start = loopRange.startProgress
         let end = loopRange.endProgress
         let duration = end - start
-        guard duration > 0.0001, end > start else {
+        guard duration > 0.0001, duration < 0.999, end > start else {
             return clampedProgress
         }
 
@@ -10423,6 +10831,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         start + (end - start) * min(max(progress, 0), 1)
     }
 
+    private func mix(_ start: SIMD3<Float>, _ end: SIMD3<Float>, _ progress: Float) -> SIMD3<Float> {
+        let amount = min(max(progress, 0), 1)
+        return start + (end - start) * amount
+    }
+
     private func appendRectangle(
         to vertices: inout [TimelineVertex],
         left: Float,
@@ -11119,6 +11532,152 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
     }
 
+    private func appendRoundedRectangle(
+        to vertices: inout [TimelineVertex],
+        left: Float,
+        right: Float,
+        top: Float,
+        bottom: Float,
+        radius requestedRadius: Float,
+        color: SIMD4<Float>,
+        drawableSize: SIMD2<Float>
+    ) {
+        guard right > left, bottom > top else {
+            return
+        }
+
+        let width = right - left
+        let height = bottom - top
+        let radius = min(max(requestedRadius, 0), width * 0.5, height * 0.5)
+        guard radius > 0.5 else {
+            appendRectangle(
+                to: &vertices,
+                left: left,
+                right: right,
+                top: top,
+                bottom: bottom,
+                color: color,
+                drawableSize: drawableSize
+            )
+            return
+        }
+
+        appendRectangle(
+            to: &vertices,
+            left: left + radius,
+            right: right - radius,
+            top: top,
+            bottom: bottom,
+            color: color,
+            drawableSize: drawableSize
+        )
+
+        let sliceCount = 8
+        for index in 0..<sliceCount {
+            let y0 = top + height * Float(index) / Float(sliceCount)
+            let y1 = top + height * Float(index + 1) / Float(sliceCount)
+            let midY = (y0 + y1) * 0.5
+            let centerY = (top + bottom) * 0.5
+            let verticalDistance = abs(midY - centerY)
+            let capWidth = sqrt(max(radius * radius - verticalDistance * verticalDistance, 0))
+            appendRectangle(
+                to: &vertices,
+                left: left + radius - capWidth,
+                right: left + radius,
+                top: y0,
+                bottom: y1,
+                color: color,
+                drawableSize: drawableSize
+            )
+            appendRectangle(
+                to: &vertices,
+                left: right - radius,
+                right: right - radius + capWidth,
+                top: y0,
+                bottom: y1,
+                color: color,
+                drawableSize: drawableSize
+            )
+        }
+    }
+
+    private func appendTopRoundedRectangle(
+        to vertices: inout [TimelineVertex],
+        left: Float,
+        right: Float,
+        top: Float,
+        bottom: Float,
+        radius requestedRadius: Float,
+        color: SIMD4<Float>,
+        drawableSize: SIMD2<Float>
+    ) {
+        guard right > left, bottom > top else {
+            return
+        }
+
+        let width = right - left
+        let height = bottom - top
+        let radius = min(max(requestedRadius, 0), width * 0.5, height)
+        guard radius > 0.5 else {
+            appendRectangle(
+                to: &vertices,
+                left: left,
+                right: right,
+                top: top,
+                bottom: bottom,
+                color: color,
+                drawableSize: drawableSize
+            )
+            return
+        }
+
+        appendRectangle(
+            to: &vertices,
+            left: left,
+            right: right,
+            top: top + radius,
+            bottom: bottom,
+            color: color,
+            drawableSize: drawableSize
+        )
+        appendRectangle(
+            to: &vertices,
+            left: left + radius,
+            right: right - radius,
+            top: top,
+            bottom: top + radius,
+            color: color,
+            drawableSize: drawableSize
+        )
+
+        let sliceCount = 8
+        for index in 0..<sliceCount {
+            let y0 = top + radius * Float(index) / Float(sliceCount)
+            let y1 = top + radius * Float(index + 1) / Float(sliceCount)
+            let midY = (y0 + y1) * 0.5
+            let verticalDistance = (top + radius) - midY
+            let capWidth = sqrt(max(radius * radius - verticalDistance * verticalDistance, 0))
+            appendRectangle(
+                to: &vertices,
+                left: left + radius - capWidth,
+                right: left + radius,
+                top: y0,
+                bottom: y1,
+                color: color,
+                drawableSize: drawableSize
+            )
+            appendRectangle(
+                to: &vertices,
+                left: right - radius,
+                right: right - radius + capWidth,
+                top: y0,
+                bottom: y1,
+                color: color,
+                drawableSize: drawableSize
+            )
+        }
+    }
+
     private func appendLoopLabelGlyph(
         to vertices: inout [TimelineVertex],
         label: Character,
@@ -11406,6 +11965,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float4 timing;
         float4 metrics;
         float4 ripple;
+        float4 waveformStyle;
+        float4 waveformStyle2;
     };
 
     struct SelectionDragEffectUniform {
@@ -11413,6 +11974,28 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float4 metrics;
         float4 effect;
         float4 color;
+        float4 mask;
+    };
+
+    struct SelectionOverlayUniform {
+        float4 rect;
+        float4 metrics;
+        float4 style;
+        float4 pulse;
+        float4 baseColor;
+        float4 progressColor;
+        float4 fisheye;
+    };
+
+    struct LoopRegionUniform {
+        float4 rect;
+        float4 metrics;
+        float4 style;
+        float4 edgeHighlight;
+        float4 fillColor;
+        float4 topColor;
+        float4 bottomColor;
+        float4 edgeColor;
     };
 
     struct TimelineRulerUniform {
@@ -11492,6 +12075,30 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float4 metrics;
         float4 effect;
         float4 color;
+        float4 mask;
+    };
+
+    struct SelectionOverlayRasterizedVertex {
+        float4 position [[position]];
+        float2 normalizedPosition;
+        float2 localPosition;
+        float4 metrics;
+        float4 style;
+        float4 pulse;
+        float4 baseColor;
+        float4 progressColor;
+    };
+
+    struct LoopRegionRasterizedVertex {
+        float4 position [[position]];
+        float2 localPosition;
+        float4 metrics;
+        float4 style;
+        float4 edgeHighlight;
+        float4 fillColor;
+        float4 topColor;
+        float4 bottomColor;
+        float4 edgeColor;
     };
 
     float fisheye_focus_weight(float normalizedDistance) {
@@ -11718,6 +12325,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             tickHeightPixels + 1.0,
             yFromTrackTopPixels
         );
+        float baseFade = (isMajor || isMedium) ?
+            smoothstep(0.35, 1.35, yFromTrackTopPixels) :
+            1.0;
+        yCoverage *= baseFade;
         if (yCoverage <= 0.0) {
             return float4(0.0);
         }
@@ -11992,6 +12603,270 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         return fract(sin(dot(value, float2(127.1, 311.7))) * 43758.5453123);
     }
 
+    vertex SelectionOverlayRasterizedVertex selection_overlay_vertex(
+        uint vertexID [[vertex_id]],
+        constant WaveformShaderQuadVertex *vertices [[buffer(0)]],
+        constant SelectionOverlayUniform &uniform [[buffer(1)]]
+    ) {
+        float2 localPosition = vertices[vertexID].position.xy;
+        float2 normalizedPosition = float2(
+            mix(uniform.rect.x, uniform.rect.y, localPosition.x),
+            mix(uniform.rect.z, uniform.rect.w, localPosition.y)
+        );
+        normalizedPosition.x = fisheye_x(normalizedPosition.x, uniform.fisheye);
+
+        SelectionOverlayRasterizedVertex out;
+        out.position = float4(
+            normalizedPosition.x * 2.0 - 1.0,
+            1.0 - normalizedPosition.y * 2.0,
+            0.0,
+            1.0
+        );
+        out.normalizedPosition = normalizedPosition;
+        out.localPosition = localPosition;
+        out.metrics = uniform.metrics;
+        out.style = uniform.style;
+        out.pulse = uniform.pulse;
+        out.baseColor = uniform.baseColor;
+        out.progressColor = uniform.progressColor;
+        return out;
+    }
+
+    static float rounded_rect_signed_distance(float2 point, float2 halfSize, float radius) {
+        float2 q = abs(point) - halfSize + radius;
+        return length(max(q, float2(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+    }
+
+    static float box_signed_distance(float2 point, float2 center, float2 halfSize) {
+        float2 q = abs(point - center) - halfSize;
+        return length(max(q, float2(0.0))) + min(max(q.x, q.y), 0.0);
+    }
+
+    static float top_rounded_tab_signed_distance(float2 pixel, float width, float height, float radius) {
+        float r = clamp(radius, 0.0, min(width * 0.5, height));
+        if (r <= 0.5) {
+            return box_signed_distance(pixel, float2(width, height) * 0.5, float2(width, height) * 0.5);
+        }
+
+        if (pixel.y < r) {
+            if (pixel.x < r) {
+                return length(pixel - float2(r, r)) - r;
+            }
+            if (pixel.x > width - r) {
+                return length(pixel - float2(width - r, r)) - r;
+            }
+        }
+
+        return box_signed_distance(pixel, float2(width, height) * 0.5, float2(width, height) * 0.5);
+    }
+
+    vertex LoopRegionRasterizedVertex loop_region_vertex(
+        uint vertexID [[vertex_id]],
+        constant WaveformShaderQuadVertex *vertices [[buffer(0)]],
+        constant LoopRegionUniform &uniform [[buffer(1)]]
+    ) {
+        float2 localPosition = vertices[vertexID].position.xy;
+        float2 normalizedPosition = float2(
+            mix(uniform.rect.x, uniform.rect.y, localPosition.x),
+            mix(uniform.rect.z, uniform.rect.w, localPosition.y)
+        );
+
+        LoopRegionRasterizedVertex out;
+        out.position = float4(
+            normalizedPosition.x * 2.0 - 1.0,
+            1.0 - normalizedPosition.y * 2.0,
+            0.0,
+            1.0
+        );
+        out.localPosition = localPosition;
+        out.metrics = uniform.metrics;
+        out.style = uniform.style;
+        out.edgeHighlight = uniform.edgeHighlight;
+        out.fillColor = uniform.fillColor;
+        out.topColor = uniform.topColor;
+        out.bottomColor = uniform.bottomColor;
+        out.edgeColor = uniform.edgeColor;
+        return out;
+    }
+
+    fragment float4 loop_region_fragment(
+        LoopRegionRasterizedVertex in [[stage_in]],
+        constant LoopRegionUniform &uniform [[buffer(1)]]
+    ) {
+        float widthPixels = max(in.metrics.x, 1.0);
+        float heightPixels = max(in.metrics.y, 1.0);
+        float radiusPixels = max(in.metrics.z, 1.0);
+        float edgeWidthPixels = max(in.metrics.w, 1.0);
+        float2 pixel = float2(in.localPosition.x * widthPixels, in.localPosition.y * heightPixels);
+
+        float distance = top_rounded_tab_signed_distance(pixel, widthPixels, heightPixels, radiusPixels);
+        float aa = max(fwidth(distance), 0.82);
+        float coverage = 1.0 - smoothstep(-aa, aa, distance);
+        if (coverage <= 0.0001) {
+            return float4(0.0);
+        }
+
+        float enabled = clamp(in.style.x, 0.0, 1.0);
+        float hover = clamp(in.style.y, 0.0, 1.0);
+        float flash = clamp(in.style.z, 0.0, 1.0);
+        float time = in.style.w;
+        float y = clamp(in.localPosition.y, 0.0, 1.0);
+        float x = clamp(in.localPosition.x, 0.0, 1.0);
+
+        float edgeDistance = abs(distance);
+        float rim = exp(-(edgeDistance * edgeDistance) / max(10.0, 8.0 + radiusPixels * 0.6));
+        float innerRim = exp(-pow(max(-distance, 0.0) / max(4.0, radiusPixels * 0.52), 2.0));
+        float topSheen = pow(max(1.0 - y, 0.0), 2.1);
+        float bottomShade = pow(max(y, 0.0), 2.4);
+        float sideEdgeDistance = min(pixel.x, widthPixels - pixel.x);
+        float sideRim = exp(-pow(sideEdgeDistance / max(edgeWidthPixels * 3.4, 2.0), 2.0));
+        float hoveredEdgeSide = clamp(in.edgeHighlight.x, -1.0, 1.0);
+        float hoveredEdgeAmount = clamp(in.edgeHighlight.y, 0.0, 1.0);
+        float hoveredEdgeDistance = hoveredEdgeSide < 0.0 ? pixel.x : widthPixels - pixel.x;
+        float hoveredEdgeCore = exp(-pow(hoveredEdgeDistance / max(edgeWidthPixels * 1.35, 1.35), 2.0));
+        float hoveredEdgeHalo = exp(-pow(hoveredEdgeDistance / max(edgeWidthPixels * 5.8, 5.8), 2.0));
+        float hoveredEdgeGlow = hoveredEdgeAmount * (hoveredEdgeCore * 0.72 + hoveredEdgeHalo * 0.42);
+
+        float liquidA = sin(pixel.x * 0.047 + pixel.y * 0.071 + time * 0.95);
+        float liquidB = sin(pixel.x * -0.031 + pixel.y * 0.055 + time * 0.62 + liquidA * 0.85);
+        float liquid = 0.5 + 0.5 * (liquidA * 0.56 + liquidB * 0.44);
+        liquid = smoothstep(0.18, 1.0, liquid);
+        float refract = (liquid - 0.5) * (0.045 + enabled * 0.04) + flash * 0.045;
+
+        float3 fill = in.fillColor.rgb;
+        float3 top = in.topColor.rgb;
+        float3 bottom = in.bottomColor.rgb;
+        float3 edge = in.edgeColor.rgb;
+        float3 color = fill;
+        color = mix(color, top, topSheen * (0.42 + enabled * 0.12));
+        color = mix(color, bottom, bottomShade * 0.24);
+        color += float3(0.11, 0.16, 0.17) * refract * enabled;
+        color = mix(color, edge, rim * (0.20 + hover * 0.12 + flash * 0.18));
+        color = mix(color, float3(1.0), flash * 0.16 + innerRim * 0.035);
+        color = mix(color, float3(1.0), clamp(hoveredEdgeGlow * 0.72, 0.0, 0.82));
+
+        float alpha = in.fillColor.a * (0.82 + topSheen * 0.24 + rim * 0.24 + hover * 0.12 + flash * 0.20);
+        alpha += in.topColor.a * topSheen * 0.32;
+        alpha += in.bottomColor.a * bottomShade * 0.18;
+        alpha += in.edgeColor.a * (rim * 0.16 + sideRim * 0.055);
+        alpha += hoveredEdgeAmount * (hoveredEdgeCore * 0.34 + hoveredEdgeHalo * 0.20);
+        alpha *= coverage;
+
+        float bottomSnap = 1.0 - smoothstep(0.0, 1.0 / max(heightPixels, 1.0), abs(1.0 - y));
+        color = mix(color, bottom, bottomSnap * 0.18);
+        alpha = min(alpha + bottomSnap * 0.018, 1.0);
+
+        return float4(clamp(color, float3(0.0), float3(1.0)), clamp(alpha, 0.0, 1.0));
+    }
+
+    static float4 selection_glass_overlay_color(
+        float2 localPosition,
+        float2 pixel,
+        float widthPixels,
+        float heightPixels,
+        float radiusPixels,
+        float progressFraction,
+        float4 style,
+        float4 pulse,
+        float4 baseColor,
+        float4 progressFillColor
+    ) {
+        float2 centered = pixel - float2(widthPixels, heightPixels) * 0.5;
+        float distance = rounded_rect_signed_distance(
+            centered,
+            max(float2(widthPixels, heightPixels) * 0.5, float2(radiusPixels + 0.5)),
+            radiusPixels
+        );
+        float aa = max(fwidth(distance), 0.85);
+        float coverage = 1.0 - smoothstep(-aa, aa, distance);
+        if (coverage <= 0.0001) {
+            return float4(0.0);
+        }
+
+        float edgeDistance = abs(distance);
+        float rim = exp(-(edgeDistance * edgeDistance) / max(18.0, 16.0 + radiusPixels * 0.35));
+        float innerRim = exp(-pow(max(-distance, 0.0) / max(6.0, radiusPixels * 0.55), 2.0));
+        float outerRim = exp(-pow(max(distance, 0.0) / max(5.0, radiusPixels * 0.35), 2.0));
+        float topSheen = pow(max(1.0 - localPosition.y, 0.0), 2.35);
+        float lowerShade = pow(max(localPosition.y, 0.0), 2.8);
+        float caustic = hash21(floor(pixel * float2(0.115, 0.073) + style.w));
+        caustic = smoothstep(0.46, 1.0, caustic) * 0.42;
+        float wave = 0.5 + 0.5 * sin((pixel.x * 0.055 - pixel.y * 0.018) + style.w * 0.24);
+
+        float dragEdgeLocalX = style.x;
+        float dragStrength = clamp(style.y, 0.0, 1.0);
+        float dragDirection = style.z >= 0.0 ? 1.0 : -1.0;
+        float dragEdge = 0.0;
+        float refractivePush = 0.0;
+        if (dragEdgeLocalX >= 0.0 && dragEdgeLocalX <= 1.0 && dragStrength > 0.001) {
+            float edgeX = dragEdgeLocalX * widthPixels;
+            float distX = abs(pixel.x - edgeX);
+            float insideSide = dragDirection > 0.0 ? step(pixel.x, edgeX) : step(edgeX, pixel.x);
+            float outsideDistance = dragDirection > 0.0 ? max(pixel.x - edgeX, 0.0) : max(edgeX - pixel.x, 0.0);
+            float outsideLimiter = exp(-(outsideDistance * outsideDistance) / max(14.0, 6.0 + dragStrength * 12.0));
+            float insideTrail = exp(-(distX * distX) / max(72.0, 30.0 + dragStrength * 95.0));
+            dragEdge = mix(outsideLimiter * 0.34, insideTrail, insideSide) * dragStrength;
+            refractivePush = exp(-(distX * distX) / max(20.0, 10.0 + dragStrength * 26.0)) * dragStrength;
+        }
+
+        float4 base = baseColor;
+        float glassAlpha = base.a * (0.78 + topSheen * 0.26 + rim * 0.42 + dragEdge * 0.22);
+        float3 glassTint = base.rgb;
+        glassTint = mix(glassTint, float3(0.78, 1.0, 1.0), 0.20 * topSheen + 0.12 * rim + 0.18 * dragEdge);
+        glassTint = mix(glassTint, float3(0.02, 0.18, 0.19), 0.12 * lowerShade);
+        glassTint += float3(0.06, 0.10, 0.11) * caustic * (0.25 + 0.35 * wave);
+        glassTint += float3(0.18, 0.35, 0.38) * refractivePush * 0.18;
+
+        float4 color = float4(glassTint, glassAlpha * coverage);
+        float4 rimColor = float4(
+            mix(float3(0.40, 0.96, 1.0), float3(1.0), clamp(rim * 0.35 + dragEdge * 0.45, 0.0, 1.0)),
+            coverage * (rim * 0.13 + innerRim * 0.045 + outerRim * 0.05 + dragEdge * 0.12)
+        );
+        color = source_over(color, rimColor);
+
+        if (progressFraction >= 0.0 && localPosition.x <= progressFraction) {
+            float progressEdge = 1.0 - smoothstep(0.0, max(0.006, fwidth(localPosition.x) * 2.0), abs(localPosition.x - progressFraction));
+            float4 progressColor = float4(
+                mix(progressFillColor.rgb, float3(1.0), progressEdge * 0.28),
+                progressFillColor.a * coverage * (0.76 + progressEdge * 0.34)
+            );
+            color = source_over(color, progressColor);
+        }
+
+        float copyPulse = clamp(pulse.x, 0.0, 1.0);
+        if (copyPulse > 0.001) {
+            float4 pulseColor = float4(
+                mix(float3(0.42, 0.96, 1.0), float3(1.0), 0.56),
+                coverage * (0.10 + 0.32 * copyPulse)
+            );
+            color = source_over(color, pulseColor);
+        }
+
+        return float4(clamp(color.rgb, float3(0.0), float3(1.0)), clamp(color.a, 0.0, 1.0));
+    }
+
+    fragment float4 selection_overlay_fragment(
+        SelectionOverlayRasterizedVertex in [[stage_in]],
+        constant SelectionOverlayUniform &uniform [[buffer(1)]]
+    ) {
+        float widthPixels = max(in.metrics.x, 1.0);
+        float heightPixels = max(in.metrics.y, 1.0);
+        float radiusPixels = max(in.metrics.z, 1.0);
+        float2 pixel = float2(in.localPosition.x * widthPixels, in.localPosition.y * heightPixels);
+        return selection_glass_overlay_color(
+            in.localPosition,
+            pixel,
+            widthPixels,
+            heightPixels,
+            radiusPixels,
+            in.metrics.w,
+            in.style,
+            in.pulse,
+            in.baseColor,
+            in.progressColor
+        );
+    }
+
     vertex SelectionDragEffectRasterizedVertex selection_drag_effect_vertex(
         uint vertexID [[vertex_id]],
         constant WaveformShaderQuadVertex *vertices [[buffer(0)]],
@@ -12014,6 +12889,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         out.metrics = uniform.metrics;
         out.effect = uniform.effect;
         out.color = uniform.color;
+        out.mask = uniform.mask;
         return out;
     }
 
@@ -12031,6 +12907,24 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float direction = in.effect.w >= 0.0 ? 1.0 : -1.0;
 
         float2 pixel = float2(in.localPosition.x * widthPixels, in.localPosition.y * heightPixels);
+        float selectionLeft = in.mask.x;
+        float selectionRight = in.mask.y;
+        if (selectionRight <= selectionLeft + 0.5) {
+            return float4(0.0);
+        }
+        float selectionRadius = max(in.mask.z, 1.0);
+        float2 selectionCenter = float2((selectionLeft + selectionRight) * 0.5, heightPixels * 0.5);
+        float2 selectionHalfSize = float2(
+            max((selectionRight - selectionLeft) * 0.5, 0.5),
+            max(heightPixels * 0.5, selectionRadius + 0.5)
+        );
+        float maskDistance = rounded_rect_signed_distance(pixel - selectionCenter, selectionHalfSize, selectionRadius);
+        float maskAA = max(fwidth(maskDistance), 0.85);
+        float roundedSelectionCoverage = 1.0 - smoothstep(-maskAA, maskAA, maskDistance);
+        if (roundedSelectionCoverage <= 0.0001) {
+            return float4(0.0);
+        }
+
         float edgeX = edgeLocalX * widthPixels;
         float endRadius = min(max(10.0, heightPixels * 0.06), max(heightPixels * 0.50, 1.0));
         float segmentTop = endRadius;
@@ -12051,7 +12945,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             trailingSide
         );
         float trailDistance = direction > 0.0 ? max(edgeX - pixel.x, 0.0) : max(pixel.x - edgeX, 0.0);
-        float alpha = in.color.a * strength * outsideLimiter * (glow * 0.32 + aura * 0.12);
+        float alpha = in.color.a * strength * outsideLimiter * roundedSelectionCoverage * (glow * 0.32 + aura * 0.12);
         float3 glowColor = mix(float3(0.22, 0.86, 1.0), float3(1.0), min(glow * 0.18, 1.0));
         float3 color = mix(in.color.rgb, glowColor, 0.42 + 0.36 * strength);
         return float4(color, clamp(alpha, 0.0, 1.0));
@@ -12097,7 +12991,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float top = effect.rect.z;
         float bottom = effect.rect.w;
         float slide = clamp(effect.ripple.y, 0.0, 1.0);
-        float shiftedRight = mix(right, left, slide);
+        float mode = effect.ripple.z;
+        float shiftedRight = mode > 1.5 ? mix(left, right, slide) : mix(right, left, slide);
         float selectionRight = max(left + 1.0 / width, shiftedRight);
         float2 point = in.normalizedPosition;
         float yAA = max(fwidth(point.y) * 0.75, 0.000001);
@@ -12112,20 +13007,153 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 float selectionXAA = max(fwidth(point.x) * 1.25, 1.0 / width);
                 float selectionCoverage = laneCoverage *
                     rectangle_coverage(point.x, left, selectionRight, selectionXAA);
-                float edgePulse = 1.0 - smoothstep(
-                    0.0,
-                    max(3.5 / width, 0.000001),
-                    abs(point.x - selectionRight)
-                );
-                color = source_over(
-                    color,
-                    float4(
+                if (mode > 1.5) {
+                    float selectionHeightPixels = max((bottom - top) * height, 1.0);
+                    float radiusPixels = min(
+                        max(8.0, selectionHeightPixels * 0.075),
+                        min(18.0, selectionWidthPixels * 0.5)
+                    );
+                    float2 selectionLocal = float2(
+                        clamp((point.x - left) / max(selectionRight - left, 0.000001), 0.0, 1.0),
+                        clamp((point.y - top) / max(bottom - top, 0.000001), 0.0, 1.0)
+                    );
+                    float2 selectionPixel = float2(
+                        selectionLocal.x * selectionWidthPixels,
+                        selectionLocal.y * selectionHeightPixels
+                    );
+                    float2 selectionCentered = selectionPixel - float2(selectionWidthPixels, selectionHeightPixels) * 0.5;
+                    float selectionDistance = rounded_rect_signed_distance(
+                        selectionCentered,
+                        max(float2(selectionWidthPixels, selectionHeightPixels) * 0.5, float2(radiusPixels + 0.5)),
+                        radiusPixels
+                    );
+                    float selectionAA = max(fwidth(selectionDistance), 0.85);
+                    selectionCoverage = 1.0 - smoothstep(-selectionAA, selectionAA, selectionDistance);
+                    float edgeStrength = (1.0 - smoothstep(0.72, 1.0, slide)) * 0.52;
+                    color = source_over(
+                        color,
+                        selection_glass_overlay_color(
+                            selectionLocal,
+                            selectionPixel,
+                            selectionWidthPixels,
+                            selectionHeightPixels,
+                            radiusPixels,
+                            -1.0,
+                            float4(1.0, edgeStrength, 1.0, effect.timing.z + effect.timing.y),
+                            float4(0.0),
+                            float4(0.02, 0.82, 0.88, 0.18),
+                            float4(0.28, 0.96, 1.0, 0.20)
+                        )
+                    );
+                } else {
+                    float edgePulse = 1.0 - smoothstep(
                         0.0,
-                        0.84,
-                        0.78,
-                        selectionCoverage * (0.21 + 0.08 * edgePulse)
-                    )
-                );
+                        max(3.5 / width, 0.000001),
+                        abs(point.x - selectionRight)
+                    );
+                    color = source_over(
+                        color,
+                        float4(
+                            0.0,
+                            0.84,
+                            0.78,
+                            selectionCoverage * (0.21 + 0.08 * edgePulse)
+                        )
+                    );
+                }
+
+                if (mode > 1.5) {
+                    uint binCount = uint(max(effect.timing.w, 1.0));
+                    float fullWidth = max(right - left, 0.000001);
+                    float revealedFraction = min(max(slide, 1.0 / max(fullWidth * width, 1.0)), 1.0);
+                    float visibleProgress = clamp((point.x - left) / max(fullWidth * revealedFraction, 0.000001), 0.0, 1.0);
+                    float localProgress = clamp(1.0 - revealedFraction + visibleProgress * revealedFraction, 0.0, 1.0);
+                    WaveformShaderBin bin = sample_waveform_bin(localProgress, bins, binCount, 0u, 0.45);
+                    float centerY = (top + bottom) * 0.5;
+                    float laneHeight = max(bottom - top, 0.000001);
+                    float waveformVolumeScale = max(effect.waveformStyle.w, 0.0);
+                    float amplitude = laneHeight * 0.39 * waveformVolumeScale;
+                    float peakTop = centerY - clamp(bin.maximumSample, -1.0, 1.0) * amplitude;
+                    float peakBottom = centerY - clamp(bin.minimumSample, -1.0, 1.0) * amplitude;
+                    float minimumVisualHeight = laneHeight * 0.006;
+                    if (peakBottom - peakTop < minimumVisualHeight) {
+                        float midpoint = (peakTop + peakBottom) * 0.5;
+                        peakTop = midpoint - minimumVisualHeight * 0.5;
+                        peakBottom = midpoint + minimumVisualHeight * 0.5;
+                    }
+                    peakTop = clamp(peakTop, top, bottom);
+                    peakBottom = clamp(peakBottom, top, bottom);
+                    float waveformCoverage = rectangle_coverage(point.y, peakTop, peakBottom, yAA);
+                    if (waveformCoverage > 0.0) {
+                        float waveformAlpha = clamp(effect.waveformStyle.y, 0.0, 1.0) * selectionCoverage;
+                        float4 baseColor = waveform_base_color(
+                            bin,
+                            clamp(effect.waveformStyle.x, 0.0, 1.0),
+                            waveformAlpha,
+                            clamp(effect.waveformStyle.z, 0.0, 1.0)
+                        );
+                        float peakAlpha = clamp(effect.waveformStyle2.x, 0.0, 1.0);
+                        float bodyAlpha = clamp(effect.waveformStyle2.y, 0.0, 1.0);
+                        float glowAlpha = clamp(effect.waveformStyle2.z, 0.0, 1.0);
+                        float glowExpansion = max(effect.waveformStyle2.w, 0.0);
+
+                        if (glowAlpha > 0.001) {
+                            float glowTop = max(peakTop - glowExpansion, top);
+                            float glowBottom = min(peakBottom + glowExpansion, bottom);
+                            float glowCoverage = rectangle_coverage(point.y, glowTop, glowBottom, yAA);
+                            if (glowCoverage > 0.0) {
+                                float4 glowColor = lightened_color(
+                                    baseColor,
+                                    0.18,
+                                    glowAlpha * waveformAlpha * glowCoverage
+                                );
+                                color = source_over(color, glowColor);
+                            }
+                        }
+
+                        if (bodyAlpha > 0.001) {
+                            float4 bodyColor = lightened_color(
+                                baseColor,
+                                0.14,
+                                bodyAlpha * waveformAlpha
+                            );
+                            color = source_over(
+                                color,
+                                center_weighted_waveform_band(
+                                    point.y,
+                                    peakTop,
+                                    peakBottom,
+                                    centerY,
+                                    bodyColor,
+                                    color_with_alpha(bodyColor, bodyColor.a * 0.42),
+                                    yAA
+                                )
+                            );
+                        }
+
+                        float4 peakCenterColor = lightened_color(
+                            baseColor,
+                            0.12,
+                            peakAlpha * waveformAlpha
+                        );
+                        float4 peakEdgeColor = color_with_alpha(
+                            baseColor,
+                            peakAlpha * 0.42 * waveformAlpha
+                        );
+                        color = source_over(
+                            color,
+                            center_weighted_waveform_band(
+                                point.y,
+                                peakTop,
+                                peakBottom,
+                                centerY,
+                                peakCenterColor,
+                                peakEdgeColor,
+                                yAA
+                            )
+                        );
+                    }
+                }
             }
         }
 
@@ -12141,6 +13169,18 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float right = max(warp.x, warp.y);
         float width = max(right - left, 0.000001);
         float slide = clamp(warp.z, 0.0, 1.0);
+        if (warp.w > 1.5) {
+            float growingRight = left + width * slide;
+            if (x < left) {
+                return x;
+            }
+            if (x < growingRight) {
+                return -1000.0;
+            }
+
+            return x - width * slide;
+        }
+
         if (x < left) {
             return x;
         }
@@ -12166,13 +13206,17 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float radius = mix(max(tuning.y, 0.0000001), max(tuning.x, 0.0000001), frontSide);
         float sideScale = mix(0.95, 0.28, frontSide);
         float lightScale = mix(0.78, 0.20, frontSide);
-        float exponent = mix(1.58, 2.90, frontSide);
-        float sideRatio = abs(offset) / radius;
-        float sideContact = exp(-pow(sideRatio, exponent));
+        float sideRatio = clamp(1.0 - abs(offset) / radius, 0.0, 1.0);
+        float sideSmooth = sideRatio * sideRatio * (3.0 - 2.0 * sideRatio);
+        float sideContact = mix(
+            sideSmooth * (0.62 + 0.38 * sideSmooth),
+            sideSmooth * sideSmooth,
+            frontSide
+        );
 
         float coreRadius = max(tuning.z, 0.0000001);
-        float coreRatio = abs(offset) / coreRadius;
-        float coreContact = exp(-pow(coreRatio, 2.0));
+        float coreRatio = clamp(1.0 - abs(offset) / coreRadius, 0.0, 1.0);
+        float coreContact = coreRatio * coreRatio * (3.0 - 2.0 * coreRatio);
         float strength = clamp(contact.y, 0.0, 1.0);
         float geometry = max(sideContact * sideScale, coreContact) * strength;
         float light = max(sideContact * lightScale, coreContact * 0.92) * strength;
@@ -12261,6 +13305,37 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             fisheye_sample_smoothing(in.normalizedPosition.x, in.fisheye)
         );
         WaveformShaderBin bin = sample_waveform_bin(localProgress, bins, binCount, binOffset, smoothAmount);
+        float localPixelSpan = max(fwidth(localProgress), 0.0);
+        float pixelBinSpan = localPixelSpan * float(binCount);
+        if (pixelBinSpan > 0.75) {
+            float envelopeAmount = smoothstep(0.75, 3.5, pixelBinSpan);
+            float halfSpan = localPixelSpan * 0.55;
+            float fullSpan = localPixelSpan * 1.10;
+            WaveformShaderBin leftNearBin = sample_waveform_bin(localProgress - halfSpan, bins, binCount, binOffset, 0.0);
+            WaveformShaderBin rightNearBin = sample_waveform_bin(localProgress + halfSpan, bins, binCount, binOffset, 0.0);
+            WaveformShaderBin leftFarBin = sample_waveform_bin(localProgress - fullSpan, bins, binCount, binOffset, 0.0);
+            WaveformShaderBin rightFarBin = sample_waveform_bin(localProgress + fullSpan, bins, binCount, binOffset, 0.0);
+            float envelopeMinimum = min(
+                min(leftFarBin.minimumSample, leftNearBin.minimumSample),
+                min(rightNearBin.minimumSample, rightFarBin.minimumSample)
+            );
+            float envelopeMaximum = max(
+                max(leftFarBin.maximumSample, leftNearBin.maximumSample),
+                max(rightNearBin.maximumSample, rightFarBin.maximumSample)
+            );
+            float envelopeRMS = max(
+                max(leftFarBin.rmsSample, leftNearBin.rmsSample),
+                max(rightNearBin.rmsSample, rightFarBin.rmsSample)
+            );
+            float envelopePeak = max(
+                max(leftFarBin.peakMagnitude, leftNearBin.peakMagnitude),
+                max(rightNearBin.peakMagnitude, rightFarBin.peakMagnitude)
+            );
+            bin.minimumSample = mix(bin.minimumSample, min(bin.minimumSample, envelopeMinimum), envelopeAmount);
+            bin.maximumSample = mix(bin.maximumSample, max(bin.maximumSample, envelopeMaximum), envelopeAmount);
+            bin.rmsSample = mix(bin.rmsSample, max(bin.rmsSample, envelopeRMS), envelopeAmount * 0.35);
+            bin.peakMagnitude = mix(bin.peakMagnitude, max(bin.peakMagnitude, envelopePeak), envelopeAmount);
+        }
         float segmentGain = mix(in.segmentGain.x, in.segmentGain.y, smoothstep(0.0, 1.0, segmentProgress));
         float gain = waveform_gain(timelineProgress, in.gainPreview) * max(segmentGain, 0.0);
         float minimumSample = clamp(bin.minimumSample * gain, -1.0, 1.0);
@@ -12312,9 +13387,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         peakTop = clamp(peakTop, laneTop, laneBottom);
         peakBottom = clamp(peakBottom, laneTop, laneBottom);
-        float rmsHeight = max(rmsSample * amplitudeHeight, minimumVisualHeight * 0.7);
-        float rmsTop = clamp(centerY - rmsHeight, laneTop, laneBottom);
-        float rmsBottom = clamp(centerY + rmsHeight, laneTop, laneBottom);
         float y = in.normalizedPosition.y;
         float yAA = max(fwidth(y) * 0.75, 0.000001);
         float alphaScale = clamp(in.baseColor.a * opacity, 0.0, 1.0);
@@ -12335,6 +13407,22 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             }
         }
 
+        if (in.style.z > 0.001) {
+            float4 bodyColor = lightened_color(baseColor, 0.14, in.style.z * alphaScale);
+            color = source_over(
+                color,
+                center_weighted_waveform_band(
+                    y,
+                    peakTop,
+                    peakBottom,
+                    centerY,
+                    bodyColor,
+                    color_with_alpha(bodyColor, bodyColor.a * 0.42),
+                    yAA
+                )
+            );
+        }
+
         float4 peakCenterColor = lightened_color(baseColor, 0.12, in.style.y * alphaScale);
         float4 peakEdgeColor = color_with_alpha(baseColor, in.style.y * 0.42 * alphaScale);
         color = source_over(
@@ -12349,22 +13437,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 yAA
             )
         );
-
-        if (in.style.z > 0.001 && rmsBottom > rmsTop) {
-            float4 rmsColor = lightened_color(baseColor, 0.22, in.style.z * alphaScale);
-            color = source_over(
-                color,
-                center_weighted_waveform_band(
-                    y,
-                    rmsTop,
-                    rmsBottom,
-                    centerY,
-                    rmsColor,
-                    color_with_alpha(rmsColor, rmsColor.a * 0.50),
-                    yAA
-                )
-            );
-        }
 
         if (lightInfluence > 0.001) {
             float touchExpansion = max(in.style2.w * 1.45, yAA * 2.0);

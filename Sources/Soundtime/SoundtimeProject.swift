@@ -1,7 +1,7 @@
 import Foundation
 
 struct SoundtimeProject: Codable, Sendable {
-    static let currentSchemaVersion = 4
+    static let currentSchemaVersion = 7
     static let launchWaveformPreviewBinCount = 4_096
 
     struct WindowLayout: Codable, Sendable {
@@ -85,15 +85,19 @@ struct SoundtimeProject: Codable, Sendable {
                 {
                     return false
                 }
-                if
-                    let modificationTime,
-                    let currentModificationTime = currentValues?.contentModificationDate?.timeIntervalSince1970,
-                    abs(modificationTime - currentModificationTime) > 0.001
-                {
-                    return false
-                }
-
                 return true
+            }
+
+            var stableSummary: String {
+                [
+                    "\(frameCount)",
+                    String(format: "%.3f", sampleRate),
+                    "\(channelCount)",
+                    "\(bitsPerSample)",
+                    "\(dataByteCount)",
+                    fileSize.map(String.init) ?? "-",
+                    modificationTime.map { String(format: "%.3f", $0) } ?? "-",
+                ].joined(separator: "|")
             }
         }
 
@@ -207,6 +211,52 @@ struct SoundtimeProject: Codable, Sendable {
     }
 
     struct Track: Codable, Sendable {
+        struct EditableSource: Codable, Sendable {
+            var importedAssetID: UUID?
+            var originalFilePath: String
+            var editableFilePath: String
+            var formatOrigin: AudioAssetFormat
+            var sourceFrameCount: Int
+            var sourceSampleRate: Double
+            var channelCount: Int
+            var ownsEditableFile: Bool
+
+            init(_ source: EditableAudioSource) {
+                importedAssetID = source.importedAssetID
+                originalFilePath = source.originalURL.path
+                editableFilePath = source.editableURL.path
+                formatOrigin = source.formatOrigin
+                sourceFrameCount = source.sourceFrameCount
+                sourceSampleRate = source.sourceSampleRate
+                channelCount = source.channelCount
+                ownsEditableFile = source.ownsEditableFile
+            }
+
+            func editableAudioSource(fileInfo: WAVFileInfo) -> EditableAudioSource? {
+                guard
+                    sourceFrameCount == fileInfo.frameCount,
+                    abs(sourceSampleRate - fileInfo.sampleRate) < 0.001,
+                    channelCount == fileInfo.channelCount
+                else {
+                    return nil
+                }
+
+                let editableURL = URL(fileURLWithPath: editableFilePath).standardizedFileURL
+                guard editableURL == fileInfo.url.standardizedFileURL else {
+                    return nil
+                }
+
+                return EditableAudioSource(
+                    importedAssetID: importedAssetID,
+                    originalURL: URL(fileURLWithPath: originalFilePath),
+                    editableURL: editableURL,
+                    formatOrigin: formatOrigin,
+                    fileInfo: fileInfo,
+                    ownsEditableFile: ownsEditableFile
+                )
+            }
+        }
+
         var id: UUID
         var editGroupID: UUID? = nil
         var name: String
@@ -215,8 +265,10 @@ struct SoundtimeProject: Codable, Sendable {
         var isMuted: Bool
         var isSoloed: Bool
         var editTimeline: AudioFileEditTimeline.PersistentState?
+        var editableSource: EditableSource? = nil
         var waveformPreview: WaveformPreview? = nil
         var ownsSourceFile: Bool? = nil
+        var transcript: TranscriptDocument? = nil
     }
 
     var tracks: [Track]
@@ -224,6 +276,8 @@ struct SoundtimeProject: Codable, Sendable {
     var masterVolume: Float?
     var timelineViewport: TimelineViewport?
     var silenceReviewState: SilenceReviewState?
+    var transcriptionJobs: [TranscriptionJob.PersistentSnapshot]?
+    var transcriptDisplayMode: TranscriptTimelineDisplayMode?
 
     var schemaVersion: Int
 
@@ -233,6 +287,8 @@ struct SoundtimeProject: Codable, Sendable {
         masterVolume: Float?,
         timelineViewport: TimelineViewport?,
         silenceReviewState: SilenceReviewState? = nil,
+        transcriptionJobs: [TranscriptionJob.PersistentSnapshot]? = nil,
+        transcriptDisplayMode: TranscriptTimelineDisplayMode? = nil,
         schemaVersion: Int = SoundtimeProject.currentSchemaVersion
     ) {
         self.tracks = tracks
@@ -240,19 +296,22 @@ struct SoundtimeProject: Codable, Sendable {
         self.masterVolume = masterVolume
         self.timelineViewport = timelineViewport
         self.silenceReviewState = silenceReviewState
+        self.transcriptionJobs = transcriptionJobs
+        self.transcriptDisplayMode = transcriptDisplayMode
         self.schemaVersion = schemaVersion
     }
 
     fileprivate func mergingMissingWaveformPreviews(from savedProject: SoundtimeProject) -> SoundtimeProject {
-        let savedPreviewsByTrack = Dictionary(
-            uniqueKeysWithValues: savedProject.tracks.compactMap { track -> (String, WaveformPreview)? in
-                guard let waveformPreview = track.waveformPreview else {
-                    return nil
-                }
-
-                return (SoundtimeProjectStore.waveformPreviewMergeKey(for: track), waveformPreview)
+        var savedPreviewsByTrackKey: [String: WaveformPreview] = [:]
+        var savedPreviewsByTrackID: [UUID: WaveformPreview] = [:]
+        for track in savedProject.tracks {
+            guard let waveformPreview = track.waveformPreview else {
+                continue
             }
-        )
+
+            savedPreviewsByTrackKey[SoundtimeProjectStore.waveformPreviewMergeKey(for: track)] = waveformPreview
+            savedPreviewsByTrackID[track.id] = waveformPreview
+        }
 
         var mergedProject = self
         mergedProject.tracks = tracks.map { track in
@@ -260,7 +319,10 @@ struct SoundtimeProject: Codable, Sendable {
                 return track
             }
 
-            guard let waveformPreview = savedPreviewsByTrack[SoundtimeProjectStore.waveformPreviewMergeKey(for: track)] else {
+            guard
+                let waveformPreview = savedPreviewsByTrackKey[SoundtimeProjectStore.waveformPreviewMergeKey(for: track)] ??
+                    savedPreviewsByTrackID[track.id]
+            else {
                 return track
             }
 
@@ -278,6 +340,8 @@ struct SoundtimeProject: Codable, Sendable {
         case masterVolume
         case timelineViewport
         case silenceReviewState
+        case transcriptionJobs
+        case transcriptDisplayMode
     }
 
     init(from decoder: Decoder) throws {
@@ -288,6 +352,14 @@ struct SoundtimeProject: Codable, Sendable {
         masterVolume = try container.decodeIfPresent(Float.self, forKey: .masterVolume)
         timelineViewport = try container.decodeIfPresent(TimelineViewport.self, forKey: .timelineViewport)
         silenceReviewState = try container.decodeIfPresent(SilenceReviewState.self, forKey: .silenceReviewState)
+        transcriptionJobs = try container.decodeIfPresent(
+            [TranscriptionJob.PersistentSnapshot].self,
+            forKey: .transcriptionJobs
+        )
+        transcriptDisplayMode = try container.decodeIfPresent(
+            TranscriptTimelineDisplayMode.self,
+            forKey: .transcriptDisplayMode
+        )
     }
 
     func encode(to encoder: Encoder) throws {
@@ -298,6 +370,8 @@ struct SoundtimeProject: Codable, Sendable {
         try container.encodeIfPresent(masterVolume, forKey: .masterVolume)
         try container.encodeIfPresent(timelineViewport, forKey: .timelineViewport)
         try container.encodeIfPresent(silenceReviewState, forKey: .silenceReviewState)
+        try container.encodeIfPresent(transcriptionJobs, forKey: .transcriptionJobs)
+        try container.encodeIfPresent(transcriptDisplayMode, forKey: .transcriptDisplayMode)
     }
 }
 
@@ -311,6 +385,35 @@ enum SoundtimeProjectStore {
     private static let projectTimelineViewportKeyPrefix = "Soundtime.projectTimelineViewport."
 
     static func load(from url: URL) throws -> SoundtimeProject {
+        let migratedProject = try loadRaw(from: url)
+        return TranscriptSidecarStore.projectResolvingSidecars(migratedProject, projectURL: url)
+    }
+
+    static func loadLaunchPreviewRecoveringAutosave(from url: URL) throws -> SoundtimeProject {
+        let autosaveURL = autosaveURL(for: url)
+        let savedProjectResult = Result {
+            try loadRaw(from: url)
+        }
+        guard
+            FileManager.default.fileExists(atPath: autosaveURL.path),
+            autosaveURL.isNewerThan(url)
+        else {
+            return try savedProjectResult.get()
+        }
+
+        let autosaveProject = try loadRaw(from: autosaveURL)
+        guard case let .success(savedProject) = savedProjectResult else {
+            return autosaveProject
+        }
+
+        return autosaveProject.mergingMissingWaveformPreviews(from: savedProject)
+    }
+
+    static func loadLaunchPreview(from url: URL) throws -> SoundtimeProject {
+        try loadRaw(from: url)
+    }
+
+    private static func loadRaw(from url: URL) throws -> SoundtimeProject {
         let data = try Data(contentsOf: url)
         return migrate(try JSONDecoder().decode(SoundtimeProject.self, from: data))
     }
@@ -336,7 +439,12 @@ enum SoundtimeProjectStore {
     }
 
     static func save(_ project: SoundtimeProject, to url: URL) throws {
-        try write(migrate(project), to: url)
+        let migratedProject = migrate(project)
+        let projectWithSidecars = try TranscriptSidecarStore.projectWithSidecarReferences(
+            migratedProject,
+            projectURL: url
+        )
+        try write(projectWithSidecars, to: url)
         rememberLastProjectURL(url)
     }
 
@@ -351,7 +459,12 @@ enum SoundtimeProjectStore {
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        try write(migrate(project), to: url)
+        let migratedProject = migrate(project)
+        let projectWithSidecars = try TranscriptSidecarStore.projectWithSidecarReferences(
+            migratedProject,
+            projectURL: url
+        )
+        try write(projectWithSidecars, to: url)
         return url
     }
 
@@ -482,6 +595,10 @@ enum SoundtimeProjectStore {
 
     private static func projectTimelineViewportKey(for projectURL: URL) -> String {
         projectTimelineViewportKeyPrefix + stablePathHash(projectURL.standardizedFileURL.path)
+    }
+
+    static func stableProjectKey(for projectURL: URL) -> String {
+        stablePathHash(projectURL.standardizedFileURL.path)
     }
 
     private static func autosaveURL(projectURL: URL?, autosaveID: UUID) -> URL {

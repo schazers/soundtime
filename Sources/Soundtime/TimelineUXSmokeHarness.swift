@@ -207,7 +207,8 @@ enum TimelineUXSmokeHarness {
             track: track,
             texture: texture,
             viewportSize: viewportSize,
-            backingScale: backingScale
+            backingScale: backingScale,
+            frameStatsBox: frameStatsBox
         )
         complete("rapid selection drag updates stay responsive and visible")
 
@@ -216,9 +217,20 @@ enum TimelineUXSmokeHarness {
             track: track,
             texture: texture,
             viewportSize: viewportSize,
-            backingScale: backingScale
+            backingScale: backingScale,
+            frameStatsBox: frameStatsBox
         )
         complete("rapid hover guide updates stay responsive and visible")
+
+        try verifyViewportInteractionUpdatesStayResponsive(
+            renderer: renderer,
+            track: track,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale,
+            frameStatsBox: frameStatsBox
+        )
+        complete("rapid viewport interaction updates stay GPU-only and visible")
 
         try verifyDeletionEffectLifecycle(
             renderer: renderer,
@@ -827,7 +839,8 @@ enum TimelineUXSmokeHarness {
         track: TimelineRenderState.Track,
         texture: MTLTexture,
         viewportSize: CGSize,
-        backingScale: Float
+        backingScale: Float,
+        frameStatsBox: FrameStatsBox
     ) throws {
         let dragOverview = makeDetailedWaveformOverview(
             duration: 480,
@@ -853,6 +866,7 @@ enum TimelineUXSmokeHarness {
         renderer.displayTrackLayout(.default)
         renderer.displayViewport(dragViewport)
         renderer.displayPlaybackActive(false)
+        frameStatsBox.samples.removeAll()
         renderer.displayPlayheadProgress(
             0.10,
             force: true,
@@ -867,15 +881,22 @@ enum TimelineUXSmokeHarness {
             displayTimestamp: baseTimestamp
         )
 
+        func publishDrag(
+            _ selection: TimelineSelection,
+            velocityPixelsPerSecond: Float = 1_250,
+            timestamp: CFTimeInterval
+        ) {
+            renderer.publishInteractionSelectionDragSnapshot(TimelineSelectionDragSnapshot(
+                selection: selection,
+                leadingProgress: selection.endProgressFloat,
+                velocityPixelsPerSecond: velocityPixelsPerSecond,
+                direction: 1,
+                timestamp: timestamp
+            ))
+        }
+
         let firstSelection = TimelineSelection(startProgress: 0.10, endProgress: 0.12, trackID: track.id)
-        renderer.publishInteractionSelection(firstSelection)
-        renderer.publishInteractionSelectionDrag(
-            firstSelection,
-            leadingProgress: firstSelection.endProgressFloat,
-            velocityPixelsPerSecond: 920,
-            direction: 1,
-            timestamp: baseTimestamp
-        )
+        publishDrag(firstSelection, velocityPixelsPerSecond: 920, timestamp: baseTimestamp)
         let firstFrame = try renderCurrentTimeline(
             renderer: renderer,
             displayTimestamp: baseTimestamp,
@@ -890,12 +911,9 @@ enum TimelineUXSmokeHarness {
                 endProgress: 0.14 + Double(warmupIndex) * 0.01,
                 trackID: track.id
             )
-            renderer.publishInteractionSelection(selection)
-            renderer.publishInteractionSelectionDrag(
+            publishDrag(
                 selection,
-                leadingProgress: selection.endProgressFloat,
                 velocityPixelsPerSecond: 980,
-                direction: 1,
                 timestamp: baseTimestamp + Double(warmupIndex + 1) / 144.0
             )
             let renderPassDescriptor = makeRenderPassDescriptor(texture: texture)
@@ -915,12 +933,8 @@ enum TimelineUXSmokeHarness {
                 endProgress: 0.12 + t * 0.68,
                 trackID: track.id
             )
-            renderer.publishInteractionSelection(selection)
-            renderer.publishInteractionSelectionDrag(
+            publishDrag(
                 selection,
-                leadingProgress: selection.endProgressFloat,
-                velocityPixelsPerSecond: 1_250,
-                direction: 1,
                 timestamp: baseTimestamp + Double(frameIndex + 10) / 144.0
             )
 
@@ -937,13 +951,35 @@ enum TimelineUXSmokeHarness {
             frameDurations.append((CACurrentMediaTime() - startTime) * 1_000)
         }
 
+        let burstTimestamp = baseTimestamp + 0.86
+        for burstIndex in 0..<240 {
+            let t = Double(burstIndex) / 239.0
+            let selection = TimelineSelection(
+                startProgress: 0.10,
+                endProgress: 0.12 + t * 0.68,
+                trackID: track.id
+            )
+            publishDrag(
+                selection,
+                velocityPixelsPerSecond: 1_800,
+                timestamp: burstTimestamp + Double(burstIndex) / 12_000.0
+            )
+        }
+        let burstRenderPassDescriptor = makeRenderPassDescriptor(texture: texture)
+        let burstStartTime = CACurrentMediaTime()
+        let burstCommandBuffer = renderer.renderOffscreen(
+            renderPassDescriptor: burstRenderPassDescriptor,
+            viewportSize: viewportSize,
+            backingScale: backingScale,
+            displayTimestamp: burstTimestamp + 1.0 / 144.0,
+            waitUntilCompleted: false
+        )
+        burstCommandBuffer?.waitUntilCompleted()
+        let burstDurationMilliseconds = (CACurrentMediaTime() - burstStartTime) * 1_000
+
         let finalSelection = TimelineSelection(startProgress: 0.10, endProgress: 0.80, trackID: track.id)
-        renderer.publishInteractionSelection(finalSelection)
-        renderer.publishInteractionSelectionDrag(
+        publishDrag(
             finalSelection,
-            leadingProgress: finalSelection.endProgressFloat,
-            velocityPixelsPerSecond: 1_250,
-            direction: 1,
             timestamp: baseTimestamp + 0.5
         )
         let lastFrame = try renderCurrentTimeline(
@@ -964,6 +1000,23 @@ enum TimelineUXSmokeHarness {
             maxMilliseconds < 8,
             String(format: "selection drag render outlier was too slow: %.2fms", maxMilliseconds)
         )
+        try require(
+            burstDurationMilliseconds < 8,
+            String(format: "selection drag burst render was too slow: %.2fms", burstDurationMilliseconds)
+        )
+
+        let dragStats = frameStatsBox.samples.filter { $0.waveformHotPathReason == "selection-drag" }
+        try require(!dragStats.isEmpty, "selection drag did not publish hot-path frame stats")
+        let fallbackStats = dragStats.filter {
+            $0.cpuWaveformVertexCount > 0 ||
+                $0.cpuWaveformFallbackDrawCount > 0 ||
+                $0.shaderBufferUploadByteCount > 0 ||
+                $0.shaderBufferUploadCount > 0
+        }
+        try require(
+            fallbackStats.isEmpty,
+            "selection drag used CPU fallback or shader uploads in \(fallbackStats.count) frames"
+        )
 
         let changedPixels = pixelDifferenceCount(firstFrame.bytes, lastFrame.bytes, threshold: 8)
         renderer.displaySelection(nil)
@@ -975,7 +1028,8 @@ enum TimelineUXSmokeHarness {
         track: TimelineRenderState.Track,
         texture: MTLTexture,
         viewportSize: CGSize,
-        backingScale: Float
+        backingScale: Float,
+        frameStatsBox: FrameStatsBox
     ) throws {
         var frameDurations: [Double] = []
         frameDurations.reserveCapacity(54)
@@ -991,6 +1045,14 @@ enum TimelineUXSmokeHarness {
             anchorTimestamp: baseTimestamp,
             resetsTouchStart: true
         )
+        try waitForVisibleWaveformBuffers(
+            renderer: renderer,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale,
+            displayTimestamp: baseTimestamp
+        )
+        frameStatsBox.samples.removeAll()
 
         renderer.displayHoverProgress(0.15, isArmed: true)
         let firstFrame = try renderTimeline(
@@ -1030,9 +1092,27 @@ enum TimelineUXSmokeHarness {
                 displayTimestamp: baseTimestamp + Double(frameIndex + 10) / 144.0,
                 waitUntilCompleted: false
             )
-            frameDurations.append((CACurrentMediaTime() - startTime) * 1_000)
             commandBuffer?.waitUntilCompleted()
+            frameDurations.append((CACurrentMediaTime() - startTime) * 1_000)
+            usleep(8_000)
         }
+
+        let burstTimestamp = baseTimestamp + 0.72
+        for burstIndex in 0..<240 {
+            let t = Float(burstIndex) / 239.0
+            renderer.publishInteractionHover(progress: 0.15 + t * 0.70, isArmed: true)
+        }
+        let burstRenderPassDescriptor = makeRenderPassDescriptor(texture: texture)
+        let burstStartTime = CACurrentMediaTime()
+        let burstCommandBuffer = renderer.renderOffscreen(
+            renderPassDescriptor: burstRenderPassDescriptor,
+            viewportSize: viewportSize,
+            backingScale: backingScale,
+            displayTimestamp: burstTimestamp + 1.0 / 144.0,
+            waitUntilCompleted: false
+        )
+        burstCommandBuffer?.waitUntilCompleted()
+        let burstDurationMilliseconds = (CACurrentMediaTime() - burstStartTime) * 1_000
 
         renderer.displayHoverProgress(0.85, isArmed: true)
         let lastFrame = try renderTimeline(
@@ -1050,17 +1130,148 @@ enum TimelineUXSmokeHarness {
         let p95Milliseconds = percentile(frameDurations, percentile: 0.95)
         let maxMilliseconds = frameDurations.max() ?? 0
         try require(
-            p95Milliseconds < 2.5,
+            p95Milliseconds < 6.9,
             String(format: "hover guide render p95 was too slow: %.2fms", p95Milliseconds)
         )
         try require(
-            maxMilliseconds < 8,
+            maxMilliseconds < 12,
             String(format: "hover guide render outlier was too slow: %.2fms", maxMilliseconds)
+        )
+        try require(
+            burstDurationMilliseconds < 8,
+            String(format: "hover guide burst render was too slow: %.2fms", burstDurationMilliseconds)
+        )
+
+        let hoverStats = frameStatsBox.samples.filter { $0.waveformHotPathReason == "hover" }
+        try require(!hoverStats.isEmpty, "hover guide did not publish hot-path frame stats")
+        let fallbackStats = hoverStats.filter {
+            $0.cpuWaveformVertexCount > 0 ||
+                $0.cpuWaveformFallbackDrawCount > 0 ||
+                $0.shaderBufferUploadByteCount > 0 ||
+                $0.shaderBufferUploadCount > 0
+        }
+        try require(
+            fallbackStats.isEmpty,
+            "hover guide used CPU fallback or shader uploads in \(fallbackStats.count) frames"
         )
 
         let changedPixels = pixelDifferenceCount(firstFrame.bytes, lastFrame.bytes, threshold: 8)
         renderer.displayHoverProgress(nil, isArmed: false)
         try require(changedPixels > 600, "hover guide did not visibly update final position: \(changedPixels)")
+    }
+
+    private static func verifyViewportInteractionUpdatesStayResponsive(
+        renderer: TimelineRenderer,
+        track: TimelineRenderState.Track,
+        texture: MTLTexture,
+        viewportSize: CGSize,
+        backingScale: Float,
+        frameStatsBox: FrameStatsBox
+    ) throws {
+        var frameDurations: [Double] = []
+        frameDurations.reserveCapacity(54)
+        let baseTimestamp = CACurrentMediaTime()
+        let startViewport = TimelineViewport(startProgress: 0.02, durationProgress: 0.24)
+
+        renderer.displayTracks([track], animateWaveformTransition: false)
+        renderer.displayTrackLayout(.default)
+        renderer.displayViewport(startViewport)
+        renderer.displayPlaybackActive(false)
+        try waitForVisibleWaveformBuffers(
+            renderer: renderer,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale,
+            displayTimestamp: baseTimestamp
+        )
+        frameStatsBox.samples.removeAll()
+
+        renderer.publishInteractionViewport(startViewport)
+        let firstFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: baseTimestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+
+        for frameIndex in 0..<54 {
+            let t = Float(frameIndex) / 53.0
+            let viewport = TimelineViewport(
+                startProgress: 0.02 + t * 0.28,
+                durationProgress: 0.24 - t * 0.06
+            )
+            renderer.publishInteractionViewport(viewport)
+
+            let renderPassDescriptor = makeRenderPassDescriptor(texture: texture)
+            let startTime = CACurrentMediaTime()
+            let commandBuffer = renderer.renderOffscreen(
+                renderPassDescriptor: renderPassDescriptor,
+                viewportSize: viewportSize,
+                backingScale: backingScale,
+                displayTimestamp: baseTimestamp + Double(frameIndex + 1) / 144.0,
+                waitUntilCompleted: false
+            )
+            commandBuffer?.waitUntilCompleted()
+            frameDurations.append((CACurrentMediaTime() - startTime) * 1_000)
+            usleep(8_000)
+        }
+
+        let burstTimestamp = baseTimestamp + 0.72
+        for burstIndex in 0..<240 {
+            let t = Float(burstIndex) / 239.0
+            renderer.publishInteractionViewport(TimelineViewport(
+                startProgress: 0.02 + t * 0.28,
+                durationProgress: 0.18
+            ))
+        }
+        let burstRenderPassDescriptor = makeRenderPassDescriptor(texture: texture)
+        let burstStartTime = CACurrentMediaTime()
+        let burstCommandBuffer = renderer.renderOffscreen(
+            renderPassDescriptor: burstRenderPassDescriptor,
+            viewportSize: viewportSize,
+            backingScale: backingScale,
+            displayTimestamp: burstTimestamp + 1.0 / 144.0,
+            waitUntilCompleted: false
+        )
+        burstCommandBuffer?.waitUntilCompleted()
+        let burstDurationMilliseconds = (CACurrentMediaTime() - burstStartTime) * 1_000
+
+        let lastFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: baseTimestamp + 1,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+
+        let p95Milliseconds = percentile(frameDurations, percentile: 0.95)
+        let maxMilliseconds = frameDurations.max() ?? 0
+        try require(
+            p95Milliseconds < 6.9,
+            String(format: "viewport interaction render p95 was too slow: %.2fms", p95Milliseconds)
+        )
+        try require(
+            maxMilliseconds < 12,
+            String(format: "viewport interaction render outlier was too slow: %.2fms", maxMilliseconds)
+        )
+        try require(
+            burstDurationMilliseconds < 8,
+            String(format: "viewport interaction burst render was too slow: %.2fms", burstDurationMilliseconds)
+        )
+
+        let viewportStats = frameStatsBox.samples.filter { $0.waveformHotPathReason == "viewport-interaction" }
+        try require(!viewportStats.isEmpty, "viewport interaction did not publish hot-path frame stats")
+        let fallbackStats = viewportStats.filter {
+            $0.cpuWaveformVertexCount > 0 || $0.cpuWaveformFallbackDrawCount > 0
+        }
+        try require(
+            fallbackStats.isEmpty,
+            "viewport interaction used CPU fallback in \(fallbackStats.count) frames"
+        )
+
+        let changedPixels = pixelDifferenceCount(firstFrame.bytes, lastFrame.bytes, threshold: 8)
+        try require(changedPixels > 4_000, "viewport interaction did not visibly update waveform: \(changedPixels)")
     }
 
     private static func verifyDeletionEffectLifecycle(

@@ -64,6 +64,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onNormalizeRequested: (() -> Void)?
     var onDenoiseRequested: (() -> Void)?
     var onSeparateMusicStemsRequested: (() -> Void)?
+    var onTranscribeSelectedTrackRequested: (() -> Void)?
+    var onToggleTranscriptLayerRequested: (() -> Void)?
+    var onTranscriptSelectionChanged: ((TranscriptTokenSelection?) -> Void)?
+    var onTranscriptEditCommandRequested: ((TranscriptEditCommand) -> Void)?
+    var onToggleTranscriptAlignmentDebugRequested: (() -> Void)?
     var onDeleteSilenceRequested: (() -> Void)?
     var onAcceptDeadAirCandidateRequested: (() -> Void)?
     var onAcceptHighConfidenceDeadAirCandidatesRequested: (() -> Void)?
@@ -82,6 +87,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onTimelineInteractionBegan: (() -> Void)?
     var onTrackLaneLayoutChanged: ((ResolvedTimelineTrackLayout) -> Void)?
     var onLoopRangeChanged: ((TimelineLoopRange) -> Void)?
+    var onLoopRangeEnabledChanged: ((Bool) -> Void)?
     var onExportWAVRequested: (() -> Void)?
     var onExportSelectedRegionRequested: (() -> Void)?
     var onExportMixdownAndStemsRequested: (() -> Void)?
@@ -90,6 +96,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var canApplyFadeEffect = false
     var canApplyDenoiseEffect = false
     var canApplyStemSeparationEffect = false
+    var canTranscribeSelectedTrack = false
     var canReapplyLastEffect = false
     var canSplitAtPlayhead = false
     var canCutSelection = false
@@ -108,6 +115,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         case clipBoundary
         case loopStart
         case loopEnd
+        case loopRegion
     }
 
     private struct ClipBoundaryHit {
@@ -121,9 +129,17 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         case zoom
     }
 
+    private enum TimelineRenderCadence {
+        case immediate
+        case coalescedInteraction
+        case displayLinkPulse
+        case none
+    }
+
     private var timelineRenderer: TimelineRenderer?
     private var currentTrackIDs: [UUID] = []
     private var currentRenderTracks: [TimelineRenderState.Track] = []
+    private let transcriptOverlayView = TimelineTranscriptOverlayView()
     private let dropPreviewLayer = CALayer()
     private let dropPreviewAccentLayer = CALayer()
     private let dropPreviewTextLayer = CATextLayer()
@@ -142,6 +158,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var selectionAnchorPoint: CGPoint?
     private var selectionAnchorTrackID: UUID?
     private var currentSelection: TimelineSelection?
+    private var liveSelectionDragSnapshot: TimelineSelectionDragSnapshot?
     private var selectionDragPreviousPoint: CGPoint?
     private var selectionDragPreviousTimestamp: CFTimeInterval?
     private var selectionDragVelocityPixelsPerSecond: CGFloat = 0
@@ -150,6 +167,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var hoveredLoopEndpoint: TimelineLoopEndpoint?
     private var activeLoopDragOffsetX: CGFloat = 0
     private var loopRange = TimelineLoopRange.default
+    private var isLoopRangeEnabled = true
+    private var isLoopRegionHovered = false
     private var hoverTrackingArea: NSTrackingArea?
     private var isInteractionSuppressed = false
     private var isDraggingSelection = false
@@ -174,13 +193,24 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var scrollGestureMode: ScrollGestureMode?
     private var timelineDisplayLink: TimelineDisplayLink?
     private var transientRenderEndTime: CFTimeInterval?
+    private var selectionDragRenderEndTime: CFTimeInterval?
     private var isProcessingSelectionAnimationActive = false
     private var needsTimelineRender = false
     private var isRenderDataPreparedRenderPending = false
     private var pendingRenderSubmittedCallbacks: [(CFTimeInterval) -> Void] = []
     private let renderFlightGate = RenderFlightGate()
+    private var pendingTranscriptOverlayUpdate = false
+    private var pendingCursorRectInvalidation = false
+    private var lastTranscriptOverlayUpdateTime: CFTimeInterval = 0
+    private let transcriptOverlayInteractionUpdateInterval: CFTimeInterval = 1.0 / 24.0
+    private var transcriptInteractionState = TranscriptInteractionState.empty
+    private var activeTranscriptDrag: TranscriptInteractionDrag?
+    private var currentTranscriptSelection: TranscriptTokenSelection?
+    private var isTranscriptAlignmentDebugVisible = false
     private var isTimelinePlaybackActive = false
     private var timelineDuration: TimeInterval = 0
+    private var isTranscriptLayerVisible = false
+    private var transcriptDisplayMode = TranscriptTimelineDisplayMode.hidden
     private var pagingPlayheadProgress: Float = 0
     private var pagingPlayheadAnchorTimestamp = CACurrentMediaTime()
     private var latestSubmittedPresentationTimestamp = CACurrentMediaTime()
@@ -191,6 +221,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private let trimHandleHitWidth: CGFloat = 18
     private let loopFlagWidth: CGFloat = 18
     private let loopFlagHeight: CGFloat = 18
+    private let loopRegionEdgeHitWidth: CGFloat = 14
     private let rightPanVelocitySmoothing: Float = 0.54
     private let rightPanMomentumDecayRate: Double = 3.85
     private let rightPanMomentumMinimumVelocity: Float = 0.00042
@@ -206,7 +237,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private let playbackStopTouchTrailRenderPulseDuration: CFTimeInterval = 1.25
     private let waveformTransitionRenderPulseDuration: CFTimeInterval = 0.24
     private let selectionDragEffectRenderPulseDuration: CFTimeInterval = 0.72
-    private let deletionEffectRenderPulseDuration: CFTimeInterval = 2.10
+    private let deletionEffectRenderPulseDuration: CFTimeInterval = 0.18
     private let targetFramesPerSecond = 144
     private let scrollZoomSensitivity: Float = 0.01
     private let supportedAudioExtensions = AudioAssetImporter.supportedAudioFileExtensions
@@ -282,13 +313,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             setViewport(.full, kicksImmediateRender: false)
         }
         updateTrackLayoutForCurrentBounds(requestRender: false)
+        updateTranscriptOverlay()
         updateTimelineRenderer { renderer in
             renderer.displayWaveform(waveformOverview)
         }
         displayTrimPreview(nil)
 
         if wasSelectionEnabled != isSelectionEnabled {
-            window?.invalidateCursorRects(for: self)
+            invalidateTimelineCursorRects()
         }
 
         startTransientRenderPulse(duration: waveformTransitionRenderPulseDuration)
@@ -316,7 +348,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     func displayTracks(
         _ tracks: [TimelineRenderState.Track],
         animateWaveformTransition: Bool = true,
-        allowImmediateWaveformPrewarm: Bool = true
+        allowImmediateWaveformPrewarm: Bool = true,
+        allowImmediateInteractiveWaveformPrewarm: Bool = true
     ) {
         let previousTimelineDuration = timelineDuration
         let previousViewport = viewport
@@ -344,18 +377,20 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             setViewport(pendingRestoredViewport, kicksImmediateRender: false)
         }
         updateTrackLayoutForCurrentBounds(requestRender: false)
+        updateTranscriptOverlay()
         updateTimelineRenderer { renderer in
             renderer.displayTracks(
                 tracks,
                 animateWaveformTransition: animateWaveformTransition,
-                allowImmediateWaveformPrewarm: allowImmediateWaveformPrewarm
+                allowImmediateWaveformPrewarm: allowImmediateWaveformPrewarm,
+                allowImmediateInteractiveWaveformPrewarm: allowImmediateInteractiveWaveformPrewarm
             )
         }
         requestTimelineRender()
         displayTrimPreview(nil)
 
         if wasSelectionEnabled != isSelectionEnabled {
-            window?.invalidateCursorRects(for: self)
+            invalidateTimelineCursorRects()
         }
 
         if animateWaveformTransition {
@@ -440,13 +475,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         let wasSelectionEnabled = isSelectionEnabled
         isSelectionEnabled = Self.hasInteractiveTimelineContent(mergedTracks)
         updateTrackLayoutForCurrentBounds(requestRender: false)
+        updateTranscriptOverlay()
         updateTimelineRenderer { renderer in
             renderer.displayTrackMixSettings(mergedTracks)
         }
         requestTimelineRender()
 
         if wasSelectionEnabled != isSelectionEnabled {
-            window?.invalidateCursorRects(for: self)
+            invalidateTimelineCursorRects()
         }
     }
 
@@ -480,10 +516,71 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                 isSoloed: track.isSoloed,
                 hasWaveform: track.hasWaveform || current?.hasWaveform == true,
                 clipRanges: track.clipRanges.isEmpty ? (current?.clipRanges ?? []) : track.clipRanges,
-                waveformSegments: track.waveformSegments.isEmpty ? (current?.waveformSegments ?? []) : track.waveformSegments,
-                waveformTileSource: track.waveformTileSource ?? current?.waveformTileSource
+                waveformSegments: Self.shouldPreserveCurrentWaveformSegments(for: track) ?
+                    (current?.waveformSegments ?? []) :
+                    track.waveformSegments,
+                waveformTileSource: track.waveformTileSource ?? current?.waveformTileSource,
+                transcript: track.transcript ?? current?.transcript
             )
         }
+    }
+
+    private static func shouldPreserveCurrentWaveformSegments(
+        for track: TimelineRenderState.Track
+    ) -> Bool {
+        track.waveformSegments.isEmpty &&
+            track.waveformOverview == nil &&
+            track.waveformTileSource == nil
+    }
+
+    func displayTranscriptLayerVisible(_ isVisible: Bool) {
+        displayTranscriptMode(isVisible ? .waveformOverlay : .hidden)
+    }
+
+    func displayTranscriptMode(_ mode: TranscriptTimelineDisplayMode) {
+        let sanitizedMode = mode
+        guard transcriptDisplayMode != sanitizedMode else {
+            updateTranscriptOverlay()
+            return
+        }
+
+        transcriptDisplayMode = sanitizedMode
+        isTranscriptLayerVisible = sanitizedMode != .hidden
+        updateTranscriptOverlay()
+    }
+
+    func displayTranscriptSelection(_ selection: TranscriptTokenSelection?) {
+        currentTranscriptSelection = selection
+        transcriptInteractionState = TranscriptInteractionModel.state(
+            previous: transcriptInteractionState,
+            selection: selection
+        )
+        transcriptOverlayView.updateInteractionState(transcriptInteractionState)
+    }
+
+    func displayTranscriptMirroredTimelineSelection(_ selection: TimelineSelection?) {
+        transcriptInteractionState = TranscriptInteractionModel.state(
+            previous: transcriptInteractionState,
+            mirroredTimelineSelection: selection
+        )
+        transcriptOverlayView.updateInteractionState(transcriptInteractionState)
+    }
+
+    func displayTranscriptActiveWord(_ wordID: UUID?) {
+        transcriptInteractionState = TranscriptInteractionModel.state(
+            previous: transcriptInteractionState,
+            activeWordID: wordID
+        )
+        transcriptOverlayView.updateInteractionState(transcriptInteractionState)
+    }
+
+    func displayTranscriptAlignmentDebug(_ isVisible: Bool) {
+        isTranscriptAlignmentDebugVisible = isVisible
+        transcriptInteractionState = TranscriptInteractionModel.state(
+            previous: transcriptInteractionState,
+            alignmentDebugEnabled: isVisible
+        )
+        transcriptOverlayView.updateInteractionState(transcriptInteractionState)
     }
 
     func updateWaveformTouchTuning(
@@ -590,8 +687,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     func displaySelection(_ selection: TimelineSelection?) {
         currentSelection = selection
+        liveSelectionDragSnapshot = nil
         if selection == nil {
-            timelineRenderer?.publishInteractionSelectionDrag(nil)
+            clearLiveSelectionDragSnapshot(clearsSelection: true)
         }
         updateTimelineRendererImmediately { renderer in
             renderer.displaySelection(selection)
@@ -613,6 +711,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
     }
 
+    func triggerSelectionCopyFlash() {
+        updateTimelineRendererImmediately { renderer in
+            renderer.triggerSelectionCopyFlash()
+        }
+        requestTimelineRender()
+        startTransientRenderPulse(duration: 0.20)
+    }
+
     func setInteractionSuppressed(_ isSuppressed: Bool) {
         guard isInteractionSuppressed != isSuppressed else {
             updateTimelineRendererImmediately { renderer in
@@ -631,15 +737,19 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             selectionAnchorProgress = nil
             selectionAnchorPoint = nil
             selectionAnchorTrackID = nil
+            clearLiveSelectionDragSnapshot()
             isDraggingSelection = false
             isDraggingTrim = false
             isDraggingLoop = false
+            activeTranscriptDrag = nil
             activeLoopDragOffsetX = 0
             displayHoverProgress(nil)
             displayHighlightedLoopEndpoint(nil)
+            displayHighlightedLoopRegion(false)
             stopRightPanMomentum()
             stopZoomMomentum()
             scrollGestureMode = nil
+            flushPendingCursorRectInvalidationIfNeeded()
         }
     }
 
@@ -659,18 +769,35 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         schedulesRender: Bool = true
     ) {
         currentSelection = selection
-        timelineRenderer?.publishInteractionSelection(selection)
-        timelineRenderer?.publishInteractionSelectionDrag(
-            selection,
+        guard let selection, selection.durationProgress > 0 else {
+            clearLiveSelectionDragSnapshot(clearsSelection: true)
+            if schedulesRender {
+                kickInteractionRenderIfPossible()
+            }
+            return
+        }
+
+        let snapshot = TimelineSelectionDragSnapshot(
+            selection: selection,
             leadingProgress: Float(leadingProgress),
             velocityPixelsPerSecond: Float(velocityPixelsPerSecond),
             direction: Float(direction),
             timestamp: timestamp
         )
-        startTransientRenderPulse(duration: selectionDragWaveformRenderPulseDuration)
+        liveSelectionDragSnapshot = snapshot
+        timelineRenderer?.publishInteractionSelectionDragSnapshot(snapshot)
+        startSelectionDragRenderPulse(duration: selectionDragWaveformRenderPulseDuration)
         if schedulesRender {
             kickInteractionRenderIfPossible()
         }
+    }
+
+    private func clearLiveSelectionDragSnapshot(clearsSelection: Bool = false) {
+        liveSelectionDragSnapshot = nil
+        if clearsSelection {
+            timelineRenderer?.publishInteractionSelection(nil)
+        }
+        timelineRenderer?.publishInteractionSelectionDragSnapshot(nil)
     }
 
     func displaySelectedTrack(_ trackID: UUID?) {
@@ -687,11 +814,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         requestTimelineRender()
     }
 
-    func displayTrimPreview(_ trimRange: TimelineTrimRange?) {
+    private func displayTrimPreview(
+        _ trimRange: TimelineTrimRange?,
+        renderCadence: TimelineRenderCadence = .immediate
+    ) {
         updateTimelineRendererImmediately { renderer in
             renderer.displayTrimPreview(trimRange)
         }
-        requestTimelineRender()
+        requestRender(cadence: renderCadence)
     }
 
     func displayLoopRange(_ loopRange: TimelineLoopRange) {
@@ -703,11 +833,34 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         updateTimelineRendererImmediately { renderer in
             renderer.displayLoopRange(loopRange)
         }
-        window?.invalidateCursorRects(for: self)
+        invalidateTimelineCursorRects()
         requestTimelineRender()
     }
 
-    private func displayHighlightedLoopEndpoint(_ endpoint: TimelineLoopEndpoint?) {
+    func displayLoopRangeEnabled(_ isEnabled: Bool) {
+        guard isLoopRangeEnabled != isEnabled else {
+            return
+        }
+
+        isLoopRangeEnabled = isEnabled
+        updateTimelineRendererImmediately { renderer in
+            renderer.displayLoopRangeEnabled(isEnabled)
+        }
+        requestTimelineRender()
+    }
+
+    func triggerLoopRangeFlash() {
+        updateTimelineRendererImmediately { renderer in
+            renderer.triggerLoopRangeFlash()
+        }
+        startTransientRenderPulse(duration: 0.35)
+        requestTimelineRender()
+    }
+
+    private func displayHighlightedLoopEndpoint(
+        _ endpoint: TimelineLoopEndpoint?,
+        renderCadence: TimelineRenderCadence = .immediate
+    ) {
         guard hoveredLoopEndpoint != endpoint else {
             return
         }
@@ -716,14 +869,33 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         updateTimelineRendererImmediately { renderer in
             renderer.displayHighlightedLoopEndpoint(endpoint)
         }
-        requestTimelineRender()
+        requestRender(cadence: renderCadence)
     }
 
-    func displayHoverProgress(_ progress: Float?, isArmed: Bool = false) {
+    private func displayHighlightedLoopRegion(
+        _ isHighlighted: Bool,
+        renderCadence: TimelineRenderCadence = .immediate
+    ) {
+        guard isLoopRegionHovered != isHighlighted else {
+            return
+        }
+
+        isLoopRegionHovered = isHighlighted
+        updateTimelineRendererImmediately { renderer in
+            renderer.displayHighlightedLoopRegion(isHighlighted)
+        }
+        requestRender(cadence: renderCadence)
+    }
+
+    private func displayHoverProgress(
+        _ progress: Float?,
+        isArmed: Bool = false,
+        renderCadence: TimelineRenderCadence = .immediate
+    ) {
         let publishedProgress = isInteractionSuppressed ? nil : progress
         let publishedArmed = isInteractionSuppressed ? false : isArmed
         timelineRenderer?.publishInteractionHover(progress: publishedProgress, isArmed: publishedArmed)
-        requestTimelineRender()
+        requestRender(cadence: renderCadence)
     }
 
     func displayGainPreview(selection: TimelineSelection?, gain: Float) {
@@ -761,6 +933,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         startTransientRenderPulse(duration: deletionEffectRenderPulseDuration)
     }
 
+    func triggerPasteEffect(selection: TimelineSelection, waveformOverview: WaveformOverview?) {
+        updateTimelineRendererImmediately { renderer in
+            renderer.triggerPasteEffect(selection: selection, waveformOverview: waveformOverview)
+        }
+        requestTimelineRender()
+        startTransientRenderPulse(duration: deletionEffectRenderPulseDuration)
+    }
+
     func clearDeletionEffects() {
         updateTimelineRenderer { renderer in
             renderer.clearDeletionEffects()
@@ -783,14 +963,18 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         layer?.cornerRadius = 8
         layer?.masksToBounds = true
         configureDropPreviewLayer()
+        transcriptOverlayView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(transcriptOverlayView)
 
         registerForDraggedTypes([.fileURL])
     }
 
     override func layout() {
         super.layout()
+        transcriptOverlayView.frame = bounds
         updateTrackLayoutForCurrentBounds(requestRender: false)
         updateDropPreviewLayout()
+        updateTranscriptOverlay()
         requestTimelineRender()
     }
 
@@ -839,10 +1023,12 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             let initialViewport = viewport
             let initialTrackLayout = trackLayout
             let initialLoopRange = loopRange
+            let initialLoopRangeEnabled = isLoopRangeEnabled
             updateTimelineRenderer { renderer in
                 renderer.displayViewport(initialViewport)
                 renderer.displayTrackLayout(initialTrackLayout)
                 renderer.displayLoopRange(initialLoopRange)
+                renderer.displayLoopRangeEnabled(initialLoopRangeEnabled)
             }
             requestTimelineRender()
         } catch {
@@ -995,12 +1181,34 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     private func updatePreferredFrameRate() {
         preferredFramesPerSecond = targetFramesPerSecond
+        PerformanceSampler.shared.updateTargetFramesPerSecond(targetFramesPerSecond)
         timelineDisplayLink?.updatePreferredFramesPerSecond(targetFramesPerSecond)
     }
 
     private func requestTimelineRender() {
         needsTimelineRender = true
         startTimelineDisplayLink()
+    }
+
+    private func requestCoalescedInteractionRender() {
+        guard !needsTimelineRender else {
+            return
+        }
+
+        requestTimelineRender()
+    }
+
+    private func requestRender(cadence: TimelineRenderCadence) {
+        switch cadence {
+        case .immediate:
+            requestTimelineRender()
+        case .coalescedInteraction:
+            requestCoalescedInteractionRender()
+        case .displayLinkPulse:
+            startTimelineDisplayLink()
+        case .none:
+            break
+        }
     }
 
     private func scheduleRenderDataPreparedRender() {
@@ -1046,37 +1254,76 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             !needsTimelineRender,
             !isTimelinePlaybackActive,
             !isProcessingSelectionAnimationActive,
-            !hasActiveTransientRenderPulse()
+            !hasActiveTransientRenderPulse(),
+            !hasActiveSelectionDragRenderPulse()
         else {
             return
         }
 
         timelineDisplayLink?.stop()
+        publishPerformanceRenderDemand()
+    }
+
+    private var isTimelineGestureActive: Bool {
+        activeDragMode != nil ||
+            activeTranscriptDrag != nil ||
+            isDraggingSelection ||
+            isDraggingTrim ||
+            isDraggingLoop ||
+            scrollGestureMode != nil ||
+            rightPanPreviousPoint != nil
+    }
+
+    private func invalidateTimelineCursorRects() {
+        guard window != nil else {
+            return
+        }
+
+        guard !isTimelineGestureActive else {
+            pendingCursorRectInvalidation = true
+            return
+        }
+
+        window?.invalidateCursorRects(for: self)
+    }
+
+    private func flushPendingCursorRectInvalidationIfNeeded() {
+        guard pendingCursorRectInvalidation, window != nil else {
+            return
+        }
+
+        pendingCursorRectInvalidation = false
+        window?.invalidateCursorRects(for: self)
     }
 
     private func tearDownTimelineAnimation() {
         timelineDisplayLink?.invalidate()
         timelineDisplayLink = nil
         transientRenderEndTime = nil
+        selectionDragRenderEndTime = nil
         isProcessingSelectionAnimationActive = false
         needsTimelineRender = false
         isTimelinePlaybackActive = false
         stopRightPanMomentum()
         stopZoomMomentum()
+        PerformanceSampler.shared.updateRenderDemand(.idle)
     }
 
     private func displayLinkDidTick(_ frame: TimelineDisplayLinkFrame) {
+        publishPerformanceRenderDemand()
         let shouldRender = needsTimelineRender ||
             isTimelinePlaybackActive ||
             isProcessingSelectionAnimationActive ||
-            hasActiveTransientRenderPulse()
+            hasActiveTransientRenderPulse() ||
+            hasActiveSelectionDragRenderPulse()
 
         guard shouldRender else {
             timelineDisplayLink?.stop()
+            PerformanceSampler.shared.updateRenderDemand(.idle)
             return
         }
 
-        if refreshLiveSelectionFromCurrentMouse(at: CACurrentMediaTime()) {
+        if refreshLiveSelectionFromCurrentMouse(sampledAt: CACurrentMediaTime()) {
             needsTimelineRender = true
         }
 
@@ -1085,7 +1332,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             !viewport.isFull,
             let playheadProgress = projectedPagingPlayheadProgress(at: frame.targetPresentationTimestamp)
         {
-            pageViewportIfNeeded(forPlayheadProgress: playheadProgress)
+            pageViewportIfNeeded(
+                forPlayheadProgress: playheadProgress,
+                renderCadence: .coalescedInteraction
+            )
         }
 
         let didSubmitRender = submitTimelineRender(frame: frame)
@@ -1148,13 +1398,44 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             scrollGestureMode != nil
     }
 
+    private func publishPerformanceRenderDemand() {
+        PerformanceSampler.shared.updateRenderDemand(currentPerformanceRenderDemand())
+    }
+
+    private func currentPerformanceRenderDemand() -> PerformanceRenderDemand {
+        if isTimelinePlaybackActive {
+            return .playback
+        }
+
+        if hasActiveSelectionDragRenderPulse() {
+            return .interaction
+        }
+
+        if isDraggingSelection ||
+            isDraggingTrim ||
+            activeDragMode != nil ||
+            rightPanMomentumTimer != nil ||
+            zoomMomentumTimer != nil ||
+            scrollGestureMode != nil
+        {
+            return .interaction
+        }
+
+        if isProcessingSelectionAnimationActive || hasActiveTransientRenderPulse() {
+            return .animation
+        }
+
+        return .idle
+    }
+
     private func kickInteractionRenderIfPossible() {
-        // Keep all visible timeline mutations on the canonical display-link
-        // render path. The old direct interaction kick raced queued renderer
-        // state updates and could leave the presented Metal frame stuck on an
-        // older viewport/playhead while model and audio state kept changing.
         timelineRenderer?.noteTimelineInteraction()
         requestTimelineRender()
+    }
+
+    private func kickInteractionRenderIfPossible(cadence: TimelineRenderCadence) {
+        timelineRenderer?.noteTimelineInteraction()
+        requestRender(cadence: cadence)
     }
 
     private func currentMousePointInTimeline() -> CGPoint? {
@@ -1166,7 +1447,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         return convert(windowPoint, from: nil)
     }
 
-    private func refreshLiveSelectionFromCurrentMouse(at timestamp: CFTimeInterval) -> Bool {
+    private func refreshLiveSelectionFromCurrentMouse(sampledAt timestamp: CFTimeInterval) -> Bool {
         guard
             isSelectionEnabled,
             activeDragMode == .selection,
@@ -1197,6 +1478,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         startTimelineDisplayLink()
     }
 
+    private func startSelectionDragRenderPulse(duration: CFTimeInterval? = nil) {
+        selectionDragRenderEndTime = CFAbsoluteTimeGetCurrent() + (duration ?? selectionDragWaveformRenderPulseDuration)
+        startTimelineDisplayLink()
+    }
+
     private var selectionDragWaveformRenderPulseDuration: CFTimeInterval {
         max(selectionDragEffectRenderPulseDuration, selectionDragWaveformTuning.contactLifetime + 0.18)
     }
@@ -1213,10 +1499,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     private func loopConstrainedPagingProgress(_ progress: Float) -> Float {
         let clampedProgress = min(max(progress, 0), 1)
+        guard isLoopRangeEnabled else {
+            return clampedProgress
+        }
+
         let start = loopRange.startProgress
         let end = loopRange.endProgress
         let duration = end - start
-        guard duration > 0.0001, end > start else {
+        guard duration > 0.0001, duration < 0.999, end > start else {
             return clampedProgress
         }
 
@@ -1242,6 +1532,19 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         self.transientRenderEndTime = nil
+        return false
+    }
+
+    private func hasActiveSelectionDragRenderPulse() -> Bool {
+        guard let selectionDragRenderEndTime else {
+            return false
+        }
+
+        if CFAbsoluteTimeGetCurrent() <= selectionDragRenderEndTime {
+            return true
+        }
+
+        self.selectionDragRenderEndTime = nil
         return false
     }
 
@@ -1462,13 +1765,28 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         if event.keyCode == 53 {
             displayTrimPreview(nil)
             displaySelection(nil)
+            displayTranscriptSelection(nil)
             onSelectionChanged?(nil)
+            onTranscriptSelectionChanged?(nil)
             onTimelineInteractionBegan?()
             activeDragMode = nil
             activeClipBoundaryHit = nil
+            activeTranscriptDrag = nil
             isDraggingSelection = false
             isDraggingTrim = false
             isDraggingLoop = false
+            flushPendingCursorRectInvalidationIfNeeded()
+            return
+        }
+
+        if (event.keyCode == 51 || event.keyCode == 117), currentTranscriptSelection != nil {
+            let kind: TranscriptEditCommandKind = event.modifierFlags.contains(.command) ?
+                .clearWordsLeaveGap :
+                .deleteWordsRipple
+            onTranscriptEditCommandRequested?(TranscriptEditCommand(
+                kind: kind,
+                selection: currentTranscriptSelection
+            ))
             return
         }
 
@@ -1504,8 +1822,22 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        addTranscriptCursorRects()
         addLoopHandleCursorRects()
         addClipBoundaryCursorRects()
+    }
+
+    private func addTranscriptCursorRects() {
+        guard isTranscriptLayerVisible else {
+            return
+        }
+
+        for rect in transcriptOverlayView.transcriptCursorRects() {
+            guard rect.width > 1, rect.height > 1 else {
+                continue
+            }
+            addCursorRect(rect, cursor: .iBeam)
+        }
     }
 
     private func addLoopHandleCursorRects() {
@@ -1514,12 +1846,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        addCursorRect(rulerRect, cursor: .pointingHand)
         for endpoint in [TimelineLoopEndpoint.start, .end] {
-            guard let rect = loopFlagRect(for: endpoint) else {
+            guard let rect = loopRegionEdgeHitRect(for: endpoint) else {
                 continue
             }
 
-            addCursorRect(rect, cursor: .pointingHand)
+            addCursorRect(rect, cursor: .resizeLeftRight)
         }
     }
 
@@ -1700,6 +2033,48 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onSeparateMusicStemsRequested?()
     }
 
+    @objc func transcribeSelectedTrack(_ sender: Any?) {
+        onTranscribeSelectedTrackRequested?()
+    }
+
+    @objc func toggleTranscriptLayer(_ sender: Any?) {
+        onToggleTranscriptLayerRequested?()
+    }
+
+    @objc func toggleTranscriptAlignmentDebug(_ sender: Any?) {
+        onToggleTranscriptAlignmentDebugRequested?()
+    }
+
+    @objc func deleteTranscriptText(_ sender: Any?) {
+        guard let currentTranscriptSelection else {
+            return
+        }
+        onTranscriptEditCommandRequested?(TranscriptEditCommand(
+            kind: .deleteWordsRipple,
+            selection: currentTranscriptSelection
+        ))
+    }
+
+    @objc func clearTranscriptText(_ sender: Any?) {
+        guard let currentTranscriptSelection else {
+            return
+        }
+        onTranscriptEditCommandRequested?(TranscriptEditCommand(
+            kind: .clearWordsLeaveGap,
+            selection: currentTranscriptSelection
+        ))
+    }
+
+    @objc func splitAtTranscriptWord(_ sender: Any?) {
+        guard let currentTranscriptSelection else {
+            return
+        }
+        onTranscriptEditCommandRequested?(TranscriptEditCommand(
+            kind: .splitAtWordBoundary,
+            selection: currentTranscriptSelection
+        ))
+    }
+
     @objc func deleteSilence(_ sender: Any?) {
         onDeleteSilenceRequested?()
     }
@@ -1744,6 +2119,18 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return canApplyDenoiseEffect
         case #selector(separateMusicStemsTimelineSelection(_:)):
             return canApplyStemSeparationEffect
+        case #selector(transcribeSelectedTrack(_:)):
+            return canTranscribeSelectedTrack
+        case #selector(toggleTranscriptLayer(_:)):
+            menuItem.state = isTranscriptLayerVisible ? .on : .off
+            return true
+        case #selector(toggleTranscriptAlignmentDebug(_:)):
+            menuItem.state = isTranscriptAlignmentDebugVisible ? .on : .off
+            return isTranscriptLayerVisible
+        case #selector(deleteTranscriptText(_:)),
+             #selector(clearTranscriptText(_:)),
+             #selector(splitAtTranscriptWord(_:)):
+            return currentTranscriptSelection != nil
         case #selector(deleteSilence(_:)):
             return canDeleteSilence
         case #selector(acceptDeadAirCandidate(_:)),
@@ -1804,7 +2191,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        PerformanceSampler.shared.recordTimelineInputEvent(kind: "mouse-entered", at: event.timestamp)
         if updateLoopHover(for: event) {
+            return
+        }
+        if updateTranscriptHover(for: event) {
             return
         }
         updateHoverGuide(for: event)
@@ -1815,7 +2206,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        PerformanceSampler.shared.recordTimelineInputEvent(kind: "mouse-moved", at: event.timestamp)
         if updateLoopHover(for: event) {
+            return
+        }
+        if updateTranscriptHover(for: event) {
             return
         }
         updateHoverGuide(for: event)
@@ -1826,8 +2221,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        PerformanceSampler.shared.recordTimelineInputEvent(kind: "mouse-exited", at: event.timestamp)
         displayHoverProgress(nil)
         displayHighlightedLoopEndpoint(nil)
+        displayHighlightedLoopRegion(false)
+        updateTranscriptHover(nil)
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -1835,12 +2233,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        PerformanceSampler.shared.recordTimelineInputEvent(kind: "scroll", at: event.timestamp)
         guard isSelectionEnabled else {
             super.scrollWheel(with: event)
             return
         }
 
-        displayHoverProgress(nil)
+        displayHoverProgress(nil, renderCadence: .coalescedInteraction)
         let hasGesturePhase = !event.phase.isEmpty || !event.momentumPhase.isEmpty
         let isGestureEnding =
             event.phase.contains(.ended) ||
@@ -1850,6 +2249,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         defer {
             if isGestureEnding || !hasGesturePhase {
                 scrollGestureMode = nil
+                flushPendingCursorRectInvalidationIfNeeded()
             }
         }
 
@@ -1893,7 +2293,12 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         let progressDelta = Float(-horizontalDelta / bounds.width) * viewport.durationProgress
-        setViewport(viewport.panned(byProgress: progressDelta))
+        setViewport(
+            viewport.panned(byProgress: progressDelta),
+            transcriptCadence: .coalescedInteraction,
+            invalidatesCursorRects: false,
+            renderCadence: .coalescedInteraction
+        )
     }
 
     override func magnify(with event: NSEvent) {
@@ -1901,12 +2306,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        PerformanceSampler.shared.recordTimelineInputEvent(kind: "magnify", at: event.timestamp)
         guard isSelectionEnabled else {
             super.magnify(with: event)
             return
         }
 
-        displayHoverProgress(nil)
+        displayHoverProgress(nil, renderCadence: .coalescedInteraction)
         stopRightPanMomentum()
         let hasGesturePhase = !event.phase.isEmpty || !event.momentumPhase.isEmpty
         let isGestureEnding =
@@ -1917,6 +2323,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         defer {
             if isGestureEnding || !hasGesturePhase {
                 scrollGestureMode = nil
+                flushPendingCursorRectInvalidationIfNeeded()
             }
         }
 
@@ -1948,6 +2355,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        PerformanceSampler.shared.recordTimelineInputEvent(kind: "smart-magnify", at: event.timestamp)
         guard isSelectionEnabled else {
             super.smartMagnify(with: event)
             return
@@ -1969,6 +2377,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        PerformanceSampler.shared.recordTimelineInputEvent(kind: "mouse-down", at: event.timestamp)
         guard isSelectionEnabled else {
             super.mouseDown(with: event)
             return
@@ -1978,6 +2387,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         stopRightPanMomentum()
         stopZoomMomentum()
         onTimelineInteractionBegan?()
+        clearLiveSelectionDragSnapshot()
         let point = currentDragPoint(for: event)
         let timelineProgress = progress(for: point)
         if let loopDragMode = loopDragMode(for: point) {
@@ -1992,6 +2402,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                 }
             } else {
                 activeLoopDragOffsetX = 0
+                displayHighlightedLoopEndpoint(nil)
+                displayHighlightedLoopRegion(loopRegionContains(point))
             }
             activeDragMode = loopDragMode
             selectionAnchorProgress = Double(progress(for: loopDragProgressPoint(from: point), followsVisualFisheye: false))
@@ -2005,6 +2417,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
         activeLoopDragOffsetX = 0
         displayHighlightedLoopEndpoint(nil)
+        displayHighlightedLoopRegion(false)
+
+        if beginTranscriptInteraction(with: event, at: point) {
+            return
+        }
 
         if event.clickCount >= 2 {
             displayHoverProgress(nil)
@@ -2068,6 +2485,12 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        PerformanceSampler.shared.recordTimelineInputEvent(kind: "mouse-dragged", at: event.timestamp)
+        if let activeTranscriptDrag {
+            updateTranscriptDrag(activeTranscriptDrag, with: currentDragPoint(for: event))
+            return
+        }
+
         guard
             isSelectionEnabled,
             let selectionAnchorProgress
@@ -2077,49 +2500,75 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         let point = currentDragPoint(for: event)
-        if activeDragMode == .loopStart || activeDragMode == .loopEnd {
-            displayHoverProgress(nil)
-            if !isDraggingLoop, didMovePastSelectionThreshold(to: point) {
+        if activeDragMode == .loopStart || activeDragMode == .loopEnd || activeDragMode == .loopRegion {
+            if activeDragMode != .loopRegion {
+                displayHoverProgress(nil, renderCadence: .coalescedInteraction)
+            }
+            if !isDraggingLoop, (activeDragMode == .loopRegion || didMovePastSelectionThreshold(to: point)) {
                 isDraggingLoop = true
+                if activeDragMode == .loopRegion {
+                    setLoopRangeEnabled(true, notifyChange: true)
+                    displayHighlightedLoopRegion(true, renderCadence: .coalescedInteraction)
+                }
             }
 
             if let activeDragMode {
-                updateLoopRange(
-                    for: activeDragMode,
-                    progress: progress(for: loopDragProgressPoint(from: point), followsVisualFisheye: false)
-                )
+                let dragProgress = progress(for: loopDragProgressPoint(from: point), followsVisualFisheye: false)
+                if activeDragMode == .loopRegion {
+                    updateLoopRegionRange(
+                        from: Float(selectionAnchorProgress),
+                        to: dragProgress,
+                        renderCadence: .coalescedInteraction,
+                        invalidatesCursorRects: false
+                    )
+                    displayHoverProgress(dragProgress, isArmed: true, renderCadence: .coalescedInteraction)
+                } else {
+                    updateLoopRange(
+                        for: activeDragMode,
+                        progress: dragProgress,
+                        renderCadence: .coalescedInteraction,
+                        invalidatesCursorRects: false
+                    )
+                }
             }
             return
         }
 
         if activeDragMode == .trimStart || activeDragMode == .trimEnd {
-            displayHoverProgress(nil)
+            displayHoverProgress(nil, renderCadence: .coalescedInteraction)
             if !isDraggingTrim, didMovePastSelectionThreshold(to: point) {
                 isDraggingTrim = true
             }
 
             if isDraggingTrim, let activeDragMode {
-                updateTrimPreview(for: activeDragMode, progress: progress(for: point, followsVisualFisheye: false))
+                updateTrimPreview(
+                    for: activeDragMode,
+                    progress: progress(for: point, followsVisualFisheye: false),
+                    renderCadence: .coalescedInteraction
+                )
             }
             return
         }
 
         if activeDragMode == .clipBoundary {
-            displayHoverProgress(nil)
+            displayHoverProgress(nil, renderCadence: .coalescedInteraction)
             if !isDraggingTrim, didMovePastSelectionThreshold(to: point) {
                 isDraggingTrim = true
             }
 
             if isDraggingTrim, let activeClipBoundaryHit {
-                updateClipBoundaryTrimPreview(hit: activeClipBoundaryHit, point: point)
-                kickInteractionRenderIfPossible()
+                updateClipBoundaryTrimPreview(
+                    hit: activeClipBoundaryHit,
+                    point: point,
+                    renderCadence: .coalescedInteraction
+                )
             }
             return
         }
 
         if !isDraggingSelection, didMovePastSelectionThreshold(to: point) {
             isDraggingSelection = true
-            displayHoverProgress(nil)
+            displayHoverProgress(nil, renderCadence: .coalescedInteraction)
         }
 
         if isDraggingSelection {
@@ -2133,15 +2582,27 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                 liveLeadingProgress: dragProgress,
                 liveVelocityPixelsPerSecond: dragVelocity.speed,
                 liveDirection: dragVelocity.direction,
-                liveTimestamp: timestamp
+                liveTimestamp: timestamp,
+                schedulesRender: true
             )
         } else {
-            displayHoverProgress(progress(for: point), isArmed: true)
+            displayHoverProgress(progress(for: point), isArmed: true, renderCadence: .coalescedInteraction)
         }
     }
 
     override func mouseUp(with event: NSEvent) {
         guard !isInteractionSuppressed else {
+            return
+        }
+
+        PerformanceSampler.shared.recordTimelineInputEvent(kind: "mouse-up", at: event.timestamp)
+        if let activeTranscriptDrag {
+            updateTranscriptDrag(activeTranscriptDrag, with: currentDragPoint(for: event), finishes: true)
+            self.activeTranscriptDrag = nil
+            if !updateTranscriptHover(for: event), !updateLoopHover(for: event) {
+                updateHoverGuide(for: event)
+            }
+            flushPendingCursorRectInvalidationIfNeeded()
             return
         }
 
@@ -2155,12 +2616,27 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         let point = currentDragPoint(for: event)
         let timelineProgress = progress(for: point)
-        if activeDragMode == .loopStart || activeDragMode == .loopEnd {
+        if activeDragMode == .loopStart || activeDragMode == .loopEnd || activeDragMode == .loopRegion {
             if let activeDragMode {
-                updateLoopRange(
-                    for: activeDragMode,
-                    progress: progress(for: loopDragProgressPoint(from: point), followsVisualFisheye: false)
-                )
+                let dragProgress = progress(for: loopDragProgressPoint(from: point), followsVisualFisheye: false)
+                if activeDragMode == .loopRegion {
+                    if isDraggingLoop {
+                        updateLoopRegionRange(
+                            from: Float(selectionAnchorProgress),
+                            to: dragProgress
+                        )
+                    } else if loopRegionContains(point) {
+                        setLoopRangeEnabled(!isLoopRangeEnabled, notifyChange: true)
+                    } else {
+                        onSeekRequested?(timelineProgress)
+                    }
+                    displayHoverProgress(nil)
+                } else {
+                    updateLoopRange(
+                        for: activeDragMode,
+                        progress: dragProgress
+                    )
+                }
             }
         } else if
             (activeDragMode == .trimStart || activeDragMode == .trimEnd),
@@ -2190,7 +2666,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             }
         } else if isDraggingSelection {
             updateSelection(from: selectionAnchorProgress, to: preciseProgress(for: point), notifyChange: true)
-            startTransientRenderPulse(duration: selectionDragWaveformRenderPulseDuration)
+            startSelectionDragRenderPulse(duration: selectionDragWaveformRenderPulseDuration)
         } else {
             displaySelection(nil)
             onSelectionChanged?(nil)
@@ -2207,6 +2683,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         isDraggingTrim = false
         isDraggingLoop = false
         activeLoopDragOffsetX = 0
+        flushPendingCursorRectInvalidationIfNeeded()
         if !updateLoopHover(for: event) {
             updateHoverGuide(for: event)
         }
@@ -2217,6 +2694,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        PerformanceSampler.shared.recordTimelineInputEvent(kind: "right-mouse-down", at: event.timestamp)
         guard isSelectionEnabled else {
             super.rightMouseDown(with: event)
             return
@@ -2245,6 +2723,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        PerformanceSampler.shared.recordTimelineInputEvent(kind: "right-mouse-dragged", at: event.timestamp)
         guard
             isSelectionEnabled,
             let previousPoint = rightPanPreviousPoint,
@@ -2265,7 +2744,12 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         if abs(horizontalDelta) >= rightPanMovementThreshold {
-            setViewport(viewport.panned(byProgress: progressDelta))
+            setViewport(
+                viewport.panned(byProgress: progressDelta),
+                transcriptCadence: .coalescedInteraction,
+                invalidatesCursorRects: false,
+                renderCadence: .coalescedInteraction
+            )
             let instantVelocity = progressDelta / Float(elapsedTime)
             rightPanVelocityProgressPerSecond =
                 rightPanVelocityProgressPerSecond * (1 - rightPanVelocitySmoothing) +
@@ -2285,6 +2769,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        PerformanceSampler.shared.recordTimelineInputEvent(kind: "right-mouse-up", at: event.timestamp)
         guard isSelectionEnabled else {
             super.rightMouseUp(with: event)
             return
@@ -2302,6 +2787,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         rightPanPreviousPoint = nil
         rightPanPreviousTime = nil
         rightPanLastMovementTime = nil
+        flushPendingCursorRectInvalidationIfNeeded()
         startRightPanMomentumIfNeeded()
         updateHoverGuide(for: event)
     }
@@ -2352,7 +2838,12 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
-        setViewport(nextViewport)
+        setViewport(
+            nextViewport,
+            transcriptCadence: .coalescedInteraction,
+            invalidatesCursorRects: false,
+            renderCadence: .coalescedInteraction
+        )
         let decay = Float(exp(-rightPanMomentumDecayRate * elapsedTime))
         rightPanVelocityProgressPerSecond *= decay
     }
@@ -2380,7 +2871,12 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         stopZoomMomentum(clearVelocity: false)
         zoomMomentumAnchorProgress = anchorProgress
-        setViewport(viewport.zoomed(by: exp(logScaleDelta), around: anchorProgress))
+        setViewport(
+            viewport.zoomed(by: exp(logScaleDelta), around: anchorProgress),
+            transcriptCadence: .coalescedInteraction,
+            invalidatesCursorRects: false,
+            renderCadence: .coalescedInteraction
+        )
 
         guard recordsVelocity else {
             return
@@ -2454,7 +2950,12 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
-        setViewport(nextViewport)
+        setViewport(
+            nextViewport,
+            transcriptCadence: .coalescedInteraction,
+            invalidatesCursorRects: false,
+            renderCadence: .coalescedInteraction
+        )
         let decay = Float(exp(-zoomMomentumDecayRate * elapsedTime))
         zoomVelocityLogScalePerSecond *= decay
     }
@@ -2556,7 +3057,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         )
     }
 
-    private func setViewport(_ nextViewport: TimelineViewport, kicksImmediateRender: Bool = true) {
+    private func setViewport(
+        _ nextViewport: TimelineViewport,
+        kicksImmediateRender: Bool = true,
+        transcriptCadence: TimelineRenderCadence = .immediate,
+        invalidatesCursorRects: Bool = true,
+        renderCadence: TimelineRenderCadence = .immediate
+    ) {
         guard viewport != nextViewport else {
             return
         }
@@ -2564,17 +3071,22 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         viewport = nextViewport
         onViewportChanged?(nextViewport)
         timelineRenderer?.publishInteractionViewport(nextViewport)
-        window?.invalidateCursorRects(for: self)
+        updateTranscriptOverlay(cadence: transcriptCadence)
+        if invalidatesCursorRects {
+            invalidateTimelineCursorRects()
+        }
         if kicksImmediateRender {
-            updateTimelineRenderer { renderer in
-                renderer.commitViewport(nextViewport)
+            if renderCadence == .immediate {
+                updateTimelineRenderer { renderer in
+                    renderer.commitViewport(nextViewport)
+                }
             }
-            kickInteractionRenderIfPossible()
+            kickInteractionRenderIfPossible(cadence: renderCadence)
         } else {
             updateTimelineRendererImmediately { renderer in
                 renderer.displayViewport(nextViewport)
             }
-            requestTimelineRender()
+            requestRender(cadence: renderCadence)
         }
     }
 
@@ -2601,7 +3113,12 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             startProgress: selectionStart - padding,
             durationProgress: min(selectionDuration + padding * 2, 1)
         )
-        setViewport(nextViewport)
+        setViewport(
+            nextViewport,
+            transcriptCadence: .coalescedInteraction,
+            invalidatesCursorRects: false,
+            renderCadence: .coalescedInteraction
+        )
     }
 
     func scrollTracks(byPixels deltaPixels: Float) {
@@ -2619,6 +3136,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             renderer.displayTrackLayout(nextTrackLayout)
         }
         updateTrackLayoutForCurrentBounds(requestRender: false)
+        updateTranscriptOverlay()
         requestTimelineRender()
     }
 
@@ -2675,6 +3193,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             lastPublishedTrackLayout = resolvedLayout
             onTrackLaneLayoutChanged?(resolvedLayout)
         }
+        updateTranscriptOverlay()
         updateTimelineRendererImmediately { renderer in
             renderer.displayTrackLayout(clampedLayout)
         }
@@ -2705,6 +3224,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             lastPublishedTrackLayout = resolvedLayout
             onTrackLaneLayoutChanged?(resolvedLayout)
         }
+        updateTranscriptOverlay()
 
         guard layoutChanged else {
             return
@@ -2718,7 +3238,62 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
     }
 
-    private func pageViewportIfNeeded(forPlayheadProgress progress: Float) {
+    private func updateTranscriptOverlay(cadence: TimelineRenderCadence = .immediate) {
+        guard cadence != .immediate else {
+            performTranscriptOverlayUpdate()
+            return
+        }
+
+        guard isTranscriptLayerVisible else {
+            performTranscriptOverlayUpdate()
+            return
+        }
+
+        let now = CACurrentMediaTime()
+        let elapsed = now - lastTranscriptOverlayUpdateTime
+        guard elapsed >= transcriptOverlayInteractionUpdateInterval else {
+            scheduleTranscriptOverlayUpdate(after: transcriptOverlayInteractionUpdateInterval - elapsed)
+            return
+        }
+
+        performTranscriptOverlayUpdate()
+    }
+
+    private func scheduleTranscriptOverlayUpdate(after delay: CFTimeInterval) {
+        guard !pendingTranscriptOverlayUpdate else {
+            return
+        }
+
+        pendingTranscriptOverlayUpdate = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(delay, 0)) { [weak self] in
+            guard let self else {
+                return
+            }
+
+            pendingTranscriptOverlayUpdate = false
+            performTranscriptOverlayUpdate()
+        }
+    }
+
+    private func performTranscriptOverlayUpdate() {
+        lastTranscriptOverlayUpdateTime = CACurrentMediaTime()
+        let cursorRectsChanged = transcriptOverlayView.configure(
+            tracks: currentRenderTracks,
+            viewport: viewport,
+            trackLayout: trackLayout,
+            timelineDuration: timelineDuration,
+            displayMode: transcriptDisplayMode,
+            interactionState: transcriptInteractionState
+        )
+        if cursorRectsChanged {
+            invalidateTimelineCursorRects()
+        }
+    }
+
+    private func pageViewportIfNeeded(
+        forPlayheadProgress progress: Float,
+        renderCadence: TimelineRenderCadence = .immediate
+    ) {
         guard isSelectionEnabled, !viewport.isFull else {
             return
         }
@@ -2764,13 +3339,19 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             )
         }
 
-        setViewport(nextViewport)
+        setViewport(
+            nextViewport,
+            transcriptCadence: renderCadence == .immediate ? .immediate : .coalescedInteraction,
+            invalidatesCursorRects: renderCadence == .immediate,
+            renderCadence: renderCadence
+        )
     }
 
     private func updateHoverGuide(for event: NSEvent) {
         guard !isInteractionSuppressed else {
-            displayHoverProgress(nil)
-            displayHighlightedLoopEndpoint(nil)
+            displayHoverProgress(nil, renderCadence: .coalescedInteraction)
+            displayHighlightedLoopEndpoint(nil, renderCadence: .coalescedInteraction)
+            displayHighlightedLoopRegion(false, renderCadence: .coalescedInteraction)
             return
         }
 
@@ -2778,19 +3359,176 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             isSelectionEnabled,
             activeDragMode == nil
         else {
-            displayHoverProgress(nil)
-            displayHighlightedLoopEndpoint(nil)
+            displayHoverProgress(nil, renderCadence: .coalescedInteraction)
+            displayHighlightedLoopEndpoint(nil, renderCadence: .coalescedInteraction)
+            displayHighlightedLoopRegion(false, renderCadence: .coalescedInteraction)
             return
         }
 
         let point = convert(event.locationInWindow, from: nil)
         guard bounds.contains(point) else {
-            displayHoverProgress(nil)
-            displayHighlightedLoopEndpoint(nil)
+            displayHoverProgress(nil, renderCadence: .coalescedInteraction)
+            displayHighlightedLoopEndpoint(nil, renderCadence: .coalescedInteraction)
+            displayHighlightedLoopRegion(false, renderCadence: .coalescedInteraction)
             return
         }
 
-        displayHoverProgress(progress(for: point))
+        displayHoverProgress(progress(for: point), renderCadence: .coalescedInteraction)
+    }
+
+    private func updateTranscriptHover(for event: NSEvent) -> Bool {
+        guard isTranscriptLayerVisible, activeDragMode == nil else {
+            updateTranscriptHover(nil)
+            return false
+        }
+
+        let point = convert(event.locationInWindow, from: nil)
+        guard bounds.contains(point), let hit = transcriptOverlayView.transcriptHit(at: point) else {
+            updateTranscriptHover(nil)
+            return false
+        }
+
+        updateTranscriptHover(hit)
+        displayHoverProgress(nil, renderCadence: .coalescedInteraction)
+        return true
+    }
+
+    private func updateTranscriptHover(_ hit: TranscriptInteractionHit?) {
+        let nextState = TranscriptInteractionModel.state(
+            previous: transcriptInteractionState,
+            hover: hit
+        )
+        guard nextState != transcriptInteractionState else {
+            return
+        }
+
+        transcriptInteractionState = nextState
+        transcriptOverlayView.updateInteractionState(transcriptInteractionState)
+    }
+
+    private func beginTranscriptInteraction(with event: NSEvent, at point: CGPoint) -> Bool {
+        guard
+            isTranscriptLayerVisible,
+            let hit = transcriptOverlayView.transcriptHit(at: point),
+            let context = transcriptContext(for: hit.trackID),
+            timelineDuration > 0
+        else {
+            updateTranscriptHover(nil)
+            return false
+        }
+
+        window?.makeFirstResponder(self)
+        onTimelineInteractionBegan?()
+        displayHoverProgress(nil)
+        displayHighlightedLoopEndpoint(nil)
+        displayHighlightedLoopRegion(false)
+        activeDragMode = nil
+        activeClipBoundaryHit = nil
+        selectionAnchorProgress = nil
+        selectionAnchorPoint = nil
+        selectionAnchorTrackID = hit.trackID
+        isDraggingSelection = false
+        isDraggingTrim = false
+        isDraggingLoop = false
+
+        let selection: TranscriptTokenSelection?
+        if
+            event.modifierFlags.contains(.shift),
+            let currentTranscriptSelection
+        {
+            selection = TranscriptInteractionModel.selection(
+                extending: currentTranscriptSelection,
+                to: hit,
+                transcript: context.transcript,
+                timeMap: context.timeMap
+            )
+        } else {
+            selection = TranscriptInteractionModel.selection(
+                from: hit,
+                transcript: context.transcript,
+                timeMap: context.timeMap
+            )
+        }
+        activeTranscriptDrag = TranscriptInteractionDrag(anchor: hit, current: hit)
+        publishTranscriptSelection(selection, notifiesWorkspace: true)
+        onSeekRequested?(progress(forProjectTime: hit.projectRange.startTime))
+        return true
+    }
+
+    private func updateTranscriptDrag(
+        _ drag: TranscriptInteractionDrag,
+        with point: CGPoint,
+        finishes: Bool = false
+    ) {
+        guard
+            let hit = transcriptOverlayView.transcriptHit(at: point) ??
+                transcriptOverlayView.nearestTranscriptHit(at: point, trackID: drag.anchor.trackID),
+            let context = transcriptContext(for: drag.anchor.trackID)
+        else {
+            if finishes {
+                onTranscriptSelectionChanged?(currentTranscriptSelection)
+            }
+            return
+        }
+
+        let nextDrag = TranscriptInteractionDrag(anchor: drag.anchor, current: hit)
+        activeTranscriptDrag = finishes ? nil : nextDrag
+        let selection = TranscriptInteractionModel.selection(
+            from: drag.anchor,
+            to: hit,
+            visibleRuns: transcriptOverlayView.visibleRunsSnapshot(),
+            transcript: context.transcript,
+            timeMap: context.timeMap
+        )
+        publishTranscriptSelection(selection, notifiesWorkspace: finishes)
+    }
+
+    private func publishTranscriptSelection(
+        _ selection: TranscriptTokenSelection?,
+        notifiesWorkspace: Bool
+    ) {
+        let didChange = currentTranscriptSelection != selection
+        if didChange {
+            displayTranscriptSelection(selection)
+            let timelineSelection = selection?.timelineSelection(timelineDuration: timelineDuration)
+            if notifiesWorkspace {
+                displaySelection(timelineSelection)
+            } else {
+                displayLiveTranscriptMirroredSelection(timelineSelection)
+            }
+        }
+        if notifiesWorkspace {
+            onTranscriptSelectionChanged?(selection)
+        }
+    }
+
+    private func displayLiveTranscriptMirroredSelection(_ selection: TimelineSelection?) {
+        currentSelection = selection
+        clearLiveSelectionDragSnapshot(clearsSelection: false)
+        timelineRenderer?.publishInteractionSelection(selection)
+        kickInteractionRenderIfPossible()
+    }
+
+    private func transcriptContext(
+        for trackID: UUID
+    ) -> (track: TimelineRenderState.Track, transcript: TranscriptDocument, timeMap: TranscriptSourceTimeMap)? {
+        guard
+            let track = currentRenderTracks.first(where: { $0.id == trackID }),
+            let transcript = track.transcript
+        else {
+            return nil
+        }
+
+        let timeMap = transcript.sourceTimeMap ?? TranscriptSourceTimeMap.fromRenderTrack(track)
+        return (track, transcript, timeMap)
+    }
+
+    private func progress(forProjectTime projectTime: TimeInterval) -> Float {
+        guard timelineDuration > 0 else {
+            return 0
+        }
+
+        return Float(min(max(projectTime / timelineDuration, 0), 1))
     }
 
     private func updateLoopHover(for event: NSEvent) -> Bool {
@@ -2799,26 +3537,28 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             isSelectionEnabled,
             activeDragMode == nil
         else {
-            displayHighlightedLoopEndpoint(nil)
+            displayHighlightedLoopEndpoint(nil, renderCadence: .coalescedInteraction)
+            displayHighlightedLoopRegion(false, renderCadence: .coalescedInteraction)
             return false
         }
 
         let point = convert(event.locationInWindow, from: nil)
         guard bounds.contains(point) else {
-            displayHighlightedLoopEndpoint(nil)
+            displayHighlightedLoopEndpoint(nil, renderCadence: .coalescedInteraction)
+            displayHighlightedLoopRegion(false, renderCadence: .coalescedInteraction)
             return false
         }
 
-        guard
-            let dragMode = loopDragMode(for: point),
-            let endpoint = loopEndpoint(for: dragMode)
-        else {
-            displayHighlightedLoopEndpoint(nil)
+        guard rulerLaneRect().contains(point) else {
+            displayHighlightedLoopEndpoint(nil, renderCadence: .coalescedInteraction)
+            displayHighlightedLoopRegion(false, renderCadence: .coalescedInteraction)
             return false
         }
 
-        displayHoverProgress(nil)
-        displayHighlightedLoopEndpoint(endpoint)
+        displayHoverProgress(nil, renderCadence: .coalescedInteraction)
+        let hoveredEndpoint = loopRegionEndpointNear(point)
+        displayHighlightedLoopEndpoint(hoveredEndpoint, renderCadence: .coalescedInteraction)
+        displayHighlightedLoopRegion(loopRegionContains(point), renderCadence: .coalescedInteraction)
         return true
     }
 
@@ -2899,8 +3639,12 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         return (selectionDragVelocityPixelsPerSecond, direction)
     }
 
-    private func updateTrimPreview(for dragMode: TimelineDragMode, progress: Float) {
-        displayTrimPreview(trimRange(for: dragMode, progress: progress))
+    private func updateTrimPreview(
+        for dragMode: TimelineDragMode,
+        progress: Float,
+        renderCadence: TimelineRenderCadence = .immediate
+    ) {
+        displayTrimPreview(trimRange(for: dragMode, progress: progress), renderCadence: renderCadence)
     }
 
     private func trimRange(for dragMode: TimelineDragMode, progress: Float) -> TimelineTrimRange {
@@ -2909,12 +3653,69 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             TimelineTrimRange(startProgress: min(max(progress, 0), 0.999), endProgress: 1)
         case .trimEnd:
             TimelineTrimRange(startProgress: 0, endProgress: max(min(progress, 1), 0.001))
-        case .selection, .clipBoundary, .loopStart, .loopEnd:
+        case .selection, .clipBoundary, .loopStart, .loopEnd, .loopRegion:
             TimelineTrimRange(startProgress: 0, endProgress: 1)
         }
     }
 
-    private func updateLoopRange(for dragMode: TimelineDragMode, progress: Float) {
+    private func setLoopRangeEnabled(_ isEnabled: Bool, notifyChange: Bool) {
+        guard isLoopRangeEnabled != isEnabled else {
+            return
+        }
+
+        isLoopRangeEnabled = isEnabled
+        updateTimelineRendererImmediately { renderer in
+            renderer.displayLoopRangeEnabled(isEnabled)
+        }
+        if notifyChange {
+            onLoopRangeEnabledChanged?(isEnabled)
+        }
+        requestTimelineRender()
+    }
+
+    private func updateLoopRegionRange(
+        from anchorProgress: Float,
+        to currentProgress: Float,
+        renderCadence: TimelineRenderCadence = .immediate,
+        invalidatesCursorRects: Bool = true
+    ) {
+        let minimumDuration = minimumLoopDurationProgress()
+        let clampedAnchor = min(max(anchorProgress, 0), 1)
+        let clampedCurrent = min(max(currentProgress, 0), 1)
+        let nextRange: TimelineLoopRange
+        if clampedCurrent >= clampedAnchor {
+            nextRange = TimelineLoopRange(
+                startProgress: clampedAnchor,
+                endProgress: min(max(clampedCurrent, clampedAnchor + minimumDuration), 1)
+            )
+        } else {
+            nextRange = TimelineLoopRange(
+                startProgress: max(min(clampedCurrent, clampedAnchor - minimumDuration), 0),
+                endProgress: clampedAnchor
+            )
+        }
+
+        guard nextRange != loopRange else {
+            return
+        }
+
+        loopRange = nextRange
+        updateTimelineRendererImmediately { renderer in
+            renderer.displayLoopRange(nextRange)
+        }
+        if invalidatesCursorRects {
+            invalidateTimelineCursorRects()
+        }
+        onLoopRangeChanged?(nextRange)
+        requestRender(cadence: renderCadence)
+    }
+
+    private func updateLoopRange(
+        for dragMode: TimelineDragMode,
+        progress: Float,
+        renderCadence: TimelineRenderCadence = .immediate,
+        invalidatesCursorRects: Bool = true
+    ) {
         let minimumDuration = minimumLoopDurationProgress()
         let nextRange: TimelineLoopRange
         switch dragMode {
@@ -2922,6 +3723,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             nextRange = loopRange.movingStart(to: progress, minimumDuration: minimumDuration)
         case .loopEnd:
             nextRange = loopRange.movingEnd(to: progress, minimumDuration: minimumDuration)
+        case .loopRegion:
+            return
         case .selection, .trimStart, .trimEnd, .clipBoundary:
             return
         }
@@ -2934,9 +3737,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         updateTimelineRendererImmediately { renderer in
             renderer.displayLoopRange(nextRange)
         }
-        window?.invalidateCursorRects(for: self)
+        if invalidatesCursorRects {
+            invalidateTimelineCursorRects()
+        }
         onLoopRangeChanged?(nextRange)
-        requestTimelineRender()
+        requestRender(cadence: renderCadence)
     }
 
     private func minimumLoopDurationProgress() -> Float {
@@ -2951,6 +3756,21 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     private func loopDragMode(for point: CGPoint) -> TimelineDragMode? {
+        guard
+            bounds.width > 0,
+            rulerLaneRect().contains(point)
+        else {
+            return nil
+        }
+
+        if let endpoint = loopRegionEndpointNear(point) {
+            return endpoint == .start ? .loopStart : .loopEnd
+        }
+
+        return .loopRegion
+    }
+
+    private func legacyLoopEndpointDragMode(for point: CGPoint) -> TimelineDragMode? {
         guard
             bounds.width > 0,
             rulerLaneRect().contains(point)
@@ -2987,13 +3807,81 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return .start
         case .loopEnd:
             return .end
-        case .selection, .trimStart, .trimEnd, .clipBoundary:
+        case .selection, .trimStart, .trimEnd, .clipBoundary, .loopRegion:
             return nil
         }
     }
 
     private func loopDragProgressPoint(from point: CGPoint) -> CGPoint {
         CGPoint(x: point.x - activeLoopDragOffsetX, y: point.y)
+    }
+
+    private func loopRegionContains(_ point: CGPoint) -> Bool {
+        guard
+            rulerLaneRect().contains(point),
+            loopRange.durationProgress < 0.999,
+            let startX = loopHandleX(forTimelineProgress: loopRange.startProgress),
+            let endX = loopHandleX(forTimelineProgress: loopRange.endProgress)
+        else {
+            return false
+        }
+
+        let left = min(startX, endX)
+        let right = max(startX, endX)
+        return point.x >= left && point.x <= right
+    }
+
+    private func loopRegionEndpointNear(_ point: CGPoint) -> TimelineLoopEndpoint? {
+        guard
+            rulerLaneRect().contains(point),
+            loopRange.durationProgress < 0.999,
+            let startX = loopHandleX(forTimelineProgress: loopRange.startProgress),
+            let endX = loopHandleX(forTimelineProgress: loopRange.endProgress)
+        else {
+            return nil
+        }
+
+        let candidates: [(endpoint: TimelineLoopEndpoint, x: CGFloat)] = [
+            (.start, min(startX, endX)),
+            (.end, max(startX, endX))
+        ]
+        let hitWidth = max(loopRegionEdgeHitWidth, 1)
+        var best: (endpoint: TimelineLoopEndpoint, distance: CGFloat)?
+        for candidate in candidates {
+            let distance = abs(point.x - candidate.x)
+            guard distance <= hitWidth * 0.5 else {
+                continue
+            }
+
+            if best == nil || distance < best!.distance {
+                best = (candidate.endpoint, distance)
+            }
+        }
+
+        return best?.endpoint
+    }
+
+    private func loopRegionEdgeHitRect(for endpoint: TimelineLoopEndpoint) -> NSRect? {
+        let progress = endpoint == .start ? loopRange.startProgress : loopRange.endProgress
+        guard
+            loopRange.durationProgress < 0.999,
+            let handleX = loopHandleX(forTimelineProgress: progress)
+        else {
+            return nil
+        }
+
+        let rulerRect = rulerLaneRect()
+        guard rulerRect.width > 0, rulerRect.height > 0 else {
+            return nil
+        }
+
+        let width = max(loopRegionEdgeHitWidth, 1)
+        return NSRect(
+            x: min(max(handleX - width * 0.5, 0), max(bounds.width - width, 0)),
+            y: rulerRect.minY,
+            width: min(width, bounds.width),
+            height: rulerRect.height
+        )
     }
 
     private func loopFlagRect(for endpoint: TimelineLoopEndpoint) -> NSRect? {
@@ -3195,7 +4083,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
     }
 
-    private func updateClipBoundaryTrimPreview(hit: ClipBoundaryHit, point: CGPoint) {
+    private func updateClipBoundaryTrimPreview(
+        hit: ClipBoundaryHit,
+        point: CGPoint,
+        renderCadence: TimelineRenderCadence = .immediate
+    ) {
         let targetProgress = constrainedClipBoundaryTarget(for: hit, point: point)
         let track = currentRenderTracks.first { $0.id == hit.trackID }
         let trackDurationProgress = track.map { Double(projectProgress(forLocalProgress: 1, track: $0)) } ?? 1
@@ -3210,11 +4102,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             endProgress = hit.clipRange.endProgress * trackDurationProgress
         }
 
-        displaySelection(TimelineSelection(
+        let selection = TimelineSelection(
             startProgress: startProgress,
             endProgress: endProgress,
             trackID: hit.trackID
-        ))
+        )
+        currentSelection = selection
+        timelineRenderer?.publishInteractionSelection(selection)
+        kickInteractionRenderIfPossible(cadence: renderCadence)
     }
 
     private func didMovePastSelectionThreshold(to point: CGPoint) -> Bool {

@@ -76,6 +76,16 @@ enum WAVAudioDecoder {
         return try decodeSamples(in: data, fileInfo: fileInfo)
     }
 
+    static func decode(url: URL, frameRange: Range<Int>) throws -> DecodedAudioBuffer {
+        guard canDecode(url) else {
+            throw DecodeError.unsupportedFileType
+        }
+
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        let fileInfo = try inspect(in: data, url: url)
+        return try decodeSamples(in: data, fileInfo: fileInfo, frameRange: frameRange)
+    }
+
     static func makeZeroCrossingProbe(url: URL, fileInfo: WAVFileInfo) throws -> WAVZeroCrossingProbe {
         try validateDecodable(fileInfo)
         let data = try Data(contentsOf: url, options: [.mappedIfSafe])
@@ -275,11 +285,20 @@ enum WAVAudioDecoder {
         return WaveformOverview(duration: fileInfo.duration, bins: bins)
     }
 
-    private static func decodeSamples(in data: Data, fileInfo: WAVFileInfo) throws -> DecodedAudioBuffer {
+    private static func decodeSamples(
+        in data: Data,
+        fileInfo: WAVFileInfo,
+        frameRange requestedFrameRange: Range<Int>? = nil
+    ) throws -> DecodedAudioBuffer {
         try validateDecodable(fileInfo)
 
         let bytesPerSample = bytesPerSample(for: fileInfo)
-        let frameCount = fileInfo.frameCount
+        let decodeStartFrame = min(max(requestedFrameRange?.lowerBound ?? 0, 0), fileInfo.frameCount)
+        let decodeEndFrame = min(
+            max(requestedFrameRange?.upperBound ?? fileInfo.frameCount, decodeStartFrame),
+            fileInfo.frameCount
+        )
+        let frameCount = max(decodeEndFrame - decodeStartFrame, 0)
         var samplesByChannel = (0..<fileInfo.channelCount).map { _ in
             [Float]()
         }
@@ -288,11 +307,12 @@ enum WAVAudioDecoder {
             samplesByChannel[channelIndex].reserveCapacity(frameCount)
         }
 
-        for frameIndex in 0..<frameCount {
-            if frameIndex.isMultiple(of: 4_096) {
+        for outputFrameIndex in 0..<frameCount {
+            if outputFrameIndex.isMultiple(of: 4_096) {
                 try ImportWorkBudget.shared.waitIfPlaybackActive()
             }
 
+            let frameIndex = decodeStartFrame + outputFrameIndex
             let frameOffset = fileInfo.dataRange.lowerBound + frameIndex * fileInfo.blockAlign
 
             for channelIndex in 0..<fileInfo.channelCount {

@@ -38,6 +38,7 @@ enum AgentResolvedCommand: Sendable, Equatable {
     case normalizeSelection
     case fadeInSelection
     case fadeOutSelection
+    case transcribeSelectedTrack
 }
 
 @MainActor
@@ -125,6 +126,41 @@ final class AgentCommandRegistry {
                 identifier: "timeline.deleteSilence",
                 title: "Delete Silence",
                 summary: "Detect and remove long silent regions from the active track or selected region."
+            )
+        )
+        register(
+            AgentCommandCapability(
+                identifier: "timeline.transcribeTrack",
+                title: "Transcribe Track",
+                summary: "Create a timed transcript for the selected or active voice track."
+            )
+        )
+        register(
+            AgentCommandCapability(
+                identifier: "transcript.showLayer",
+                title: "Show Transcript Layer",
+                summary: "Show or hide timed transcript text aligned with the timeline."
+            )
+        )
+        register(
+            AgentCommandCapability(
+                identifier: "transcript.selectWords",
+                title: "Select Transcript Words",
+                summary: "Resolve transcript word selections into precise audio time ranges."
+            )
+        )
+        register(
+            AgentCommandCapability(
+                identifier: "transcript.editByText",
+                title: "Edit Audio By Text",
+                summary: "Plan delete, clear, pause-shortening, split, nudge, and correction edits from transcript text."
+            )
+        )
+        register(
+            AgentCommandCapability(
+                identifier: "transcript.export",
+                title: "Export Transcript",
+                summary: "Export transcript text, captions, or JSON for podcast publishing workflows."
             )
         )
         register(
@@ -270,6 +306,9 @@ final class AgentCommandController {
         }
         if normalized.contains("normalize") {
             return .normalizeSelection
+        }
+        if normalized.contains("transcribe") || normalized.contains("transcript") {
+            return .transcribeSelectedTrack
         }
         if normalized.contains("fade in") {
             return .fadeInSelection

@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private lazy var audioPreferencesWindowController = AudioDevicePreferencesWindowController()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        LaunchStartupTrace.shared.mark(.appDelegateDidFinishLaunching)
         configureMainMenu()
 
         openProjectWindow(restoresLastProject: true)
@@ -44,9 +45,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.windowControllers.removeAll { $0 === closingController || $0 === controller }
         }
         windowControllers.append(controller)
-        controller.showWindow(nil)
         if restoresLastProject {
-            controller.restoreLastProjectIfNeeded()
+            controller.prepareForDeferredProjectRestore()
+        }
+        LaunchStartupTrace.shared.mark(
+            .windowShowRequested,
+            fields: ["restoresLastProject": "\(restoresLastProject)"]
+        )
+        controller.showWindow(nil)
+        controller.window?.contentView?.layoutSubtreeIfNeeded()
+        controller.window?.displayIfNeeded()
+        LaunchStartupTrace.shared.mark(
+            .windowVisible,
+            fields: [
+                "restoresLastProject": "\(restoresLastProject)",
+                "isVisible": "\(controller.window?.isVisible == true)",
+            ]
+        )
+        if restoresLastProject {
+            DispatchQueue.main.async { [weak controller] in
+                controller?.restoreLastProjectAfterLaunchPreviewRender()
+            }
         }
         return controller
     }
@@ -146,6 +165,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             action: #selector(TimelineView.exportStems(_:)),
             keyEquivalent: ""
         ))
+        menu.addItem(.separator())
+        let hideItem = NSMenuItem(
+            title: "Hide Soundtime",
+            action: #selector(NSApplication.hide(_:)),
+            keyEquivalent: "h"
+        )
+        hideItem.target = NSApplication.shared
+        menu.addItem(hideItem)
+        let hideOthersItem = NSMenuItem(
+            title: "Hide Others",
+            action: #selector(NSApplication.hideOtherApplications(_:)),
+            keyEquivalent: "h"
+        )
+        hideOthersItem.keyEquivalentModifierMask = [.command, .option]
+        hideOthersItem.target = NSApplication.shared
+        menu.addItem(hideOthersItem)
+        let showAllItem = NSMenuItem(
+            title: "Show All",
+            action: #selector(NSApplication.unhideAllApplications(_:)),
+            keyEquivalent: ""
+        )
+        showAllItem.target = NSApplication.shared
+        menu.addItem(showAllItem)
         menu.addItem(.separator())
         let quitItem = NSMenuItem(
             title: "Quit Soundtime",
@@ -342,6 +384,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             action: #selector(TimelineView.separateMusicStemsTimelineSelection(_:)),
             keyEquivalent: ""
         ))
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(
+            title: "Transcribe Selected Track",
+            action: #selector(TimelineView.transcribeSelectedTrack(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Show Transcript Layer",
+            action: #selector(TimelineView.toggleTranscriptLayer(_:)),
+            keyEquivalent: "t"
+        ))
+        let alignmentDebugItem = NSMenuItem(
+            title: "Show Transcript Alignment Debug",
+            action: #selector(TimelineView.toggleTranscriptAlignmentDebug(_:)),
+            keyEquivalent: "t"
+        )
+        alignmentDebugItem.keyEquivalentModifierMask = [.command, .option]
+        menu.addItem(alignmentDebugItem)
+        menu.addItem(NSMenuItem(
+            title: "Delete Transcript Text",
+            action: #selector(TimelineView.deleteTranscriptText(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Clear Transcript Text",
+            action: #selector(TimelineView.clearTranscriptText(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Split At Transcript Word",
+            action: #selector(TimelineView.splitAtTranscriptWord(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(.separator())
         menu.addItem(NSMenuItem(
             title: "Review Shorten Silence",
             action: #selector(TimelineView.deleteSilence(_:)),

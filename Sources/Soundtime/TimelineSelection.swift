@@ -34,3 +34,29 @@ struct TimelineSelection: Equatable, Sendable {
         durationProgress * totalDuration
     }
 }
+
+struct TimelineSelectionDragSnapshot: Equatable, Sendable {
+    let selection: TimelineSelection
+    let leadingProgress: Float
+    let velocityPixelsPerSecond: Float
+    let direction: Float
+    let timestamp: CFTimeInterval
+
+    init(
+        selection: TimelineSelection,
+        leadingProgress: Float,
+        velocityPixelsPerSecond: Float,
+        direction: Float,
+        timestamp: CFTimeInterval
+    ) {
+        self.selection = selection
+        self.leadingProgress = min(max(leadingProgress, 0), 1)
+        self.velocityPixelsPerSecond = max(velocityPixelsPerSecond, 0)
+        if abs(direction) < 0.001 {
+            self.direction = 0
+        } else {
+            self.direction = direction > 0 ? 1 : -1
+        }
+        self.timestamp = timestamp
+    }
+}

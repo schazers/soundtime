@@ -710,7 +710,7 @@ final class WaveformOverviewDiskCacheStore: @unchecked Sendable {
     }
 }
 
-private enum WaveformOverviewBinaryCodec {
+enum WaveformOverviewBinaryCodec {
     static func encode(_ overview: WaveformOverview) -> Data {
         var data = Data()
         data.reserveCapacity(overview.bins.count * 6 * MemoryLayout<UInt32>.size)

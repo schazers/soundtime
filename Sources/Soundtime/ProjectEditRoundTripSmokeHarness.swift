@@ -18,6 +18,11 @@ enum ProjectEditRoundTripSmokeHarness {
         let sampleRate = 48_000.0
         let trackID = UUID(uuidString: "11111111-2222-3333-4444-555555555555") ?? UUID()
         let sourceURL = URL(fileURLWithPath: "/tmp/SoundtimeProjectEditRoundTrip.wav")
+        try? FileManager.default.removeItem(at: sourceURL)
+        try Data(count: 44 + sourceFrameCount * 4).write(to: sourceURL, options: [.atomic])
+        defer {
+            try? FileManager.default.removeItem(at: sourceURL)
+        }
         let fileInfo = WAVFileInfo(
             url: sourceURL,
             formatTag: 1,
@@ -64,6 +69,13 @@ enum ProjectEditRoundTripSmokeHarness {
         try require(pastedFrames == copiedClip.frameCount, "pasted clip frame count mismatch")
 
         let originalState = try requireValue(timeline.persistentState, "edited timeline did not persist")
+        let editableSource = EditableAudioSource(
+            originalURL: URL(fileURLWithPath: "/tmp/SoundtimeProjectEditRoundTripOriginal.mp3"),
+            editableURL: sourceURL,
+            formatOrigin: .mp3,
+            fileInfo: fileInfo,
+            ownsEditableFile: true
+        )
         let sourceOverview = syntheticOverview(duration: Double(sourceFrameCount) / sampleRate, binCount: 512)
         let originalEditedOverview = timeline.waveformOverview(from: sourceOverview)
         let waveformPreview = try requireValue(
@@ -75,6 +87,7 @@ enum ProjectEditRoundTripSmokeHarness {
             ),
             "could not create launch waveform preview"
         )
+        let transcript = syntheticTranscript(trackID: trackID, duration: timeline.duration)
         let project = SoundtimeProject(
             tracks: [
                 SoundtimeProject.Track(
@@ -85,7 +98,9 @@ enum ProjectEditRoundTripSmokeHarness {
                     isMuted: true,
                     isSoloed: false,
                     editTimeline: originalState,
-                    waveformPreview: waveformPreview
+                    editableSource: SoundtimeProject.Track.EditableSource(editableSource),
+                    waveformPreview: waveformPreview,
+                    transcript: transcript
                 ),
             ],
             windowLayout: SoundtimeProject.WindowLayout(x: 20, y: 40, width: 1280, height: 720),
@@ -111,6 +126,12 @@ enum ProjectEditRoundTripSmokeHarness {
             editTimeline: originalState,
             waveformPreview: waveformPreview
         )
+        try requireLaunchSnapshotSidecarRoundTrip(
+            fileInfo: fileInfo,
+            trackID: trackID,
+            editTimeline: originalState,
+            editableSource: editableSource
+        )
         try requireMultiTrackEditGraphStressRoundTrip(fileInfo: fileInfo)
 
         let decodedTrack = try requireValue(decodedProject.tracks.first, "decoded project has no track")
@@ -120,10 +141,30 @@ enum ProjectEditRoundTripSmokeHarness {
         try require(abs(decodedTrack.volume - 0.73) < 0.000_001, "track volume did not persist")
         try require(decodedTrack.isMuted, "track mute state did not persist")
         try require(!decodedTrack.isSoloed, "track solo state did not persist")
+        let decodedEditableSource = try requireValue(decodedTrack.editableSource, "track dropped editable source metadata")
+        let restoredEditableSource = try requireValue(
+            decodedEditableSource.editableAudioSource(fileInfo: fileInfo),
+            "editable source metadata did not restore"
+        )
+        try require(restoredEditableSource.id == editableSource.id, "editable source ID did not round-trip")
+        try require(restoredEditableSource.formatOrigin == .mp3, "editable source format origin did not persist")
+        try require(restoredEditableSource.originalURL.pathExtension == "mp3", "editable source original path did not persist")
         let decodedPreview = try requireValue(decodedTrack.waveformPreview, "track dropped launch waveform preview")
         try require(decodedPreview.isValid(for: fileInfo), "launch waveform preview did not validate")
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSinceNow: 60)],
+            ofItemAtPath: sourceURL.path
+        )
+        try require(
+            decodedPreview.isValid(for: fileInfo),
+            "launch waveform preview should tolerate metadata-only file timestamp drift"
+        )
         try require(decodedPreview.sourceOverview.bins.count == 128, "source launch preview was not compacted")
         try require(decodedPreview.displayOverview.bins.count == 128, "display launch preview was not compacted")
+        let decodedTranscript = try requireValue(decodedTrack.transcript, "track dropped transcript")
+        try require(decodedTranscript.trackID == trackID, "transcript track ID did not persist")
+        try require(decodedTranscript.words.count == transcript.words.count, "transcript words did not persist")
+        try require(decodedTranscript.segments.count == transcript.segments.count, "transcript segments did not persist")
         let restoredLaunchOverview = decodedPreview.displayOverview.waveformOverview
         try require(
             abs(restoredLaunchOverview.duration - originalEditedOverview.duration) < 0.000_001,
@@ -182,9 +223,11 @@ enum ProjectEditRoundTripSmokeHarness {
                 "project preserves track and mixer state",
                 "project preserves edit timeline state",
                 "project preserves compact launch waveform preview",
+                "project preserves transcript documents",
                 "restored timeline renders audio identical to original edits",
                 "legacy projects migrate and decode",
                 "autosave recovery preserves saved launch waveform previews",
+                "launch snapshot sidecar preserves compact binary first-paint visuals",
                 "remembered timeline viewport round-trips",
                 "multi-track edit graph stress round-trips",
             ],
@@ -224,6 +267,38 @@ enum ProjectEditRoundTripSmokeHarness {
             ))
         }
         return WaveformOverview(duration: duration, bins: bins)
+    }
+
+    private static func syntheticTranscript(trackID: UUID, duration: TimeInterval) -> TranscriptDocument {
+        let words = [
+            TranscriptWord(text: "hello", startTime: 0.1, endTime: 0.35, confidence: 0.98, speakerID: "speaker-1"),
+            TranscriptWord(text: "soundtime", startTime: 0.38, endTime: 0.86, confidence: 0.96, speakerID: "speaker-1"),
+            TranscriptWord(
+                text: "transcript",
+                startTime: min(duration * 0.50, 1.2),
+                endTime: min(duration * 0.50 + 0.48, duration),
+                confidence: 0.95,
+                speakerID: "speaker-1"
+            ),
+        ]
+        return TranscriptDocument(
+            trackID: trackID,
+            sourceRevision: 2,
+            sourceDuration: duration,
+            languageCode: "en",
+            providerIdentifier: "smoke.transcription",
+            providerDisplayName: "Smoke Transcriber",
+            segments: [
+                TranscriptSegment(
+                    speakerID: "speaker-1",
+                    speakerLabel: "Speaker 1",
+                    startTime: words.first?.startTime ?? 0,
+                    endTime: words.last?.endTime ?? duration,
+                    text: words.map(\.text).joined(separator: " "),
+                    words: words
+                ),
+            ]
+        )
     }
 
     private static func requireAutosaveRecoveryPreservesSavedWaveformPreviews(
@@ -269,7 +344,9 @@ enum ProjectEditRoundTripSmokeHarness {
                 SoundtimeProject.Track(
                     id: trackID,
                     name: "Autosaved Track",
-                    filePath: fileInfo.url.path,
+                    filePath: fileInfo.url.deletingLastPathComponent()
+                        .appendingPathComponent("SoundtimeAutosavePreviewMerge-RestoredPath.wav")
+                        .path,
                     volume: 0.9,
                     isMuted: true,
                     isSoloed: false,
@@ -300,6 +377,21 @@ enum ProjectEditRoundTripSmokeHarness {
             recoveredPreview.displayOverview.bins.count == waveformPreview.displayOverview.bins.count,
             "autosave recovery preview bin count mismatch"
         )
+
+        let launchPreviewProject = try SoundtimeProjectStore.loadLaunchPreviewRecoveringAutosave(from: projectURL)
+        let launchPreviewTrack = try requireValue(
+            launchPreviewProject.tracks.first,
+            "launch preview recovery dropped track"
+        )
+        let launchPreview = try requireValue(
+            launchPreviewTrack.waveformPreview,
+            "launch preview recovery dropped saved waveform preview"
+        )
+        try require(launchPreview.isValid(for: fileInfo), "launch preview recovery preview is invalid")
+        try require(
+            launchPreview.displayOverview.bins.count == waveformPreview.displayOverview.bins.count,
+            "launch preview recovery preview bin count mismatch"
+        )
     }
 
     private static func requireRememberedTimelineViewportRoundTrip() throws {
@@ -319,6 +411,134 @@ enum ProjectEditRoundTripSmokeHarness {
                 abs(restored.durationProgress - viewport.durationProgress) < 0.000_001,
             "remembered timeline viewport did not round-trip"
         )
+    }
+
+    private static func requireLaunchSnapshotSidecarRoundTrip(
+        fileInfo: WAVFileInfo,
+        trackID: UUID,
+        editTimeline: AudioFileEditTimeline.PersistentState,
+        editableSource: EditableAudioSource
+    ) throws {
+        let projectURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SoundtimeLaunchSnapshot-\(UUID().uuidString)")
+            .appendingPathExtension(SoundtimeProjectStore.fileExtension)
+        try Data("launch snapshot project v1".utf8).write(to: projectURL, options: [.atomic])
+        let sourceOverview = syntheticOverview(
+            duration: fileInfo.duration,
+            binCount: ProjectLaunchSnapshot.maximumOverviewBinCount + 257
+        )
+        let displayOverview = syntheticOverview(
+            duration: fileInfo.duration,
+            binCount: ProjectLaunchSnapshot.maximumOverviewBinCount + 513
+        )
+        let windowLayout = SoundtimeProject.WindowLayout(x: 11, y: 22, width: 1440, height: 810)
+        let viewport = SoundtimeProject.TimelineViewport(startProgress: 0.31, durationProgress: 0.12)
+        let snapshot = ProjectLaunchSnapshot(
+            projectURL: projectURL,
+            windowLayout: windowLayout,
+            timelineViewport: viewport,
+            masterVolume: 0.44,
+            transcriptDisplayMode: .waveformOverlay,
+            tracks: [
+                ProjectLaunchSnapshot.TrackDraft(
+                    id: trackID,
+                    editGroupID: UUID(uuidString: "99999999-2222-3333-4444-555555555555"),
+                    name: "Launch Snapshot Track",
+                    filePath: fileInfo.url.path,
+                    durationHint: fileInfo.duration,
+                    sourceWaveformOverview: sourceOverview,
+                    displayWaveformOverview: displayOverview,
+                    editTimeline: editTimeline,
+                    editableSource: SoundtimeProject.Track.EditableSource(editableSource),
+                    ownsSourceFile: true,
+                    volume: 0.52,
+                    isMuted: false,
+                    isSoloed: true
+                ),
+            ]
+        )
+
+        defer {
+            ProjectLaunchSnapshotStore.remove(for: projectURL)
+            try? FileManager.default.removeItem(at: projectURL)
+        }
+
+        try ProjectLaunchSnapshotStore.save(snapshot, for: projectURL)
+        let snapshotURL = ProjectLaunchSnapshotStore.snapshotURL(for: projectURL)
+        let binaryData = try Data(contentsOf: snapshotURL)
+        try require(ProjectLaunchSnapshotBinaryCodec.hasBinaryMagic(binaryData), "launch snapshot sidecar was not binary")
+        let legacyJSONData = try JSONEncoder().encode(snapshot)
+        try require(
+            binaryData.count < legacyJSONData.count,
+            "binary launch snapshot should be smaller than legacy JSON/base64"
+        )
+        let restored = try ProjectLaunchSnapshotStore.load(for: projectURL)
+        try require(restored.isDrawable, "launch snapshot was not drawable")
+        try require(restored.windowLayout?.width == windowLayout.width, "launch snapshot window layout did not persist")
+        try require(
+            abs((restored.timelineViewport?.startProgress ?? -1) - viewport.startProgress) < 0.000_001,
+            "launch snapshot viewport did not persist"
+        )
+        let restoredTrack = try requireValue(restored.tracks.first, "launch snapshot dropped track")
+        try require(restoredTrack.id == trackID, "launch snapshot track ID mismatch")
+        try require(restoredTrack.name == "Launch Snapshot Track", "launch snapshot track name mismatch")
+        try require(abs(restoredTrack.volume - 0.52) < 0.000_001, "launch snapshot track volume mismatch")
+        try require(restoredTrack.isSoloed, "launch snapshot track solo mismatch")
+        let restoredSourceOverview = try requireValue(
+            restoredTrack.sourceWaveformOverview,
+            "launch snapshot dropped source overview"
+        )
+        let restoredDisplayOverview = try requireValue(
+            restoredTrack.displayWaveformOverview,
+            "launch snapshot dropped display overview"
+        )
+        try require(
+            restoredSourceOverview.bins.count == ProjectLaunchSnapshot.maximumOverviewBinCount,
+            "launch snapshot source overview was not compacted"
+        )
+        try require(
+            restoredDisplayOverview.bins.count == ProjectLaunchSnapshot.maximumOverviewBinCount,
+            "launch snapshot display overview was not compacted"
+        )
+        try require(
+            abs(restoredDisplayOverview.duration - fileInfo.duration) < 0.000_001,
+            "launch snapshot overview duration mismatch"
+        )
+        try require(
+            restoredTrack.editTimeline?.segments.count == editTimeline.segments.count,
+            "launch snapshot edit timeline mismatch"
+        )
+        try require(
+            restoredTrack.editableSource?.formatOrigin == .mp3,
+            "launch snapshot editable source metadata mismatch"
+        )
+
+        try legacyJSONData.write(to: snapshotURL, options: [.atomic])
+        let legacyRestored = try ProjectLaunchSnapshotStore.load(for: projectURL)
+        try require(legacyRestored.isDrawable, "legacy JSON launch snapshot fallback failed")
+
+        try ProjectLaunchSnapshotStore.save(snapshot, for: projectURL)
+        try Data("changed source file invalidates launch previews".utf8).write(to: fileInfo.url, options: [.atomic])
+        let sourceInvalidated = try ProjectLaunchSnapshotStore.load(for: projectURL)
+        let invalidatedTrack = try requireValue(
+            sourceInvalidated.tracks.first,
+            "source-invalidated launch snapshot dropped track"
+        )
+        try require(invalidatedTrack.sourceOverview == nil, "stale source preview was not stripped")
+        try require(invalidatedTrack.displayOverview == nil, "stale display preview was not stripped")
+        try require(invalidatedTrack.editTimeline == nil, "stale edit timeline was not stripped")
+        try require(invalidatedTrack.durationHint == nil, "stale duration hint was not stripped")
+        try Data(count: fileInfo.dataRange.upperBound).write(to: fileInfo.url, options: [.atomic])
+
+        try Data("launch snapshot project v2 with a changed file size".utf8).write(to: projectURL, options: [.atomic])
+        do {
+            _ = try ProjectLaunchSnapshotStore.load(for: projectURL)
+            throw SmokeError.invalidProject("stale launch snapshot was accepted after project file changed")
+        } catch let error as SmokeError {
+            throw error
+        } catch {
+            // Expected: stale snapshots are discarded so first paint cannot show the wrong project revision.
+        }
     }
 
     private static func requireRenderedAudioMatchesEdits(
