@@ -11,6 +11,19 @@ if CommandLine.arguments.contains("--timeline-perf-baseline") {
     }
 }
 
+if CommandLine.arguments.contains("--production-readiness-smoke") ||
+    CommandLine.arguments.contains("--production-readiness-smoke-quick") ||
+    CommandLine.arguments.contains("--production-readiness-plan")
+{
+    do {
+        try ProductionReadinessHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        exit(0)
+    } catch {
+        fputs("Soundtime production readiness smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
 if CommandLine.arguments.contains("--launch-performance-smoke") ||
     CommandLine.arguments.contains("--launch-performance-smoke-full")
 {
