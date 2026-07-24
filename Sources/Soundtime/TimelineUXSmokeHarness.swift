@@ -164,6 +164,16 @@ enum TimelineUXSmokeHarness {
         )
         complete("pan changes viewport rendering and playhead x")
 
+        try verifyLoopWrapKeepsPlayheadMapped(
+            renderer: renderer,
+            track: track,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale,
+            frameStatsBox: frameStatsBox
+        )
+        complete("loop wrap keeps playhead effects mapped")
+
         try verifyUltraZoomStillRenders(
             renderer: renderer,
             track: track,
@@ -436,7 +446,7 @@ enum TimelineUXSmokeHarness {
     ) throws {
         let renderer = try TimelineRenderer(device: device, pixelFormat: pixelFormat)
         let trackID = UUID()
-        let duration: TimeInterval = 8 * 60
+        let duration: TimeInterval = 60
         let coarseOverview = makeDetailedWaveformOverview(
             duration: duration,
             binCount: 4_096,
@@ -444,7 +454,7 @@ enum TimelineUXSmokeHarness {
         )
         let refinedOverview = makeDetailedWaveformOverview(
             duration: duration,
-            binCount: 131_072,
+            binCount: 32_768,
             seed: 0xF17E_1D
         )
         let coarseTrack = TimelineRenderState.Track(
@@ -470,7 +480,7 @@ enum TimelineUXSmokeHarness {
         let baseTimestamp = CACurrentMediaTime()
         renderer.displayTracks([coarseTrack], animateWaveformTransition: false)
         renderer.displayTrackLayout(.default)
-        renderer.displayViewport(.full)
+        renderer.displayViewport(TimelineViewport(startProgress: 0.18, durationProgress: 0.10))
         renderer.displayPlaybackActive(false)
         renderer.displayPlayheadProgress(
             0,
@@ -499,7 +509,7 @@ enum TimelineUXSmokeHarness {
         renderer.displayTracks([refinedTrack], animateWaveformTransition: false)
         renderer.displayHoverProgress(0.45, isArmed: true)
 
-        for attempt in 0..<220 {
+        for attempt in 0..<60 {
             _ = try renderCurrentTimeline(
                 renderer: renderer,
                 displayTimestamp: baseTimestamp + 0.1 + Double(attempt) * 0.016,
@@ -511,8 +521,28 @@ enum TimelineUXSmokeHarness {
                 drawableSize: viewportSize,
                 backingScale: backingScale
             )
+            try require(
+                (binCounts.max() ?? 0) < 32_768,
+                "refined waveform promoted while hover interaction was active; visible bins \(binCounts)"
+            )
+            usleep(8_000)
+        }
+
+        renderer.displayHoverProgress(nil, isArmed: false)
+        usleep(450_000)
+        for _ in 0..<220 {
+            _ = try renderCurrentTimeline(
+                renderer: renderer,
+                displayTimestamp: CACurrentMediaTime(),
+                texture: texture,
+                viewportSize: viewportSize,
+                backingScale: backingScale
+            )
+            let binCounts = renderer.visibleWaveformDrawableBinCounts(
+                drawableSize: viewportSize,
+                backingScale: backingScale
+            )
             if (binCounts.max() ?? 0) >= 32_768 {
-                renderer.displayHoverProgress(nil, isArmed: false)
                 return
             }
             usleep(8_000)
@@ -522,7 +552,6 @@ enum TimelineUXSmokeHarness {
             drawableSize: viewportSize,
             backingScale: backingScale
         )
-        renderer.displayHoverProgress(nil, isArmed: false)
         try require(
             (finalBinCounts.max() ?? 0) >= 32_768,
             "refined waveform never promoted beyond coarse preview; visible bins \(finalBinCounts)"
@@ -653,6 +682,76 @@ enum TimelineUXSmokeHarness {
         let firstX = try requireValue(first.summary.cyanCentroidX, "pan smoke could not find first playhead")
         let secondX = try requireValue(second.summary.cyanCentroidX, "pan smoke could not find panned playhead")
         try require(secondX < firstX - 80, "panning did not move playhead left as viewport moved right: \(firstX) -> \(secondX)")
+    }
+
+    private static func verifyLoopWrapKeepsPlayheadMapped(
+        renderer: TimelineRenderer,
+        track: TimelineRenderState.Track,
+        texture: MTLTexture,
+        viewportSize: CGSize,
+        backingScale: Float,
+        frameStatsBox: FrameStatsBox
+    ) throws {
+        let loopRange = TimelineLoopRange(startProgress: 0.25, endProgress: 0.45)
+        let initialPlayheadProgress: Float = 0.44
+        let duration = try requireValue(track.durationHint, "loop-wrap smoke track had no duration")
+        let baseTimestamp = CACurrentMediaTime()
+        let wrappedTimestamp = baseTimestamp + duration * 0.04
+        let projectedProgress = initialPlayheadProgress + Float((wrappedTimestamp - baseTimestamp) / duration)
+        let expectedProgress = loopRange.startProgress +
+            (projectedProgress - loopRange.endProgress).truncatingRemainder(dividingBy: loopRange.durationProgress)
+
+        renderer.displayTracks([track], animateWaveformTransition: false)
+        renderer.displayTrackLayout(.default)
+        renderer.displayViewport(.full)
+        renderer.displayLoopRange(loopRange)
+        renderer.displayLoopRangeEnabled(true)
+        renderer.displayPlaybackActive(true)
+        renderer.displayPlayheadProgress(
+            initialPlayheadProgress,
+            force: true,
+            anchorTimestamp: baseTimestamp,
+            resetsTouchStart: true
+        )
+        try waitForVisibleWaveformBuffers(
+            renderer: renderer,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale,
+            displayTimestamp: baseTimestamp
+        )
+        frameStatsBox.samples.removeAll()
+
+        let frame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: wrappedTimestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        try requireCyanX(
+            frame.summary,
+            expectedX: Double(frame.summary.width) * Double(expectedProgress),
+            tolerance: 44,
+            label: "loop wrap"
+        )
+
+        let playbackStats = frameStatsBox.samples.filter { $0.waveformHotPathReason == "playback" }
+        try require(!playbackStats.isEmpty, "loop-wrap playback did not publish frame stats")
+        let hotPathViolations = playbackStats.filter {
+            $0.cpuWaveformVertexCount > 0 ||
+                $0.cpuWaveformFallbackDrawCount > 0 ||
+                $0.shaderBufferUploadByteCount > 0 ||
+                $0.shaderBufferUploadCount > 0
+        }
+        try require(
+            hotPathViolations.isEmpty,
+            "loop-wrap playback used CPU fallback or shader uploads in \(hotPathViolations.count) frames"
+        )
+
+        renderer.displayPlaybackActive(false)
+        renderer.displayLoopRange(.default)
+        renderer.displayLoopRangeEnabled(true)
     }
 
     private static func verifyUltraZoomStillRenders(
@@ -1263,11 +1362,14 @@ enum TimelineUXSmokeHarness {
         let viewportStats = frameStatsBox.samples.filter { $0.waveformHotPathReason == "viewport-interaction" }
         try require(!viewportStats.isEmpty, "viewport interaction did not publish hot-path frame stats")
         let fallbackStats = viewportStats.filter {
-            $0.cpuWaveformVertexCount > 0 || $0.cpuWaveformFallbackDrawCount > 0
+            $0.cpuWaveformVertexCount > 0 ||
+                $0.cpuWaveformFallbackDrawCount > 0 ||
+                $0.shaderBufferUploadByteCount > 0 ||
+                $0.shaderBufferUploadCount > 0
         }
         try require(
             fallbackStats.isEmpty,
-            "viewport interaction used CPU fallback in \(fallbackStats.count) frames"
+            "viewport interaction used CPU fallback or shader uploads in \(fallbackStats.count) frames"
         )
 
         let changedPixels = pixelDifferenceCount(firstFrame.bytes, lastFrame.bytes, threshold: 8)
@@ -1282,14 +1384,31 @@ enum TimelineUXSmokeHarness {
         backingScale: Float
     ) throws {
         renderer.clearDeletionEffects()
+        renderer.displayLoopRange(.default)
+        renderer.displayLoopRangeEnabled(true)
+        renderer.displayHoverProgress(nil, isArmed: false)
+        renderer.displaySelection(nil)
         let selection = TimelineSelection(startProgress: 0.24, endProgress: 0.32, trackID: track.id)
         let baseTimestamp = CACurrentMediaTime()
-        let baseFrame = try renderTimeline(
+        renderer.displayTracks([track], animateWaveformTransition: false)
+        renderer.displayTrackLayout(.default)
+        renderer.displayViewport(.full)
+        renderer.displayPlaybackActive(false)
+        renderer.displayPlayheadProgress(
+            0.24,
+            force: true,
+            anchorTimestamp: baseTimestamp,
+            resetsTouchStart: true
+        )
+        try waitForVisibleWaveformBuffers(
             renderer: renderer,
-            tracks: [track],
-            viewport: .full,
-            playheadProgress: 0.24,
-            isPlaybackActive: false,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale,
+            displayTimestamp: baseTimestamp
+        )
+        let baseFrame = try renderCurrentTimeline(
+            renderer: renderer,
             displayTimestamp: baseTimestamp,
             texture: texture,
             viewportSize: viewportSize,
@@ -1297,12 +1416,8 @@ enum TimelineUXSmokeHarness {
         )
 
         renderer.triggerDeletionEffect(selection: selection)
-        let activeFrame = try renderTimeline(
+        let activeFrame = try renderCurrentTimeline(
             renderer: renderer,
-            tracks: [track],
-            viewport: .full,
-            playheadProgress: 0.24,
-            isPlaybackActive: false,
             displayTimestamp: baseTimestamp + 0.02,
             texture: texture,
             viewportSize: viewportSize,
@@ -1313,22 +1428,34 @@ enum TimelineUXSmokeHarness {
             "delete animation effect did not visibly alter the render"
         )
 
-        let expiredFrame = try renderTimeline(
+        _ = try renderCurrentTimeline(
             renderer: renderer,
-            tracks: [track],
-            viewport: .full,
-            playheadProgress: 0.24,
-            isPlaybackActive: false,
             displayTimestamp: baseTimestamp + 2.20,
             texture: texture,
             viewportSize: viewportSize,
             backingScale: backingScale
         )
-        try require(
-            pixelDifferenceCount(baseFrame.bytes, expiredFrame.bytes, threshold: 12) < 600,
-            "delete animation effect did not visually expire"
+        let settledTimestamp = baseTimestamp + 2.56
+        let expiredFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: settledTimestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
         )
         renderer.clearDeletionEffects()
+        let clearedFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: settledTimestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        let expiryDifference = pixelDifferenceCount(clearedFrame.bytes, expiredFrame.bytes, threshold: 12)
+        try require(
+            expiryDifference < 120,
+            "delete animation effect did not visually expire; pixel delta \(expiryDifference)"
+        )
     }
 
     private static func verifyDeleteAnimationKeepsLeftSideStable(
@@ -1748,8 +1875,7 @@ enum TimelineUXSmokeHarness {
             "hot render loop used CPU waveform fallback in \(cpuFallbackSamples.count) frames"
         )
         let uploadSamples = hotSamples.filter {
-            $0.waveformHotPathReason != "viewport-interaction" &&
-                ($0.shaderBufferUploadCount > 0 || $0.shaderBufferUploadByteCount > 0)
+            $0.shaderBufferUploadCount > 0 || $0.shaderBufferUploadByteCount > 0
         }
         try require(
             uploadSamples.isEmpty,
