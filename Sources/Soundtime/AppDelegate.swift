@@ -1,4 +1,5 @@
 import AppKit
+import QuartzCore
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -19,9 +20,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        let startedAt = CACurrentMediaTime()
+        LaunchStartupTrace.shared.mark(
+            .appTerminateStarted,
+            fields: ["windows": "\(windowControllers.count)"]
+        )
         for controller in windowControllers {
+            controller.prepareForImmediateWindowClose()
             controller.persistOpenProjectWindowLayout()
         }
+        let elapsedMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
+        LaunchStartupTrace.shared.mark(
+            .appTerminateFinished,
+            fields: [
+                "elapsedMs": String(format: "%.2f", elapsedMilliseconds),
+                "windows": "\(windowControllers.count)",
+                "launchSnapshotWrite": "false",
+                "firstFramePacketWrite": "false",
+            ]
+        )
+        SoundtimeDiagnostics.shared.record(
+            category: .system,
+            severity: elapsedMilliseconds > 16 ? .warning : .info,
+            name: "app-terminate-project-state-persisted",
+            message: "Application termination persisted only lightweight launch state synchronously.",
+            fields: [
+                "elapsedMs": String(format: "%.2f", elapsedMilliseconds),
+                "windows": "\(windowControllers.count)",
+                "launchSnapshotWrite": "false",
+                "firstFramePacketWrite": "false",
+            ]
+        )
     }
 
     @objc private func newProject(_ sender: Any?) {
@@ -36,7 +65,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @discardableResult
     private func openProjectWindow(restoresLastProject: Bool) -> MainWindowController {
-        let controller = MainWindowController(restoresLastProject: restoresLastProject)
+        let launchPlan = ProjectLaunchCoordinator.resolveLaunchPlan(restoresLastProject: restoresLastProject)
+        LaunchStartupTrace.shared.mark(
+            .launchPlanResolved,
+            fields: launchPlan.diagnosticFields
+        )
+        let controller = MainWindowController(launchPlan: launchPlan)
         controller.onWindowWillClose = { [weak self, weak controller] closingController in
             guard let controller else {
                 return
@@ -45,26 +79,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.windowControllers.removeAll { $0 === closingController || $0 === controller }
         }
         windowControllers.append(controller)
-        if restoresLastProject {
-            controller.prepareForDeferredProjectRestore()
-        }
         LaunchStartupTrace.shared.mark(
             .windowShowRequested,
-            fields: ["restoresLastProject": "\(restoresLastProject)"]
+            fields: launchPlan.diagnosticFields
         )
         controller.showWindow(nil)
         controller.window?.contentView?.layoutSubtreeIfNeeded()
         controller.window?.displayIfNeeded()
+        if launchPlan.restoresProject, controller.submitDeferredLaunchPreviewRenderIfNeeded() {
+            controller.window?.contentView?.layoutSubtreeIfNeeded()
+            controller.window?.displayIfNeeded()
+        }
         LaunchStartupTrace.shared.mark(
             .windowVisible,
             fields: [
-                "restoresLastProject": "\(restoresLastProject)",
+                "restoresLastProject": "\(launchPlan.restoresProject)",
                 "isVisible": "\(controller.window?.isVisible == true)",
             ]
         )
-        if restoresLastProject {
+        if launchPlan.restoresProject {
             DispatchQueue.main.async { [weak controller] in
-                controller?.restoreLastProjectAfterLaunchPreviewRender()
+                guard let controller else {
+                    return
+                }
+
+                controller.prepareForDeferredProjectRestore()
+                controller.submitDeferredLaunchPreviewRenderIfNeeded()
+                controller.restoreLastProjectAfterLaunchPreviewRender()
             }
         }
         return controller

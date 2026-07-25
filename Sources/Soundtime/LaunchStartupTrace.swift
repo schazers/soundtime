@@ -4,13 +4,18 @@ import QuartzCore
 enum LaunchStartupMilestone: String, Sendable {
     case processEntry = "process-entry"
     case appDelegateDidFinishLaunching = "app-delegate-did-finish-launching"
+    case launchPlanResolved = "launch-plan-resolved"
     case mainWindowControllerInitStart = "main-window-controller-init-start"
+    case windowFrameChosen = "window-frame-chosen"
     case mainWindowCreated = "main-window-created"
+    case workspaceFirstPaintInstalled = "workspace-first-paint-installed"
     case deferredWindowLayoutApplied = "deferred-window-layout-applied"
     case deferredProjectRestorePrepared = "deferred-project-restore-prepared"
     case windowShowRequested = "window-show-requested"
     case windowVisible = "window-visible"
     case launchPreviewLoadStarted = "launch-preview-load-started"
+    case firstFrameWaveformPacketLoaded = "first-frame-waveform-packet-loaded"
+    case firstFrameWaveformPacketInstalled = "first-frame-waveform-packet-installed"
     case launchSnapshotLoaded = "launch-snapshot-loaded"
     case launchProjectPreviewLoaded = "launch-project-preview-loaded"
     case launchPreviewUnavailable = "launch-preview-unavailable"
@@ -25,6 +30,12 @@ enum LaunchStartupMilestone: String, Sendable {
     case playbackTrackReady = "playback-track-ready"
     case playbackReady = "playback-ready"
     case playbackReadyWithFailures = "playback-ready-with-failures"
+    case windowCloseRequested = "window-close-requested"
+    case windowClosePrepared = "window-close-prepared"
+    case windowCloseStatePersisted = "window-close-state-persisted"
+    case windowCloseFinished = "window-close-finished"
+    case appTerminateStarted = "app-terminate-started"
+    case appTerminateFinished = "app-terminate-finished"
     case launchFailed = "launch-failed"
 }
 
@@ -194,10 +205,26 @@ final class LaunchStartupTrace: @unchecked Sendable {
         case .playbackReady, .playbackReadyWithFailures:
             return event.elapsedMilliseconds > 6_000 ? .severe :
                 (event.elapsedMilliseconds > 2_500 ? .warning : .info)
+        case .firstFrameWaveformPacketLoaded:
+            return event.deltaMilliseconds > 35 ? .warning : .info
+        case .firstFrameWaveformPacketInstalled:
+            return event.deltaMilliseconds > 25 ? .warning : .info
+        case .launchPlanResolved:
+            return event.deltaMilliseconds > 50 ? .warning : .info
+        case .windowFrameChosen:
+            return event.deltaMilliseconds > 10 ? .warning : .info
+        case .workspaceFirstPaintInstalled:
+            return event.deltaMilliseconds > 30 ? .warning : .info
         case .launchSnapshotLoaded:
             return event.deltaMilliseconds > 75 ? .warning : .info
         case .launchProjectPreviewLoaded:
             return event.deltaMilliseconds > 120 ? .warning : .info
+        case .windowClosePrepared, .windowCloseStatePersisted:
+            return event.deltaMilliseconds > 10 ? .warning : .info
+        case .windowCloseFinished:
+            return event.deltaMilliseconds > 20 ? .warning : .info
+        case .appTerminateFinished:
+            return event.deltaMilliseconds > 20 ? .warning : .info
         case .launchFailed:
             return .warning
         default:
@@ -215,10 +242,26 @@ final class LaunchStartupTrace: @unchecked Sendable {
             return (1_000, "elapsed")
         case .playbackReady, .playbackReadyWithFailures:
             return (2_500, "elapsed")
+        case .firstFrameWaveformPacketLoaded:
+            return (35, "delta")
+        case .firstFrameWaveformPacketInstalled:
+            return (25, "delta")
+        case .launchPlanResolved:
+            return (50, "delta")
+        case .windowFrameChosen:
+            return (10, "delta")
+        case .workspaceFirstPaintInstalled:
+            return (30, "delta")
         case .launchSnapshotLoaded:
             return (75, "delta")
         case .launchProjectPreviewLoaded:
             return (120, "delta")
+        case .windowClosePrepared, .windowCloseStatePersisted:
+            return (10, "delta")
+        case .windowCloseFinished:
+            return (20, "delta")
+        case .appTerminateFinished:
+            return (20, "delta")
         default:
             return nil
         }

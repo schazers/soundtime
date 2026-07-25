@@ -1,4 +1,5 @@
 import AppKit
+import QuartzCore
 
 final class MainWindowController: NSWindowController, NSWindowDelegate {
     private static let fallbackContentSize = NSSize(width: 1104, height: 460)
@@ -8,11 +9,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     var onWindowWillClose: ((MainWindowController) -> Void)?
 
     convenience init(restoresLastProject: Bool = true) {
+        self.init(launchPlan: ProjectLaunchCoordinator.resolveLaunchPlan(restoresLastProject: restoresLastProject))
+    }
+
+    convenience init(launchPlan: ProjectLaunchPlan) {
         LaunchStartupTrace.shared.mark(
             .mainWindowControllerInitStart,
-            fields: ["restoresLastProject": "\(restoresLastProject)"]
+            fields: launchPlan.diagnosticFields
         )
-        let contentViewController = WorkspaceViewController(restoresLastProject: restoresLastProject)
+        let contentViewController = WorkspaceViewController(
+            launchPlan: launchPlan
+        )
         let window = NSWindow(
             contentRect: NSRect(origin: .zero, size: Self.fallbackContentSize),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -40,10 +47,23 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
         self.init(window: window)
         window.delegate = self
+        if let layout = launchPlan.windowLayout {
+            applyWindowLayout(layout)
+        }
+        LaunchStartupTrace.shared.mark(
+            .windowFrameChosen,
+            fields: [
+                "source": launchPlan.windowLayout == nil ? "fallback" : "launch-plan",
+                "width": String(format: "%.0f", window.frame.width),
+                "height": String(format: "%.0f", window.frame.height),
+            ].merging(launchPlan.diagnosticFields) { _, new in new }
+        )
         LaunchStartupTrace.shared.mark(
             .mainWindowCreated,
             fields: [
-                "restoresLastProject": "\(restoresLastProject)",
+                "restoresLastProject": "\(launchPlan.restoresProject)",
+                "initialFirstFrame": "\(launchPlan.firstPaintFrame != nil)",
+                "initialTracks": "\(launchPlan.expectedTrackCount)",
                 "width": String(format: "%.0f", window.frame.width),
                 "height": String(format: "%.0f", window.frame.height),
             ]
@@ -54,6 +74,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         (window?.contentViewController?.view as? WorkspaceView)?.persistCurrentProjectWindowLayout()
     }
 
+    func prepareForImmediateWindowClose() {
+        (window?.contentViewController?.view as? WorkspaceView)?.prepareForImmediateWindowClose()
+    }
+
     func restoreLastProjectIfNeeded() {
         (window?.contentViewController?.view as? WorkspaceView)?.restoreLastProjectIfNeeded()
     }
@@ -62,16 +86,57 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         (window?.contentViewController?.view as? WorkspaceView)?.restoreLastProjectAfterLaunchPreviewRender()
     }
 
-    func prepareForDeferredProjectRestore() {
+    @discardableResult
+    func submitDeferredLaunchPreviewRenderIfNeeded() -> Bool {
+        (window?.contentViewController?.view as? WorkspaceView)?
+            .submitDeferredLaunchPreviewRenderIfNeeded() ?? false
+    }
+
+    func prepareWindowLayoutForDeferredProjectRestore() {
         if applyDeferredProjectWindowLayoutIfAvailable() {
             LaunchStartupTrace.shared.mark(.deferredWindowLayoutApplied)
         }
+    }
+
+    func prepareVisualShellForDeferredProjectRestore() {
+        (window?.contentViewController?.view as? WorkspaceView)?.prepareVisualShellForDeferredProjectRestore()
+    }
+
+    func prepareForDeferredProjectRestore() {
         (window?.contentViewController?.view as? WorkspaceView)?.prepareForDeferredProjectRestore()
     }
 
     func windowWillClose(_ notification: Notification) {
+        let startedAt = CACurrentMediaTime()
+        LaunchStartupTrace.shared.mark(.windowCloseRequested)
+        SoundtimeDiagnostics.shared.record(
+            category: .system,
+            severity: .info,
+            name: "project-window-close-requested",
+            message: "Project window close started.",
+            fields: [:]
+        )
+        prepareForImmediateWindowClose()
         persistOpenProjectWindowLayout()
         onWindowWillClose?(self)
+        let elapsedMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
+        LaunchStartupTrace.shared.mark(
+            .windowCloseFinished,
+            fields: [
+                "elapsedMs": String(format: "%.2f", elapsedMilliseconds),
+                "launchSnapshotWrite": "false",
+                "firstFramePacketWrite": "false",
+            ]
+        )
+        SoundtimeDiagnostics.shared.record(
+            category: .system,
+            severity: elapsedMilliseconds > 16 ? .warning : .info,
+            name: "project-window-close-finished",
+            message: "Project window close finished its synchronous work.",
+            fields: [
+                "elapsedMs": String(format: "%.2f", elapsedMilliseconds),
+            ]
+        )
     }
 
     func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
@@ -142,14 +207,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private static func deferredProjectWindowLayout() -> SoundtimeProject.WindowLayout? {
-        if
-            let lastProjectURL = SoundtimeProjectStore.lastProjectURL(),
-            FileManager.default.fileExists(atPath: lastProjectURL.path)
-        {
-            return SoundtimeProjectStore.rememberedWindowLayout(for: lastProjectURL)
-        }
-
-        return nil
+        ProjectLaunchCoordinator.preferredWindowLayoutForLastProject()
     }
 
     private func applyWindowLayout(_ layout: SoundtimeProject.WindowLayout) {

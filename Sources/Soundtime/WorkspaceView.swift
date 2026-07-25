@@ -596,6 +596,10 @@ final class WorkspaceView: NSView {
     private var trackSelectionAnchorID: UUID?
     private var defaultEditGroupID = UUID()
     private var currentProjectURL: URL?
+    private var currentProjectID = UUID()
+    private var currentEditGraphRevision: UInt64 = 1
+    private var currentVisualRevision: UInt64 = 1
+    private var currentLaunchStateRevision: UInt64 = 1
     private var hasRestoredLastProject = false
     private var isDeferredProjectRestorePending = false
     private var isLoadingProject = false
@@ -604,6 +608,7 @@ final class WorkspaceView: NSView {
     private var launchPreviewLoadGeneration = 0
     private var isLaunchPreviewLoadInFlight = false
     private var pendingHydrationAfterLaunchPreviewLoad = false
+    private var isLaunchVisualPreviewPendingImmediateRender = false
     private var projectHydrationQueue: ProjectHydrationQueue?
     private var projectPlaybackPrimedTrackIDs: Set<UUID> = []
     private var projectHydrationCompletedTrackIDs: Set<UUID> = []
@@ -1049,13 +1054,26 @@ final class WorkspaceView: NSView {
     private var isAutosaveSuppressed = false
     private var wavFileInfoCache: [URL: WAVFileInfo] = [:]
     private var invalidWAVFileInfoCache: Set<URL> = []
+    private let launchPlan: ProjectLaunchPlan
 
     override init(frame frameRect: NSRect) {
+        launchPlan = .newProject()
         super.init(frame: frameRect)
         configure()
     }
 
+    init(
+        frame frameRect: NSRect = .zero,
+        launchPlan: ProjectLaunchPlan
+    ) {
+        self.launchPlan = launchPlan
+        super.init(frame: frameRect)
+        configure()
+        applyInitialLaunchPlanIfAvailable()
+    }
+
     required init?(coder: NSCoder) {
+        launchPlan = .newProject(reason: "coder")
         super.init(coder: coder)
         configure()
     }
@@ -1705,8 +1723,47 @@ final class WorkspaceView: NSView {
         tearDownRuntimeState()
     }
 
+    func prepareForImmediateWindowClose() {
+        let startedAt = CACurrentMediaTime()
+        viewportPersistenceWorkItem?.cancel()
+        viewportPersistenceWorkItem = nil
+        launchSnapshotSaveWorkItem?.cancel()
+        launchSnapshotSaveWorkItem = nil
+        launchSnapshotSaveGeneration += 1
+        launchWaveformCacheTasks.values.forEach { $0.cancel() }
+        launchWaveformCacheTasks.removeAll()
+        launchWaveformCacheRequestIDs.removeAll()
+        projectHydrationQueue?.cancel()
+        projectHydrationQueue = nil
+        persistLatestTimelineViewport(flushImmediately: false, schedulesLaunchSnapshot: false)
+
+        let elapsedMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
+        LaunchStartupTrace.shared.mark(
+            .windowClosePrepared,
+            fields: [
+                "elapsedMs": String(format: "%.2f", elapsedMilliseconds),
+                "tracks": "\(projectTracks.count)",
+                "launchSnapshotWrite": "false",
+                "firstFramePacketWrite": "false",
+            ]
+        )
+        SoundtimeDiagnostics.shared.record(
+            category: .system,
+            severity: elapsedMilliseconds > 8 ? .warning : .info,
+            name: "project-window-close-prepared",
+            message: "Prepared window close without synchronously writing launch waveform caches.",
+            fields: [
+                "elapsedMs": String(format: "%.2f", elapsedMilliseconds),
+                "tracks": "\(projectTracks.count)",
+                "launchSnapshotWrite": "false",
+                "firstFramePacketWrite": "false",
+                "canceledLaunchCacheWork": "true",
+            ]
+        )
+    }
+
     private func tearDownRuntimeState() {
-        persistLatestTimelineViewport(flushImmediately: true)
+        persistLatestTimelineViewport(flushImmediately: false, schedulesLaunchSnapshot: false)
         PerformanceDashboardWindowController.closeIfLoaded()
         if let keyDownMonitor {
             NSEvent.removeMonitor(keyDownMonitor)
@@ -2203,6 +2260,28 @@ final class WorkspaceView: NSView {
             finishDeferredProjectRestore()
         }
 
+        if
+            launchPlan.restoresProject,
+            let targetProjectURL = launchPlan.targetProjectURL
+        {
+            if FileManager.default.fileExists(atPath: targetProjectURL.path) {
+                if launchPlan.usesAutosaveRecovery {
+                    loadProject(from: targetProjectURL)
+                } else {
+                    loadRecoveredAutosave(from: targetProjectURL)
+                }
+                return
+            }
+
+            SoundtimeDiagnostics.shared.record(
+                category: .system,
+                severity: .warning,
+                name: "launch-plan-target-missing",
+                message: "The launch plan target disappeared before project hydration.",
+                fields: launchPlan.diagnosticFields
+            )
+        }
+
         if let lastProjectURL = SoundtimeProjectStore.lastProjectURL() {
             if FileManager.default.fileExists(atPath: lastProjectURL.path) {
                 loadProject(from: lastProjectURL)
@@ -2224,7 +2303,7 @@ final class WorkspaceView: NSView {
             return
         }
 
-        if isLaunchPreviewLoadInFlight, projectTracks.isEmpty {
+        if isLaunchPreviewLoadInFlight {
             pendingHydrationAfterLaunchPreviewLoad = true
             let generation = launchPreviewLoadGeneration
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak self] in
@@ -2251,39 +2330,31 @@ final class WorkspaceView: NSView {
             return
         }
 
-        var didRestore = false
-        let restoreOnce: (String) -> Void = { [weak self] reason in
-            guard let self, !didRestore else {
+        let submittedPreviewRender = submitDeferredLaunchPreviewRenderIfNeeded()
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isDeferredProjectRestorePending else {
                 return
             }
 
-            didRestore = true
             SoundtimeDiagnostics.shared.record(
                 category: .system,
                 severity: .info,
                 name: "launch-hydration-start",
-                message: "Starting full project hydration after launch preview.",
-                fields: ["reason": reason]
+                message: "Starting full project hydration after the launch preview was applied.",
+                fields: [
+                    "reason": submittedPreviewRender ?
+                        "preview-render-requested" :
+                        "preview-render-not-required",
+                ]
             )
             self.restoreLastProjectIfNeeded()
-        }
-
-        timelineSurface.notifyAfterNextSubmittedTimelineRender { submittedAt in
-            LaunchStartupTrace.shared.markOnce(
-                .firstTimelineRenderSubmitted,
-                fields: ["submittedAt": String(format: "%.3f", submittedAt)]
-            )
-            restoreOnce("first-preview-render-submitted")
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.65) {
-            restoreOnce("preview-render-timeout")
         }
     }
 
     func prepareForDeferredProjectRestore() {
         guard
             !hasRestoredLastProject,
-            restorableLaunchProjectURL() != nil || SoundtimeProjectStore.recoverableAutosaveURLs().first != nil
+            let launchTarget = deferredProjectRestoreTarget()
         else {
             return
         }
@@ -2292,52 +2363,306 @@ final class WorkspaceView: NSView {
         setProjectReadinessState(.launchPreviewLoading)
         LaunchStartupTrace.shared.mark(.deferredProjectRestorePrepared)
 
-        if let url = restorableLaunchProjectURL() {
-            if applyFirstPaintLaunchSnapshotIfAvailable(projectURL: url) {
-                return
-            }
-            loadDeferredLaunchPreviewAsync(projectURL: url, usesAutosaveRecovery: true)
-        } else if let recoveryURL = SoundtimeProjectStore.recoverableAutosaveURLs().first {
-            loadDeferredLaunchPreviewAsync(projectURL: recoveryURL, usesAutosaveRecovery: false)
+        if hasDrawableDeferredLaunchPreviewApplied {
+            setProjectReadinessState(
+                .visualReady(trackCount: projectTracks.count),
+                statusOverride: ProjectLaunchFirstFrame.Source.firstFrameWaveformPacket.statusOverride
+            )
+            return
+        }
+
+        if let firstFrame = ProjectLaunchCoordinator.loadCachedFirstPaintFrame(
+            projectURL: launchTarget.visualCacheURL
+        ) ?? ProjectLaunchCoordinator.loadShell(projectURL: launchTarget.visualCacheURL) {
+            applyLaunchFirstFrame(firstFrame, stateProjectURL: launchTarget.projectURL)
+            recordLaunchFirstFrameLoaded(firstFrame, firstPaint: true)
+            return
+        }
+
+        loadDeferredLaunchPreviewAsync(
+            projectURL: launchTarget.projectURL,
+            usesAutosaveRecovery: launchTarget.usesAutosaveRecovery
+        )
+    }
+
+    func prepareVisualShellForDeferredProjectRestore() {
+        guard
+            !hasRestoredLastProject,
+            let launchTarget = deferredProjectRestoreTarget()
+        else {
+            return
+        }
+        guard projectTracks.isEmpty else {
+            assertNoDefaultPlaceholderWasInstalledDuringRestore(reason: "deferred-shell-skipped")
+            return
+        }
+
+        isDeferredProjectRestorePending = true
+        setProjectReadinessState(.launchPreviewLoading)
+
+        if let firstFrame = ProjectLaunchCoordinator.loadCachedFirstPaintFrame(
+            projectURL: launchTarget.visualCacheURL
+        ) {
+            applyLaunchFirstFrame(firstFrame, stateProjectURL: launchTarget.projectURL)
+            recordLaunchFirstFrameLoaded(firstFrame, firstPaint: false)
+            return
+        }
+
+        guard let shell = ProjectLaunchCoordinator.loadShell(projectURL: launchTarget.visualCacheURL) else {
+            return
+        }
+
+        applyLaunchFirstFrame(shell, stateProjectURL: launchTarget.projectURL)
+        recordLaunchFirstFrameLoaded(shell, firstPaint: false)
+    }
+
+    private func applyInitialLaunchPlanIfAvailable() {
+        guard launchPlan.restoresProject else {
+            return
+        }
+
+        isDeferredProjectRestorePending = true
+        if let firstPaintFrame = launchPlan.firstPaintFrame {
+            applyLaunchFirstFrame(firstPaintFrame, stateProjectURL: launchPlan.targetProjectURL)
+            assertNoDefaultPlaceholderWasInstalledDuringRestore(reason: "initial-first-paint")
+            recordLaunchFirstFrameLoaded(firstPaintFrame, firstPaint: false)
+            LaunchStartupTrace.shared.mark(
+                .workspaceFirstPaintInstalled,
+                fields: launchPlan.diagnosticFields
+            )
+        } else {
+            setProjectReadinessState(.launchPreviewLoading, statusOverride: "opening project")
+            SoundtimeDiagnostics.shared.record(
+                category: .system,
+                severity: .severe,
+                name: "startup-first-paint-frame-missing",
+                message: "A restorable project had no cached first-paint frame or shell before window construction.",
+                fields: launchPlan.diagnosticFields
+            )
+            LaunchStartupTrace.shared.mark(
+                .launchPreviewUnavailable,
+                fields: launchPlan.diagnosticFields
+            )
         }
     }
 
-    private func applyFirstPaintLaunchSnapshotIfAvailable(projectURL: URL) -> Bool {
-        let startedAt = CACurrentMediaTime()
+    private func assertNoDefaultPlaceholderWasInstalledDuringRestore(reason: String) {
+        guard launchPlan.restoresProject else {
+            return
+        }
         guard
-            let snapshot = ProjectLaunchSnapshotStore.loadForFirstPaintIfAvailable(for: projectURL),
-            snapshot.isDrawable
+            projectTracks.count == 1,
+            projectTracks.first?.sourceURL.path == "/dev/null",
+            projectTracks.first?.waveformOverview == nil,
+            projectTracks.first?.sourceWaveformOverview == nil
         else {
-            return false
+            return
         }
 
-        let loadMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
-        LaunchStartupTrace.shared.mark(
-            .launchSnapshotLoaded,
-            fields: [
-                "file": projectURL.lastPathComponent,
-                "loadMs": String(format: "%.2f", loadMilliseconds),
-                "firstPaint": "true",
-            ]
-        )
-        applyDeferredLaunchSnapshot(snapshot, projectURL: projectURL)
         SoundtimeDiagnostics.shared.record(
             category: .system,
-            severity: loadMilliseconds > 35 ? .warning : .info,
-            name: "launch-first-paint-snapshot-loaded",
-            message: "Compact binary launch snapshot was applied before the first window paint.",
-            fields: [
-                "file": projectURL.lastPathComponent,
-                "loadMs": String(format: "%.2f", loadMilliseconds),
-            ]
+            severity: .severe,
+            name: "startup-placeholder-window-displayed",
+            message: "Restore-mode startup installed the default empty-project placeholder track.",
+            fields: launchPlan.diagnosticFields.merging([
+                "reason": reason,
+            ]) { _, new in new }
         )
-        return true
+        assertionFailure("Restore startup must not install the default empty-project placeholder.")
     }
 
-    private enum DeferredLaunchPreviewResult: Sendable {
-        case snapshot(ProjectLaunchSnapshot, URL, TimeInterval)
-        case projectPreview(SoundtimeProject, URL, TimeInterval)
-        case unavailable(URL, String, TimeInterval)
+    private var hasDrawableDeferredLaunchPreviewApplied: Bool {
+        !projectTracks.isEmpty &&
+            projectTracks.contains { track in
+                track.waveformOverview != nil || track.sourceWaveformOverview != nil
+            }
+    }
+
+    private struct DeferredProjectRestoreTarget {
+        var projectURL: URL
+        var visualCacheURL: URL
+        var usesAutosaveRecovery: Bool
+    }
+
+    private func deferredProjectRestoreTarget() -> DeferredProjectRestoreTarget? {
+        if
+            launchPlan.restoresProject,
+            let targetProjectURL = launchPlan.targetProjectURL
+        {
+            return DeferredProjectRestoreTarget(
+                projectURL: targetProjectURL.standardizedFileURL,
+                visualCacheURL: (launchPlan.visualCacheURL ?? targetProjectURL).standardizedFileURL,
+                usesAutosaveRecovery: launchPlan.usesAutosaveRecovery
+            )
+        }
+
+        if let url = restorableLaunchProjectURL() {
+            return DeferredProjectRestoreTarget(
+                projectURL: url.standardizedFileURL,
+                visualCacheURL: (
+                    SoundtimeProjectStore.recoverableAutosaveURL(for: url) ?? url
+                ).standardizedFileURL,
+                usesAutosaveRecovery: true
+            )
+        }
+
+        guard let recoveryURL = SoundtimeProjectStore.recoverableAutosaveURLs().first else {
+            return nil
+        }
+        return DeferredProjectRestoreTarget(
+            projectURL: recoveryURL.standardizedFileURL,
+            visualCacheURL: recoveryURL.standardizedFileURL,
+            usesAutosaveRecovery: false
+        )
+    }
+
+    private func applyLaunchFirstFrame(
+        _ firstFrame: ProjectLaunchFirstFrame,
+        stateProjectURL: URL? = nil
+    ) {
+        let applyStartedAt = CACurrentMediaTime()
+        let stateProjectURL = (stateProjectURL ?? firstFrame.projectURL).standardizedFileURL
+        withoutAutosave {
+            clearProjectForLoad(publishesTimeline: false)
+            currentProjectURL = stateProjectURL
+            applyLaunchFirstFrameIdentity(firstFrame)
+        }
+        applyWindowLayout(
+            SoundtimeProjectStore.rememberedWindowLayout(for: stateProjectURL) ??
+                firstFrame.windowLayout
+        )
+        applyProjectMasterVolume(firstFrame.masterVolume)
+        applyProjectTimelineViewport(
+            SoundtimeProjectStore.rememberedTimelineViewport(for: stateProjectURL) ??
+                firstFrame.timelineViewport
+        )
+        applyProjectTranscriptDisplayMode(firstFrame.transcriptDisplayMode)
+        resetWaveformFisheyeTuningToDefaults()
+
+        projectTracks = firstFrame.tracks.map { track in
+            launchPreviewTrack(from: track)
+        }
+        normalizeLoadedProjectEditGroups(reason: firstFrame.source.recordSourceName)
+        activeTrackID = projectTracks.first?.id
+        selectedTrackID = nil
+        selectedTrackIDs.removeAll()
+        selectedTimelineRange = nil
+        selectedTranscriptSelection = nil
+        activeTranscriptWordID = nil
+        loadedAudioSummary = nil
+        currentPlaybackStatus = "opening last project"
+
+        if firstFrame.isShellOnly {
+            setProjectReadinessState(.launchPreviewLoading, statusOverride: firstFrame.source.statusOverride)
+            isLaunchVisualPreviewPendingImmediateRender = false
+        } else {
+            setProjectReadinessState(
+                .visualReady(trackCount: projectTracks.count),
+                statusOverride: firstFrame.source.statusOverride
+            )
+            isLaunchVisualPreviewPendingImmediateRender = firstFrame.summary.hasAnyDrawableWaveform
+        }
+
+        window?.title = projectWindowTitle()
+        timelineSurface.prepareLaunchPreviewFirstPaint(
+            selectedTrackIDs: selectedTrackIDs,
+            primaryTrackID: selectedTrackID
+        )
+        refreshProjectTimelineDisplay(
+            animateWaveformTransition: false,
+            allowImmediateWaveformPrewarm: !firstFrame.isShellOnly,
+            allowImmediateInteractiveWaveformPrewarm: false,
+            updatesRendererImmediately: true
+        )
+        updateProjectDisplayTiming()
+        syncActiveTrackFields()
+        updateEffectCommandState()
+
+        if !firstFrame.isShellOnly {
+            recordLaunchVisualSkeletonApplied(
+                source: firstFrame.source.recordSourceName,
+                projectURL: stateProjectURL,
+                summary: firstFrame.summary,
+                applyMilliseconds: (CACurrentMediaTime() - applyStartedAt) * 1_000
+            )
+        }
+    }
+
+    private func recordLaunchFirstFrameLoaded(
+        _ firstFrame: ProjectLaunchFirstFrame,
+        firstPaint: Bool
+    ) {
+        var fields = firstFrame.summary.diagnosticFields
+        fields["file"] = firstFrame.projectURL.lastPathComponent
+        fields["source"] = firstFrame.source.rawValue
+        fields["loadMs"] = String(format: "%.2f", firstFrame.loadMilliseconds)
+        fields["firstPaint"] = "\(firstPaint)"
+
+        switch firstFrame.source {
+        case .firstFrameWaveformPacket:
+            LaunchStartupTrace.shared.mark(
+                .firstFrameWaveformPacketLoaded,
+                fields: fields
+            )
+            LaunchStartupTrace.shared.mark(
+                .firstFrameWaveformPacketInstalled,
+                fields: fields
+            )
+        case .launchSnapshot:
+            LaunchStartupTrace.shared.mark(.launchSnapshotLoaded, fields: fields)
+        case .savedProjectPreview, .recoveredAutosavePreview:
+            LaunchStartupTrace.shared.mark(.launchProjectPreviewLoaded, fields: fields)
+        case .deferredLaunchSnapshot:
+            LaunchStartupTrace.shared.mark(.launchSnapshotLoaded, fields: fields)
+        case .deferredProjectPreview:
+            LaunchStartupTrace.shared.mark(.launchProjectPreviewLoaded, fields: fields)
+        case .firstFrameWaveformShell, .launchSnapshotShell, .launchManifestShell:
+            break
+        }
+
+        let severity: SoundtimeDiagnosticSeverity
+        if firstFrame.isShellOnly {
+            severity = firstFrame.loadMilliseconds > 8 ? .warning : .info
+        } else if firstFrame.source == .deferredProjectPreview {
+            severity = firstFrame.loadMilliseconds > 50 ? .warning : .info
+        } else {
+            severity = firstFrame.loadMilliseconds > 35 ? .warning : .info
+        }
+
+        SoundtimeDiagnostics.shared.record(
+            category: .system,
+            severity: severity,
+            name: firstFrame.source.diagnosticName,
+            message: launchFirstFrameDiagnosticMessage(firstFrame),
+            fields: fields
+        )
+    }
+
+    private func launchFirstFrameDiagnosticMessage(_ firstFrame: ProjectLaunchFirstFrame) -> String {
+        switch firstFrame.source {
+        case .firstFrameWaveformShell:
+            "First-frame waveform manifest was applied before the launch window became visible."
+        case .launchSnapshotShell:
+            "Launch snapshot manifest was applied before the launch window became visible."
+        case .launchManifestShell:
+            "Tiny launch manifest was applied before the launch window became visible."
+        case .firstFrameWaveformPacket:
+            "First-frame waveform packet was applied before project hydration."
+        case .launchSnapshot:
+            "Compact binary launch snapshot was applied before the first window paint."
+        case .savedProjectPreview:
+            firstFrame.summary.hasAnyDrawableWaveform ?
+                "Saved project preview was applied before the first window paint." :
+                "Saved project preview was applied before first paint, but no cached waveform was available yet."
+        case .recoveredAutosavePreview:
+            firstFrame.summary.hasAnyDrawableWaveform ?
+                "Recovered autosave preview was applied before the first window paint." :
+                "Recovered autosave preview was applied before first paint, but no cached waveform was available yet."
+        case .deferredLaunchSnapshot:
+            "Launch snapshot was loaded off the first window-paint path."
+        case .deferredProjectPreview:
+            "Project preview was loaded off the first window-paint path."
+        }
     }
 
     private func loadDeferredLaunchPreviewAsync(projectURL: URL, usesAutosaveRecovery: Bool) {
@@ -2346,30 +2671,18 @@ final class WorkspaceView: NSView {
         isLaunchPreviewLoadInFlight = true
         pendingHydrationAfterLaunchPreviewLoad = false
         let standardizedProjectURL = projectURL.standardizedFileURL
+        let launchPreviewCache = waveformOverviewDiskCache
         LaunchStartupTrace.shared.mark(
             .launchPreviewLoadStarted,
             fields: ["file": standardizedProjectURL.lastPathComponent]
         )
 
         DispatchQueue.global(qos: .userInitiated).async {
-            let startedAt = CACurrentMediaTime()
-            let result: DeferredLaunchPreviewResult
-            if let snapshot = try? ProjectLaunchSnapshotStore.load(for: standardizedProjectURL), snapshot.isDrawable {
-                result = .snapshot(snapshot, standardizedProjectURL, (CACurrentMediaTime() - startedAt) * 1_000)
-            } else {
-                do {
-                    let project = usesAutosaveRecovery ?
-                        try SoundtimeProjectStore.loadLaunchPreviewRecoveringAutosave(from: standardizedProjectURL) :
-                        try SoundtimeProjectStore.loadLaunchPreview(from: standardizedProjectURL)
-                    result = .projectPreview(project, standardizedProjectURL, (CACurrentMediaTime() - startedAt) * 1_000)
-                } catch {
-                    result = .unavailable(
-                        standardizedProjectURL,
-                        error.localizedDescription,
-                        (CACurrentMediaTime() - startedAt) * 1_000
-                    )
-                }
-            }
+            let result = ProjectLaunchCoordinator.loadDeferredFirstFrame(
+                projectURL: standardizedProjectURL,
+                usesAutosaveRecovery: usesAutosaveRecovery,
+                waveformOverviewDiskCache: launchPreviewCache
+            )
 
             DispatchQueue.main.async { [weak self] in
                 guard
@@ -2381,45 +2694,21 @@ final class WorkspaceView: NSView {
                 }
 
                 self.isLaunchPreviewLoadInFlight = false
+                var didApplyLaunchPreview = false
                 switch result {
-                case let .snapshot(snapshot, url, loadMilliseconds):
+                case let .firstFrame(firstFrame):
                     LaunchStartupTrace.shared.mark(
-                        .launchSnapshotLoaded,
+                        firstFrame.source == .deferredLaunchSnapshot ?
+                            .launchSnapshotLoaded :
+                            .launchProjectPreviewLoaded,
                         fields: [
-                            "file": url.lastPathComponent,
-                            "loadMs": String(format: "%.2f", loadMilliseconds),
+                            "file": firstFrame.projectURL.lastPathComponent,
+                            "loadMs": String(format: "%.2f", firstFrame.loadMilliseconds),
                         ]
                     )
-                    self.applyDeferredLaunchSnapshot(snapshot, projectURL: url)
-                    SoundtimeDiagnostics.shared.record(
-                        category: .system,
-                        severity: loadMilliseconds > 35 ? .warning : .info,
-                        name: "launch-snapshot-loaded",
-                        message: "Launch snapshot was loaded off the first window-paint path.",
-                        fields: [
-                            "file": url.lastPathComponent,
-                            "loadMs": String(format: "%.2f", loadMilliseconds),
-                        ]
-                    )
-                case let .projectPreview(project, url, loadMilliseconds):
-                    LaunchStartupTrace.shared.mark(
-                        .launchProjectPreviewLoaded,
-                        fields: [
-                            "file": url.lastPathComponent,
-                            "loadMs": String(format: "%.2f", loadMilliseconds),
-                        ]
-                    )
-                    self.applyDeferredLaunchProjectPreview(project, projectURL: url)
-                    SoundtimeDiagnostics.shared.record(
-                        category: .system,
-                        severity: loadMilliseconds > 50 ? .warning : .info,
-                        name: "launch-project-preview-loaded",
-                        message: "Legacy project preview was loaded off the first window-paint path.",
-                        fields: [
-                            "file": url.lastPathComponent,
-                            "loadMs": String(format: "%.2f", loadMilliseconds),
-                        ]
-                    )
+                    self.applyLaunchFirstFrame(firstFrame, stateProjectURL: standardizedProjectURL)
+                    didApplyLaunchPreview = true
+                    self.recordLaunchFirstFrameLoaded(firstFrame, firstPaint: false)
                 case let .unavailable(url, message, loadMilliseconds):
                     LaunchStartupTrace.shared.mark(
                         .launchPreviewUnavailable,
@@ -2442,128 +2731,16 @@ final class WorkspaceView: NSView {
                     )
                 }
 
+                if didApplyLaunchPreview {
+                    self.submitDeferredLaunchPreviewRenderIfNeeded()
+                }
+
                 if self.pendingHydrationAfterLaunchPreviewLoad {
                     self.pendingHydrationAfterLaunchPreviewLoad = false
                     self.restoreLastProjectAfterLaunchPreviewRender()
                 }
             }
         }
-    }
-
-    private func applyDeferredLaunchSnapshot(_ snapshot: ProjectLaunchSnapshot, projectURL: URL) {
-        let applyStartedAt = CACurrentMediaTime()
-        let visualSummary = ProjectLaunchReadinessClassifier.summarize(snapshot: snapshot)
-        withoutAutosave {
-            clearProjectForLoad(publishesTimeline: false)
-            currentProjectURL = projectURL
-        }
-        applyWindowLayout(SoundtimeProjectStore.rememberedWindowLayout(for: projectURL) ?? snapshot.windowLayout)
-        applyProjectMasterVolume(snapshot.masterVolume)
-        applyProjectTimelineViewport(
-            SoundtimeProjectStore.rememberedTimelineViewport(for: projectURL) ?? snapshot.timelineViewport
-        )
-        applyProjectTranscriptDisplayMode(snapshot.transcriptDisplayMode)
-        resetWaveformFisheyeTuningToDefaults()
-
-        projectTracks = snapshot.tracks.map { track in
-            launchPreviewTrack(from: track)
-        }
-        normalizeLoadedProjectEditGroups(reason: "launch-snapshot")
-        activeTrackID = projectTracks.first?.id
-        selectedTrackID = nil
-        selectedTrackIDs.removeAll()
-        selectedTimelineRange = nil
-        selectedTranscriptSelection = nil
-        activeTranscriptWordID = nil
-        loadedAudioSummary = nil
-        currentPlaybackStatus = "opening last project"
-        setProjectReadinessState(
-            .visualReady(trackCount: projectTracks.count),
-            statusOverride: "launch snapshot ready - opening project"
-        )
-
-        window?.title = projectWindowTitle()
-        timelineSurface.displaySelection(nil)
-        timelineSurface.displayTranscriptSelection(nil)
-        timelineSurface.displayTranscriptActiveWord(nil)
-        publishSelectedTracksToTimeline()
-        refreshProjectTimelineDisplay(
-            animateWaveformTransition: false,
-            allowImmediateWaveformPrewarm: false,
-            allowImmediateInteractiveWaveformPrewarm: false
-        )
-        updateProjectDisplayTiming()
-        syncActiveTrackFields()
-        updateEffectCommandState()
-        recordLaunchVisualSkeletonApplied(
-            source: "snapshot",
-            projectURL: projectURL,
-            summary: visualSummary,
-            applyMilliseconds: (CACurrentMediaTime() - applyStartedAt) * 1_000
-        )
-        SoundtimeDiagnostics.shared.record(
-            category: .system,
-            severity: .info,
-            name: "launch-snapshot-hit",
-            message: "Applied launch snapshot for first project paint.",
-            fields: [
-                "file": projectURL.lastPathComponent,
-                "tracks": "\(snapshot.tracks.count)",
-            ]
-        )
-    }
-
-    private func applyDeferredLaunchProjectPreview(_ project: SoundtimeProject, projectURL: URL) {
-        let applyStartedAt = CACurrentMediaTime()
-        let visualSummary = ProjectLaunchReadinessClassifier.summarize(project: project)
-        withoutAutosave {
-            clearProjectForLoad(publishesTimeline: false)
-            currentProjectURL = projectURL
-        }
-        applyWindowLayout(SoundtimeProjectStore.rememberedWindowLayout(for: projectURL) ?? project.windowLayout)
-        applyProjectMasterVolume(project.masterVolume)
-        applyProjectTimelineViewport(
-            SoundtimeProjectStore.rememberedTimelineViewport(for: projectURL) ?? project.timelineViewport
-        )
-        applyProjectTranscriptDisplayMode(project.transcriptDisplayMode)
-        resetWaveformFisheyeTuningToDefaults()
-
-        projectTracks = project.tracks.map { track in
-            launchPreviewTrack(from: track, projectURL: projectURL)
-        }
-        normalizeLoadedProjectEditGroups(reason: "launch-project-preview")
-        activeTrackID = projectTracks.first?.id
-        selectedTrackID = nil
-        selectedTrackIDs.removeAll()
-        selectedTimelineRange = nil
-        selectedTranscriptSelection = nil
-        activeTranscriptWordID = nil
-        loadedAudioSummary = nil
-        currentPlaybackStatus = "opening last project"
-        setProjectReadinessState(
-            .visualReady(trackCount: projectTracks.count),
-            statusOverride: "opening last project"
-        )
-
-        window?.title = projectWindowTitle()
-        timelineSurface.displaySelection(nil)
-        timelineSurface.displayTranscriptSelection(nil)
-        timelineSurface.displayTranscriptActiveWord(nil)
-        publishSelectedTracksToTimeline()
-        refreshProjectTimelineDisplay(
-            animateWaveformTransition: false,
-            allowImmediateWaveformPrewarm: false,
-            allowImmediateInteractiveWaveformPrewarm: false
-        )
-        updateProjectDisplayTiming()
-        syncActiveTrackFields()
-        updateEffectCommandState()
-        recordLaunchVisualSkeletonApplied(
-            source: "project-preview",
-            projectURL: projectURL,
-            summary: visualSummary,
-            applyMilliseconds: (CACurrentMediaTime() - applyStartedAt) * 1_000
-        )
     }
 
     private func recordLaunchVisualSkeletonApplied(
@@ -2592,7 +2769,11 @@ final class WorkspaceView: NSView {
             fields: fields
         )
 
-        timelineSurface.notifyAfterNextSubmittedTimelineRender { _ in
+        timelineSurface.notifyAfterNextSubmittedTimelineRender { submittedAt in
+            LaunchStartupTrace.shared.markOnce(
+                .firstTimelineRenderSubmitted,
+                fields: ["submittedAt": String(format: "%.3f", submittedAt)]
+            )
             LaunchStartupTrace.shared.markOnce(.firstWaveformVisibleFrame, fields: fields)
         }
     }
@@ -2633,7 +2814,7 @@ final class WorkspaceView: NSView {
             transcript = track.transcript
         }
 
-        init(track: ProjectLaunchSnapshot.Track) {
+        init(track: ProjectLaunchFirstFrame.Track) {
             let previewSourceOverview = track.sourceWaveformOverview
             let previewDisplayOverview = track.displayWaveformOverview
             let fileTimeline = track.editTimeline.flatMap(AudioFileEditTimeline.init)
@@ -2641,7 +2822,7 @@ final class WorkspaceView: NSView {
             id = track.id
             editGroupID = track.editGroupID
             name = track.name
-            sourceURL = URL(fileURLWithPath: track.filePath).standardizedFileURL
+            sourceURL = track.sourceURL.standardizedFileURL
             durationHint = fileTimeline?.duration ??
                 previewDisplayOverview?.duration ??
                 previewSourceOverview?.duration ??
@@ -2653,7 +2834,7 @@ final class WorkspaceView: NSView {
             volume = track.volume
             isMuted = track.isMuted
             isSoloed = track.isSoloed
-            transcript = nil
+            transcript = track.transcript
         }
 
         func projectTrack(defaultEditGroupID: UUID) -> ProjectTrack {
@@ -2705,10 +2886,34 @@ final class WorkspaceView: NSView {
     }
 
     private func launchPreviewTrack(
-        from track: ProjectLaunchSnapshot.Track
+        from track: ProjectLaunchFirstFrame.Track
     ) -> ProjectTrack {
         ProjectLaunchTrackSkeleton(track: track)
             .projectTrack(defaultEditGroupID: defaultEditGroupID)
+    }
+
+    @discardableResult
+    func submitDeferredLaunchPreviewRenderIfNeeded() -> Bool {
+        guard isLaunchVisualPreviewPendingImmediateRender else {
+            return false
+        }
+
+        let didSubmit = timelineSurface.submitImmediateTimelineRenderForFirstPaint()
+        guard didSubmit else {
+            return false
+        }
+
+        isLaunchVisualPreviewPendingImmediateRender = false
+        SoundtimeDiagnostics.shared.record(
+            category: .render,
+            severity: .info,
+            name: "launch-first-paint-render-submitted",
+            message: "Submitted cached launch waveform preview immediately after the window became drawable.",
+            fields: [
+                "tracks": "\(projectTracks.count)",
+            ]
+        )
+        return true
     }
 
     private func finishDeferredProjectRestore() {
@@ -2719,6 +2924,7 @@ final class WorkspaceView: NSView {
         isDeferredProjectRestorePending = false
         isLaunchPreviewLoadInFlight = false
         pendingHydrationAfterLaunchPreviewLoad = false
+        isLaunchVisualPreviewPendingImmediateRender = false
         if !isDenoiseModalInteractionLocked, activeDenoiseRequestID == nil, pendingDenoiseReview == nil {
             timelineSurface.setInteractionSuppressed(false)
         }
@@ -2804,7 +3010,8 @@ final class WorkspaceView: NSView {
         rebuildControls: Bool = true,
         animateWaveformTransition: Bool = true,
         allowImmediateWaveformPrewarm: Bool = true,
-        allowImmediateInteractiveWaveformPrewarm: Bool = true
+        allowImmediateInteractiveWaveformPrewarm: Bool = true,
+        updatesRendererImmediately: Bool = false
     ) {
         if !isDenoiseModalInteractionLocked, activeDenoiseRequestID == nil, pendingDenoiseReview == nil {
             timelineSurface.setInteractionSuppressed(false)
@@ -2814,7 +3021,8 @@ final class WorkspaceView: NSView {
             timelineRenderTracks(),
             animateWaveformTransition: animateWaveformTransition,
             allowImmediateWaveformPrewarm: allowImmediateWaveformPrewarm,
-            allowImmediateInteractiveWaveformPrewarm: allowImmediateInteractiveWaveformPrewarm
+            allowImmediateInteractiveWaveformPrewarm: allowImmediateInteractiveWaveformPrewarm,
+            updatesRendererImmediately: updatesRendererImmediately
         )
         publishSelectedTracksToTimeline()
         if rebuildControls {
@@ -14222,16 +14430,46 @@ final class WorkspaceView: NSView {
     }
 
     func persistCurrentProjectWindowLayout() {
-        persistLatestTimelineViewport(flushImmediately: true)
-        guard
-            let currentProjectURL,
-            let layout = currentWindowLayout()
-        else {
+        let startedAt = CACurrentMediaTime()
+        viewportPersistenceWorkItem?.cancel()
+        viewportPersistenceWorkItem = nil
+        persistLatestTimelineViewport(schedulesLaunchSnapshot: false)
+
+        guard let currentProjectURL else {
             return
         }
 
-        SoundtimeProjectStore.rememberWindowLayout(layout, for: currentProjectURL)
-        scheduleLaunchSnapshotSaveIfNeeded(reason: "window-layout", delay: 0.2)
+        let layout = currentWindowLayout()
+        if let layout {
+            advanceLaunchStateRevision()
+            SoundtimeProjectStore.rememberWindowLayout(layout, for: currentProjectURL)
+        }
+        if let overlay = currentLaunchStateOverlay(windowLayout: layout) {
+            SoundtimeProjectStore.rememberLaunchStateOverlay(overlay, for: currentProjectURL)
+        }
+
+        let elapsedMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
+        LaunchStartupTrace.shared.mark(
+            .windowCloseStatePersisted,
+            fields: [
+                "elapsedMs": String(format: "%.2f", elapsedMilliseconds),
+                "tracks": "\(projectTracks.count)",
+                "launchSnapshotWrite": "false",
+                "firstFramePacketWrite": "false",
+            ]
+        )
+        SoundtimeDiagnostics.shared.record(
+            category: .system,
+            severity: elapsedMilliseconds > 10 ? .warning : .info,
+            name: "project-close-state-persisted",
+            message: "Persisted lightweight project launch state without synchronously writing waveform previews.",
+            fields: [
+                "elapsedMs": String(format: "%.2f", elapsedMilliseconds),
+                "tracks": "\(projectTracks.count)",
+                "launchSnapshotWrite": "false",
+                "firstFramePacketWrite": "false",
+            ]
+        )
     }
 
     private func timelineViewportDidChange(_ viewport: TimelineViewport) {
@@ -14258,7 +14496,10 @@ final class WorkspaceView: NSView {
         DispatchQueue.main.asyncAfter(deadline: .now() + viewportPersistenceDelay, execute: workItem)
     }
 
-    private func persistLatestTimelineViewport(flushImmediately: Bool = false) {
+    private func persistLatestTimelineViewport(
+        flushImmediately: Bool = false,
+        schedulesLaunchSnapshot: Bool = true
+    ) {
         viewportPersistenceWorkItem?.cancel()
         viewportPersistenceWorkItem = nil
 
@@ -14272,11 +14513,38 @@ final class WorkspaceView: NSView {
         }
 
         latestTimelineViewportForPersistence = viewport
+        advanceLaunchStateRevision()
         SoundtimeProjectStore.rememberTimelineViewport(viewport, for: currentProjectURL)
-        scheduleLaunchSnapshotSaveIfNeeded(reason: "timeline-viewport", delay: 0.5)
+        if schedulesLaunchSnapshot {
+            scheduleLaunchSnapshotSaveIfNeeded(reason: "timeline-viewport", delay: 0.5)
+        }
         if flushImmediately {
             UserDefaults.standard.synchronize()
         }
+    }
+
+    private func currentLaunchStateOverlay(
+        windowLayout: SoundtimeProject.WindowLayout?
+    ) -> SoundtimeProjectLaunchStateOverlay? {
+        guard !projectTracks.isEmpty else {
+            return nil
+        }
+
+        return SoundtimeProjectLaunchStateOverlay(
+            createdAt: Date().timeIntervalSince1970,
+            windowLayout: windowLayout ?? currentWindowLayout(),
+            timelineViewport: currentTimelineViewport(),
+            masterVolume: volumeControl.perceptualVolume,
+            transcriptDisplayMode: isTranscriptLayerVisible ? .waveformOverlay : .hidden,
+            tracks: projectTracks.map { track in
+                SoundtimeProjectLaunchStateOverlay.TrackState(
+                    id: track.id,
+                    volume: track.volume,
+                    isMuted: track.isMuted,
+                    isSoloed: track.isSoloed
+                )
+            }
+        )
     }
 
     private func scheduleAutosaveIfNeeded() {
@@ -14322,20 +14590,91 @@ final class WorkspaceView: NSView {
 
         let snapshotStartedAt = CACurrentMediaTime()
         let project = currentProject(includeWaveformPreviews: false)
-        let snapshotDurationMilliseconds = (CACurrentMediaTime() - snapshotStartedAt) * 1_000
         let projectURL = currentProjectURL
+        let launchSnapshotDraft = currentLaunchSnapshotDraft(projectURL: projectURL ?? URL(fileURLWithPath: "/"))
+        let snapshotDurationMilliseconds = (CACurrentMediaTime() - snapshotStartedAt) * 1_000
         let autosaveID = autosaveID
         let trackCount = projectTracks.count
 
-        DispatchQueue.global(qos: .utility).async { [project, projectURL, autosaveID] in
+        DispatchQueue.global(qos: .utility).async { [project, projectURL, autosaveID, launchSnapshotDraft] in
             let writeStartedAt = CACurrentMediaTime()
-            let result: Result<URL, Error>
+            let result: Result<(url: URL, launchBundleSaved: Bool, snapshotSaved: Bool, firstFramePacketSaved: Bool), Error>
             do {
-                result = .success(try SoundtimeProjectStore.saveAutosave(
+                let autosaveURL = try SoundtimeProjectStore.saveAutosave(
                     project,
                     projectURL: projectURL,
                     autosaveID: autosaveID
-                ))
+                )
+                let snapshot = ProjectLaunchSnapshot(
+                    projectURL: autosaveURL,
+                    projectID: launchSnapshotDraft.projectID,
+                    editGraphRevision: launchSnapshotDraft.editGraphRevision,
+                    visualRevision: launchSnapshotDraft.visualRevision,
+                    launchStateRevision: launchSnapshotDraft.launchStateRevision,
+                    windowLayout: launchSnapshotDraft.windowLayout,
+                    timelineViewport: launchSnapshotDraft.timelineViewport,
+                    masterVolume: launchSnapshotDraft.masterVolume,
+                    transcriptDisplayMode: launchSnapshotDraft.transcriptDisplayMode,
+                    tracks: launchSnapshotDraft.tracks
+                )
+                let packet = ProjectFirstFrameWaveformPacket(
+                    projectURL: autosaveURL,
+                    projectID: launchSnapshotDraft.projectID,
+                    editGraphRevision: launchSnapshotDraft.editGraphRevision,
+                    visualRevision: launchSnapshotDraft.visualRevision,
+                    launchStateRevision: launchSnapshotDraft.launchStateRevision,
+                    windowLayout: launchSnapshotDraft.windowLayout,
+                    timelineViewport: launchSnapshotDraft.timelineViewport,
+                    masterVolume: launchSnapshotDraft.masterVolume,
+                    transcriptDisplayMode: launchSnapshotDraft.transcriptDisplayMode,
+                    tracks: launchSnapshotDraft.tracks
+                )
+                let manifest = ProjectLaunchManifest(
+                    projectURL: autosaveURL,
+                    projectID: launchSnapshotDraft.projectID,
+                    editGraphRevision: launchSnapshotDraft.editGraphRevision,
+                    visualRevision: launchSnapshotDraft.visualRevision,
+                    launchStateRevision: launchSnapshotDraft.launchStateRevision,
+                    windowLayout: launchSnapshotDraft.windowLayout,
+                    timelineViewport: launchSnapshotDraft.timelineViewport,
+                    masterVolume: launchSnapshotDraft.masterVolume,
+                    transcriptDisplayMode: launchSnapshotDraft.transcriptDisplayMode,
+                    tracks: launchSnapshotDraft.tracks,
+                    snapshotByteCount: (try? ProjectLaunchSnapshotBinaryCodec.encode(snapshot))?.count,
+                    firstFramePacketByteCount: (try? ProjectFirstFrameWaveformPacketBinaryCodec.encode(packet))?.count,
+                    snapshotDrawable: ProjectLaunchReadinessClassifier.summarize(snapshot: snapshot).hasAnyDrawableWaveform,
+                    firstFramePacketDrawable: ProjectLaunchReadinessClassifier.summarize(packet: packet).hasAnyDrawableWaveform
+                )
+                let launchBundleSaved: Bool
+                do {
+                    try ProjectLaunchCacheBundleStore.publish(
+                        manifest: manifest,
+                        firstFramePacket: packet,
+                        snapshot: snapshot,
+                        for: autosaveURL
+                    )
+                    launchBundleSaved = true
+                } catch {
+                    launchBundleSaved = false
+                }
+                let snapshotSaved: Bool
+                let firstFramePacketSaved: Bool
+                do {
+                    try ProjectLaunchSnapshotStore.save(snapshot, for: autosaveURL)
+                    snapshotSaved = true
+                } catch {
+                    snapshotSaved = false
+                }
+                do {
+                    try ProjectFirstFrameWaveformPacketStore.save(packet, for: autosaveURL)
+                    firstFramePacketSaved = true
+                } catch {
+                    firstFramePacketSaved = false
+                }
+                if snapshotSaved || firstFramePacketSaved {
+                    try? ProjectLaunchManifestStore.save(manifest, for: autosaveURL)
+                }
+                result = .success((autosaveURL, launchBundleSaved, snapshotSaved, firstFramePacketSaved))
             } catch {
                 result = .failure(error)
             }
@@ -14354,7 +14693,7 @@ final class WorkspaceView: NSView {
                 ]
 
                 switch result {
-                case let .success(url):
+                case let .success((url, launchBundleSaved, snapshotSaved, firstFramePacketSaved)):
                     SoundtimeDiagnostics.shared.record(
                         category: .system,
                         severity: snapshotDurationMilliseconds > 8 ? .warning : .info,
@@ -14362,6 +14701,9 @@ final class WorkspaceView: NSView {
                         message: "Project autosave was written.",
                         fields: timingFields.merging([
                             "file": url.lastPathComponent,
+                            "launchBundle": launchBundleSaved ? "true" : "false",
+                            "launchSnapshot": snapshotSaved ? "true" : "false",
+                            "firstFramePacket": firstFramePacketSaved ? "true" : "false",
                         ]) { _, new in new }
                     )
                 case let .failure(error):
@@ -14428,31 +14770,83 @@ final class WorkspaceView: NSView {
         let trackCount = draft.tracks.count
         DispatchQueue.global(qos: .utility).async { [draft, projectURL, reason, trackCount] in
             let startedAt = CACurrentMediaTime()
-            let result = Result {
+            let result = Result { () -> (packetDrawable: Bool, launchBundleSaved: Bool) in
                 let snapshot = ProjectLaunchSnapshot(
                     projectURL: projectURL,
+                    projectID: draft.projectID,
+                    editGraphRevision: draft.editGraphRevision,
+                    visualRevision: draft.visualRevision,
+                    launchStateRevision: draft.launchStateRevision,
                     windowLayout: draft.windowLayout,
                     timelineViewport: draft.timelineViewport,
                     masterVolume: draft.masterVolume,
                     transcriptDisplayMode: draft.transcriptDisplayMode,
                     tracks: draft.tracks
                 )
+                let packet = ProjectFirstFrameWaveformPacket(
+                    projectURL: projectURL,
+                    projectID: draft.projectID,
+                    editGraphRevision: draft.editGraphRevision,
+                    visualRevision: draft.visualRevision,
+                    launchStateRevision: draft.launchStateRevision,
+                    windowLayout: draft.windowLayout,
+                    timelineViewport: draft.timelineViewport,
+                    masterVolume: draft.masterVolume,
+                    transcriptDisplayMode: draft.transcriptDisplayMode,
+                    tracks: draft.tracks
+                )
+                let snapshotData = try ProjectLaunchSnapshotBinaryCodec.encode(snapshot)
+                let packetData = try ProjectFirstFrameWaveformPacketBinaryCodec.encode(packet)
+                let packetDrawable = ProjectLaunchReadinessClassifier.summarize(packet: packet).hasAnyDrawableWaveform
+                let manifest = ProjectLaunchManifest(
+                    projectURL: projectURL,
+                    projectID: draft.projectID,
+                    editGraphRevision: draft.editGraphRevision,
+                    visualRevision: draft.visualRevision,
+                    launchStateRevision: draft.launchStateRevision,
+                    windowLayout: draft.windowLayout,
+                    timelineViewport: draft.timelineViewport,
+                    masterVolume: draft.masterVolume,
+                    transcriptDisplayMode: draft.transcriptDisplayMode,
+                    tracks: draft.tracks,
+                    snapshotByteCount: snapshotData.count,
+                    firstFramePacketByteCount: packetData.count,
+                    snapshotDrawable: ProjectLaunchReadinessClassifier.summarize(snapshot: snapshot).hasAnyDrawableWaveform,
+                    firstFramePacketDrawable: packetDrawable
+                )
+                let launchBundleSaved: Bool
+                do {
+                    try ProjectLaunchCacheBundleStore.publish(
+                        manifest: manifest,
+                        firstFramePacket: packet,
+                        snapshot: snapshot,
+                        for: projectURL
+                    )
+                    launchBundleSaved = true
+                } catch {
+                    launchBundleSaved = false
+                }
                 try ProjectLaunchSnapshotStore.save(snapshot, for: projectURL)
+                try ProjectFirstFrameWaveformPacketStore.save(packet, for: projectURL)
+                try ProjectLaunchManifestStore.save(manifest, for: projectURL)
+                return (packetDrawable, launchBundleSaved)
             }
             let durationMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
 
             DispatchQueue.main.async {
                 switch result {
-                case .success:
+                case let .success((packetDrawable, launchBundleSaved)):
                     SoundtimeDiagnostics.shared.record(
                         category: .system,
                         severity: durationMilliseconds > 40 ? .warning : .info,
                         name: "launch-snapshot-saved",
-                        message: "Project launch snapshot was written.",
+                        message: "Project launch snapshot and first-frame waveform packet were written.",
                         fields: [
                             "file": projectURL.lastPathComponent,
                             "reason": reason,
                             "tracks": "\(trackCount)",
+                            "launchBundle": "\(launchBundleSaved)",
+                            "firstFramePacketDrawable": "\(packetDrawable)",
                             "writeMs": String(format: "%.2f", durationMilliseconds),
                         ]
                     )
@@ -14474,6 +14868,10 @@ final class WorkspaceView: NSView {
     }
 
     private struct LaunchSnapshotDraft {
+        var projectID: UUID
+        var editGraphRevision: UInt64
+        var visualRevision: UInt64
+        var launchStateRevision: UInt64
         var windowLayout: SoundtimeProject.WindowLayout?
         var timelineViewport: SoundtimeProject.TimelineViewport?
         var masterVolume: Float?
@@ -14481,8 +14879,22 @@ final class WorkspaceView: NSView {
         var tracks: [ProjectLaunchSnapshot.TrackDraft]
     }
 
+    private nonisolated static func fileByteCount(_ url: URL) -> Int? {
+        guard
+            let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+            let byteCount = (attributes[.size] as? NSNumber)?.intValue
+        else {
+            return nil
+        }
+        return byteCount
+    }
+
     private func currentLaunchSnapshotDraft(projectURL: URL) -> LaunchSnapshotDraft {
         LaunchSnapshotDraft(
+            projectID: currentProjectID,
+            editGraphRevision: currentEditGraphRevision,
+            visualRevision: currentVisualRevision,
+            launchStateRevision: currentLaunchStateRevision,
             windowLayout: currentWindowLayout(),
             timelineViewport: currentTimelineViewport(),
             masterVolume: volumeControl.perceptualVolume,
@@ -14775,6 +15187,7 @@ final class WorkspaceView: NSView {
         withoutAutosave {
             clearProjectForLoad(publishesTimeline: false)
             currentProjectURL = remembersProjectURL ? projectURL : nil
+            applyProjectIdentity(project)
         }
         if remembersProjectURL {
             SoundtimeProjectStore.rememberLastProjectURL(projectURL)
@@ -14794,6 +15207,7 @@ final class WorkspaceView: NSView {
         resetWaveformFisheyeTuningToDefaults()
         projectHydrationCompletedTrackIDs.removeAll()
         projectHydrationFailedTrackIDs.removeAll()
+        let cachedPreviewTrackCount = project.tracks.filter { $0.waveformPreview != nil }.count
 
         isLoadingProject = true
         projectTracks = project.tracks.map { track in
@@ -14827,8 +15241,9 @@ final class WorkspaceView: NSView {
         restoreSilenceReviewState(project.silenceReviewState)
         refreshProjectTimelineDisplay(
             animateWaveformTransition: false,
-            allowImmediateWaveformPrewarm: false,
-            allowImmediateInteractiveWaveformPrewarm: false
+            allowImmediateWaveformPrewarm: true,
+            allowImmediateInteractiveWaveformPrewarm: false,
+            updatesRendererImmediately: true
         )
         updateProjectDisplayTiming()
         syncActiveTrackFields()
@@ -14848,8 +15263,15 @@ final class WorkspaceView: NSView {
             fields: [
                 "file": projectURL.lastPathComponent,
                 "tracks": "\(project.tracks.count)",
+                "cachedPreviews": "\(cachedPreviewTrackCount)",
                 "loadMs": String(format: "%.2f", loadDurationMilliseconds),
             ]
+        )
+
+        attachCachedLaunchPreviewsAfterSkeleton(
+            project,
+            projectURL: projectURL,
+            loadGeneration: loadGeneration
         )
 
         primeLoadedProjectPlayback(
@@ -14865,6 +15287,110 @@ final class WorkspaceView: NSView {
                 statusPrefix: statusPrefix
             )
         }
+    }
+
+    private func attachCachedLaunchPreviewsAfterSkeleton(
+        _ project: SoundtimeProject,
+        projectURL: URL,
+        loadGeneration: Int
+    ) {
+        guard !project.tracks.isEmpty else {
+            return
+        }
+
+        let cache = waveformOverviewDiskCache
+        let orderedTracks = ProjectLaunchHydrationPlanner.orderedTracks(
+            project.tracks,
+            activeTrackID: activeTrackID,
+            selectedTrackIDs: selectedTrackIDs
+        )
+        let expectedTrackCount = orderedTracks.count
+        let startedAt = CACurrentMediaTime()
+
+        for (order, track) in orderedTracks.enumerated() {
+            DispatchQueue.global(qos: .userInitiated).async {
+                let hydratedTrack = ProjectLaunchPreviewWaveformCacheHydrator.hydratedTrack(
+                    track,
+                    waveformOverviewDiskCache: cache
+                )
+                guard hydratedTrack.waveformPreview != nil else {
+                    return
+                }
+
+                let elapsedMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
+                DispatchQueue.main.async { [weak self] in
+                    self?.applyCachedLaunchPreviewTrack(
+                        hydratedTrack,
+                        projectURL: projectURL,
+                        loadGeneration: loadGeneration,
+                        order: order,
+                        expectedTrackCount: expectedTrackCount,
+                        elapsedMilliseconds: elapsedMilliseconds
+                    )
+                }
+            }
+        }
+    }
+
+    private func applyCachedLaunchPreviewTrack(
+        _ track: SoundtimeProject.Track,
+        projectURL: URL,
+        loadGeneration: Int,
+        order: Int,
+        expectedTrackCount: Int,
+        elapsedMilliseconds: Double
+    ) {
+        guard
+            projectLoadGeneration == loadGeneration,
+            let waveformPreview = track.waveformPreview,
+            let trackIndex = projectTracks.firstIndex(where: { $0.id == track.id })
+        else {
+            return
+        }
+
+        let previousDisplayBinCount = projectTracks[trackIndex].waveformOverview?.bins.count ?? 0
+        let previousSourceBinCount = projectTracks[trackIndex].sourceWaveformOverview?.bins.count ?? 0
+        let sourceOverview = waveformPreview.sourceOverview.waveformOverview
+        let displayOverview = waveformPreview.displayOverview.waveformOverview
+        projectTracks[trackIndex].sourceWaveformOverview = bestAvailableLaunchOverview(
+            sourceOverview,
+            projectTracks[trackIndex].sourceWaveformOverview
+        )
+        projectTracks[trackIndex].waveformOverview = bestAvailableLaunchOverview(
+            displayOverview,
+            projectTracks[trackIndex].waveformOverview
+        ) ?? projectTracks[trackIndex].sourceWaveformOverview
+        projectTracks[trackIndex].durationHint = projectTracks[trackIndex].durationHint ??
+            displayOverview.duration
+
+        let newDisplayBinCount = projectTracks[trackIndex].waveformOverview?.bins.count ?? 0
+        let newSourceBinCount = projectTracks[trackIndex].sourceWaveformOverview?.bins.count ?? 0
+        guard newDisplayBinCount > previousDisplayBinCount || newSourceBinCount > previousSourceBinCount else {
+            return
+        }
+
+        refreshProjectTimelineDisplay(
+            rebuildControls: false,
+            animateWaveformTransition: false,
+            allowImmediateWaveformPrewarm: true,
+            allowImmediateInteractiveWaveformPrewarm: false,
+            updatesRendererImmediately: true
+        )
+        SoundtimeDiagnostics.shared.record(
+            category: .system,
+            severity: elapsedMilliseconds > 120 ? .warning : .info,
+            name: "project-launch-preview-attached",
+            message: "A cached waveform preview was attached after the visual project skeleton.",
+            fields: [
+                "file": projectURL.lastPathComponent,
+                "trackID": track.id.uuidString,
+                "track": track.name,
+                "order": "\(order + 1)",
+                "tracks": "\(expectedTrackCount)",
+                "bins": "\(newDisplayBinCount)",
+                "elapsedMs": String(format: "%.2f", elapsedMilliseconds),
+            ]
+        )
     }
 
     private func primeLoadedProjectPlayback(
@@ -15271,8 +15797,9 @@ final class WorkspaceView: NSView {
             refreshProjectTimelineDisplay(
                 rebuildControls: false,
                 animateWaveformTransition: false,
-                allowImmediateWaveformPrewarm: false,
-                allowImmediateInteractiveWaveformPrewarm: false
+                allowImmediateWaveformPrewarm: true,
+                allowImmediateInteractiveWaveformPrewarm: false,
+                updatesRendererImmediately: true
             )
             updateProjectDisplayTiming(sampleRateHint: hydration.fileInfo.sampleRate)
             updateTimeReadout()
@@ -15370,6 +15897,42 @@ final class WorkspaceView: NSView {
         return first.bins.count >= second.bins.count ? first : second
     }
 
+    private func resetProjectIdentityForNewDocument() {
+        currentProjectID = UUID()
+        currentEditGraphRevision = 1
+        currentVisualRevision = 1
+        currentLaunchStateRevision = 1
+    }
+
+    private func applyProjectIdentity(_ project: SoundtimeProject) {
+        currentProjectID = project.projectID
+        currentEditGraphRevision = max(project.editGraphRevision, 1)
+        currentVisualRevision = max(project.visualRevision, 1)
+        currentLaunchStateRevision = max(project.launchStateRevision, 1)
+    }
+
+    private func applyLaunchFirstFrameIdentity(_ firstFrame: ProjectLaunchFirstFrame) {
+        if let projectID = firstFrame.projectID {
+            currentProjectID = projectID
+        }
+        if let editGraphRevision = firstFrame.editGraphRevision {
+            currentEditGraphRevision = max(editGraphRevision, 1)
+        }
+        if let visualRevision = firstFrame.visualRevision {
+            currentVisualRevision = max(visualRevision, 1)
+        }
+        if let launchStateRevision = firstFrame.launchStateRevision {
+            currentLaunchStateRevision = max(launchStateRevision, 1)
+        }
+    }
+
+    private func advanceLaunchStateRevision() {
+        currentLaunchStateRevision = currentLaunchStateRevision &+ 1
+        if currentLaunchStateRevision == 0 {
+            currentLaunchStateRevision = 1
+        }
+    }
+
     private func clearProjectForLoad(publishesTimeline: Bool = true) {
         projectHydrationQueue?.cancel()
         projectHydrationQueue = nil
@@ -15391,6 +15954,7 @@ final class WorkspaceView: NSView {
         selectedTrackIDs.removeAll()
         trackSelectionAnchorID = nil
         defaultEditGroupID = UUID()
+        resetProjectIdentityForNewDocument()
         decodedAudioBuffer = nil
         audioTimeline = nil
         editUndoStack.removeAll()
@@ -15522,6 +16086,10 @@ final class WorkspaceView: NSView {
 
     private func currentProject(includeWaveformPreviews: Bool = true) -> SoundtimeProject {
         SoundtimeProject(
+            projectID: currentProjectID,
+            editGraphRevision: currentEditGraphRevision,
+            visualRevision: currentVisualRevision,
+            launchStateRevision: currentLaunchStateRevision,
             tracks: projectTracks.compactMap { track in
                 guard let fileInfo = decodableWAVFileInfo(for: track.sourceURL) else {
                     return nil
