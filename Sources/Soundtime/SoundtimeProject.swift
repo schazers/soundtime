@@ -1,7 +1,7 @@
 import Foundation
 
 struct SoundtimeProject: Codable, Sendable {
-    static let currentSchemaVersion = 7
+    static let currentSchemaVersion = 8
     static let launchWaveformPreviewBinCount = 4_096
 
     struct WindowLayout: Codable, Sendable {
@@ -271,6 +271,10 @@ struct SoundtimeProject: Codable, Sendable {
         var transcript: TranscriptDocument? = nil
     }
 
+    var projectID: UUID
+    var editGraphRevision: UInt64
+    var visualRevision: UInt64
+    var launchStateRevision: UInt64
     var tracks: [Track]
     var windowLayout: WindowLayout?
     var masterVolume: Float?
@@ -282,6 +286,10 @@ struct SoundtimeProject: Codable, Sendable {
     var schemaVersion: Int
 
     init(
+        projectID: UUID = UUID(),
+        editGraphRevision: UInt64 = 1,
+        visualRevision: UInt64 = 1,
+        launchStateRevision: UInt64 = 1,
         tracks: [Track],
         windowLayout: WindowLayout?,
         masterVolume: Float?,
@@ -291,6 +299,10 @@ struct SoundtimeProject: Codable, Sendable {
         transcriptDisplayMode: TranscriptTimelineDisplayMode? = nil,
         schemaVersion: Int = SoundtimeProject.currentSchemaVersion
     ) {
+        self.projectID = projectID
+        self.editGraphRevision = max(editGraphRevision, 1)
+        self.visualRevision = max(visualRevision, 1)
+        self.launchStateRevision = max(launchStateRevision, 1)
         self.tracks = tracks
         self.windowLayout = windowLayout
         self.masterVolume = masterVolume
@@ -335,6 +347,10 @@ struct SoundtimeProject: Codable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion
+        case projectID
+        case editGraphRevision
+        case visualRevision
+        case launchStateRevision
         case tracks
         case windowLayout
         case masterVolume
@@ -347,6 +363,10 @@ struct SoundtimeProject: Codable, Sendable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
+        projectID = try container.decodeIfPresent(UUID.self, forKey: .projectID) ?? UUID()
+        editGraphRevision = max(try container.decodeIfPresent(UInt64.self, forKey: .editGraphRevision) ?? 1, 1)
+        visualRevision = max(try container.decodeIfPresent(UInt64.self, forKey: .visualRevision) ?? 1, 1)
+        launchStateRevision = max(try container.decodeIfPresent(UInt64.self, forKey: .launchStateRevision) ?? 1, 1)
         tracks = try container.decodeIfPresent([Track].self, forKey: .tracks) ?? []
         windowLayout = try container.decodeIfPresent(WindowLayout.self, forKey: .windowLayout)
         masterVolume = try container.decodeIfPresent(Float.self, forKey: .masterVolume)
@@ -365,6 +385,10 @@ struct SoundtimeProject: Codable, Sendable {
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(schemaVersion, forKey: .schemaVersion)
+        try container.encode(projectID, forKey: .projectID)
+        try container.encode(editGraphRevision, forKey: .editGraphRevision)
+        try container.encode(visualRevision, forKey: .visualRevision)
+        try container.encode(launchStateRevision, forKey: .launchStateRevision)
         try container.encode(tracks, forKey: .tracks)
         try container.encodeIfPresent(windowLayout, forKey: .windowLayout)
         try container.encodeIfPresent(masterVolume, forKey: .masterVolume)
@@ -375,6 +399,22 @@ struct SoundtimeProject: Codable, Sendable {
     }
 }
 
+struct SoundtimeProjectLaunchStateOverlay: Codable, Sendable {
+    struct TrackState: Codable, Sendable {
+        var id: UUID
+        var volume: Float
+        var isMuted: Bool
+        var isSoloed: Bool
+    }
+
+    var createdAt: TimeInterval
+    var windowLayout: SoundtimeProject.WindowLayout?
+    var timelineViewport: SoundtimeProject.TimelineViewport?
+    var masterVolume: Float?
+    var transcriptDisplayMode: TranscriptTimelineDisplayMode?
+    var tracks: [TrackState]
+}
+
 enum SoundtimeProjectStore {
     static let fileExtension = "soundtime"
     static let autosaveFileExtension = "soundtime-autosave"
@@ -383,6 +423,7 @@ enum SoundtimeProjectStore {
     private static let recentProjectURLPathsKey = "Soundtime.recentProjectURLPaths"
     private static let projectWindowLayoutKeyPrefix = "Soundtime.projectWindowLayout."
     private static let projectTimelineViewportKeyPrefix = "Soundtime.projectTimelineViewport."
+    private static let projectLaunchStateOverlayKeyPrefix = "Soundtime.projectLaunchStateOverlay."
 
     static func load(from url: URL) throws -> SoundtimeProject {
         let migratedProject = try loadRaw(from: url)
@@ -490,6 +531,17 @@ enum SoundtimeProjectStore {
             .sorted { $0.modificationDateOrDistantPast > $1.modificationDateOrDistantPast }
     }
 
+    static func recoverableAutosaveURL(for projectURL: URL) -> URL? {
+        let autosaveURL = autosaveURL(for: projectURL)
+        guard
+            FileManager.default.fileExists(atPath: autosaveURL.path),
+            autosaveURL.isNewerThan(projectURL)
+        else {
+            return nil
+        }
+        return autosaveURL
+    }
+
     private static func write(_ project: SoundtimeProject, to url: URL) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -584,6 +636,25 @@ enum SoundtimeProjectStore {
         return try? JSONDecoder().decode(SoundtimeProject.TimelineViewport.self, from: data)
     }
 
+    static func rememberLaunchStateOverlay(
+        _ overlay: SoundtimeProjectLaunchStateOverlay,
+        for projectURL: URL
+    ) {
+        guard let data = try? JSONEncoder().encode(overlay) else {
+            return
+        }
+
+        UserDefaults.standard.set(data, forKey: projectLaunchStateOverlayKey(for: projectURL))
+    }
+
+    static func rememberedLaunchStateOverlay(for projectURL: URL) -> SoundtimeProjectLaunchStateOverlay? {
+        guard let data = UserDefaults.standard.data(forKey: projectLaunchStateOverlayKey(for: projectURL)) else {
+            return nil
+        }
+
+        return try? JSONDecoder().decode(SoundtimeProjectLaunchStateOverlay.self, from: data)
+    }
+
     private static func recentProjectURLPaths() -> [String] {
         (UserDefaults.standard.stringArray(forKey: recentProjectURLPathsKey) ?? [])
             .filter { !$0.isEmpty }
@@ -595,6 +666,10 @@ enum SoundtimeProjectStore {
 
     private static func projectTimelineViewportKey(for projectURL: URL) -> String {
         projectTimelineViewportKeyPrefix + stablePathHash(projectURL.standardizedFileURL.path)
+    }
+
+    private static func projectLaunchStateOverlayKey(for projectURL: URL) -> String {
+        projectLaunchStateOverlayKeyPrefix + stablePathHash(projectURL.standardizedFileURL.path)
     }
 
     static func stableProjectKey(for projectURL: URL) -> String {

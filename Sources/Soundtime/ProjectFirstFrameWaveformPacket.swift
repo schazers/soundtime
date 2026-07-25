@@ -1,155 +1,33 @@
 import Foundation
 
-struct ProjectLaunchSnapshot: Codable, Sendable {
+struct ProjectFirstFrameWaveformPacket: Codable, Sendable {
     static let currentSchemaVersion = 2
-    static let maximumOverviewBinCount = 32_768
-
-    struct ProjectFileMetadata: Codable, Sendable, Equatable {
-        var canonicalPath: String?
-        var fileSize: Int64?
-        var modificationTime: TimeInterval?
-
-        init(projectURL: URL) {
-            self.init(fileURL: projectURL)
-        }
-
-        init(fileURL: URL) {
-            canonicalPath = fileURL.standardizedFileURL.path
-            let attributes = try? FileManager.default.attributesOfItem(
-                atPath: fileURL.standardizedFileURL.path
-            )
-            fileSize = (attributes?[.size] as? NSNumber)?.int64Value
-            modificationTime = (attributes?[.modificationDate] as? Date)?.timeIntervalSince1970
-        }
-
-        func isCompatible(with other: ProjectFileMetadata) -> Bool {
-            if let canonicalPath {
-                guard let otherCanonicalPath = other.canonicalPath, canonicalPath == otherCanonicalPath else {
-                    return false
-                }
-            }
-
-            if let fileSize {
-                guard let otherFileSize = other.fileSize, fileSize == otherFileSize else {
-                    return false
-                }
-            }
-
-            if let modificationTime {
-                guard
-                    let otherModificationTime = other.modificationTime,
-                    abs(modificationTime - otherModificationTime) <= 0.001
-                else {
-                    return false
-                }
-            }
-
-            return true
-        }
-    }
-
-    struct OverviewPayload: Codable, Sendable {
-        var duration: TimeInterval
-        var binCount: Int
-        var encodedBins: Data
-
-        init?(_ overview: WaveformOverview?, maximumBinCount: Int = ProjectLaunchSnapshot.maximumOverviewBinCount) {
-            guard let overview, !overview.isEmpty, overview.duration.isFinite else {
-                return nil
-            }
-
-            let reducedOverview = overview.reducedForLaunchSnapshot(maximumBinCount: maximumBinCount)
-            duration = reducedOverview.duration
-            binCount = reducedOverview.bins.count
-            encodedBins = WaveformOverviewBinaryCodec.encode(reducedOverview)
-        }
-
-        init(duration: TimeInterval, binCount: Int, encodedBins: Data) {
-            self.duration = duration
-            self.binCount = binCount
-            self.encodedBins = encodedBins
-        }
-
-        func waveformOverview() -> WaveformOverview? {
-            try? WaveformOverviewBinaryCodec.decode(
-                encodedBins,
-                duration: duration,
-                expectedBinCount: binCount
-            )
-        }
-    }
+    static let maximumOverviewBinCount = ProjectLaunchSnapshot.maximumOverviewBinCount
 
     struct Track: Codable, Sendable {
         var id: UUID
         var editGroupID: UUID?
         var name: String
         var filePath: String
-        var sourceMetadata: ProjectFileMetadata?
+        var sourceMetadata: ProjectLaunchSnapshot.ProjectFileMetadata?
         var durationHint: TimeInterval?
-        var sourceOverview: OverviewPayload?
-        var displayOverview: OverviewPayload?
+        var displayOverview: ProjectLaunchSnapshot.OverviewPayload?
         var editTimeline: AudioFileEditTimeline.PersistentState?
         var editableSource: SoundtimeProject.Track.EditableSource?
         var ownsSourceFile: Bool?
         var volume: Float
         var isMuted: Bool
         var isSoloed: Bool
-
-        var sourceWaveformOverview: WaveformOverview? {
-            sourceOverview?.waveformOverview()
-        }
 
         var displayWaveformOverview: WaveformOverview? {
             displayOverview?.waveformOverview()
         }
-
-        var hasCompatibleSourceFile: Bool {
-            guard let sourceMetadata else {
-                return true
-            }
-
-            let sourceURL = URL(fileURLWithPath: filePath).standardizedFileURL
-            return sourceMetadata.isCompatible(with: ProjectFileMetadata(fileURL: sourceURL))
-        }
-
-        func validatedForLaunch(validatesSourceFile: Bool = true) -> Track {
-            guard validatesSourceFile else {
-                return self
-            }
-
-            guard !hasCompatibleSourceFile else {
-                return self
-            }
-
-            var track = self
-            track.durationHint = nil
-            track.sourceOverview = nil
-            track.displayOverview = nil
-            track.editTimeline = nil
-            return track
-        }
-    }
-
-    struct TrackDraft: Sendable {
-        var id: UUID
-        var editGroupID: UUID?
-        var name: String
-        var filePath: String
-        var durationHint: TimeInterval?
-        var sourceWaveformOverview: WaveformOverview?
-        var displayWaveformOverview: WaveformOverview?
-        var editTimeline: AudioFileEditTimeline.PersistentState?
-        var editableSource: SoundtimeProject.Track.EditableSource?
-        var ownsSourceFile: Bool?
-        var volume: Float
-        var isMuted: Bool
-        var isSoloed: Bool
     }
 
     var schemaVersion: Int
     var createdAt: TimeInterval
     var projectPath: String
-    var projectMetadata: ProjectFileMetadata
+    var projectMetadata: ProjectLaunchSnapshot.ProjectFileMetadata
     var projectID: UUID?
     var editGraphRevision: UInt64?
     var visualRevision: UInt64?
@@ -171,12 +49,12 @@ struct ProjectLaunchSnapshot: Codable, Sendable {
         timelineViewport: SoundtimeProject.TimelineViewport?,
         masterVolume: Float?,
         transcriptDisplayMode: TranscriptTimelineDisplayMode?,
-        tracks: [TrackDraft]
+        tracks: [ProjectLaunchSnapshot.TrackDraft]
     ) {
         schemaVersion = Self.currentSchemaVersion
         createdAt = Date().timeIntervalSince1970
         projectPath = projectURL.standardizedFileURL.path
-        projectMetadata = ProjectFileMetadata(projectURL: projectURL)
+        projectMetadata = ProjectLaunchSnapshot.ProjectFileMetadata(projectURL: projectURL)
         self.projectID = projectID
         self.editGraphRevision = editGraphRevision
         self.visualRevision = visualRevision
@@ -190,23 +68,25 @@ struct ProjectLaunchSnapshot: Codable, Sendable {
         self.masterVolume = masterVolume
         self.transcriptDisplayMode = transcriptDisplayMode
         self.tracks = tracks.map { draft in
-            let sourceOverview = OverviewPayload(draft.sourceWaveformOverview)
-            let displayOverview = OverviewPayload(
-                draft.displayWaveformOverview ?? draft.sourceWaveformOverview
+            let displayOverview = ProjectLaunchSnapshot.OverviewPayload(
+                draft.displayWaveformOverview ?? draft.sourceWaveformOverview,
+                maximumBinCount: Self.maximumOverviewBinCount
             )
             let durationHint = draft.durationHint ??
                 draft.displayWaveformOverview?.duration ??
                 draft.sourceWaveformOverview?.duration ??
-                draft.editTimeline?.launchSnapshotDuration
+                Self.launchSnapshotDuration(from: draft.editTimeline) ??
+                Self.editableDuration(from: draft.editableSource)
             return Track(
                 id: draft.id,
                 editGroupID: draft.editGroupID,
                 name: draft.name,
                 filePath: draft.filePath,
-                sourceMetadata: ProjectFileMetadata(fileURL: URL(fileURLWithPath: draft.filePath)),
+                sourceMetadata: ProjectLaunchSnapshot.ProjectFileMetadata(
+                    fileURL: URL(fileURLWithPath: draft.filePath)
+                ),
                 durationHint: durationHint,
-                sourceOverview: sourceOverview,
-                displayOverview: displayOverview ?? sourceOverview,
+                displayOverview: displayOverview,
                 editTimeline: draft.editTimeline,
                 editableSource: draft.editableSource,
                 ownsSourceFile: draft.ownsSourceFile,
@@ -221,7 +101,7 @@ struct ProjectLaunchSnapshot: Codable, Sendable {
         schemaVersion: Int,
         createdAt: TimeInterval,
         projectPath: String,
-        projectMetadata: ProjectFileMetadata,
+        projectMetadata: ProjectLaunchSnapshot.ProjectFileMetadata,
         projectID: UUID? = nil,
         editGraphRevision: UInt64? = nil,
         visualRevision: UInt64? = nil,
@@ -251,16 +131,7 @@ struct ProjectLaunchSnapshot: Codable, Sendable {
 
     var isDrawable: Bool {
         schemaVersion == Self.currentSchemaVersion &&
-            tracks.contains { $0.displayOverview != nil || $0.sourceOverview != nil || $0.durationHint != nil }
-    }
-
-    func isCompatible(with projectURL: URL) -> Bool {
-        let standardizedProjectPath = projectURL.standardizedFileURL.path
-        guard projectPath == standardizedProjectPath else {
-            return false
-        }
-
-        return projectMetadata.isCompatible(with: ProjectFileMetadata(projectURL: projectURL))
+            tracks.contains { $0.displayOverview != nil || $0.durationHint != nil }
     }
 
     func isCompatibleForFirstPaint(with projectURL: URL) -> Bool {
@@ -268,65 +139,59 @@ struct ProjectLaunchSnapshot: Codable, Sendable {
         guard projectPath == standardizedProjectURL.path else {
             return false
         }
-        return projectMetadata.isCompatible(with: ProjectFileMetadata(projectURL: standardizedProjectURL))
+        return projectMetadata.isCompatible(with: ProjectLaunchSnapshot.ProjectFileMetadata(projectURL: standardizedProjectURL))
     }
 
-    func validatedForLaunch(
-        projectURL: URL,
-        validatesTrackSources: Bool = true
-    ) -> ProjectLaunchSnapshot {
-        var snapshot = self
-        snapshot.tracks = tracks.map { $0.validatedForLaunch(validatesSourceFile: validatesTrackSources) }
-        return snapshot
+    private static func editableDuration(from source: SoundtimeProject.Track.EditableSource?) -> TimeInterval? {
+        guard
+            let source,
+            source.sourceSampleRate > 0,
+            source.sourceSampleRate.isFinite
+        else {
+            return nil
+        }
+        return Double(source.sourceFrameCount) / source.sourceSampleRate
+    }
+
+    private static func launchSnapshotDuration(from state: AudioFileEditTimeline.PersistentState?) -> TimeInterval? {
+        guard
+            let state,
+            state.sourceSampleRate > 0,
+            state.sourceSampleRate.isFinite
+        else {
+            return nil
+        }
+        let frameCount = state.segments.reduce(0) { $0 + max($1.frameCount, 0) }
+        return Double(frameCount) / state.sourceSampleRate
     }
 }
 
-enum ProjectLaunchSnapshotStore {
-    private static let fileExtension = "soundtime-launch-snapshot"
-    static let firstPaintSynchronousByteLimit = 32 * 1_024 * 1_024
+enum ProjectFirstFrameWaveformPacketStore {
+    private static let fileExtension = "soundtime-first-frame-waveforms"
+    static let firstPaintSynchronousByteLimit = 8 * 1_024 * 1_024
     static let firstPaintManifestByteLimit = 512 * 1_024
 
-    static func load(for projectURL: URL) throws -> ProjectLaunchSnapshot {
-        let data = try Data(contentsOf: snapshotURL(for: projectURL))
-        let snapshot: ProjectLaunchSnapshot
-        do {
-            snapshot = try ProjectLaunchSnapshotBinaryCodec.decode(data)
-        } catch ProjectLaunchSnapshotBinaryCodec.CodecError.notBinarySnapshot {
-            snapshot = try JSONDecoder().decode(ProjectLaunchSnapshot.self, from: data)
-        }
-        guard snapshot.schemaVersion == ProjectLaunchSnapshot.currentSchemaVersion else {
-            throw CocoaError(.fileReadCorruptFile)
-        }
-        guard snapshot.isCompatible(with: projectURL) else {
-            throw CocoaError(.fileReadCorruptFile)
-        }
-        return snapshot.validatedForLaunch(projectURL: projectURL)
-    }
-
-    static func loadForFirstPaintIfAvailable(for projectURL: URL) -> ProjectLaunchSnapshot? {
-        let url = snapshotURL(for: projectURL)
+    static func loadForFirstPaintIfAvailable(for projectURL: URL) -> ProjectFirstFrameWaveformPacket? {
+        let url = packetURL(for: projectURL)
         guard
             let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
             let fileSize = (attributes[.size] as? NSNumber)?.intValue,
             fileSize > 0,
             fileSize <= firstPaintSynchronousByteLimit,
             let data = try? Data(contentsOf: url),
-            ProjectLaunchSnapshotBinaryCodec.hasBinaryMagic(data),
-            let snapshot = try? ProjectLaunchSnapshotBinaryCodec.decode(data),
-            snapshot.schemaVersion == ProjectLaunchSnapshot.currentSchemaVersion,
-            snapshot.isCompatibleForFirstPaint(with: projectURL)
+            ProjectFirstFrameWaveformPacketBinaryCodec.hasBinaryMagic(data),
+            let packet = try? ProjectFirstFrameWaveformPacketBinaryCodec.decode(data),
+            packet.schemaVersion == ProjectFirstFrameWaveformPacket.currentSchemaVersion,
+            packet.isCompatibleForFirstPaint(with: projectURL)
         else {
             return nil
         }
 
-        return snapshot.validatedForLaunch(
-            projectURL: projectURL,
-            validatesTrackSources: false
-        )
+        return packet
     }
 
-    static func loadShellForFirstPaintIfAvailable(for projectURL: URL) -> ProjectLaunchSnapshot? {
-        let url = snapshotURL(for: projectURL)
+    static func loadShellForFirstPaintIfAvailable(for projectURL: URL) -> ProjectFirstFrameWaveformPacket? {
+        let url = packetURL(for: projectURL)
         guard
             let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
             let fileSize = (attributes[.size] as? NSNumber)?.intValue,
@@ -340,9 +205,9 @@ enum ProjectLaunchSnapshotStore {
             try? fileHandle.close()
         }
 
-        let headerData = fileHandle.readData(ofLength: ProjectLaunchSnapshotBinaryCodec.headerByteCount)
+        let headerData = fileHandle.readData(ofLength: ProjectFirstFrameWaveformPacketBinaryCodec.headerByteCount)
         guard
-            let manifestByteCount = try? ProjectLaunchSnapshotBinaryCodec.manifestByteCount(
+            let manifestByteCount = try? ProjectFirstFrameWaveformPacketBinaryCodec.manifestByteCount(
                 fromHeader: headerData
             ),
             manifestByteCount > 0,
@@ -354,59 +219,56 @@ enum ProjectLaunchSnapshotStore {
         let manifestData = fileHandle.readData(ofLength: manifestByteCount)
         guard
             manifestData.count == manifestByteCount,
-            let snapshot = try? ProjectLaunchSnapshotBinaryCodec.decodeManifestOnly(manifestData),
-            snapshot.schemaVersion == ProjectLaunchSnapshot.currentSchemaVersion,
-            snapshot.isCompatibleForFirstPaint(with: projectURL)
+            let packet = try? ProjectFirstFrameWaveformPacketBinaryCodec.decodeManifestOnly(manifestData),
+            packet.schemaVersion == ProjectFirstFrameWaveformPacket.currentSchemaVersion,
+            packet.isCompatibleForFirstPaint(with: projectURL)
         else {
             return nil
         }
 
-        return snapshot.validatedForLaunch(
-            projectURL: projectURL,
-            validatesTrackSources: false
-        )
+        return packet
     }
 
-    static func save(_ snapshot: ProjectLaunchSnapshot, for projectURL: URL) throws {
-        let url = snapshotURL(for: projectURL)
+    static func save(_ packet: ProjectFirstFrameWaveformPacket, for projectURL: URL) throws {
+        let url = packetURL(for: projectURL)
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        let data = try ProjectLaunchSnapshotBinaryCodec.encode(snapshot)
+        let data = try ProjectFirstFrameWaveformPacketBinaryCodec.encode(packet)
         try data.write(to: url, options: [.atomic])
     }
 
     static func remove(for projectURL: URL) {
-        try? FileManager.default.removeItem(at: snapshotURL(for: projectURL))
+        try? FileManager.default.removeItem(at: packetURL(for: projectURL))
     }
 
-    static func snapshotURL(for projectURL: URL) -> URL {
-        snapshotsDirectoryURL()
+    static func packetURL(for projectURL: URL) -> URL {
+        packetsDirectoryURL()
             .appendingPathComponent(SoundtimeProjectStore.stableProjectKey(for: projectURL))
             .appendingPathExtension(fileExtension)
             .standardizedFileURL
     }
 
-    private static func snapshotsDirectoryURL() -> URL {
+    private static func packetsDirectoryURL() -> URL {
         let baseDirectory = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
         ).first ?? URL(fileURLWithPath: NSTemporaryDirectory())
         return baseDirectory
             .appendingPathComponent("Soundtime", isDirectory: true)
-            .appendingPathComponent("LaunchSnapshots", isDirectory: true)
+            .appendingPathComponent("FirstFrameWaveforms", isDirectory: true)
             .standardizedFileURL
     }
 }
 
-enum ProjectLaunchSnapshotBinaryCodec {
+enum ProjectFirstFrameWaveformPacketBinaryCodec {
     enum CodecError: Error {
-        case notBinarySnapshot
+        case notBinaryPacket
         case invalidPayload
     }
 
-    private static let magic = Array("STLSNP02".utf8)
+    private static let magic = Array("STFFWP01".utf8)
     private static let containerVersion: UInt32 = 1
     static var headerByteCount: Int {
         magic.count + 4 + 8 + 8
@@ -426,7 +288,6 @@ enum ProjectLaunchSnapshotBinaryCodec {
         var filePath: String
         var sourceMetadata: ProjectLaunchSnapshot.ProjectFileMetadata?
         var durationHint: TimeInterval?
-        var sourceOverview: OverviewDescriptor?
         var displayOverview: OverviewDescriptor?
         var editTimeline: AudioFileEditTimeline.PersistentState?
         var editableSource: SoundtimeProject.Track.EditableSource?
@@ -454,15 +315,13 @@ enum ProjectLaunchSnapshotBinaryCodec {
         var tracks: [TrackManifest]
     }
 
-    static func encode(_ snapshot: ProjectLaunchSnapshot) throws -> Data {
+    static func encode(_ packet: ProjectFirstFrameWaveformPacket) throws -> Data {
         var overviewBlob = Data()
-        overviewBlob.reserveCapacity(snapshot.tracks.reduce(0) { total, track in
-            total +
-                (track.sourceOverview?.encodedBins.count ?? 0) +
-                (track.displayOverview?.encodedBins.count ?? 0)
+        overviewBlob.reserveCapacity(packet.tracks.reduce(0) { total, track in
+            total + (track.displayOverview?.encodedBins.count ?? 0)
         })
 
-        let trackManifests = snapshot.tracks.map { track in
+        let trackManifests = packet.tracks.map { track in
             TrackManifest(
                 id: track.id,
                 editGroupID: track.editGroupID,
@@ -470,7 +329,6 @@ enum ProjectLaunchSnapshotBinaryCodec {
                 filePath: track.filePath,
                 sourceMetadata: track.sourceMetadata,
                 durationHint: track.durationHint,
-                sourceOverview: appendOverview(track.sourceOverview, to: &overviewBlob),
                 displayOverview: appendOverview(track.displayOverview, to: &overviewBlob),
                 editTimeline: track.editTimeline,
                 editableSource: track.editableSource,
@@ -483,19 +341,19 @@ enum ProjectLaunchSnapshotBinaryCodec {
 
         let manifest = Manifest(
             containerVersion: containerVersion,
-            schemaVersion: snapshot.schemaVersion,
-            createdAt: snapshot.createdAt,
-            projectPath: snapshot.projectPath,
-            projectMetadata: snapshot.projectMetadata,
-            projectID: snapshot.projectID,
-            editGraphRevision: snapshot.editGraphRevision,
-            visualRevision: snapshot.visualRevision,
-            launchStateRevision: snapshot.launchStateRevision,
-            visualFingerprint: snapshot.visualFingerprint,
-            windowLayout: snapshot.windowLayout,
-            timelineViewport: snapshot.timelineViewport,
-            masterVolume: snapshot.masterVolume,
-            transcriptDisplayMode: snapshot.transcriptDisplayMode,
+            schemaVersion: packet.schemaVersion,
+            createdAt: packet.createdAt,
+            projectPath: packet.projectPath,
+            projectMetadata: packet.projectMetadata,
+            projectID: packet.projectID,
+            editGraphRevision: packet.editGraphRevision,
+            visualRevision: packet.visualRevision,
+            launchStateRevision: packet.launchStateRevision,
+            visualFingerprint: packet.visualFingerprint,
+            windowLayout: packet.windowLayout,
+            timelineViewport: packet.timelineViewport,
+            masterVolume: packet.masterVolume,
+            transcriptDisplayMode: packet.transcriptDisplayMode,
             tracks: trackManifests
         )
         let manifestData = try JSONEncoder().encode(manifest)
@@ -511,9 +369,9 @@ enum ProjectLaunchSnapshotBinaryCodec {
         return data
     }
 
-    static func decode(_ data: Data) throws -> ProjectLaunchSnapshot {
+    static func decode(_ data: Data) throws -> ProjectFirstFrameWaveformPacket {
         guard data.count >= magic.count, Array(data.prefix(magic.count)) == magic else {
-            throw CodecError.notBinarySnapshot
+            throw CodecError.notBinaryPacket
         }
 
         var offset = magic.count
@@ -540,14 +398,13 @@ enum ProjectLaunchSnapshotBinaryCodec {
         }
 
         let tracks = try manifest.tracks.map { track in
-            ProjectLaunchSnapshot.Track(
+            ProjectFirstFrameWaveformPacket.Track(
                 id: track.id,
                 editGroupID: track.editGroupID,
                 name: track.name,
                 filePath: track.filePath,
                 sourceMetadata: track.sourceMetadata,
                 durationHint: track.durationHint,
-                sourceOverview: try overviewPayload(track.sourceOverview, blobStart: blobStart, data: data),
                 displayOverview: try overviewPayload(track.displayOverview, blobStart: blobStart, data: data),
                 editTimeline: track.editTimeline,
                 editableSource: track.editableSource,
@@ -558,7 +415,7 @@ enum ProjectLaunchSnapshotBinaryCodec {
             )
         }
 
-        return ProjectLaunchSnapshot(
+        return ProjectFirstFrameWaveformPacket(
             schemaVersion: manifest.schemaVersion,
             createdAt: manifest.createdAt,
             projectPath: manifest.projectPath,
@@ -578,7 +435,7 @@ enum ProjectLaunchSnapshotBinaryCodec {
 
     static func manifestByteCount(fromHeader data: Data) throws -> Int {
         guard data.count == headerByteCount, Array(data.prefix(magic.count)) == magic else {
-            throw CodecError.notBinarySnapshot
+            throw CodecError.notBinaryPacket
         }
 
         var offset = magic.count
@@ -596,23 +453,20 @@ enum ProjectLaunchSnapshotBinaryCodec {
         return manifestLength
     }
 
-    static func decodeManifestOnly(_ manifestData: Data) throws -> ProjectLaunchSnapshot {
+    static func decodeManifestOnly(_ manifestData: Data) throws -> ProjectFirstFrameWaveformPacket {
         let manifest = try JSONDecoder().decode(Manifest.self, from: manifestData)
         guard manifest.containerVersion == containerVersion else {
             throw CodecError.invalidPayload
         }
 
         let tracks = manifest.tracks.map { track in
-            ProjectLaunchSnapshot.Track(
+            ProjectFirstFrameWaveformPacket.Track(
                 id: track.id,
                 editGroupID: track.editGroupID,
                 name: track.name,
                 filePath: track.filePath,
                 sourceMetadata: track.sourceMetadata,
-                durationHint: track.durationHint ??
-                    track.displayOverview?.duration ??
-                    track.sourceOverview?.duration,
-                sourceOverview: nil,
+                durationHint: track.durationHint ?? track.displayOverview?.duration,
                 displayOverview: nil,
                 editTimeline: track.editTimeline,
                 editableSource: track.editableSource,
@@ -623,7 +477,7 @@ enum ProjectLaunchSnapshotBinaryCodec {
             )
         }
 
-        return ProjectLaunchSnapshot(
+        return ProjectFirstFrameWaveformPacket(
             schemaVersion: manifest.schemaVersion,
             createdAt: manifest.createdAt,
             projectPath: manifest.projectPath,
@@ -730,104 +584,35 @@ enum ProjectLaunchSnapshotBinaryCodec {
     }
 }
 
-enum ProjectLaunchHydrationDefaults {
-    static let firstRefinementBinCount = 131_072
-    static let maximumConcurrentTrackHydrations = 2
-}
-
-struct ProjectLaunchVisualReadinessSummary: Sendable, Equatable {
-    var trackCount: Int
-    var drawableWaveformTrackCount: Int
-    var durationOnlyTrackCount: Int
-    var blankTrackCount: Int
-    var playbackMetadataTrackCount: Int
-
-    var hasTracks: Bool {
-        trackCount > 0
-    }
-
-    var hasAnyDrawableWaveform: Bool {
-        drawableWaveformTrackCount > 0
-    }
-
-    var hasDrawableWaveformForEveryTrack: Bool {
-        hasTracks && drawableWaveformTrackCount == trackCount
-    }
-
-    var isFirstFrameUsable: Bool {
-        hasTracks && blankTrackCount == 0
-    }
-
-    var diagnosticFields: [String: String] {
-        [
-            "tracks": "\(trackCount)",
-            "drawableWaveforms": "\(drawableWaveformTrackCount)",
-            "allWaveformsDrawable": "\(hasDrawableWaveformForEveryTrack)",
-            "durationOnly": "\(durationOnlyTrackCount)",
-            "blank": "\(blankTrackCount)",
-            "playbackMetadata": "\(playbackMetadataTrackCount)",
-            "firstFrameUsable": "\(isFirstFrameUsable)",
-        ]
-    }
-}
-
-enum ProjectLaunchReadinessClassifier {
-    static func summarize(snapshot: ProjectLaunchSnapshot) -> ProjectLaunchVisualReadinessSummary {
-        summarize(snapshot.tracks.map { track in
-            TrackReadiness(
-                hasDrawableWaveform: track.displayOverview != nil || track.sourceOverview != nil,
-                hasDurationHint: track.durationHint != nil ||
-                    track.displayOverview?.duration.isFinite == true ||
-                    track.sourceOverview?.duration.isFinite == true ||
-                    track.editTimeline?.launchSnapshotDuration != nil ||
-                    editableDuration(from: track.editableSource) != nil,
-                hasPlaybackMetadata: track.editableSource != nil || track.editTimeline != nil
-            )
-        })
-    }
-
-    static func summarize(project: SoundtimeProject) -> ProjectLaunchVisualReadinessSummary {
-        summarize(project.tracks.map { track in
-            TrackReadiness(
-                hasDrawableWaveform: track.waveformPreview?.sourceOverview.bins.isEmpty == false ||
-                    track.waveformPreview?.displayOverview.bins.isEmpty == false,
-                hasDurationHint: track.editTimeline?.launchSnapshotDuration != nil ||
-                    track.waveformPreview?.sourceOverview.duration.isFinite == true ||
-                    track.waveformPreview?.displayOverview.duration.isFinite == true ||
-                    editableDuration(from: track.editableSource) != nil,
-                hasPlaybackMetadata: track.editableSource != nil || track.editTimeline != nil
-            )
-        })
-    }
-
-    private struct TrackReadiness {
-        var hasDrawableWaveform: Bool
-        var hasDurationHint: Bool
-        var hasPlaybackMetadata: Bool
-    }
-
-    private static func summarize(_ tracks: [TrackReadiness]) -> ProjectLaunchVisualReadinessSummary {
+extension ProjectLaunchReadinessClassifier {
+    static func summarize(packet: ProjectFirstFrameWaveformPacket) -> ProjectLaunchVisualReadinessSummary {
         var drawableWaveformTrackCount = 0
         var durationOnlyTrackCount = 0
         var blankTrackCount = 0
         var playbackMetadataTrackCount = 0
 
-        for track in tracks {
-            if track.hasDrawableWaveform {
+        for track in packet.tracks {
+            let hasDrawableWaveform = track.displayOverview != nil
+            let hasDurationHint = track.durationHint != nil ||
+                track.displayOverview?.duration.isFinite == true ||
+                packetLaunchSnapshotDuration(from: track.editTimeline) != nil ||
+                packetEditableDuration(from: track.editableSource) != nil
+
+            if hasDrawableWaveform {
                 drawableWaveformTrackCount += 1
-            } else if track.hasDurationHint {
+            } else if hasDurationHint {
                 durationOnlyTrackCount += 1
             } else {
                 blankTrackCount += 1
             }
 
-            if track.hasPlaybackMetadata {
+            if track.editTimeline != nil || track.editableSource != nil {
                 playbackMetadataTrackCount += 1
             }
         }
 
         return ProjectLaunchVisualReadinessSummary(
-            trackCount: tracks.count,
+            trackCount: packet.tracks.count,
             drawableWaveformTrackCount: drawableWaveformTrackCount,
             durationOnlyTrackCount: durationOnlyTrackCount,
             blankTrackCount: blankTrackCount,
@@ -835,7 +620,19 @@ enum ProjectLaunchReadinessClassifier {
         )
     }
 
-    private static func editableDuration(from source: SoundtimeProject.Track.EditableSource?) -> TimeInterval? {
+    private static func packetLaunchSnapshotDuration(from state: AudioFileEditTimeline.PersistentState?) -> TimeInterval? {
+        guard
+            let state,
+            state.sourceSampleRate > 0,
+            state.sourceSampleRate.isFinite
+        else {
+            return nil
+        }
+        let frameCount = state.segments.reduce(0) { $0 + max($1.frameCount, 0) }
+        return Double(frameCount) / state.sourceSampleRate
+    }
+
+    private static func packetEditableDuration(from source: SoundtimeProject.Track.EditableSource?) -> TimeInterval? {
         guard
             let source,
             source.sourceSampleRate > 0,
@@ -844,88 +641,5 @@ enum ProjectLaunchReadinessClassifier {
             return nil
         }
         return Double(source.sourceFrameCount) / source.sourceSampleRate
-    }
-}
-
-enum ProjectLaunchHydrationPlanner {
-    static func orderedTracks(
-        _ tracks: [SoundtimeProject.Track],
-        activeTrackID: UUID?,
-        selectedTrackIDs: Set<UUID>
-    ) -> [SoundtimeProject.Track] {
-        tracks.enumerated()
-            .sorted { lhs, rhs in
-                let lhsPriority = priority(
-                    forTrackID: lhs.element.id,
-                    order: lhs.offset,
-                    activeTrackID: activeTrackID,
-                    selectedTrackIDs: selectedTrackIDs
-                )
-                let rhsPriority = priority(
-                    forTrackID: rhs.element.id,
-                    order: rhs.offset,
-                    activeTrackID: activeTrackID,
-                    selectedTrackIDs: selectedTrackIDs
-                )
-                if lhsPriority == rhsPriority {
-                    return lhs.offset < rhs.offset
-                }
-                return lhsPriority < rhsPriority
-            }
-            .map(\.element)
-    }
-
-    static func priority(
-        forTrackID trackID: UUID,
-        order: Int,
-        activeTrackID: UUID?,
-        selectedTrackIDs: Set<UUID>
-    ) -> Int {
-        if trackID == activeTrackID {
-            return order
-        }
-        if selectedTrackIDs.contains(trackID) {
-            return 1_000 + order
-        }
-        return 10_000 + order
-    }
-}
-
-private extension AudioFileEditTimeline.PersistentState {
-    var launchSnapshotDuration: TimeInterval? {
-        guard sourceSampleRate > 0, sourceSampleRate.isFinite else {
-            return nil
-        }
-        let frameCount = segments.reduce(0) { $0 + max($1.frameCount, 0) }
-        return Double(frameCount) / sourceSampleRate
-    }
-}
-
-private extension WaveformOverview {
-    func reducedForLaunchSnapshot(maximumBinCount: Int) -> WaveformOverview {
-        guard bins.count > maximumBinCount, maximumBinCount > 0 else {
-            return self
-        }
-
-        let sourceCount = bins.count
-        let binsPerOutput = Double(sourceCount) / Double(maximumBinCount)
-        var reducedBins: [WaveformOverview.Bin] = []
-        reducedBins.reserveCapacity(maximumBinCount)
-
-        for outputIndex in 0..<maximumBinCount {
-            let startIndex = min(
-                max(Int((Double(outputIndex) * binsPerOutput).rounded(.down)), 0),
-                sourceCount - 1
-            )
-            let rawEndIndex = Int((Double(outputIndex + 1) * binsPerOutput).rounded(.down))
-            let endIndex = min(max(rawEndIndex, startIndex + 1), sourceCount)
-            var accumulator = WaveformBinAccumulator()
-            for sourceIndex in startIndex..<endIndex {
-                accumulator.addBin(bins[sourceIndex])
-            }
-            reducedBins.append(accumulator.makeBin())
-        }
-
-        return WaveformOverview(duration: duration, bins: reducedBins)
     }
 }
