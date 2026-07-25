@@ -93,6 +93,15 @@ class TimelineMetalLayerView: NSView {
         )
     }
 
+    func currentTimelineDrawableMetricsForPrewarm() -> (viewportSize: CGSize, backingScale: Float) {
+        updateDrawableSize()
+        let drawableState = currentDrawableState()
+        return (
+            viewportSize: drawableState.viewportSize,
+            backingScale: Float(drawableState.backingScale)
+        )
+    }
+
     private func configureLayerHosting() {
         wantsLayer = true
         configure(metalLayer: timelineMetalLayer)

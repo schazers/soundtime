@@ -349,7 +349,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         _ tracks: [TimelineRenderState.Track],
         animateWaveformTransition: Bool = true,
         allowImmediateWaveformPrewarm: Bool = true,
-        allowImmediateInteractiveWaveformPrewarm: Bool = true
+        allowImmediateInteractiveWaveformPrewarm: Bool = true,
+        updatesRendererImmediately: Bool = false
     ) {
         let previousTimelineDuration = timelineDuration
         let previousViewport = viewport
@@ -360,7 +361,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         let wasSelectionEnabled = isSelectionEnabled
         isSelectionEnabled = Self.hasInteractiveTimelineContent(tracks)
         if !wasSelectionEnabled || !isSelectionEnabled {
-            setViewport(.full, kicksImmediateRender: false)
+            setViewport(.full, kicksImmediateRender: false, marksInteraction: false)
         } else if
             previousTimelineDuration > 0,
             nextTimelineDuration > 0,
@@ -370,21 +371,42 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                 previousDuration: previousTimelineDuration,
                 nextDuration: nextTimelineDuration
             )
-            setViewport(preservedViewport, kicksImmediateRender: false)
+            setViewport(preservedViewport, kicksImmediateRender: false, marksInteraction: false)
         }
         if let pendingRestoredViewport, isSelectionEnabled {
             self.pendingRestoredViewport = nil
-            setViewport(pendingRestoredViewport, kicksImmediateRender: false)
+            setViewport(pendingRestoredViewport, kicksImmediateRender: false, marksInteraction: false)
         }
         updateTrackLayoutForCurrentBounds(requestRender: false)
         updateTranscriptOverlay()
-        updateTimelineRenderer { renderer in
+        let drawableMetrics = currentTimelineDrawableMetricsForPrewarm()
+        let rendererUpdate: @Sendable (TimelineRenderer) -> Void = { renderer in
+            renderer.updatePrewarmViewportSize(
+                drawableMetrics.viewportSize,
+                backingScale: drawableMetrics.backingScale
+            )
             renderer.displayTracks(
                 tracks,
                 animateWaveformTransition: animateWaveformTransition,
                 allowImmediateWaveformPrewarm: allowImmediateWaveformPrewarm,
                 allowImmediateInteractiveWaveformPrewarm: allowImmediateInteractiveWaveformPrewarm
             )
+            if
+                updatesRendererImmediately,
+                allowImmediateWaveformPrewarm,
+                !allowImmediateInteractiveWaveformPrewarm,
+                !animateWaveformTransition
+            {
+                renderer.prepareFirstPaintWaveformShaderBuffers(
+                    drawableSize: drawableMetrics.viewportSize,
+                    backingScale: drawableMetrics.backingScale
+                )
+            }
+        }
+        if updatesRendererImmediately {
+            updateTimelineRendererImmediately(rendererUpdate)
+        } else {
+            updateTimelineRenderer(rendererUpdate)
         }
         requestTimelineRender()
         displayTrimPreview(nil)
@@ -455,13 +477,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     func restoreViewport(_ restoredViewport: TimelineViewport?) {
         guard let restoredViewport else {
             pendingRestoredViewport = nil
-            setViewport(.full, kicksImmediateRender: false)
+            setViewport(.full, kicksImmediateRender: false, marksInteraction: false)
             return
         }
 
         if isSelectionEnabled {
             pendingRestoredViewport = nil
-            setViewport(restoredViewport, kicksImmediateRender: false)
+            setViewport(restoredViewport, kicksImmediateRender: false, marksInteraction: false)
         } else {
             pendingRestoredViewport = restoredViewport
         }
@@ -572,6 +594,24 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             activeWordID: wordID
         )
         transcriptOverlayView.updateInteractionState(transcriptInteractionState)
+    }
+
+    func prepareLaunchPreviewFirstPaint(
+        selectedTrackIDs: Set<UUID>,
+        primaryTrackID: UUID?
+    ) {
+        currentSelection = nil
+        liveSelectionDragSnapshot = nil
+        currentTranscriptSelection = nil
+        let keepsAlignmentDebugVisible = transcriptInteractionState.alignmentDebugEnabled
+        transcriptInteractionState = TranscriptInteractionState.empty
+        transcriptInteractionState.alignmentDebugEnabled = keepsAlignmentDebugVisible
+        transcriptOverlayView.updateInteractionState(transcriptInteractionState)
+
+        updateTimelineRendererImmediately { renderer in
+            renderer.displaySelection(nil, marksInteraction: false)
+            renderer.displaySelectedTracks(selectedTrackIDs, primaryTrackID: primaryTrackID)
+        }
     }
 
     func displayTranscriptAlignmentDebug(_ isVisible: Bool) {
@@ -685,14 +725,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         requestTimelineRender()
     }
 
-    func displaySelection(_ selection: TimelineSelection?) {
+    func displaySelection(_ selection: TimelineSelection?, marksInteraction: Bool = true) {
         currentSelection = selection
         liveSelectionDragSnapshot = nil
         if selection == nil {
             clearLiveSelectionDragSnapshot(clearsSelection: true)
         }
         updateTimelineRendererImmediately { renderer in
-            renderer.displaySelection(selection)
+            renderer.displaySelection(selection, marksInteraction: marksInteraction)
         }
         requestTimelineRender()
     }
@@ -1025,8 +1065,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             let initialLoopRange = loopRange
             let initialLoopRangeEnabled = isLoopRangeEnabled
             updateTimelineRenderer { renderer in
-                renderer.displayViewport(initialViewport)
-                renderer.displayTrackLayout(initialTrackLayout)
+                renderer.displayViewport(initialViewport, marksInteraction: false)
+                renderer.displayTrackLayout(initialTrackLayout, marksInteraction: false)
                 renderer.displayLoopRange(initialLoopRange)
                 renderer.displayLoopRangeEnabled(initialLoopRangeEnabled)
             }
@@ -1188,6 +1228,24 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private func requestTimelineRender() {
         needsTimelineRender = true
         startTimelineDisplayLink()
+    }
+
+    @discardableResult
+    func submitImmediateTimelineRenderForFirstPaint() -> Bool {
+        guard timelineRenderer != nil else {
+            return false
+        }
+
+        let drawableMetrics = currentTimelineDrawableMetricsForPrewarm()
+        updateTimelineRendererImmediately { renderer in
+            renderer.prepareFirstPaintWaveformShaderBuffers(
+                drawableSize: drawableMetrics.viewportSize,
+                backingScale: drawableMetrics.backingScale
+            )
+        }
+        needsTimelineRender = true
+        startTimelineDisplayLink()
+        return true
     }
 
     private func requestCoalescedInteractionRender() {
@@ -3062,7 +3120,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         kicksImmediateRender: Bool = true,
         transcriptCadence: TimelineRenderCadence = .immediate,
         invalidatesCursorRects: Bool = true,
-        renderCadence: TimelineRenderCadence = .immediate
+        renderCadence: TimelineRenderCadence = .immediate,
+        marksInteraction: Bool = true
     ) {
         guard viewport != nextViewport else {
             return
@@ -3070,7 +3129,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         viewport = nextViewport
         onViewportChanged?(nextViewport)
-        timelineRenderer?.publishInteractionViewport(nextViewport)
+        if marksInteraction {
+            timelineRenderer?.publishInteractionViewport(nextViewport)
+        }
         updateTranscriptOverlay(cadence: transcriptCadence)
         if invalidatesCursorRects {
             invalidateTimelineCursorRects()
@@ -3078,13 +3139,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         if kicksImmediateRender {
             if renderCadence == .immediate {
                 updateTimelineRenderer { renderer in
-                    renderer.commitViewport(nextViewport)
+                    renderer.commitViewport(nextViewport, marksInteraction: marksInteraction)
                 }
             }
             kickInteractionRenderIfPossible(cadence: renderCadence)
         } else {
             updateTimelineRendererImmediately { renderer in
-                renderer.displayViewport(nextViewport)
+                renderer.displayViewport(nextViewport, marksInteraction: marksInteraction)
             }
             requestRender(cadence: renderCadence)
         }
@@ -3195,7 +3256,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
         updateTranscriptOverlay()
         updateTimelineRendererImmediately { renderer in
-            renderer.displayTrackLayout(clampedLayout)
+            renderer.displayTrackLayout(clampedLayout, marksInteraction: requestRender)
         }
         if requestRender {
             requestTimelineRender()
