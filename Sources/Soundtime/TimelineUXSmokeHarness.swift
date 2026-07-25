@@ -119,6 +119,25 @@ enum TimelineUXSmokeHarness {
         )
         complete("initial waveform publish survives active hover")
 
+        try verifyLaunchRestoreRendersWaveformsOnFirstFrame(
+            waveformOverview: waveformOverview,
+            device: device,
+            pixelFormat: pixelFormat,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        complete("launch restore renders cached waveforms on first frame")
+
+        try verifyLaunchPreviewHandoffKeepsWaveformsDrawable(
+            device: device,
+            pixelFormat: pixelFormat,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        complete("launch preview handoff keeps waveforms drawable")
+
         try verifyRefinedWaveformPromotesBeyondLaunchPreview(
             device: device,
             pixelFormat: pixelFormat,
@@ -434,6 +453,168 @@ enum TimelineUXSmokeHarness {
         try require(
             (lastFrame?.summary.nonBackgroundPixelCount ?? 0) > 10_000,
             "initial waveform render stayed blank while hover was active"
+        )
+    }
+
+    private static func verifyLaunchRestoreRendersWaveformsOnFirstFrame(
+        waveformOverview: WaveformOverview,
+        device: MTLDevice,
+        pixelFormat: MTLPixelFormat,
+        texture: MTLTexture,
+        viewportSize: CGSize,
+        backingScale: Float
+    ) throws {
+        let renderer = try TimelineRenderer(device: device, pixelFormat: pixelFormat)
+        let restoredViewport = TimelineViewport(startProgress: 0.18, durationProgress: 0.62)
+        let tracks = (0..<3).map { index in
+            TimelineRenderState.Track(
+                id: UUID(),
+                waveformVersion: 31 + index,
+                waveformOverview: waveformOverview,
+                durationHint: waveformOverview.duration,
+                volume: 1,
+                isMuted: false,
+                isSoloed: false,
+                clipRanges: [TimelineRenderState.ClipRange(startProgress: 0, endProgress: 1)]
+            )
+        }
+        let displayTimestamp = CACurrentMediaTime()
+        renderer.displayViewport(restoredViewport, marksInteraction: false)
+        renderer.displayTrackLayout(.default, marksInteraction: false)
+        renderer.displaySelection(nil, marksInteraction: false)
+        renderer.displayTracks(
+            tracks,
+            animateWaveformTransition: false,
+            allowImmediateWaveformPrewarm: true,
+            allowImmediateInteractiveWaveformPrewarm: false
+        )
+
+        let firstFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: displayTimestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+
+        try require(
+            firstFrame.summary.brightPixelCount > 2_400,
+            "launch restore first frame did not contain enough waveform pixels: \(firstFrame.summary.brightPixelCount)"
+        )
+        let drawableBinCounts = renderer.visibleWaveformDrawableBinCounts(
+            drawableSize: viewportSize,
+            backingScale: backingScale
+        )
+        try require(
+            drawableBinCounts.count == tracks.count,
+            "launch restore did not make every cached waveform drawable before first frame: \(drawableBinCounts)"
+        )
+    }
+
+    private static func verifyLaunchPreviewHandoffKeepsWaveformsDrawable(
+        device: MTLDevice,
+        pixelFormat: MTLPixelFormat,
+        texture: MTLTexture,
+        viewportSize: CGSize,
+        backingScale: Float
+    ) throws {
+        let renderer = try TimelineRenderer(device: device, pixelFormat: pixelFormat)
+        let launchOverview = makeDetailedWaveformOverview(duration: 520, binCount: 32_768, seed: 61)
+        let savedProjectOverview = makeDetailedWaveformOverview(duration: 520, binCount: 4_096, seed: 61)
+        let trackIDs = (0..<3).map { _ in UUID() }
+        let launchTracks = trackIDs.enumerated().map { index, id in
+            TimelineRenderState.Track(
+                id: id,
+                waveformVersion: 80 + index,
+                waveformOverview: launchOverview,
+                durationHint: launchOverview.duration,
+                volume: 1,
+                isMuted: false,
+                isSoloed: false,
+                clipRanges: [TimelineRenderState.ClipRange(startProgress: 0, endProgress: 1)]
+            )
+        }
+        let savedProjectTracks = trackIDs.enumerated().map { index, id in
+            TimelineRenderState.Track(
+                id: id,
+                waveformVersion: 80 + index,
+                waveformOverview: savedProjectOverview,
+                durationHint: savedProjectOverview.duration,
+                volume: 1,
+                isMuted: false,
+                isSoloed: false,
+                clipRanges: [TimelineRenderState.ClipRange(startProgress: 0, endProgress: 1)]
+            )
+        }
+
+        renderer.displayViewport(.full, marksInteraction: false)
+        renderer.displayTrackLayout(.default, marksInteraction: false)
+        renderer.displaySelection(nil, marksInteraction: false)
+        renderer.displayTracks(
+            launchTracks,
+            animateWaveformTransition: false,
+            allowImmediateWaveformPrewarm: true,
+            allowImmediateInteractiveWaveformPrewarm: false
+        )
+        renderer.prepareFirstPaintWaveformShaderBuffers(
+            drawableSize: viewportSize,
+            backingScale: backingScale
+        )
+        let launchFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        try require(
+            launchFrame.summary.brightPixelCount > 2_400,
+            "launch handoff setup did not draw cached waveforms: \(launchFrame.summary.brightPixelCount)"
+        )
+        let launchDrawableBinCounts = renderer.visibleWaveformDrawableBinCounts(
+            drawableSize: viewportSize,
+            backingScale: backingScale
+        )
+        let launchMipState = renderer.debugVisibleWaveformMipBinState(
+            drawableSize: viewportSize,
+            backingScale: backingScale
+        )
+        try require(
+            (launchDrawableBinCounts.min() ?? 0) >= 32_768,
+            "launch handoff setup did not use high-quality cached waveforms: \(launchDrawableBinCounts) state=\(launchMipState)"
+        )
+
+        renderer.displayTracks(
+            savedProjectTracks,
+            animateWaveformTransition: false,
+            allowImmediateWaveformPrewarm: false,
+            allowImmediateInteractiveWaveformPrewarm: false
+        )
+        renderer.prepareFirstPaintWaveformShaderBuffers(
+            drawableSize: viewportSize,
+            backingScale: backingScale
+        )
+        let handoffFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        try require(
+            handoffFrame.summary.brightPixelCount > 2_400,
+            "saved-project handoff blanked cached launch waveforms: \(handoffFrame.summary.brightPixelCount)"
+        )
+
+        let drawableBinCounts = renderer.visibleWaveformDrawableBinCounts(
+            drawableSize: viewportSize,
+            backingScale: backingScale
+        )
+        try require(
+            drawableBinCounts.count == savedProjectTracks.count,
+            "saved-project handoff left tracks without drawable buffers: \(drawableBinCounts)"
+        )
+        try require(
+            (drawableBinCounts.min() ?? 0) >= 32_768,
+            "saved-project handoff downgraded cached launch waveform quality: \(drawableBinCounts) launchState=\(launchMipState) handoffState=\(renderer.debugVisibleWaveformMipBinState(drawableSize: viewportSize, backingScale: backingScale))"
         )
     }
 

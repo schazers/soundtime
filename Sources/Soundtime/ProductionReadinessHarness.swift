@@ -202,16 +202,19 @@ enum ProductionReadinessHarness {
                     "Defer per-track source validation until full restore so cached previews never blank the first frame.",
                     "Hydrate audio and waveform refinement after the first usable frame.",
                     "Never present blank cached tracks unless the source is truly stale or missing.",
+                    "Persist only tiny launch state synchronously on close; keep waveform packet/manifest writes fresh before quit.",
                 ],
                 qualityGate: [
                     "Cached multitrack projects show tracks and previews on first paint.",
                     "No project decode, waveform refinement, or zero-crossing work blocks first window display.",
                     "Source changes are detected by full restore without blocking first-paint visuals.",
                     "Missing/stale source state is diagnostic, not a normal visual blank.",
+                    "Close-path diagnostics report no synchronous launch snapshot or first-frame packet writes.",
                 ],
                 manualChecks: [
                     "Launch a previously opened three-track project and confirm final window size appears immediately.",
                     "Hit play as soon as the window appears and confirm no beach ball.",
+                    "Quit with a loaded multitrack project and confirm the window disappears immediately without a beach ball.",
                 ],
                 smokeCommands: [
                     SmokeCommand(label: "launch performance smoke", arguments: ["--launch-performance-smoke"], runsInQuickMode: true),

@@ -19,6 +19,7 @@ enum LaunchPerformanceSmokeHarness {
         let trackCount = fullMode ? 24 : 8
         let binCount = fullMode ? 65_536 : 32_768
         let loadBudgetMilliseconds = fullMode ? 220.0 : 140.0
+        let launchPlanResolveBudgetMilliseconds = fullMode ? 420.0 : 260.0
         let sourceFrameCount = 48_000 * 90
         let sampleRate = 48_000.0
         let directory = FileManager.default.temporaryDirectory
@@ -26,9 +27,38 @@ enum LaunchPerformanceSmokeHarness {
         let projectURL = directory
             .appendingPathComponent("LaunchPerformance")
             .appendingPathExtension(SoundtimeProjectStore.fileExtension)
+        let driftProjectURL = directory
+            .appendingPathComponent("LaunchPerformanceDrift")
+            .appendingPathExtension(SoundtimeProjectStore.fileExtension)
+        let previousLastProjectURL = SoundtimeProjectStore.lastProjectURL()
+        let previousRecentProjectURLs = SoundtimeProjectStore.recentProjectURLs()
+        var autosaveURLForCleanup: URL?
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer {
             ProjectLaunchSnapshotStore.remove(for: projectURL)
+            ProjectLaunchSnapshotStore.remove(for: driftProjectURL)
+            ProjectFirstFrameWaveformPacketStore.remove(for: projectURL)
+            ProjectFirstFrameWaveformPacketStore.remove(for: driftProjectURL)
+            ProjectLaunchManifestStore.remove(for: projectURL)
+            ProjectLaunchManifestStore.remove(for: driftProjectURL)
+            ProjectLaunchCacheBundleStore.remove(for: projectURL)
+            ProjectLaunchCacheBundleStore.remove(for: driftProjectURL)
+            if let autosaveURLForCleanup {
+                ProjectLaunchSnapshotStore.remove(for: autosaveURLForCleanup)
+                ProjectFirstFrameWaveformPacketStore.remove(for: autosaveURLForCleanup)
+                ProjectLaunchManifestStore.remove(for: autosaveURLForCleanup)
+                ProjectLaunchCacheBundleStore.remove(for: autosaveURLForCleanup)
+                try? FileManager.default.removeItem(at: autosaveURLForCleanup)
+            }
+            SoundtimeProjectStore.clearRecentProjectURLs()
+            for recentProjectURL in previousRecentProjectURLs.reversed() {
+                SoundtimeProjectStore.rememberRecentProjectURL(recentProjectURL)
+            }
+            if let previousLastProjectURL {
+                SoundtimeProjectStore.rememberLastProjectURL(previousLastProjectURL)
+            } else {
+                SoundtimeProjectStore.forgetLastProjectURL()
+            }
             try? FileManager.default.removeItem(at: directory)
         }
 
@@ -58,8 +88,8 @@ enum LaunchPerformanceSmokeHarness {
                 editableSource: nil,
                 ownsSourceFile: false,
                 volume: Float(0.70 + Double(index) * 0.005),
-                isMuted: false,
-                isSoloed: false
+                isMuted: index == 1,
+                isSoloed: index == 2
             )
         }
 
@@ -73,9 +103,15 @@ enum LaunchPerformanceSmokeHarness {
         )
         let snapshotReadiness = ProjectLaunchReadinessClassifier.summarize(snapshot: snapshot)
         try require(snapshotReadiness.trackCount == trackCount, "snapshot readiness track count mismatch")
+        try require(snapshot.tracks[1].isMuted, "launch snapshot did not preserve muted track state")
+        try require(snapshot.tracks[2].isSoloed, "launch snapshot did not preserve soloed track state")
         try require(
             snapshotReadiness.drawableWaveformTrackCount == trackCount,
             "snapshot readiness did not count drawable waveforms"
+        )
+        try require(
+            snapshotReadiness.hasDrawableWaveformForEveryTrack,
+            "snapshot readiness should require every track to have a drawable waveform for first paint"
         )
         try require(snapshotReadiness.isFirstFrameUsable, "snapshot readiness should be first-frame usable")
 
@@ -85,6 +121,10 @@ enum LaunchPerformanceSmokeHarness {
         durationOnlySnapshot.tracks[0].durationHint = Double(sourceFrameCount) / sampleRate
         let durationOnlyReadiness = ProjectLaunchReadinessClassifier.summarize(snapshot: durationOnlySnapshot)
         try require(durationOnlyReadiness.durationOnlyTrackCount == 1, "duration-only launch track was not classified")
+        try require(
+            !durationOnlyReadiness.hasDrawableWaveformForEveryTrack,
+            "duration-only launch track should keep the snapshot off the all-waveforms first-paint path"
+        )
         try require(durationOnlyReadiness.isFirstFrameUsable, "duration-only launch track should still be first-frame usable")
 
         let plannerTracks = tracks.map { draft in
@@ -119,6 +159,7 @@ enum LaunchPerformanceSmokeHarness {
             to: primePlainURL
         )
         let primeEditedInfo = try WAVAudioDecoder.inspect(url: primeEditedURL)
+        let primePlainInfo = try WAVAudioDecoder.inspect(url: primePlainURL)
         let editedTimelineState = AudioFileEditTimeline.PersistentState(
             sourceFrameCount: primeEditedInfo.frameCount,
             sourceSampleRate: primeEditedInfo.sampleRate,
@@ -203,7 +244,489 @@ enum LaunchPerformanceSmokeHarness {
             throw SmokeError.failed("plain playback prime did not use file source")
         }
 
+        let launchOverviewCache = WaveformOverviewDiskCacheStore(
+            rootDirectory: directory.appendingPathComponent("LaunchOverviewCache", isDirectory: true)
+        )
+        let cachedEditedSourceOverview = syntheticOverview(
+            duration: primeEditedInfo.duration,
+            binCount: 4_096
+        )
+        let cachedPlainOverview = syntheticOverview(
+            duration: primePlainInfo.duration,
+            binCount: ProjectLaunchSnapshot.maximumOverviewBinCount + 4_096
+        )
+        let editedPrimeTimeline = try requireValue(
+            AudioFileEditTimeline(persistentState: editedTimelineState),
+            "could not restore edited timeline for cache hydration smoke"
+        )
+        let cachedEditedDisplayOverview = syntheticOverview(
+            duration: editedPrimeTimeline.duration,
+            binCount: 2_048
+        )
+        try launchOverviewCache.saveOverview(
+            cachedEditedSourceOverview,
+            targetBinCount: cachedEditedSourceOverview.bins.count,
+            samplesPerBin: 32,
+            fileInfo: primeEditedInfo
+        )
+        try launchOverviewCache.saveEditedOverview(
+            cachedEditedDisplayOverview,
+            fileInfo: primeEditedInfo,
+            editTimeline: editedPrimeTimeline
+        )
+        try launchOverviewCache.saveOverview(
+            cachedPlainOverview,
+            targetBinCount: cachedPlainOverview.bins.count,
+            samplesPerBin: 32,
+            fileInfo: primePlainInfo
+        )
+        let cachedPreviewProject = ProjectLaunchPreviewWaveformCacheHydrator.hydratedProject(
+            primeProject,
+            waveformOverviewDiskCache: launchOverviewCache
+        )
+        let cachedPreviewReadiness = ProjectLaunchReadinessClassifier.summarize(project: cachedPreviewProject)
+        try require(
+            cachedPreviewReadiness.drawableWaveformTrackCount == primeProject.tracks.count,
+            "cached launch preview hydration did not make every preview-less track drawable"
+        )
+        let cachedEditedPreview = try requireValue(
+            cachedPreviewProject.tracks.first { $0.id == primeEditedTrackID }?.waveformPreview,
+            "cached launch preview hydration did not attach edited track preview"
+        )
+        try require(
+            cachedEditedPreview.displayOverview.bins.count == cachedEditedDisplayOverview.bins.count,
+            "cached launch preview hydration did not prefer edited display overview"
+        )
+        let cachedPlainPreview = try requireValue(
+            cachedPreviewProject.tracks.first { $0.id == primePlainTrackID }?.waveformPreview,
+            "cached launch preview hydration did not attach plain track preview"
+        )
+        try require(
+            cachedPlainPreview.displayOverview.bins.count == ProjectLaunchSnapshot.maximumOverviewBinCount,
+            "cached launch preview hydration did not reduce larger cached overview for launch display"
+        )
+
         try ProjectLaunchSnapshotStore.save(snapshot, for: projectURL)
+        let firstFramePacket = ProjectFirstFrameWaveformPacket(
+            projectURL: projectURL,
+            windowLayout: snapshot.windowLayout,
+            timelineViewport: snapshot.timelineViewport,
+            masterVolume: snapshot.masterVolume,
+            transcriptDisplayMode: snapshot.transcriptDisplayMode,
+            tracks: tracks
+        )
+        try ProjectFirstFrameWaveformPacketStore.save(firstFramePacket, for: projectURL)
+        let packetURL = ProjectFirstFrameWaveformPacketStore.packetURL(for: projectURL)
+        let packetData = try Data(contentsOf: packetURL)
+        try require(
+            ProjectFirstFrameWaveformPacketBinaryCodec.hasBinaryMagic(packetData),
+            "first-frame waveform packet sidecar did not use binary magic"
+        )
+        try require(
+            packetData.count <= ProjectFirstFrameWaveformPacketStore.firstPaintSynchronousByteLimit,
+            "first-frame waveform packet exceeded synchronous first-paint byte limit"
+        )
+        let loadedFirstFramePacket = try requireValue(
+            ProjectFirstFrameWaveformPacketStore.loadForFirstPaintIfAvailable(for: projectURL),
+            "first-frame waveform packet was not available for first paint"
+        )
+        let packetReadiness = ProjectLaunchReadinessClassifier.summarize(packet: loadedFirstFramePacket)
+        try require(packetReadiness.hasDrawableWaveformForEveryTrack, "first-frame packet should draw every track")
+        try require(
+            loadedFirstFramePacket.tracks[1].isMuted,
+            "first-frame packet dropped muted track state"
+        )
+        try require(
+            loadedFirstFramePacket.tracks[2].isSoloed,
+            "first-frame packet dropped soloed track state"
+        )
+        let launchManifest = ProjectLaunchManifest(
+            projectURL: projectURL,
+            windowLayout: snapshot.windowLayout,
+            timelineViewport: snapshot.timelineViewport,
+            masterVolume: snapshot.masterVolume,
+            transcriptDisplayMode: snapshot.transcriptDisplayMode,
+            tracks: tracks,
+            snapshotByteCount: Self.fileByteCount(ProjectLaunchSnapshotStore.snapshotURL(for: projectURL)),
+            firstFramePacketByteCount: Self.fileByteCount(ProjectFirstFrameWaveformPacketStore.packetURL(for: projectURL)),
+            snapshotDrawable: snapshotReadiness.hasAnyDrawableWaveform,
+            firstFramePacketDrawable: packetReadiness.hasAnyDrawableWaveform
+        )
+        try ProjectLaunchManifestStore.save(launchManifest, for: projectURL)
+        let publishedGeneration = try ProjectLaunchCacheBundleStore.publish(
+            manifest: launchManifest,
+            firstFramePacket: firstFramePacket,
+            snapshot: snapshot,
+            for: projectURL
+        )
+        try require(
+            publishedGeneration.manifestByteCount > 0 &&
+                (publishedGeneration.firstFramePacketByteCount ?? 0) > 0 &&
+                (publishedGeneration.snapshotByteCount ?? 0) > 0,
+            "atomic launch cache generation did not report written artifact sizes"
+        )
+        let bundledManifest = try requireValue(
+            ProjectLaunchCacheBundleStore.loadManifest(for: projectURL),
+            "atomic launch cache manifest should be available for first paint"
+        )
+        try require(
+            bundledManifest.visualFingerprint == launchManifest.visualFingerprint,
+            "atomic launch cache manifest fingerprint mismatch"
+        )
+        let bundledPacket = try requireValue(
+            ProjectLaunchCacheBundleStore.loadFirstFramePacketForFirstPaintIfAvailable(for: projectURL),
+            "atomic launch cache packet should be available for first paint"
+        )
+        try require(
+            bundledPacket.visualFingerprint == launchManifest.visualFingerprint,
+            "atomic launch cache packet fingerprint mismatch"
+        )
+        let bundledSnapshot = try requireValue(
+            ProjectLaunchCacheBundleStore.loadSnapshotForFirstPaintIfAvailable(for: projectURL),
+            "atomic launch cache snapshot should be available for first paint"
+        )
+        try require(
+            bundledSnapshot.visualFingerprint == launchManifest.visualFingerprint,
+            "atomic launch cache snapshot fingerprint mismatch"
+        )
+        let loadedLaunchManifest = try requireValue(
+            ProjectLaunchManifestStore.load(for: projectURL),
+            "launch manifest should be available for first-paint shell"
+        )
+        try require(
+            loadedLaunchManifest.tracks.count == trackCount,
+            "launch manifest did not preserve immediate track shells"
+        )
+        try require(
+            loadedLaunchManifest.tracks[1].isMuted && loadedLaunchManifest.tracks[2].isSoloed,
+            "launch manifest dropped mute/solo state"
+        )
+        try require(
+            loadedLaunchManifest.visualFingerprint == loadedFirstFramePacket.visualFingerprint,
+            "launch manifest and first-frame packet fingerprints should match"
+        )
+        let manifestURL = ProjectLaunchManifestStore.manifestURL(for: projectURL)
+        try Data(count: ProjectLaunchManifestStore.firstPaintSynchronousByteLimit + 1)
+            .write(to: manifestURL, options: [.atomic])
+        try require(
+            ProjectLaunchManifestStore.load(for: projectURL) == nil,
+            "oversized launch manifest should not load on the synchronous first-paint path"
+        )
+        try require(
+            ProjectLaunchCacheBundleStore.loadManifest(for: projectURL) != nil,
+            "atomic launch cache should remain available when a legacy manifest is corrupted"
+        )
+        try ProjectLaunchManifestStore.save(launchManifest, for: projectURL)
+        let packetShell = try requireValue(
+            ProjectFirstFrameWaveformPacketStore.loadShellForFirstPaintIfAvailable(for: projectURL),
+            "first-frame packet shell was not available for pre-window visual restore"
+        )
+        try require(packetShell.tracks.count == trackCount, "first-frame packet shell track count mismatch")
+        try require(packetShell.tracks[1].isMuted, "first-frame packet shell dropped muted track state")
+        try require(packetShell.tracks[2].isSoloed, "first-frame packet shell dropped soloed track state")
+        try require(
+            packetShell.tracks.allSatisfy { $0.displayOverview == nil },
+            "first-frame packet shell should not decode waveform payloads"
+        )
+        let launchOverlay = SoundtimeProjectLaunchStateOverlay(
+            createdAt: 1234.5,
+            windowLayout: SoundtimeProject.WindowLayout(x: 9, y: 8, width: 1440, height: 900),
+            timelineViewport: SoundtimeProject.TimelineViewport(startProgress: 0.17, durationProgress: 0.27),
+            masterVolume: 0.66,
+            transcriptDisplayMode: .waveformOverlay,
+            tracks: tracks.enumerated().map { index, track in
+                SoundtimeProjectLaunchStateOverlay.TrackState(
+                    id: track.id,
+                    volume: index == 3 ? 1.25 : Float(0.25 + Double(index) * 0.01),
+                    isMuted: index == 0 || index == 3,
+                    isSoloed: index == 2
+                )
+            }
+        )
+        SoundtimeProjectStore.rememberLaunchStateOverlay(launchOverlay, for: projectURL)
+        let rememberedLaunchOverlay = try requireValue(
+            SoundtimeProjectStore.rememberedLaunchStateOverlay(for: projectURL),
+            "lightweight launch state overlay did not round-trip"
+        )
+        try require(
+            rememberedLaunchOverlay.windowLayout?.width == 1440,
+            "lightweight launch overlay dropped window layout"
+        )
+        try require(
+            rememberedLaunchOverlay.timelineViewport?.durationProgress == 0.27,
+            "lightweight launch overlay dropped timeline viewport"
+        )
+        try require(
+            rememberedLaunchOverlay.masterVolume == 0.66,
+            "lightweight launch overlay dropped master volume"
+        )
+        try require(
+            rememberedLaunchOverlay.transcriptDisplayMode == .waveformOverlay,
+            "lightweight launch overlay dropped transcript display mode"
+        )
+        try require(
+            rememberedLaunchOverlay.tracks[0].isMuted &&
+                rememberedLaunchOverlay.tracks[2].isSoloed &&
+                rememberedLaunchOverlay.tracks[3].isMuted,
+            "lightweight launch overlay dropped per-track mute/solo state"
+        )
+        let coordinatorShell = try requireValue(
+            ProjectLaunchCoordinator.loadShell(projectURL: projectURL),
+            "launch coordinator did not load launch manifest shell"
+        )
+        try require(
+            coordinatorShell.source == .launchManifestShell,
+            "launch coordinator should prefer the tiny launch manifest shell"
+        )
+        try require(
+            coordinatorShell.isShellOnly,
+            "launch coordinator shell should remain manifest-only"
+        )
+        try require(
+            coordinatorShell.tracks.count == trackCount,
+            "launch coordinator shell did not preserve immediate track count"
+        )
+        try require(
+            coordinatorShell.tracks[0].isMuted &&
+                coordinatorShell.tracks[2].isSoloed &&
+                coordinatorShell.tracks[3].isMuted,
+            "launch coordinator shell did not apply lightweight per-track overlay"
+        )
+        try require(
+            coordinatorShell.tracks[3].volume == 1,
+            "launch coordinator shell did not clamp invalid overlay volume"
+        )
+        try require(
+            coordinatorShell.tracks.allSatisfy { $0.displayWaveformOverview == nil },
+            "launch coordinator shell should not decode waveform payloads"
+        )
+        let coordinatorFirstFrame = try requireValue(
+            ProjectLaunchCoordinator.loadFirstFrame(
+                projectURL: projectURL,
+                usesAutosaveRecovery: true,
+                waveformOverviewDiskCache: launchOverviewCache
+            ),
+            "launch coordinator did not load first-frame visual packet"
+        )
+        try require(
+            coordinatorFirstFrame.source == .firstFrameWaveformPacket,
+            "launch coordinator should prefer first-frame packets over snapshots"
+        )
+        let coordinatorCachedFirstPaintFrame = try requireValue(
+            ProjectLaunchCoordinator.loadCachedFirstPaintFrame(projectURL: projectURL),
+            "launch coordinator did not load cached first-paint visual frame"
+        )
+        try require(
+            coordinatorCachedFirstPaintFrame.source == .firstFrameWaveformPacket,
+            "cached first-paint frame should prefer first-frame packets over snapshots"
+        )
+        try require(
+            coordinatorCachedFirstPaintFrame.summary.hasDrawableWaveformForEveryTrack,
+            "cached first-paint frame should draw every track"
+        )
+        try require(
+            coordinatorFirstFrame.summary.hasDrawableWaveformForEveryTrack,
+            "launch coordinator first-frame packet should draw every track"
+        )
+        try require(
+            coordinatorFirstFrame.tracks[0].isMuted &&
+                coordinatorFirstFrame.tracks[2].isSoloed &&
+                coordinatorFirstFrame.tracks[3].isMuted,
+            "launch coordinator first-frame packet did not apply lightweight per-track overlay"
+        )
+        try require(
+            coordinatorFirstFrame.tracks[3].volume == 1,
+            "launch coordinator first-frame packet did not clamp invalid overlay volume"
+        )
+        try require(
+            coordinatorFirstFrame.windowLayout?.width == 1440,
+            "launch coordinator did not apply lightweight window layout overlay"
+        )
+        SoundtimeProjectStore.rememberLastProjectURL(projectURL)
+        let rememberedProjectPlan = ProjectLaunchCoordinator.resolveLaunchPlan(restoresLastProject: true)
+        try require(
+            rememberedProjectPlan.restoresProject,
+            "remembered project launch plan should restore a project"
+        )
+        try require(
+            rememberedProjectPlan.targetProjectURL == projectURL.standardizedFileURL,
+            "remembered project launch plan target URL mismatch"
+        )
+        try require(
+            rememberedProjectPlan.visualCacheURL == projectURL.standardizedFileURL,
+            "remembered project launch plan visual cache URL mismatch"
+        )
+        try require(
+            rememberedProjectPlan.expectedTrackCount == trackCount,
+            "remembered project launch plan did not preserve first-paint track count"
+        )
+        try require(
+            rememberedProjectPlan.windowLayout?.width == 1440,
+            "remembered project launch plan did not apply launch overlay window layout before window construction"
+        )
+        try require(
+            rememberedProjectPlan.resolveMilliseconds < launchPlanResolveBudgetMilliseconds,
+            String(
+                format: "remembered project launch plan exceeded first-paint resolve budget (%.2fms > %.2fms)",
+                rememberedProjectPlan.resolveMilliseconds,
+                launchPlanResolveBudgetMilliseconds
+            )
+        )
+        let restorableProjectFirstPaintFrame = try requireValue(
+            ProjectLaunchCoordinator.cachedFirstPaintFrameForRestorableProject(),
+            "launch coordinator did not provide remembered-project first-paint data before window construction"
+        )
+        try require(
+            restorableProjectFirstPaintFrame.projectURL == projectURL.standardizedFileURL,
+            "remembered-project first-paint frame used the wrong project URL"
+        )
+        try require(
+            restorableProjectFirstPaintFrame.tracks.count == trackCount,
+            "remembered-project first-paint frame did not preserve the cached track count"
+        )
+
+        let autosaveProject = SoundtimeProject(
+            tracks: Array(tracks.prefix(3)).map { draft in
+                SoundtimeProject.Track(
+                    id: draft.id,
+                    editGroupID: draft.editGroupID,
+                    name: draft.name,
+                    filePath: draft.filePath,
+                    volume: draft.volume,
+                    isMuted: draft.isMuted,
+                    isSoloed: draft.isSoloed
+                )
+            },
+            windowLayout: SoundtimeProject.WindowLayout(x: 77, y: 88, width: 1660, height: 940),
+            masterVolume: 0.72,
+            timelineViewport: SoundtimeProject.TimelineViewport(startProgress: 0.12, durationProgress: 0.24),
+            transcriptDisplayMode: .hidden
+        )
+        let autosaveURL = try SoundtimeProjectStore.saveAutosave(
+            autosaveProject,
+            projectURL: projectURL,
+            autosaveID: UUID()
+        )
+        autosaveURLForCleanup = autosaveURL
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSinceNow: 20)],
+            ofItemAtPath: autosaveURL.path
+        )
+        let autosaveTracks = Array(tracks.prefix(3))
+        let autosaveSnapshot = ProjectLaunchSnapshot(
+            projectURL: autosaveURL,
+            windowLayout: autosaveProject.windowLayout,
+            timelineViewport: autosaveProject.timelineViewport,
+            masterVolume: autosaveProject.masterVolume,
+            transcriptDisplayMode: autosaveProject.transcriptDisplayMode ?? .hidden,
+            tracks: autosaveTracks
+        )
+        let autosavePacket = ProjectFirstFrameWaveformPacket(
+            projectURL: autosaveURL,
+            windowLayout: autosaveSnapshot.windowLayout,
+            timelineViewport: autosaveSnapshot.timelineViewport,
+            masterVolume: autosaveSnapshot.masterVolume,
+            transcriptDisplayMode: autosaveSnapshot.transcriptDisplayMode,
+            tracks: autosaveTracks
+        )
+        let autosaveReadiness = ProjectLaunchReadinessClassifier.summarize(snapshot: autosaveSnapshot)
+        let autosavePacketReadiness = ProjectLaunchReadinessClassifier.summarize(packet: autosavePacket)
+        let autosaveManifest = ProjectLaunchManifest(
+            projectURL: autosaveURL,
+            windowLayout: autosaveSnapshot.windowLayout,
+            timelineViewport: autosaveSnapshot.timelineViewport,
+            masterVolume: autosaveSnapshot.masterVolume,
+            transcriptDisplayMode: autosaveSnapshot.transcriptDisplayMode,
+            tracks: autosaveTracks,
+            snapshotByteCount: nil,
+            firstFramePacketByteCount: nil,
+            snapshotDrawable: autosaveReadiness.hasAnyDrawableWaveform,
+            firstFramePacketDrawable: autosavePacketReadiness.hasAnyDrawableWaveform
+        )
+        try ProjectLaunchCacheBundleStore.publish(
+            manifest: autosaveManifest,
+            firstFramePacket: autosavePacket,
+            snapshot: autosaveSnapshot,
+            for: autosaveURL
+        )
+        let restorableAutosaveFirstPaintFrame = try requireValue(
+            ProjectLaunchCoordinator.cachedFirstPaintFrameForRestorableProject(),
+            "launch coordinator did not provide recovered-autosave first-paint data before window construction"
+        )
+        let recoveredAutosavePlan = ProjectLaunchCoordinator.resolveLaunchPlan(restoresLastProject: true)
+        try require(
+            recoveredAutosavePlan.restoresProject,
+            "recovered autosave launch plan should restore a project"
+        )
+        try require(
+            recoveredAutosavePlan.targetProjectURL == projectURL.standardizedFileURL,
+            "recovered autosave launch plan should hydrate through the remembered saved project"
+        )
+        try require(
+            recoveredAutosavePlan.visualCacheURL == autosaveURL.standardizedFileURL,
+            "recovered autosave launch plan should use the newer autosave visual cache"
+        )
+        try require(
+            recoveredAutosavePlan.usesAutosaveRecovery,
+            "recovered autosave launch plan should keep autosave recovery enabled"
+        )
+        try require(
+            recoveredAutosavePlan.expectedTrackCount == autosaveTracks.count,
+            "recovered autosave launch plan did not preserve autosave first-paint track count"
+        )
+        try require(
+            recoveredAutosavePlan.windowLayout?.width == 1440,
+            "recovered autosave launch plan did not apply saved-project launch overlay before window construction"
+        )
+        try require(
+            recoveredAutosavePlan.firstPaintFrame?.projectURL == autosaveURL.standardizedFileURL,
+            "recovered autosave launch plan first-paint frame used the wrong visual source"
+        )
+        try require(
+            recoveredAutosavePlan.firstPaintFrame?.tracks[0].isMuted == true &&
+                recoveredAutosavePlan.firstPaintFrame?.tracks[2].isSoloed == true,
+            "recovered autosave launch plan did not apply saved-project mute/solo overlay to the visual frame"
+        )
+        try require(
+            recoveredAutosavePlan.firstPaintFrame?.masterVolume == 0.66,
+            "recovered autosave launch plan did not apply saved-project master-volume overlay to the visual frame"
+        )
+        try require(
+            restorableAutosaveFirstPaintFrame.projectURL == autosaveURL.standardizedFileURL,
+            "recovered-autosave first-paint frame used the saved project instead of the newer autosave"
+        )
+        try require(
+            restorableAutosaveFirstPaintFrame.tracks.count == autosaveTracks.count,
+            "recovered-autosave first-paint frame did not preserve the autosave track count"
+        )
+        try require(
+            restorableAutosaveFirstPaintFrame.windowLayout?.width == 1440,
+            "recovered-autosave first-paint frame did not apply the saved-project launch overlay"
+        )
+        try require(
+            loadedFirstFramePacket.tracks.allSatisfy {
+                ($0.displayOverview?.binCount ?? 0) <= ProjectFirstFrameWaveformPacket.maximumOverviewBinCount
+            },
+            "first-frame packet did not cap waveform preview bins under the renderer sync budget"
+        )
+        var partialPacket = ProjectFirstFrameWaveformPacket(
+            projectURL: driftProjectURL,
+            windowLayout: nil,
+            timelineViewport: nil,
+            masterVolume: nil,
+            transcriptDisplayMode: .hidden,
+            tracks: Array(tracks.prefix(3))
+        )
+        partialPacket.tracks[0].displayOverview = nil
+        try ProjectFirstFrameWaveformPacketStore.save(partialPacket, for: driftProjectURL)
+        let partialLoadedPacket = try requireValue(
+            ProjectFirstFrameWaveformPacketStore.loadForFirstPaintIfAvailable(for: driftProjectURL),
+            "partial first-frame packet should still load for first paint"
+        )
+        let partialPacketReadiness = ProjectLaunchReadinessClassifier.summarize(packet: partialLoadedPacket)
+        try require(partialPacketReadiness.hasAnyDrawableWaveform, "partial first-frame packet should preserve drawable tracks")
+        try require(partialPacketReadiness.blankTrackCount == 0, "duration-backed first-frame packet should avoid blank tracks")
+
         let snapshotURL = ProjectLaunchSnapshotStore.snapshotURL(for: projectURL)
         let binaryData = try Data(contentsOf: snapshotURL)
         let legacyJSONData = try JSONEncoder().encode(snapshot)
@@ -219,10 +742,62 @@ enum LaunchPerformanceSmokeHarness {
                 "binary snapshot was not available for bounded first-paint load"
             )
             try require(firstPaintSnapshot.tracks.count == trackCount, "first-paint snapshot track count mismatch")
+            let snapshotShell = try requireValue(
+                ProjectLaunchSnapshotStore.loadShellForFirstPaintIfAvailable(for: projectURL),
+                "binary snapshot shell was not available for pre-window visual restore"
+            )
+            try require(snapshotShell.tracks.count == trackCount, "snapshot shell track count mismatch")
+            try require(snapshotShell.tracks[1].isMuted, "snapshot shell dropped muted track state")
+            try require(snapshotShell.tracks[2].isSoloed, "snapshot shell dropped soloed track state")
+            try require(
+                snapshotShell.tracks.allSatisfy { $0.displayOverview == nil && $0.sourceOverview == nil },
+                "snapshot shell should not decode waveform payloads"
+            )
         } else {
             try require(
                 firstPaintSnapshot == nil,
                 "oversized binary snapshot should not load on the synchronous first-paint path"
+            )
+        }
+
+        try Data("first-paint drift original".utf8).write(to: driftProjectURL, options: [.atomic])
+        let driftSnapshot = ProjectLaunchSnapshot(
+            projectURL: driftProjectURL,
+            windowLayout: nil,
+            timelineViewport: nil,
+            masterVolume: nil,
+            transcriptDisplayMode: .hidden,
+            tracks: [tracks[0]]
+        )
+        try ProjectLaunchSnapshotStore.save(driftSnapshot, for: driftProjectURL)
+        let driftManifest = ProjectLaunchManifest(
+            projectURL: driftProjectURL,
+            windowLayout: driftSnapshot.windowLayout,
+            timelineViewport: driftSnapshot.timelineViewport,
+            masterVolume: driftSnapshot.masterVolume,
+            transcriptDisplayMode: driftSnapshot.transcriptDisplayMode,
+            tracks: [tracks[0]],
+            snapshotByteCount: Self.fileByteCount(ProjectLaunchSnapshotStore.snapshotURL(for: driftProjectURL)),
+            firstFramePacketByteCount: nil,
+            snapshotDrawable: true,
+            firstFramePacketDrawable: false
+        )
+        try ProjectLaunchManifestStore.save(driftManifest, for: driftProjectURL)
+        try require(
+            ProjectLaunchManifestStore.load(for: driftProjectURL) != nil,
+            "launch manifest should load before project metadata drift"
+        )
+        let driftSnapshotURL = ProjectLaunchSnapshotStore.snapshotURL(for: driftProjectURL)
+        let driftSnapshotBytes = try Data(contentsOf: driftSnapshotURL).count
+        try Data("first-paint drift modified".utf8).write(to: driftProjectURL, options: [.atomic])
+        try require(
+            ProjectLaunchManifestStore.load(for: driftProjectURL) == nil,
+            "launch manifest should reject project metadata drift"
+        )
+        if driftSnapshotBytes <= ProjectLaunchSnapshotStore.firstPaintSynchronousByteLimit {
+            try require(
+                ProjectLaunchSnapshotStore.loadForFirstPaintIfAvailable(for: driftProjectURL) == nil,
+                "first-paint snapshot should reject project metadata drift"
             )
         }
 
@@ -266,7 +841,7 @@ enum LaunchPerformanceSmokeHarness {
         if binaryData.count <= ProjectLaunchSnapshotStore.firstPaintSynchronousByteLimit {
             let staleFirstPaintSnapshot = try requireValue(
                 ProjectLaunchSnapshotStore.loadForFirstPaintIfAvailable(for: projectURL),
-                "stale-source snapshot should still be available for first paint"
+                "unchanged-project stale-source snapshot should still be available for first paint"
             )
             let staleFirstPaintTrack = try requireValue(
                 staleFirstPaintSnapshot.tracks.first,
@@ -306,16 +881,30 @@ enum LaunchPerformanceSmokeHarness {
 
         LaunchStartupTrace.shared.resetForSmokeTesting()
         LaunchStartupTrace.shared.mark(.processEntry, recordsDiagnosticEvent: false)
+        LaunchStartupTrace.shared.mark(.launchPlanResolved, recordsDiagnosticEvent: false)
+        LaunchStartupTrace.shared.mark(.mainWindowControllerInitStart, recordsDiagnosticEvent: false)
+        LaunchStartupTrace.shared.mark(.windowFrameChosen, recordsDiagnosticEvent: false)
+        LaunchStartupTrace.shared.mark(.workspaceFirstPaintInstalled, recordsDiagnosticEvent: false)
         LaunchStartupTrace.shared.mark(.windowVisible, recordsDiagnosticEvent: false)
+        LaunchStartupTrace.shared.mark(.firstFrameWaveformPacketLoaded, recordsDiagnosticEvent: false)
+        LaunchStartupTrace.shared.mark(.firstFrameWaveformPacketInstalled, recordsDiagnosticEvent: false)
         LaunchStartupTrace.shared.mark(.visualSkeletonApplied, fields: snapshotReadiness.diagnosticFields, recordsDiagnosticEvent: false)
+        LaunchStartupTrace.shared.markOnce(.firstTimelineRenderSubmitted, recordsDiagnosticEvent: false)
         LaunchStartupTrace.shared.markOnce(.firstWaveformVisibleFrame, recordsDiagnosticEvent: false)
         LaunchStartupTrace.shared.markOnce(.firstWaveformVisibleFrame, recordsDiagnosticEvent: false)
         let launchTraceEvents = LaunchStartupTrace.shared.snapshot()
         try require(
             launchTraceEvents.map(\.milestone) == [
                 .processEntry,
+                .launchPlanResolved,
+                .mainWindowControllerInitStart,
+                .windowFrameChosen,
+                .workspaceFirstPaintInstalled,
                 .windowVisible,
+                .firstFrameWaveformPacketLoaded,
+                .firstFrameWaveformPacketInstalled,
                 .visualSkeletonApplied,
+                .firstTimelineRenderSubmitted,
                 .firstWaveformVisibleFrame,
             ],
             "launch trace milestones were not recorded in order"
@@ -323,6 +912,89 @@ enum LaunchPerformanceSmokeHarness {
         try require(
             launchTraceEvents.last?.elapsedMilliseconds ?? -1 >= 0,
             "launch trace did not produce elapsed timing"
+        )
+        let visualSkeletonEvent = try requireValue(
+            launchTraceEvents.first { $0.milestone == .visualSkeletonApplied },
+            "launch trace did not include visual skeleton timing"
+        )
+        try require(
+            visualSkeletonEvent.fields["tracks"] == "\(trackCount)",
+            "visual skeleton trace did not preserve the expected track count"
+        )
+        try require(
+            visualSkeletonEvent.fields["blank"] == "0",
+            "visual skeleton trace allowed blank first-paint tracks"
+        )
+        try require(
+            visualSkeletonEvent.fields["allWaveformsDrawable"] == "true",
+            "visual skeleton trace did not require drawable cached waveforms"
+        )
+        try require(
+            visualSkeletonEvent.fields["firstFrameUsable"] == "true",
+            "visual skeleton trace did not require a usable first frame"
+        )
+
+        LaunchStartupTrace.shared.resetForSmokeTesting()
+        LaunchStartupTrace.shared.mark(.windowCloseRequested, recordsDiagnosticEvent: false)
+        LaunchStartupTrace.shared.mark(
+            .windowClosePrepared,
+            fields: [
+                "launchSnapshotWrite": "false",
+                "firstFramePacketWrite": "false",
+            ],
+            recordsDiagnosticEvent: false
+        )
+        LaunchStartupTrace.shared.mark(
+            .windowCloseStatePersisted,
+            fields: [
+                "launchSnapshotWrite": "false",
+                "firstFramePacketWrite": "false",
+            ],
+            recordsDiagnosticEvent: false
+        )
+        LaunchStartupTrace.shared.mark(
+            .windowCloseFinished,
+            fields: [
+                "launchSnapshotWrite": "false",
+                "firstFramePacketWrite": "false",
+            ],
+            recordsDiagnosticEvent: false
+        )
+        LaunchStartupTrace.shared.mark(.appTerminateStarted, recordsDiagnosticEvent: false)
+        LaunchStartupTrace.shared.mark(
+            .appTerminateFinished,
+            fields: [
+                "launchSnapshotWrite": "false",
+                "firstFramePacketWrite": "false",
+            ],
+            recordsDiagnosticEvent: false
+        )
+        let closeTraceEvents = LaunchStartupTrace.shared.snapshot()
+        try require(
+            closeTraceEvents.map(\.milestone) == [
+                .windowCloseRequested,
+                .windowClosePrepared,
+                .windowCloseStatePersisted,
+                .windowCloseFinished,
+                .appTerminateStarted,
+                .appTerminateFinished,
+            ],
+            "close trace milestones were not recorded in order"
+        )
+        let closeCriticalEvents = closeTraceEvents.filter {
+            [
+                .windowClosePrepared,
+                .windowCloseStatePersisted,
+                .windowCloseFinished,
+                .appTerminateFinished,
+            ].contains($0.milestone)
+        }
+        try require(
+            closeCriticalEvents.allSatisfy {
+                $0.fields["launchSnapshotWrite"] == "false" &&
+                    $0.fields["firstFramePacketWrite"] == "false"
+            },
+            "close trace allowed synchronous launch waveform cache writes"
         )
 
         if let reportURL = StabilityReportWriter.writePassedSuite(
@@ -335,20 +1007,43 @@ enum LaunchPerformanceSmokeHarness {
                 "per-track source validation strips stale previews",
                 "launch visual readiness distinguishes drawable, placeholder, and blank tracks",
                 "playback prime restores file-backed audio without waveform or zero-crossing work",
+                "preview-less projects recover drawable launch waveforms from disk cache",
                 "launch startup trace records ordered first-frame milestones",
                 "snapshot load time remains inside startup budget",
                 "first-paint launch snapshots preserve cached previews while deferring per-track source validation",
+                "first-paint launch snapshots reject saved-project metadata drift",
+                "first-frame waveform packets are small binary sidecars",
+                "first-frame waveform packets cap previews under the synchronous renderer budget",
+                "partial first-frame waveform packets preserve drawable tracks instead of rejecting the whole project",
+                "tiny launch manifests restore track shells and mute/solo state before waveform payloads",
+                "tiny launch manifests reject saved-project metadata drift",
+                "lightweight launch state overlay preserves close-time UI state without waveform cache writes",
+                "launch coordinator applies overlay state before first-frame rendering",
+                "launch plan resolves final project target, visual cache, and first-paint track count before window construction",
+                "recovered autosave launch uses autosave visuals while preserving saved-project UI state",
+                "startup trace rejects placeholder-before-project launch ordering",
+                "atomic launch cache generation publishes manifest, packet, and snapshot coherently",
+                "launch coordinator can recover first-paint data from the atomic cache when legacy sidecars are stale",
+                "launch trace rejects blank/placeholder first-paint skeletons",
+                "close trace proves synchronous close skips waveform cache writes",
             ],
             metadata: [
                 "tracks": "\(trackCount)",
                 "binsPerTrack": "\(binCount)",
                 "binaryBytes": "\(binaryData.count)",
+                "firstFramePacketBytes": "\(packetData.count)",
+                "launchGenerationManifestBytes": "\(publishedGeneration.manifestByteCount)",
+                "launchGenerationPacketBytes": "\(publishedGeneration.firstFramePacketByteCount ?? 0)",
+                "launchGenerationSnapshotBytes": "\(publishedGeneration.snapshotByteCount ?? 0)",
+                "firstFramePacketMaxBins": "\(ProjectFirstFrameWaveformPacket.maximumOverviewBinCount)",
                 "firstPaintByteLimit": "\(ProjectLaunchSnapshotStore.firstPaintSynchronousByteLimit)",
                 "legacyJSONBytes": "\(legacyJSONData.count)",
                 "drawableWaveformTracks": "\(snapshotReadiness.drawableWaveformTrackCount)",
+                "packetDrawableWaveformTracks": "\(packetReadiness.drawableWaveformTrackCount)",
                 "durationOnlyTracks": "\(durationOnlyReadiness.durationOnlyTrackCount)",
                 "playbackPrimeMs": String(format: "%.2f", playbackPrime.elapsedMilliseconds),
                 "playbackPrimeTracks": "\(playbackPrime.tracks.count)",
+                "cachedPreviewDrawableTracks": "\(cachedPreviewReadiness.drawableWaveformTrackCount)",
                 "firstPaintBlankTracksAfterStaleSource": firstPaintBlankTracksAfterStaleSource,
                 "blankTracksAfterStaleValidation": "\(staleReadiness.blankTrackCount)",
                 "averageLoadMs": String(format: "%.2f", averageLoadMilliseconds),
@@ -404,6 +1099,16 @@ enum LaunchPerformanceSmokeHarness {
             frameCount: frameCount,
             samplesByChannel: [left, right]
         )
+    }
+
+    private static func fileByteCount(_ url: URL) -> Int? {
+        guard
+            let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+            let byteCount = (attributes[.size] as? NSNumber)?.intValue
+        else {
+            return nil
+        }
+        return byteCount
     }
 
     private static func requireValue<Value>(_ value: Value?, _ message: String) throws -> Value {
