@@ -62,19 +62,24 @@ enum UserPerceivedTimingSmokeHarness {
     private struct TimingBudget {
         var warning: Double
         var failure: Double
+
+        init(_ budget: ShippabilityTimingBudgets.Budget) {
+            warning = budget.warningMilliseconds
+            failure = budget.failureMilliseconds
+        }
     }
 
     private static let budgets: [String: TimingBudget] = [
-        "windowVisibleMilliseconds": TimingBudget(warning: 250, failure: 500),
-        "firstWaveformVisibleMilliseconds": TimingBudget(warning: 100, failure: 160),
-        "playbackReadyMilliseconds": TimingBudget(warning: 350, failure: 600),
-        "firstPlayCommandMilliseconds": TimingBudget(warning: 16, failure: 35),
-        "clickToSeekVisualMilliseconds": TimingBudget(warning: 8, failure: 16),
-        "selectionDragEdgeMilliseconds": TimingBudget(warning: 8, failure: 16),
-        "deleteAnimationStartMilliseconds": TimingBudget(warning: 8, failure: 16),
-        "pasteAnimationStartMilliseconds": TimingBudget(warning: 8, failure: 16),
-        "saveLatencyMilliseconds": TimingBudget(warning: 60, failure: 160),
-        "closeLatencyMilliseconds": TimingBudget(warning: 20, failure: 50),
+        "windowVisibleMilliseconds": TimingBudget(ShippabilityTimingBudgets.windowVisible),
+        "firstWaveformVisibleMilliseconds": TimingBudget(ShippabilityTimingBudgets.firstWaveformVisible),
+        "playbackReadyMilliseconds": TimingBudget(ShippabilityTimingBudgets.playbackReady),
+        "firstPlayCommandMilliseconds": TimingBudget(ShippabilityTimingBudgets.firstPlayCommand),
+        "clickToSeekVisualMilliseconds": TimingBudget(ShippabilityTimingBudgets.clickToSeekVisual),
+        "selectionDragEdgeMilliseconds": TimingBudget(ShippabilityTimingBudgets.selectionDragEdge),
+        "deleteAnimationStartMilliseconds": TimingBudget(ShippabilityTimingBudgets.deleteAnimationStart),
+        "pasteAnimationStartMilliseconds": TimingBudget(ShippabilityTimingBudgets.pasteAnimationStart),
+        "saveLatencyMilliseconds": TimingBudget(ShippabilityTimingBudgets.saveLatency),
+        "closeLatencyMilliseconds": TimingBudget(ShippabilityTimingBudgets.closeLatency),
     ]
 
     static func runFromCommandLine(arguments: [String]) throws {
@@ -398,7 +403,7 @@ enum UserPerceivedTimingSmokeHarness {
         case .quick:
             selectedIDs = ["st-ship-project-001", "st-ship-project-004"]
         case .standard:
-            selectedIDs = Set(manifest.projects.map(\.id)).subtracting(["st-ship-project-007"])
+            selectedIDs = Set(manifest.projects.map(\.id)).subtracting(["st-ship-project-007", "st-ship-project-008"])
         case .stress:
             selectedIDs = Set(manifest.projects.map(\.id))
         }

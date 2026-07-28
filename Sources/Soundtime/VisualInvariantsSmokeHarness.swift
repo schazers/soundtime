@@ -215,11 +215,42 @@ enum VisualInvariantsSmokeHarness {
         record(launchPlan.firstPaintFrame?.summary.hasDrawableWaveformForEveryTrack == true, "first-paint frame was not drawable for every track")
         record(firstPaint.trackCount == expectedTrackCount, "first paint did not show the final track count")
         record(firstPaint.placeholderTrackCount == 0, "first paint showed a placeholder lane")
+        record(firstPaint.durationOnlyTrackCount == 0, "first paint fell back to duration-only lanes")
         record(firstPaint.blankTrackCount == 0, "first paint had blank waveform lanes")
         record(firstPaint.drawableWaveformTrackCount == expectedTrackCount, "first paint did not show cached waveforms for every track")
         record(firstPaint.mutedTrackCount == expectedMutedTrackCount, "first paint did not apply muted track state")
         record(firstPaint.soloedTrackCount == expectedSoloedTrackCount, "first paint did not apply soloed track state")
         record(firstPaint.isVisualReady, "first paint was not visually ready")
+        record(firstPaint.tracks.count == project.tracks.count, "first paint track diagnostics did not match the project")
+        let firstPaintTracksByID = Dictionary(uniqueKeysWithValues: firstPaint.tracks.map { ($0.id, $0) })
+        for expectedTrack in project.tracks {
+            guard let renderedTrack = firstPaintTracksByID[expectedTrack.id] else {
+                record(false, "first paint missed track \(expectedTrack.name)")
+                continue
+            }
+            record(renderedTrack.name == expectedTrack.name, "first paint track name drifted for \(expectedTrack.name)")
+            record(renderedTrack.isMuted == expectedTrack.isMuted, "first paint muted state drifted for \(expectedTrack.name)")
+            record(renderedTrack.isSoloed == expectedTrack.isSoloed, "first paint solo state drifted for \(expectedTrack.name)")
+            record(renderedTrack.hasDrawableWaveform, "first paint had no drawable waveform for \(expectedTrack.name)")
+            if let expectedPreview = expectedTrack.waveformPreview {
+                record(
+                    renderedTrack.waveformBinCount >= expectedPreview.displayOverview.bins.count,
+                    "first paint display preview bins were missing for \(expectedTrack.name)"
+                )
+                record(
+                    renderedTrack.sourceWaveformBinCount >= expectedPreview.sourceOverview.bins.count,
+                    "first paint source preview bins were missing for \(expectedTrack.name)"
+                )
+                record(
+                    approximatelyEqual(
+                        renderedTrack.durationSeconds,
+                        expectedPreview.displayOverview.duration,
+                        tolerance: 0.05
+                    ),
+                    "first paint duration drifted for \(expectedTrack.name)"
+                )
+            }
+        }
         if let viewport = project.timelineViewport {
             record(
                 approximatelyEqual(firstPaint.timelineViewportStartProgress, viewport.startProgress, tolerance: 0.000_5),
@@ -275,6 +306,15 @@ enum VisualInvariantsSmokeHarness {
             transcriptSnapshot = snapshot
             record(snapshot.transcriptLayerVisible, "transcript layer was not visible after hydration")
             record(snapshot.activeTranscriptWordID != nil, "transcript active word did not follow the playhead")
+            if
+                let transcript = project.tracks.first(where: { $0.transcript != nil })?.transcript,
+                let expectedWord = transcript.word(atSourceTime: TimeInterval(seekTarget) * max(snapshot.projectDurationSeconds, 0))
+            {
+                record(
+                    snapshot.activeTranscriptWordID == expectedWord.id,
+                    "transcript active word did not match the playhead time"
+                )
+            }
         }
 
         let selectionStart = 0.12
@@ -395,7 +435,7 @@ enum VisualInvariantsSmokeHarness {
         case .quick:
             selectedIDs = ["st-ship-project-001", "st-ship-project-004"]
         case .standard:
-            selectedIDs = Set(manifest.projects.map(\.id)).subtracting(["st-ship-project-007"])
+            selectedIDs = Set(manifest.projects.map(\.id)).subtracting(["st-ship-project-007", "st-ship-project-008"])
         case .stress:
             selectedIDs = Set(manifest.projects.map(\.id))
         }
@@ -447,6 +487,11 @@ enum VisualInvariantsSmokeHarness {
         ]
         metadata["checkedFirstPaintTracks"] = "\(reports.reduce(0) { $0 + $1.firstPaintSnapshot.trackCount })"
         metadata["checkedDrawableWaveformTracks"] = "\(reports.reduce(0) { $0 + $1.firstPaintSnapshot.drawableWaveformTrackCount })"
+        metadata["checkedBlankWaveformTracks"] = "\(reports.reduce(0) { $0 + $1.firstPaintSnapshot.blankTrackCount })"
+        metadata["checkedDurationOnlyWaveformTracks"] = "\(reports.reduce(0) { $0 + $1.firstPaintSnapshot.durationOnlyTrackCount })"
+        metadata["checkedPlaceholderTracks"] = "\(reports.reduce(0) { $0 + $1.firstPaintSnapshot.placeholderTrackCount })"
+        metadata["checkedMinimumFirstPaintWaveformBins"] = "\(reports.flatMap { $0.firstPaintSnapshot.tracks.map(\.waveformBinCount) }.min() ?? 0)"
+        metadata["checkedMinimumFirstPaintSourceWaveformBins"] = "\(reports.flatMap { $0.firstPaintSnapshot.tracks.map(\.sourceWaveformBinCount) }.min() ?? 0)"
         metadata["checkedTranscriptWords"] = "\(reports.reduce(0) { $0 + $1.expectedTranscriptWordCount })"
         return metadata
     }

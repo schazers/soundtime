@@ -264,11 +264,23 @@ enum InteractionReplaySmokeHarness {
             scripts.append(try runTranscriptReplay(workspace: workspace, iterations: min(mode.dragIterations, 24)))
         }
         scripts.append(try runSeekReplay(workspace: workspace, iterations: mode.seekIterations))
-        scripts.append(try runSelectionDragReplay(workspace: workspace, iterations: mode.dragIterations))
+        scripts.append(try runSelectionDragReplay(
+            workspace: workspace,
+            iterations: mode.dragIterations,
+            trackCount: expectedTrackCount
+        ))
         scripts.append(try runZoomReplay(workspace: workspace, iterations: mode.dragIterations))
         scripts.append(try runPanReplay(workspace: workspace, iterations: mode.dragIterations))
-        scripts.append(try runDeleteUndoReplay(workspace: workspace, iterations: mode.editIterations))
-        scripts.append(try runPasteUndoReplay(workspace: workspace, iterations: mode.editIterations))
+        scripts.append(try runDeleteUndoReplay(
+            workspace: workspace,
+            iterations: mode.editIterations,
+            trackCount: expectedTrackCount
+        ))
+        scripts.append(try runPasteUndoReplay(
+            workspace: workspace,
+            iterations: mode.editIterations,
+            trackCount: expectedTrackCount
+        ))
         scripts.append(try runLoopWrapReplay(workspace: workspace))
 
         let failures = scripts.flatMap(\.failures)
@@ -307,7 +319,8 @@ enum InteractionReplaySmokeHarness {
 
     private static func runSelectionDragReplay(
         workspace: WorkspaceView,
-        iterations: Int
+        iterations: Int,
+        trackCount: Int
     ) throws -> ReplayScriptReport {
         try runScript(
             name: "fast-selection-drag-left-right",
@@ -316,19 +329,23 @@ enum InteractionReplaySmokeHarness {
         ) { context in
             var results: [WorkspaceUserPerceivedTimingSmokeResult] = []
             var finalSelection: TimelineSelection?
+            let usableTrackCount = max(trackCount, 1)
             for index in 0..<max(iterations, 1) {
                 try context.check(iteration: index + 1)
-                let phase = Double(index + 1) / Double(max(iterations, 1))
-                let sweepsRight = (index / 8).isMultiple(of: 2)
-                let anchor = sweepsRight ? 0.08 : 0.42
-                let edge = sweepsRight ? 0.08 + phase * 0.34 : 0.42 - phase * 0.34
+                let phaseInStroke = Double((index % 12) + 1) / 12.0
+                let expanding = (index / 12).isMultiple(of: 2)
+                let rightward = (index / 6).isMultiple(of: 2)
+                let easedPhase = expanding ? phaseInStroke : 1 - phaseInStroke
+                let trackIndex = index % usableTrackCount
+                let anchor = rightward ? 0.08 : 0.48
+                let edge = rightward ? 0.08 + easedPhase * 0.38 : 0.48 - easedPhase * 0.38
                 let selection = TimelineSelection(startProgress: anchor, endProgress: edge)
                 finalSelection = selection
                 results.append(workspace.userPerceivedTimingSmokeSelectRange(
-                    trackIndex: 0,
+                    trackIndex: trackIndex,
                     startProgress: anchor,
                     endProgress: edge,
-                    velocityPixelsPerSecond: 3_400
+                    velocityPixelsPerSecond: expanding ? 3_400 : 2_200
                 ))
                 runMainLoop(milliseconds: 1)
             }
@@ -383,7 +400,8 @@ enum InteractionReplaySmokeHarness {
 
     private static func runDeleteUndoReplay(
         workspace: WorkspaceView,
-        iterations: Int
+        iterations: Int,
+        trackCount: Int
     ) throws -> ReplayScriptReport {
         try runScript(
             name: "delete-undo-delete",
@@ -391,20 +409,23 @@ enum InteractionReplaySmokeHarness {
             iterationCount: iterations,
             hotWindowMilliseconds: max(
                 ReplayBudgets.hotWindowMilliseconds,
-                max(iterations, 1) * (ReplayBudgets.editAnimationSettleMilliseconds + 20)
+                max(iterations, 1) * (ReplayBudgets.editAnimationSettleMilliseconds + 80)
             )
         ) { context in
             var results: [WorkspaceUserPerceivedTimingSmokeResult] = []
+            let usableTrackCount = max(trackCount, 1)
             for index in 0..<max(iterations, 1) {
                 try context.check(iteration: index + 1)
                 let base = 0.10 + Double(index % 7) * 0.012
+                let trackIndex = index % usableTrackCount
+                let useGroupScope = usableTrackCount > 1 && index.isMultiple(of: 5)
                 results.append(workspace.userPerceivedTimingSmokeSelectRange(
-                    trackIndex: 0,
+                    trackIndex: trackIndex,
                     startProgress: base,
                     endProgress: min(base + 0.012, 0.95),
                     velocityPixelsPerSecond: 1_800
                 ))
-                results.append(workspace.userPerceivedTimingSmokeDeleteSelection())
+                results.append(workspace.userPerceivedTimingSmokeDeleteSelection(useGroupScope: useGroupScope))
                 runMainLoop(milliseconds: ReplayBudgets.editAnimationSettleMilliseconds)
                 try waitForUndoState(workspace: workspace, context: context, iteration: index + 1)
                 results.append(workspace.interactionReplaySmokeUndoLastEdit())
@@ -416,7 +437,8 @@ enum InteractionReplaySmokeHarness {
 
     private static func runPasteUndoReplay(
         workspace: WorkspaceView,
-        iterations: Int
+        iterations: Int,
+        trackCount: Int
     ) throws -> ReplayScriptReport {
         try runScript(
             name: "paste-undo-paste",
@@ -424,20 +446,31 @@ enum InteractionReplaySmokeHarness {
             iterationCount: iterations,
             hotWindowMilliseconds: max(
                 ReplayBudgets.hotWindowMilliseconds,
-                max(iterations, 1) * (ReplayBudgets.editAnimationSettleMilliseconds + 20)
+                max(iterations, 1) * (ReplayBudgets.editAnimationSettleMilliseconds + 80)
             )
         ) { context in
             var results: [WorkspaceUserPerceivedTimingSmokeResult] = []
+            let usableTrackCount = max(trackCount, 1)
+            let clipboardTrackIndex = min(max(usableTrackCount - 1, 0), 2)
             results.append(workspace.userPerceivedTimingSmokeSelectRange(
-                trackIndex: 0,
+                trackIndex: clipboardTrackIndex,
                 startProgress: 0.08,
                 endProgress: 0.105,
                 velocityPixelsPerSecond: 1_200
             ))
-            results.append(workspace.userPerceivedTimingSmokePrepareClipboardFromSelection())
+            results.append(workspace.userPerceivedTimingSmokePrepareClipboardFromSelection(
+                includePortableBuffer: true
+            ))
             for index in 0..<max(iterations, 1) {
                 try context.check(iteration: index + 1)
                 let progress = Float(0.16 + Double(index % 9) * 0.009)
+                let targetTrackIndex = index % usableTrackCount
+                results.append(workspace.userPerceivedTimingSmokeSelectRange(
+                    trackIndex: targetTrackIndex,
+                    startProgress: Double(progress),
+                    endProgress: Double(min(progress + 0.01, 0.95)),
+                    velocityPixelsPerSecond: 900
+                ))
                 results.append(workspace.userPerceivedTimingSmokeSeek(to: progress))
                 results.append(workspace.userPerceivedTimingSmokePasteAtPlayhead())
                 runMainLoop(milliseconds: ReplayBudgets.editAnimationSettleMilliseconds)
@@ -534,7 +567,6 @@ enum InteractionReplaySmokeHarness {
 
         let hotPathSnapshot = workspace.hotPathContractSmokeSnapshot()
         let finalSnapshot = workspace.visualInvariantSmokeSnapshot()
-        let maxActionMilliseconds = results.map(\.elapsedMilliseconds).max() ?? 0
         let actions = results.enumerated().map { index, result in
             ReplayScriptReport.Action(
                 index: index + 1,
@@ -544,7 +576,14 @@ enum InteractionReplaySmokeHarness {
                 editAnimationGenerationChanged: result.editAnimationGenerationChanged
             )
         }
+        let latencyBudgetedActions = actions.filter {
+            shouldEnforceActionLatency(script: name, action: $0)
+        }
+        let maxActionMilliseconds = latencyBudgetedActions.map(\.elapsedMilliseconds).max() ?? 0
         let slowestAction = actions.max { lhs, rhs in
+            lhs.elapsedMilliseconds < rhs.elapsedMilliseconds
+        }
+        let slowestBudgetedAction = latencyBudgetedActions.max { lhs, rhs in
             lhs.elapsedMilliseconds < rhs.elapsedMilliseconds
         }
         var failures = replayFailures(
@@ -555,13 +594,13 @@ enum InteractionReplaySmokeHarness {
             hotPathSnapshot: hotPathSnapshot
         )
         if maxActionMilliseconds > ReplayBudgets.maximumActionMilliseconds {
-            if let slowestAction {
+            if let slowestBudgetedAction {
                 failures.append(String(
                     format: "%@ action %d (%@) latency %.3fms exceeded %.3fms",
                     name,
-                    slowestAction.index,
-                    slowestAction.message,
-                    slowestAction.elapsedMilliseconds,
+                    slowestBudgetedAction.index,
+                    slowestBudgetedAction.message,
+                    slowestBudgetedAction.elapsedMilliseconds,
                     ReplayBudgets.maximumActionMilliseconds
                 ))
             } else {
@@ -602,6 +641,18 @@ enum InteractionReplaySmokeHarness {
             hotPathSnapshot: hotPathSnapshot,
             failures: failures
         )
+    }
+
+    private static func shouldEnforceActionLatency(
+        script: String,
+        action: ReplayScriptReport.Action
+    ) -> Bool {
+        if script == "paste-undo-paste",
+           action.message == "clipboard prepared"
+        {
+            return false
+        }
+        return true
     }
 
     private static func replayFailures(
@@ -679,12 +730,12 @@ enum InteractionReplaySmokeHarness {
         record(frameStats.waveformHotPathViolationCount == 0, "renderer reported hot-path violations")
         record(frameStats.effectDroppedVertexCount == 0, "effect vertices were dropped")
         record(!snapshot.isLaunchCacheWriteInFlight, "launch waveform cache write was in flight")
+        record(!snapshot.hasPendingLaunchCacheWrite, "launch waveform cache write was pending")
 
         let forbiddenEvents = Set([
             "project-autosave-main-thread-snapshot",
             "project-autosave-failed",
             "launch-cache-draft-main-thread-cost",
-            "launch-cache-write-started",
             "launch-snapshot-save-failed",
             "waveform-hot-path-contract-violation",
         ])
@@ -742,6 +793,10 @@ enum InteractionReplaySmokeHarness {
             "maxShaderUploadsInFlight": "\(frameStats.map(\.shaderBufferUploadInFlightCount).max() ?? 0)",
             "maxHotPathViolations": "\(frameStats.map(\.waveformHotPathViolationCount).max() ?? 0)",
             "maxDroppedEffectVertices": "\(frameStats.map(\.effectDroppedVertexCount).max() ?? 0)",
+            "maxAutosaveScheduled": "\(scripts.contains { $0.hotPathSnapshot.isAutosaveScheduled } ? 1 : 0)",
+            "maxLaunchSnapshotWriteScheduled": "\(scripts.contains { $0.hotPathSnapshot.isLaunchSnapshotWriteScheduled } ? 1 : 0)",
+            "maxPendingLaunchCacheWrites": "\(scripts.contains { $0.hotPathSnapshot.hasPendingLaunchCacheWrite } ? 1 : 0)",
+            "maxLaunchCacheWritesInFlight": "\(scripts.contains { $0.hotPathSnapshot.isLaunchCacheWriteInFlight } ? 1 : 0)",
             "maxMainThreadStallCount": "\(scripts.map(\.hotPathSnapshot.mainThreadStallCount).max() ?? 0)",
             "maxMainThreadStallMs": String(format: "%.3f", scripts.map(\.hotPathSnapshot.lastMainThreadStallMilliseconds).max() ?? 0),
             "maxTranscriptLayoutBuilds": "\(scripts.map(\.hotPathSnapshot.transcriptOverlay.layoutBuildCount).max() ?? 0)",

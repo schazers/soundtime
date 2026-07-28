@@ -45,6 +45,24 @@ enum ShippabilityFixtureBuilder {
         var durationSeconds: Double
     }
 
+    private enum FixtureProfile: String {
+        case quick
+        case full
+
+        var includesTrueLongFixtures: Bool {
+            self == .full
+        }
+
+        var description: String {
+            switch self {
+            case .quick:
+                return "quick"
+            case .full:
+                return "full"
+            }
+        }
+    }
+
     private struct GeneratedAudio {
         var id: String
         var role: String
@@ -80,6 +98,7 @@ enum ShippabilityFixtureBuilder {
 
         var schemaVersion: Int
         var fixtureVersion: String
+        var profile: String
         var generatedBy: String
         var namingScheme: String
         var supportedImportFormatsCovered: [String]
@@ -197,7 +216,22 @@ enum ShippabilityFixtureBuilder {
             projectReady: false,
             importExpectation: .recognizedUnsupported
         ),
+        ExpectedAudioFixture(
+            id: "st-ship-audio-013",
+            role: "True long podcast-scale WAV for release startup and playback confidence",
+            path: "audio/st-ship-audio-013-true-long-podcast-30m.wav",
+            format: .wav,
+            durationSeconds: 1_800,
+            projectReady: true,
+            importExpectation: .importable
+        ),
     ]
+
+    private static func expectedAudioFixtures(for profile: FixtureProfile) -> [ExpectedAudioFixture] {
+        expectedAudioFixtures.filter { expected in
+            profile.includesTrueLongFixtures || expected.id != "st-ship-audio-013"
+        }
+    }
 
     private static let expectedProjectFixtures: [ExpectedProjectFixture] = [
         ExpectedProjectFixture(
@@ -223,7 +257,7 @@ enum ShippabilityFixtureBuilder {
         ),
         ExpectedProjectFixture(
             id: "st-ship-project-004",
-            role: "Three-track mixed session with mute state and shared edit group",
+            role: "Three-track mixed session with mute/solo state and shared edit group",
             path: "projects/st-ship-project-004-three-track-session.soundtime",
             trackCount: 3,
             durationSeconds: 180
@@ -249,16 +283,31 @@ enum ShippabilityFixtureBuilder {
             trackCount: 100,
             durationSeconds: 12
         ),
+        ExpectedProjectFixture(
+            id: "st-ship-project-008",
+            role: "True 30-minute WAV project for full release startup coverage",
+            path: "projects/st-ship-project-008-true-long-wav-release.soundtime",
+            trackCount: 1,
+            durationSeconds: 1_800
+        ),
     ]
+
+    private static func expectedProjectFixtures(for profile: FixtureProfile) -> [ExpectedProjectFixture] {
+        expectedProjectFixtures.filter { expected in
+            profile.includesTrueLongFixtures || expected.id != "st-ship-project-008"
+        }
+    }
 
     static func runFromCommandLine(arguments: [String]) throws {
         let rootDirectory = outputDirectory(
             from: arguments,
             primaryFlag: "--build-shippability-fixtures"
         )
-        let result = try buildFixtures(rootDirectory: rootDirectory)
+        let profile = fixtureProfile(from: arguments)
+        let result = try buildFixtures(rootDirectory: rootDirectory, profile: profile)
         print("Soundtime shippability fixtures generated")
         print("root: \(rootDirectory.path)")
+        print("profile: \(profile.description)")
         print("audio files: \(result.audio.count)")
         print("projects: \(result.projects.count)")
         print("manifest: \(rootDirectory.appendingPathComponent("fixtures-manifest.json").path)")
@@ -269,11 +318,23 @@ enum ShippabilityFixtureBuilder {
             from: arguments,
             primaryFlag: "--verify-shippability-fixtures"
         )
-        try verifyExistingFixtures(rootDirectory: rootDirectory)
+        let profile = fixtureProfile(from: arguments)
+        try verifyExistingFixtures(rootDirectory: rootDirectory, profile: profile)
         print("Soundtime shippability fixtures verified")
         print("root: \(rootDirectory.path)")
-        print("audio files: \(expectedAudioFixtures.count)")
-        print("projects: \(expectedProjectFixtures.count)")
+        print("profile: \(profile.description)")
+        print("audio files: \(expectedAudioFixtures(for: profile).count)")
+        print("projects: \(expectedProjectFixtures(for: profile).count)")
+    }
+
+    private static func fixtureProfile(from arguments: [String]) -> FixtureProfile {
+        guard let profileIndex = arguments.firstIndex(of: "--fixture-profile"),
+              arguments.indices.contains(profileIndex + 1),
+              let profile = FixtureProfile(rawValue: arguments[profileIndex + 1])
+        else {
+            return .full
+        }
+        return profile
     }
 
     private static func outputDirectory(
@@ -301,7 +362,7 @@ enum ShippabilityFixtureBuilder {
     }
 
     @discardableResult
-    private static func buildFixtures(rootDirectory: URL) throws -> (
+    private static func buildFixtures(rootDirectory: URL, profile: FixtureProfile) throws -> (
         audio: [GeneratedAudio],
         projects: [GeneratedProject]
     ) {
@@ -332,6 +393,19 @@ enum ShippabilityFixtureBuilder {
             directory: audioDirectory,
             generator: makePodcastSample
         )
+        if profile.includesTrueLongFixtures {
+            audio["trueLongPodcast"] = try writeStreamingWAVFixture(
+                id: "st-ship-audio-013",
+                slug: "true-long-podcast",
+                durationLabel: "30m",
+                role: "True long podcast-scale WAV for release startup and playback confidence",
+                duration: 1_800,
+                sampleRate: 24_000,
+                channelCount: 1,
+                directory: audioDirectory,
+                generator: makePodcastSample
+            )
+        }
         audio["musicBed"] = try writeWAVFixture(
             id: "st-ship-audio-003",
             slug: "music-bed",
@@ -459,15 +533,17 @@ enum ShippabilityFixtureBuilder {
 
         let projects = try writeProjects(
             projectDirectory: projectDirectory,
-            audio: audio
+            audio: audio,
+            profile: profile
         )
         try writeManifest(
             rootDirectory: rootDirectory,
+            profile: profile,
             audio: audio.values.sorted { $0.id < $1.id },
             projects: projects
         )
         try writeReadme(rootDirectory: rootDirectory)
-        try verifyExistingFixtures(rootDirectory: rootDirectory)
+        try verifyExistingFixtures(rootDirectory: rootDirectory, profile: profile)
         return (Array(audio.values), projects)
     }
 
@@ -505,6 +581,88 @@ enum ShippabilityFixtureBuilder {
             sourceOverview: overview,
             format: .wav,
             duration: duration,
+            projectReady: true,
+            importExpectation: .importable
+        )
+    }
+
+    private static func writeStreamingWAVFixture(
+        id: String,
+        slug: String,
+        durationLabel: String,
+        role: String,
+        duration: TimeInterval,
+        sampleRate fixtureSampleRate: Double,
+        channelCount: Int,
+        directory: URL,
+        generator: (Double, Int, TimeInterval, inout SeededNoise) -> Float
+    ) throws -> GeneratedAudio {
+        let url = directory.appendingPathComponent("\(id)-\(slug)-\(durationLabel).wav")
+        let frameCount = max(Int((duration * fixtureSampleRate).rounded()), 1)
+        let binCount = min(sourceOverviewBinCount, frameCount)
+        var bins: [WaveformOverview.Bin] = []
+        bins.reserveCapacity(binCount)
+
+        let writer = try StreamingWAVTakeWriter(url: url)
+        var noise = SeededNoise(seed: UInt64(abs(url.path.hashValue)) | 1)
+        var accumulator = WaveformBinAccumulator()
+        var currentBinIndex = 0
+        var frameIndex = 0
+        let framesPerChunk = 8_192
+
+        while frameIndex < frameCount {
+            let endFrame = min(frameIndex + framesPerChunk, frameCount)
+            var samplesByChannel = Array(repeating: [Float](), count: channelCount)
+            for channelIndex in samplesByChannel.indices {
+                samplesByChannel[channelIndex].reserveCapacity(endFrame - frameIndex)
+            }
+
+            for frame in frameIndex..<endFrame {
+                let time = Double(frame) / fixtureSampleRate
+                let binIndex = min(frame * binCount / frameCount, binCount - 1)
+                while currentBinIndex < binIndex {
+                    bins.append(accumulator.makeBin())
+                    accumulator = WaveformBinAccumulator()
+                    currentBinIndex += 1
+                }
+
+                var mixedSample: Float = 0
+                for channel in 0..<channelCount {
+                    let sample = generator(time, channel, duration, &noise)
+                    samplesByChannel[channel].append(sample)
+                    mixedSample += sample
+                }
+                accumulator.addSample(mixedSample / Float(max(channelCount, 1)))
+            }
+
+            writer.append(AudioRecordingChunk(
+                samplesByChannel: samplesByChannel,
+                sampleRate: fixtureSampleRate,
+                channelCount: channelCount,
+                frameCount: endFrame - frameIndex,
+                hostTimestamp: 0
+            ))
+            frameIndex = endFrame
+        }
+
+        while currentBinIndex < binCount {
+            bins.append(accumulator.makeBin())
+            accumulator = WaveformBinAccumulator()
+            currentBinIndex += 1
+        }
+
+        let recordedTake = try writer.finish()
+        try setStableModificationDate(at: recordedTake.url, offset: Int(id.suffix(3)) ?? 0)
+        let fileInfo = try WAVAudioDecoder.inspect(url: recordedTake.url)
+        return GeneratedAudio(
+            id: id,
+            role: role,
+            url: recordedTake.url,
+            buffer: nil,
+            fileInfo: fileInfo,
+            sourceOverview: WaveformOverview(duration: fileInfo.duration, bins: bins),
+            format: .wav,
+            duration: fileInfo.duration,
             projectReady: true,
             importExpectation: .importable
         )
@@ -556,7 +714,8 @@ enum ShippabilityFixtureBuilder {
 
     private static func writeProjects(
         projectDirectory: URL,
-        audio: [String: GeneratedAudio]
+        audio: [String: GeneratedAudio],
+        profile: FixtureProfile
     ) throws -> [GeneratedProject] {
         let shortVoice = try requireValue(audio["shortVoice"], "missing short voice fixture")
         let longPodcast = try requireValue(audio["longPodcast"], "missing long podcast fixture")
@@ -631,7 +790,7 @@ enum ShippabilityFixtureBuilder {
         projects.append(try writeProject(
             id: "st-ship-project-004",
             slug: "three-track-session",
-            role: "Three-track mixed session with mute state and shared edit group",
+            role: "Three-track mixed session with mute/solo state and shared edit group",
             directory: projectDirectory,
             project: project(
                 id: uuid(4),
@@ -658,7 +817,8 @@ enum ShippabilityFixtureBuilder {
                         name: "Transient Markers",
                         audio: transients,
                         volume: 0.65,
-                        isMuted: false
+                        isMuted: false,
+                        isSoloed: true
                     ),
                 ],
                 viewport: .init(startProgress: 0.02, durationProgress: 0.16)
@@ -723,6 +883,29 @@ enum ShippabilityFixtureBuilder {
                 viewport: .init(startProgress: 0, durationProgress: 1)
             )
         ))
+        if profile.includesTrueLongFixtures {
+            let trueLongPodcast = try requireValue(audio["trueLongPodcast"], "missing true long podcast fixture")
+            projects.append(try writeProject(
+                id: "st-ship-project-008",
+                slug: "true-long-wav-release",
+                role: "True 30-minute WAV project for full release startup coverage",
+                directory: projectDirectory,
+                project: project(
+                    id: uuid(8),
+                    tracks: [
+                        track(
+                            id: uuid(109),
+                            groupID: uuid(906),
+                            name: "Thirty Minute Podcast",
+                            audio: trueLongPodcast,
+                            volume: 0.95,
+                            isMuted: false
+                        ),
+                    ],
+                    viewport: .init(startProgress: 0.36, durationProgress: 0.035)
+                )
+            ))
+        }
 
         return projects
     }
@@ -876,6 +1059,8 @@ enum ShippabilityFixtureBuilder {
             frameCount: max(Int(fileInfo.sampleRate * 0.75), 1),
             atProgress: 0.48
         )
+        _ = timeline.split(atProgress: 0.34)
+        _ = timeline.split(atProgress: 0.78)
         _ = timeline.applyFade(.fadeIn, to: TimelineSelection(startProgress: 0.62, endProgress: 0.74))
         return timeline
     }
@@ -902,7 +1087,7 @@ enum ShippabilityFixtureBuilder {
         var wordCounter = 0
         var segmentCounter = 0
 
-        while currentTime < min(duration - 1, 72) {
+        while currentTime < duration - 1 {
             let words = phrases[segmentCounter % phrases.count]
             let segmentStart = currentTime
             var transcriptWords: [TranscriptWord] = []
@@ -1229,12 +1414,14 @@ enum ShippabilityFixtureBuilder {
 
     private static func writeManifest(
         rootDirectory: URL,
+        profile: FixtureProfile,
         audio: [GeneratedAudio],
         projects: [GeneratedProject]
     ) throws {
         let manifest = FixtureManifest(
             schemaVersion: 1,
             fixtureVersion: "v1",
+            profile: profile.rawValue,
             generatedBy: "Soundtime ShippabilityFixtureBuilder",
             namingScheme: expectedNamingScheme,
             supportedImportFormatsCovered: expectedSupportedImportFormatsCovered,
@@ -1293,13 +1480,14 @@ enum ShippabilityFixtureBuilder {
         )
     }
 
-    private static func verifyExistingFixtures(rootDirectory: URL) throws {
+    private static func verifyExistingFixtures(rootDirectory: URL, profile: FixtureProfile) throws {
         let manifestURL = rootDirectory.appendingPathComponent("fixtures-manifest.json")
         let manifestData = try Data(contentsOf: manifestURL)
         let manifest = try JSONDecoder().decode(FixtureManifest.self, from: manifestData)
 
         try require(manifest.schemaVersion == 1, "unexpected fixture manifest schema \(manifest.schemaVersion)")
         try require(manifest.fixtureVersion == "v1", "unexpected fixture version \(manifest.fixtureVersion)")
+        try require(manifest.profile == profile.rawValue, "fixture profile drifted: \(manifest.profile)")
         try require(manifest.namingScheme == expectedNamingScheme, "fixture naming scheme drifted")
         try require(
             manifest.supportedImportFormatsCovered == expectedSupportedImportFormatsCovered,
@@ -1309,14 +1497,16 @@ enum ShippabilityFixtureBuilder {
             manifest.recognizedUnsupportedFormatsCovered == expectedRecognizedUnsupportedFormatsCovered,
             "recognized unsupported format coverage drifted"
         )
-        try verifyAudioManifest(manifest.audio, rootDirectory: rootDirectory)
-        try verifyProjectManifest(manifest.projects, rootDirectory: rootDirectory)
+        try verifyAudioManifest(manifest.audio, rootDirectory: rootDirectory, profile: profile)
+        try verifyProjectManifest(manifest.projects, rootDirectory: rootDirectory, profile: profile)
     }
 
     private static func verifyAudioManifest(
         _ entries: [FixtureManifest.Entry],
-        rootDirectory: URL
+        rootDirectory: URL,
+        profile: FixtureProfile
     ) throws {
+        let expectedAudioFixtures = expectedAudioFixtures(for: profile)
         try require(entries.count == expectedAudioFixtures.count, "audio fixture count drifted")
         try require(Set(entries.map(\.id)).count == entries.count, "audio fixture IDs are not unique")
         let entriesByID = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) })
@@ -1371,8 +1561,10 @@ enum ShippabilityFixtureBuilder {
 
     private static func verifyProjectManifest(
         _ entries: [FixtureManifest.Entry],
-        rootDirectory: URL
+        rootDirectory: URL,
+        profile: FixtureProfile
     ) throws {
+        let expectedProjectFixtures = expectedProjectFixtures(for: profile)
         try require(entries.count == expectedProjectFixtures.count, "project fixture count drifted")
         try require(Set(entries.map(\.id)).count == entries.count, "project fixture IDs are not unique")
         let entriesByID = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) })

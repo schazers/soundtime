@@ -85,6 +85,14 @@ enum AudioSafetySmokeHarness {
         var maxLoopSampleError: Float = 0
         var maxGraphSwapMilliseconds = 0.0
         var graphSwapP95Milliseconds = 0.0
+        var outputDeviceConfigureCount = 0
+        var outputDeviceInvalidateCount = 0
+        var outputDeviceStartCount = 0
+        var seekCheckCount = 0
+        var loopCapturedFrameCount = 0
+        var graphSwapTrackCount = 0
+        var graphSwapUpdateCount = 0
+        var graphSwapRenderBlockCount = 0
         var importedFormatCount = 0
         var importedFileCount = 0
         var importedFormats: [String] = []
@@ -189,6 +197,14 @@ enum AudioSafetySmokeHarness {
                 "maxLoopSampleError": String(format: "%.8f", metrics.maxLoopSampleError),
                 "maxGraphSwapMilliseconds": String(format: "%.3f", metrics.maxGraphSwapMilliseconds),
                 "graphSwapP95Milliseconds": String(format: "%.3f", metrics.graphSwapP95Milliseconds),
+                "outputDeviceConfigureCount": "\(metrics.outputDeviceConfigureCount)",
+                "outputDeviceInvalidateCount": "\(metrics.outputDeviceInvalidateCount)",
+                "outputDeviceStartCount": "\(metrics.outputDeviceStartCount)",
+                "seekCheckCount": "\(metrics.seekCheckCount)",
+                "loopCapturedFrameCount": "\(metrics.loopCapturedFrameCount)",
+                "graphSwapTrackCount": "\(metrics.graphSwapTrackCount)",
+                "graphSwapUpdateCount": "\(metrics.graphSwapUpdateCount)",
+                "graphSwapRenderBlockCount": "\(metrics.graphSwapRenderBlockCount)",
                 "importedFormatCount": "\(metrics.importedFormatCount)",
                 "importedFileCount": "\(metrics.importedFileCount)",
                 "importedFormats": metrics.importedFormats.joined(separator: ","),
@@ -237,6 +253,9 @@ enum AudioSafetySmokeHarness {
         try require(outputDevice.configureCount == 2, "output device refresh did not reconfigure")
         try require(outputDevice.corePointer == firstCorePointer, "output device refresh changed core pointer unexpectedly")
         try require(outputDevice.lastSampleRate == sampleRate, "output device refresh changed sample rate unexpectedly")
+        metrics.outputDeviceConfigureCount = max(metrics.outputDeviceConfigureCount, outputDevice.configureCount)
+        metrics.outputDeviceInvalidateCount = max(metrics.outputDeviceInvalidateCount, outputDevice.invalidateCount)
+        metrics.outputDeviceStartCount = max(metrics.outputDeviceStartCount, outputDevice.startCount)
         metrics.absorb(playbackEngine.realtimeSnapshotForSafetySmoke())
     }
 
@@ -264,6 +283,7 @@ enum AudioSafetySmokeHarness {
             render(corePointer: corePointer, blockCount: 1, frameCount: 256, sampleRate: sampleRate)
             let committed = playbackEngine.snapshot()
             metrics.maxSeekFrameError = max(metrics.maxSeekFrameError, abs(committed.frameIndex - expectedFrame))
+            metrics.seekCheckCount += 2
             try require(
                 abs(committed.frameIndex - expectedFrame) <= 1,
                 "committed paused seek landed on frame \(committed.frameIndex), expected \(expectedFrame)"
@@ -275,6 +295,7 @@ enum AudioSafetySmokeHarness {
         let playingSnapshot = playbackEngine.snapshot()
         let expectedFrame = Int((Double(frameCount) * 0.42).rounded(.down))
         metrics.maxSeekFrameError = max(metrics.maxSeekFrameError, abs(playingSnapshot.frameIndex - expectedFrame))
+        metrics.seekCheckCount += 1
         try require(abs(playingSnapshot.frameIndex - expectedFrame) <= 1, "playing seek did not mirror exact frame immediately")
         render(corePointer: corePointer, blockCount: 4, frameCount: 256, sampleRate: sampleRate)
         playbackEngine.pause()
@@ -308,6 +329,7 @@ enum AudioSafetySmokeHarness {
         core.seek(toFrame: loopStartFrame)
         let actual = renderCaptured(corePointer: corePointer, blockCount: 3, frameCount: 256, sampleRate: sampleRate)
         core.pause()
+        metrics.loopCapturedFrameCount = max(metrics.loopCapturedFrameCount, min(expected.left.count, actual.left.count))
 
         var maxError: Float = 0
         for index in expected.left.indices {
@@ -379,6 +401,9 @@ enum AudioSafetySmokeHarness {
 
         renderGroup.wait()
         playbackEngine.pause()
+        metrics.graphSwapTrackCount = max(metrics.graphSwapTrackCount, mode.graphSwapTrackCount)
+        metrics.graphSwapUpdateCount = max(metrics.graphSwapUpdateCount, mode.graphSwapUpdateCount)
+        metrics.graphSwapRenderBlockCount = max(metrics.graphSwapRenderBlockCount, mode.renderBlockCount)
         metrics.maxGraphSwapMilliseconds = publishDurations.max() ?? 0
         metrics.graphSwapP95Milliseconds = percentile(publishDurations, percentile: 0.95)
         metrics.absorb(playbackEngine.realtimeSnapshotForSafetySmoke())

@@ -367,6 +367,7 @@ enum HotPathContractSmokeHarness {
         record(frameStats.waveformHotPathViolationCount == 0, "renderer reported hot-path violations")
         record(frameStats.effectDroppedVertexCount == 0, "effect vertices were dropped")
         record(!snapshot.isLaunchCacheWriteInFlight, "launch waveform cache write was in flight")
+        record(!snapshot.hasPendingLaunchCacheWrite, "launch waveform cache write was pending during interaction")
         record(snapshot.mainThreadStallCount == 0, "main thread stall events were recorded")
         record(
             snapshot.lastMainThreadStallMilliseconds <= HotPathBudgets.maximumMainThreadStallMilliseconds,
@@ -377,7 +378,6 @@ enum HotPathContractSmokeHarness {
             "project-autosave-main-thread-snapshot",
             "project-autosave-failed",
             "launch-cache-draft-main-thread-cost",
-            "launch-cache-write-started",
             "launch-snapshot-save-failed",
             "waveform-hot-path-contract-violation",
         ])
@@ -443,7 +443,7 @@ enum HotPathContractSmokeHarness {
         case .quick:
             selectedIDs = ["st-ship-project-004", "st-ship-project-006"]
         case .standard:
-            selectedIDs = Set(manifest.projects.map(\.id)).subtracting(["st-ship-project-007"])
+            selectedIDs = Set(manifest.projects.map(\.id)).subtracting(["st-ship-project-007", "st-ship-project-008"])
         case .stress:
             selectedIDs = Set(manifest.projects.map(\.id))
         }
@@ -475,6 +475,10 @@ enum HotPathContractSmokeHarness {
             "maxShaderUploadsInFlight": "\(frameStats.map(\.shaderBufferUploadInFlightCount).max() ?? 0)",
             "maxHotPathViolations": "\(frameStats.map(\.waveformHotPathViolationCount).max() ?? 0)",
             "maxTranscriptLayoutBuilds": "\(scenarioReports.map(\.snapshot.transcriptOverlay.layoutBuildCount).max() ?? 0)",
+            "maxAutosaveScheduled": "\(scenarioReports.contains { $0.snapshot.isAutosaveScheduled } ? 1 : 0)",
+            "maxLaunchSnapshotWriteScheduled": "\(scenarioReports.contains { $0.snapshot.isLaunchSnapshotWriteScheduled } ? 1 : 0)",
+            "maxPendingLaunchCacheWrites": "\(scenarioReports.contains { $0.snapshot.hasPendingLaunchCacheWrite } ? 1 : 0)",
+            "maxLaunchCacheWritesInFlight": "\(scenarioReports.contains { $0.snapshot.isLaunchCacheWriteInFlight } ? 1 : 0)",
             "maxMainThreadStallCount": "\(scenarioReports.map(\.snapshot.mainThreadStallCount).max() ?? 0)",
             "maxMainThreadStallMs": String(format: "%.3f", scenarioReports.map(\.snapshot.lastMainThreadStallMilliseconds).max() ?? 0),
             "maxDashboardFrameDisplayMs": String(
