@@ -10,6 +10,12 @@ let package = Package(
     products: [
         .executable(name: "Soundtime", targets: ["Soundtime"]),
     ],
+    dependencies: [
+        .package(
+            url: "https://github.com/sparkle-project/Sparkle",
+            exact: "2.9.2"
+        ),
+    ],
     targets: [
         .target(
             name: "SoundtimeAudioCore",
@@ -19,6 +25,7 @@ let package = Package(
             name: "Soundtime",
             dependencies: [
                 "SoundtimeAudioCore",
+                .product(name: "Sparkle", package: "Sparkle"),
             ],
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
@@ -26,6 +33,10 @@ let package = Package(
                 .linkedFramework("CoreAudio"),
                 .linkedFramework("Metal"),
                 .linkedFramework("Security"),
+                .unsafeFlags([
+                    "-Xlinker", "-rpath",
+                    "-Xlinker", "@executable_path/../Frameworks",
+                ]),
             ]
         ),
         .testTarget(

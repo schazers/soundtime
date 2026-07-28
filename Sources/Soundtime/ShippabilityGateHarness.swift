@@ -823,6 +823,13 @@ enum ShippabilityGateHarness {
                 ])
             ),
             GatePhase(
+                name: "application updates",
+                detail: "Verify update state, bundle metadata, stable/beta policy, critical and phased appcast entries, signing/notarization scripts, and private-key hygiene.",
+                kind: .commands([
+                    command("application update smoke", ["--application-update-smoke"]),
+                ])
+            ),
+            GatePhase(
                 name: "user perceived timing",
                 detail: "Measure human-visible launch, waveform, playback, interaction, edit, save, and close latency against golden projects.",
                 kind: .commands([

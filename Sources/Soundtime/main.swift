@@ -9,6 +9,18 @@ private let shippabilityGateCommandFlags: Set<String> = [
     "--rc-gate",
 ]
 
+if CommandLine.arguments.contains("--application-update-smoke") {
+    do {
+        try MainActor.assumeIsolated {
+            try ApplicationUpdateSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        }
+        exit(0)
+    } catch {
+        fputs("Soundtime application update smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
 if CommandLine.arguments.contains("--timeline-perf-baseline") {
     do {
         try TimelinePerfBaselineHarness.runFromCommandLine(arguments: CommandLine.arguments)

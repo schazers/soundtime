@@ -78,6 +78,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         (window?.contentViewController?.view as? WorkspaceView)?.prepareForImmediateWindowClose()
     }
 
+    func applicationUpdateRestartBlockers() -> [ApplicationUpdateRestartBlocker] {
+        (window?.contentViewController?.view as? WorkspaceView)?
+            .applicationUpdateRestartBlockers() ?? []
+    }
+
     func restoreLastProjectIfNeeded() {
         (window?.contentViewController?.view as? WorkspaceView)?.restoreLastProjectIfNeeded()
     }

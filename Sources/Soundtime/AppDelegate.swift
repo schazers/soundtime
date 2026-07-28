@@ -5,7 +5,11 @@ import QuartzCore
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowControllers: [MainWindowController] = []
     private weak var openRecentMenu: NSMenu?
-    private lazy var audioPreferencesWindowController = AudioDevicePreferencesWindowController()
+    private weak var checkForUpdatesMenuItem: NSMenuItem?
+    private let updateCoordinator = ApplicationUpdateCoordinator()
+    private lazy var audioPreferencesWindowController = AudioDevicePreferencesWindowController(
+        updateService: updateCoordinator.service
+    )
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         LaunchStartupTrace.shared.mark(.appDelegateDidFinishLaunching)
@@ -13,6 +17,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         openProjectWindow(restoresLastProject: true)
         NSApplication.shared.activate(ignoringOtherApps: true)
+        updateCoordinator.restartBlockersProvider = { [weak self] in
+            self?.windowControllers.flatMap { $0.applicationUpdateRestartBlockers() } ?? []
+        }
+        updateCoordinator.startAfterLaunchSettles()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -20,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        updateCoordinator.applicationWillTerminate()
         let startedAt = CACurrentMediaTime()
         LaunchStartupTrace.shared.mark(
             .appTerminateStarted,
@@ -61,6 +70,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func showPreferences(_ sender: Any?) {
         audioPreferencesWindowController.showWindow(sender)
         NSApplication.shared.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func checkForUpdates(_ sender: Any?) {
+        updateCoordinator.checkForUpdates()
     }
 
     @discardableResult
@@ -146,6 +159,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         preferencesItem.target = self
         menu.addItem(preferencesItem)
+        let checkForUpdatesItem = NSMenuItem(
+            title: "Check for Updates...",
+            action: #selector(checkForUpdates(_:)),
+            keyEquivalent: ""
+        )
+        checkForUpdatesItem.target = self
+        menu.addItem(checkForUpdatesItem)
+        checkForUpdatesMenuItem = checkForUpdatesItem
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(
             title: "Open Project...",
@@ -522,5 +543,14 @@ extension AppDelegate: NSMenuDelegate {
         if menu === openRecentMenu {
             rebuildOpenRecentMenu(menu)
         }
+    }
+}
+
+extension AppDelegate: NSMenuItemValidation {
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem === checkForUpdatesMenuItem {
+            return updateCoordinator.service.canCheckForUpdates
+        }
+        return true
     }
 }

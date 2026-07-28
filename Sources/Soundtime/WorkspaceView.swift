@@ -795,6 +795,7 @@ final class WorkspaceView: NSView {
         }
     }
     private var activeImportID = UUID()
+    private var activeImportOperationIDs: Set<UUID> = []
     private var audioImportPrewarm: AudioImportPrewarm?
     private var selectedAudioFile: AudioFileMetadata?
     private var decodedAudioBuffer: DecodedAudioBuffer?
@@ -1271,6 +1272,43 @@ final class WorkspaceView: NSView {
         super.init(frame: frameRect)
         configure()
         applyInitialLaunchPlanIfAvailable()
+    }
+
+    func applicationUpdateRestartBlockers() -> [ApplicationUpdateRestartBlocker] {
+        var blockers: [ApplicationUpdateRestartBlocker] = []
+        if recordingTrackID != nil {
+            blockers.append(ApplicationUpdateRestartBlocker(
+                kind: .recording,
+                title: "Recording in progress",
+                message: "Stop the current recording before Soundtime restarts to install the update.",
+                canResolveAutomatically: false
+            ))
+        }
+        if audioExportService.hasActiveExport {
+            blockers.append(ApplicationUpdateRestartBlocker(
+                kind: .export,
+                title: "Export in progress",
+                message: "Let the current export finish or cancel it before installing the update.",
+                canResolveAutomatically: false
+            ))
+        }
+        if !activeImportOperationIDs.isEmpty {
+            blockers.append(ApplicationUpdateRestartBlocker(
+                kind: .importOrConversion,
+                title: "Audio import in progress",
+                message: "Wait for the current audio import to finish before installing the update.",
+                canResolveAutomatically: false
+            ))
+        }
+        if activeDenoiseTask != nil || activeTranscriptionTask != nil {
+            blockers.append(ApplicationUpdateRestartBlocker(
+                kind: .apiProcessing,
+                title: "Audio processing in progress",
+                message: "Wait for the current processing job to finish or cancel it before installing the update.",
+                canResolveAutomatically: false
+            ))
+        }
+        return blockers
     }
 
     required init?(coder: NSCoder) {
@@ -4997,6 +5035,8 @@ final class WorkspaceView: NSView {
 
         let importID = UUID()
         activeImportID = importID
+        let importOperationID = UUID()
+        activeImportOperationIDs.insert(importOperationID)
         selectedAudioFile = nil
         decodedAudioBuffer = nil
         audioTimeline = nil
@@ -5027,11 +5067,17 @@ final class WorkspaceView: NSView {
             return
         }
 
-        Task { [weak self, importID, url] in
+        Task { [weak self, importID, importOperationID, url] in
+            guard let self else {
+                return
+            }
+            defer {
+                self.activeImportOperationIDs.remove(importOperationID)
+            }
             do {
                 let result = try await AudioImportPipeline.loadDroppedFile(at: url)
 
-                guard let self, self.activeImportID == importID else {
+                guard self.activeImportID == importID else {
                     return
                 }
 
@@ -5092,7 +5138,7 @@ final class WorkspaceView: NSView {
                     self.metadataLabel.stringValue = "\(result.metadata.formattedSummary) - WAV decode failed: \(message)"
                 }
             } catch {
-                guard let self, self.activeImportID == importID else {
+                guard self.activeImportID == importID else {
                     return
                 }
 
@@ -5247,12 +5293,17 @@ final class WorkspaceView: NSView {
         PerformanceDashboardWindowController.refreshIfVisible()
 
         let normalizedURL = url.standardizedFileURL
-        Task { [weak self, normalizedURL, importName] in
+        let importOperationID = UUID()
+        activeImportOperationIDs.insert(importOperationID)
+        Task { [weak self, importOperationID, normalizedURL, importName] in
+            guard let self else {
+                return
+            }
+            defer {
+                self.activeImportOperationIDs.remove(importOperationID)
+            }
             do {
                 let assetInfo = try await AudioAssetImporter.inspect(url: normalizedURL)
-                guard let self else {
-                    return
-                }
 
                 let importIdentity = self.addPendingAudioAssetTrack(
                     at: normalizedURL,
@@ -5304,10 +5355,6 @@ final class WorkspaceView: NSView {
                 )
                 PerformanceDashboardWindowController.refreshIfVisible()
             } catch {
-                guard let self else {
-                    return
-                }
-
                 self.updateStatus("\(importName) import failed: \(error.localizedDescription)")
                 SoundtimeDiagnostics.shared.record(
                     category: .audio,

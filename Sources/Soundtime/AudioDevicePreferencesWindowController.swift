@@ -3,17 +3,30 @@ import CoreAudio
 
 @MainActor
 final class AudioDevicePreferencesWindowController: NSWindowController {
+    private let updateService: ApplicationUpdateService
     private let inputPopup = NSPopUpButton()
     private let outputPopup = NSPopUpButton()
     private let audioShakeAPIKeyField = NSSecureTextField()
     private let audioShakeAPIKeyStatusLabel = NSTextField(labelWithString: "")
     private let deepgramAPIKeyField = NSSecureTextField()
     private let deepgramAPIKeyStatusLabel = NSTextField(labelWithString: "")
+    private let automaticallyCheckForUpdatesButton = NSButton(
+        checkboxWithTitle: "Automatically check for updates",
+        target: nil,
+        action: nil
+    )
+    private let automaticallyDownloadUpdatesButton = NSButton(
+        checkboxWithTitle: "Download updates automatically",
+        target: nil,
+        action: nil
+    )
+    private let updateChannelPopup = NSPopUpButton()
 
-    init() {
+    init(updateService: ApplicationUpdateService = DisabledApplicationUpdateService()) {
+        self.updateService = updateService
         let contentView = NSView()
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 405),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 520),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -34,6 +47,7 @@ final class AudioDevicePreferencesWindowController: NSWindowController {
         reloadDevices()
         reloadAudioShakeAPIKey()
         reloadDeepgramAPIKey()
+        reloadUpdatePreferences()
         super.showWindow(sender)
         window?.makeKeyAndOrderFront(sender)
     }
@@ -52,6 +66,10 @@ final class AudioDevicePreferencesWindowController: NSWindowController {
         apiTitleLabel.font = .systemFont(ofSize: 20, weight: .semibold)
         apiTitleLabel.textColor = .labelColor
         apiTitleLabel.translatesAutoresizingMaskIntoConstraints = false
+        let updatesTitleLabel = NSTextField(labelWithString: "Updates")
+        updatesTitleLabel.font = .systemFont(ofSize: 20, weight: .semibold)
+        updatesTitleLabel.textColor = .labelColor
+        updatesTitleLabel.translatesAutoresizingMaskIntoConstraints = false
 
         inputPopup.target = self
         inputPopup.action = #selector(inputChanged(_:))
@@ -120,6 +138,22 @@ final class AudioDevicePreferencesWindowController: NSWindowController {
             saveButton: saveDeepgramAPIKeyButton,
             clearButton: clearDeepgramAPIKeyButton
         )
+        automaticallyCheckForUpdatesButton.target = self
+        automaticallyCheckForUpdatesButton.action = #selector(updatePreferencesChanged(_:))
+        automaticallyDownloadUpdatesButton.target = self
+        automaticallyDownloadUpdatesButton.action = #selector(updatePreferencesChanged(_:))
+        updateChannelPopup.addItems(withTitles: ApplicationUpdateChannel.allCases.map(\.displayName))
+        updateChannelPopup.target = self
+        updateChannelPopup.action = #selector(updatePreferencesChanged(_:))
+        let updateControls = NSStackView(views: [
+            automaticallyCheckForUpdatesButton,
+            automaticallyDownloadUpdatesButton,
+            makeUpdateChannelRow(),
+        ])
+        updateControls.orientation = .vertical
+        updateControls.alignment = .leading
+        updateControls.spacing = 8
+        updateControls.translatesAutoresizingMaskIntoConstraints = false
 
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(titleLabel)
@@ -129,6 +163,8 @@ final class AudioDevicePreferencesWindowController: NSWindowController {
         contentView.addSubview(audioShakeAPIKeyStatusLabel)
         contentView.addSubview(deepgramAPIKeyRow)
         contentView.addSubview(deepgramAPIKeyStatusLabel)
+        contentView.addSubview(updatesTitleLabel)
+        contentView.addSubview(updateControls)
 
         NSLayoutConstraint.activate([
             titleLabel.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 24),
@@ -158,7 +194,25 @@ final class AudioDevicePreferencesWindowController: NSWindowController {
             deepgramAPIKeyStatusLabel.topAnchor.constraint(equalTo: deepgramAPIKeyRow.bottomAnchor, constant: 8),
             deepgramAPIKeyStatusLabel.leadingAnchor.constraint(equalTo: deepgramAPIKeyField.leadingAnchor),
             deepgramAPIKeyStatusLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -28),
+
+            updatesTitleLabel.topAnchor.constraint(equalTo: deepgramAPIKeyStatusLabel.bottomAnchor, constant: 24),
+            updatesTitleLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 28),
+            updatesTitleLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -28),
+
+            updateControls.topAnchor.constraint(equalTo: updatesTitleLabel.bottomAnchor, constant: 14),
+            updateControls.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 28),
+            updateControls.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -28),
         ])
+    }
+
+    private func makeUpdateChannelRow() -> NSView {
+        let label = NSTextField(labelWithString: "Update channel")
+        label.textColor = NSColor(white: 0.72, alpha: 1)
+        let row = NSStackView(views: [label, updateChannelPopup])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 12
+        return row
     }
 
     private func makeLabel(_ title: String) -> NSTextField {
@@ -273,6 +327,14 @@ final class AudioDevicePreferencesWindowController: NSWindowController {
         }
     }
 
+    private func reloadUpdatePreferences() {
+        let preferences = updateService.preferences
+        automaticallyCheckForUpdatesButton.state = preferences.automaticallyChecksForUpdates ? .on : .off
+        automaticallyDownloadUpdatesButton.state = preferences.automaticallyDownloadsUpdates ? .on : .off
+        automaticallyDownloadUpdatesButton.isEnabled = preferences.automaticallyChecksForUpdates
+        updateChannelPopup.selectItem(withTitle: preferences.channel.displayName)
+    }
+
     private func reload(
         popup: NSPopUpButton,
         devices: [AudioDeviceInfo],
@@ -337,6 +399,20 @@ final class AudioDevicePreferencesWindowController: NSWindowController {
         } catch {
             deepgramAPIKeyStatusLabel.stringValue = error.localizedDescription
         }
+    }
+
+    @objc private func updatePreferencesChanged(_ sender: Any?) {
+        let channel = ApplicationUpdateChannel.allCases.first {
+            $0.displayName == updateChannelPopup.titleOfSelectedItem
+        } ?? .stable
+        let automaticallyChecks = automaticallyCheckForUpdatesButton.state == .on
+        updateService.preferences = ApplicationUpdatePreferences(
+            automaticallyChecksForUpdates: automaticallyChecks,
+            automaticallyDownloadsUpdates: automaticallyChecks &&
+                automaticallyDownloadUpdatesButton.state == .on,
+            channel: channel
+        )
+        reloadUpdatePreferences()
     }
 
     private func deviceID(from popup: NSPopUpButton) -> AudioDeviceID? {
