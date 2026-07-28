@@ -364,7 +364,7 @@ final class TimelineTranscriptOverlayView: NSView {
                     timelineDuration: timelineDuration,
                     displayMode: displayMode
                 ),
-                visibleProjectRange: TranscriptViewportGeometry.visibleProjectRange(
+                visibleProjectRange: TranscriptViewportGeometry.layoutCacheProjectRange(
                     viewport: viewport,
                     timelineDuration: timelineDuration
                 ),
@@ -375,9 +375,13 @@ final class TimelineTranscriptOverlayView: NSView {
             )
         }
 
+        let layoutViewport = TranscriptViewportGeometry.layoutCacheViewport(
+            viewport: viewport,
+            timelineDuration: timelineDuration
+        )
         let layout = TranscriptLayoutEngine.makeLayout(TranscriptTimelineLayoutInput(
             tracks: tracks,
-            viewport: viewport,
+            viewport: layoutViewport,
             trackLayout: trackLayout,
             timelineDuration: timelineDuration,
             bounds: bounds.size,
@@ -392,7 +396,7 @@ final class TimelineTranscriptOverlayView: NSView {
                 timelineDuration: timelineDuration,
                 displayMode: displayMode
             ),
-            visibleProjectRange: TranscriptViewportGeometry.visibleProjectRange(
+            visibleProjectRange: TranscriptViewportGeometry.layoutCacheProjectRange(
                 viewport: viewport,
                 timelineDuration: timelineDuration
             ),

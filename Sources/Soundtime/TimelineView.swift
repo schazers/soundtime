@@ -3492,6 +3492,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         updateTranscriptOverlayLiveGeometry()
+        if shouldRelayoutTranscriptOverlayForUncoveredViewport() {
+            performTranscriptOverlayUpdate()
+            return
+        }
 
         let now = CACurrentMediaTime()
         let elapsed = now - lastTranscriptOverlayUpdateTime
@@ -3501,6 +3505,30 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         performTranscriptOverlayUpdate()
+    }
+
+    private func shouldRelayoutTranscriptOverlayForUncoveredViewport() -> Bool {
+        guard
+            !shouldDeferTranscriptOverlayLayoutForNonViewportHotPath,
+            isTranscriptViewportRelayoutAllowed,
+            transcriptOverlayView.requiresLayoutRebuild(
+                tracks: currentRenderTracks,
+                viewport: viewport,
+                trackLayout: trackLayout,
+                timelineDuration: timelineDuration,
+                displayMode: transcriptDisplayMode
+            )
+        else {
+            return false
+        }
+
+        return !transcriptOverlayView.canReuseLayoutForLiveGeometry(
+            tracks: currentRenderTracks,
+            viewport: viewport,
+            trackLayout: trackLayout,
+            timelineDuration: timelineDuration,
+            displayMode: transcriptDisplayMode
+        )
     }
 
     private func scheduleTranscriptOverlayUpdate(after delay: CFTimeInterval) {

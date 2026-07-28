@@ -2,6 +2,8 @@ import CoreGraphics
 import Foundation
 
 enum TranscriptViewportGeometry {
+    private static let layoutCacheViewportOverscanMultiplier: TimeInterval = 1.0
+
     static func visibleProjectRange(
         viewport: TimelineViewport,
         timelineDuration: TimeInterval
@@ -9,6 +11,49 @@ enum TranscriptViewportGeometry {
         TranscriptionTimeRange(
             startTime: TimeInterval(viewport.startProgress) * timelineDuration,
             endTime: TimeInterval(viewport.endProgress) * timelineDuration
+        )
+    }
+
+    static func layoutCacheProjectRange(
+        viewport: TimelineViewport,
+        timelineDuration: TimeInterval
+    ) -> TranscriptionTimeRange {
+        let visibleRange = visibleProjectRange(
+            viewport: viewport,
+            timelineDuration: timelineDuration
+        )
+        guard
+            timelineDuration.isFinite,
+            timelineDuration > 0,
+            visibleRange.duration.isFinite,
+            visibleRange.duration > 0,
+            visibleRange.duration < timelineDuration
+        else {
+            return visibleRange
+        }
+
+        let padding = visibleRange.duration * layoutCacheViewportOverscanMultiplier
+        return TranscriptionTimeRange(
+            startTime: max(visibleRange.startTime - padding, 0),
+            endTime: min(visibleRange.endTime + padding, timelineDuration)
+        )
+    }
+
+    static func layoutCacheViewport(
+        viewport: TimelineViewport,
+        timelineDuration: TimeInterval
+    ) -> TimelineViewport {
+        let range = layoutCacheProjectRange(
+            viewport: viewport,
+            timelineDuration: timelineDuration
+        )
+        guard timelineDuration.isFinite, timelineDuration > 0 else {
+            return viewport
+        }
+
+        return TimelineViewport(
+            startProgress: Float(range.startTime / timelineDuration),
+            durationProgress: Float(range.duration / timelineDuration)
         )
     }
 

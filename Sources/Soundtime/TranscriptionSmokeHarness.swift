@@ -683,6 +683,108 @@ enum TranscriptionSmokeHarness {
             abs(exactRun.rect.width - liveRect.width) < 1.5,
             "transcript live width transform did not match exact relayout"
         )
+        try verifyTranscriptLivePanCacheGeometry()
+    }
+
+    private static func verifyTranscriptLivePanCacheGeometry() throws {
+        let trackID = UUID(uuidString: "00000000-0000-0000-0000-000000000301") ?? UUID()
+        let firstWord = TranscriptWord(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000302") ?? UUID(),
+            text: "first",
+            startTime: 0.35,
+            endTime: 0.6
+        )
+        let pannedWord = TranscriptWord(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000303") ?? UUID(),
+            text: "panned",
+            startTime: 2.2,
+            endTime: 2.55
+        )
+        let transcript = TranscriptDocument(
+            trackID: trackID,
+            sourceRevision: 1,
+            sourceDuration: 6,
+            providerIdentifier: "smoke.transcription",
+            providerDisplayName: "Smoke Transcription",
+            segments: [
+                TranscriptSegment(
+                    startTime: 0.35,
+                    endTime: 0.6,
+                    text: "first",
+                    words: [firstWord]
+                ),
+                TranscriptSegment(
+                    startTime: 2.2,
+                    endTime: 2.55,
+                    text: "panned",
+                    words: [pannedWord]
+                ),
+            ]
+        )
+        let renderTrack = TimelineRenderState.Track(
+            id: trackID,
+            waveformVersion: 1,
+            waveformOverview: nil,
+            durationHint: 6,
+            volume: 1,
+            isMuted: false,
+            isSoloed: false,
+            hasWaveform: true,
+            transcript: transcript
+        )
+        let initialViewport = TimelineViewport(startProgress: 0, durationProgress: 0.25)
+        let pannedViewport = TimelineViewport(startProgress: 0.22, durationProgress: 0.25)
+        let initialExactLayout = TranscriptLayoutEngine.makeLayout(TranscriptTimelineLayoutInput(
+            tracks: [renderTrack],
+            viewport: initialViewport,
+            trackLayout: .default,
+            timelineDuration: 6,
+            bounds: CGSize(width: 600, height: 140),
+            displayMode: .waveformOverlay
+        ))
+        try require(
+            !initialExactLayout.runs.contains { $0.wordID == pannedWord.id },
+            "transcript pan fixture unexpectedly exposed the future word in the exact initial viewport"
+        )
+
+        let cacheViewport = TranscriptViewportGeometry.layoutCacheViewport(
+            viewport: initialViewport,
+            timelineDuration: 6
+        )
+        let cacheLayout = TranscriptLayoutEngine.makeLayout(TranscriptTimelineLayoutInput(
+            tracks: [renderTrack],
+            viewport: cacheViewport,
+            trackLayout: .default,
+            timelineDuration: 6,
+            bounds: CGSize(width: 600, height: 140),
+            displayMode: .waveformOverlay
+        ))
+        let cachedPanRun = try requireValue(
+            cacheLayout.runs.first { $0.wordID == pannedWord.id },
+            "transcript pan cache did not prefetch the word revealed by panning"
+        )
+        let pannedVisibleRange = TranscriptViewportGeometry.visibleProjectRange(
+            viewport: pannedViewport,
+            timelineDuration: 6
+        )
+        let cachedRange = TranscriptViewportGeometry.layoutCacheProjectRange(
+            viewport: initialViewport,
+            timelineDuration: 6
+        )
+        try require(
+            TranscriptViewportGeometry.range(pannedVisibleRange, isCoveredBy: cachedRange),
+            "transcript pan cache range did not cover the panned viewport"
+        )
+        let pannedRect = TranscriptViewportGeometry.displayRect(
+            for: cachedPanRun,
+            viewport: pannedViewport,
+            timelineDuration: 6,
+            boundsWidth: 600
+        )
+        try require(
+            pannedRect.maxX >= 0 && pannedRect.minX <= 600,
+            "transcript pan cache word did not render inside the panned viewport"
+        )
     }
 
     private static func verifyTranscriptValidityAndJobSnapshot(trackID: UUID) throws {
