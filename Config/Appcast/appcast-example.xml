@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0"
+     xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel>
+    <title>Soundtime Updates</title>
+    <item>
+      <title>Soundtime 0.2.0</title>
+      <pubDate>Tue, 28 Jul 2026 12:00:00 -0700</pubDate>
+      <sparkle:version>2</sparkle:version>
+      <sparkle:shortVersionString>0.2.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <sparkle:phasedRolloutInterval>86400</sparkle:phasedRolloutInterval>
+      <enclosure
+        url="https://updates.soundtime.app/releases/Soundtime-0.2.0.zip"
+        length="12345678"
+        type="application/octet-stream"
+        sparkle:edSignature="REPLACE_WITH_GENERATED_SIGNATURE"/>
+    </item>
+    <item>
+      <title>Soundtime 0.2.1 Critical Fix</title>
+      <pubDate>Tue, 28 Jul 2026 13:00:00 -0700</pubDate>
+      <sparkle:version>3</sparkle:version>
+      <sparkle:shortVersionString>0.2.1</sparkle:shortVersionString>
+      <sparkle:criticalUpdate/>
+      <enclosure
+        url="https://updates.soundtime.app/releases/Soundtime-0.2.1.zip"
+        length="12345678"
+        type="application/octet-stream"
+        sparkle:edSignature="REPLACE_WITH_GENERATED_SIGNATURE"/>
+    </item>
+    <item>
+      <title>Soundtime 0.3.0 Beta</title>
+      <pubDate>Tue, 28 Jul 2026 14:00:00 -0700</pubDate>
+      <sparkle:version>4</sparkle:version>
+      <sparkle:shortVersionString>0.3.0-beta.1</sparkle:shortVersionString>
+      <sparkle:channel>beta</sparkle:channel>
+      <enclosure
+        url="https://updates.soundtime.app/releases/Soundtime-0.3.0-beta.1.zip"
+        length="12345678"
+        type="application/octet-stream"
+        sparkle:edSignature="REPLACE_WITH_GENERATED_SIGNATURE"/>
+    </item>
+  </channel>
+</rss>
