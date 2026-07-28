@@ -51,6 +51,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onSelectAllClipsOnTrackRequested: (() -> Void)?
     var onUndo: (() -> Void)?
     var onExportRequested: (() -> Void)?
+    var onSelectionRegionContextExportRequested: (() -> Void)?
     var onImportAudioFileRequested: (() -> Void)?
     var onOpenProjectRequested: (() -> Void)?
     var onOpenRecentProjectRequested: ((URL) -> Void)?
@@ -2390,7 +2391,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return canSplitAtPlayhead
         case #selector(reapplyLastEffect(_:)):
             return canReapplyLastEffect
-        case #selector(exportSelectedRegion(_:)):
+        case #selector(exportSelectedRegion(_:)), #selector(exportSelectionFromContextMenu(_:)):
             return currentSelection?.durationProgress ?? 0 > 0
         case #selector(deleteTimelineSelection(_:)):
             return canDeleteSelection
@@ -2937,6 +2938,12 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         window?.makeFirstResponder(self)
+        let point = convert(event.locationInWindow, from: nil)
+        if shouldShowSelectionContextMenu(at: point) {
+            showSelectionContextMenu(with: event)
+            return
+        }
+
         stopRightPanMomentum()
         stopZoomMomentum()
         onTimelineInteractionBegan?()
@@ -2952,6 +2959,60 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         isDraggingTrim = false
         isDraggingLoop = false
         displayHoverProgress(nil)
+    }
+
+    private func shouldShowSelectionContextMenu(at point: CGPoint) -> Bool {
+        guard
+            let selection = currentSelection,
+            selection.durationProgress > 0
+        else {
+            return false
+        }
+
+        let progress = preciseProgress(for: point, followsVisualFisheye: false)
+        guard progress >= selection.startProgress, progress <= selection.endProgress else {
+            return false
+        }
+
+        guard let pointTrackID = trackID(at: point) else {
+            return false
+        }
+
+        if let selectionTrackID = selection.trackID {
+            return pointTrackID == selectionTrackID
+        }
+        return true
+    }
+
+    private func showSelectionContextMenu(with event: NSEvent) {
+        let menu = NSMenu(title: "Selected Region")
+
+        let exportItem = NSMenuItem(
+            title: "Export Selected Region...",
+            action: #selector(exportSelectionFromContextMenu(_:)),
+            keyEquivalent: ""
+        )
+        exportItem.target = self
+        menu.addItem(exportItem)
+        menu.addItem(.separator())
+
+        let copyItem = NSMenuItem(title: "Copy", action: #selector(copyTimelineSelection(_:)), keyEquivalent: "")
+        copyItem.target = self
+        menu.addItem(copyItem)
+
+        let cutItem = NSMenuItem(title: "Cut", action: #selector(cutTimelineSelection(_:)), keyEquivalent: "")
+        cutItem.target = self
+        menu.addItem(cutItem)
+
+        let deleteItem = NSMenuItem(title: "Delete Time", action: #selector(removeTimeRangeAcrossScope(_:)), keyEquivalent: "")
+        deleteItem.target = self
+        menu.addItem(deleteItem)
+
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
+
+    @objc private func exportSelectionFromContextMenu(_ sender: Any?) {
+        onSelectionRegionContextExportRequested?()
     }
 
     override func rightMouseDragged(with event: NSEvent) {

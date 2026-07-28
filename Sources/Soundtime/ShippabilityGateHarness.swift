@@ -2,9 +2,10 @@ import Darwin
 import Foundation
 
 enum ShippabilityGateHarness {
+    private static let gateReportSchemaVersion = 7
     private static let featureDoneProductBarCommand = "swift build && swift run Soundtime --product-bar"
     private static let releaseCandidateProductBarCommand = "swift build && swift run Soundtime --release-candidate-gate"
-    private static let productBarRule = "Feature work is not done until the feature-done product bar passes; release candidates require the release-candidate product bar."
+    private static let productBarRule = "Feature work is not done until the feature-done product bar passes; release candidates require the release-candidate product bar with zero failures, zero budget warnings, and zero regression warnings."
 
     private enum GateMode: String, Codable {
         case quick
@@ -110,6 +111,15 @@ enum ShippabilityGateHarness {
             }
         }
 
+        var blocksOnWarnings: Bool {
+            switch self {
+            case .manual, .featureDone:
+                return false
+            case .releaseCandidate:
+                return true
+            }
+        }
+
         func resolvedMode(requestedMode: GateMode, arguments: [String]) throws -> GateMode {
             let explicitQuick = arguments.contains("--quick")
             let explicitStandard = arguments.contains("--standard")
@@ -130,7 +140,12 @@ enum ShippabilityGateHarness {
             }
         }
 
-        func decision(for status: String, budgetFailureCount: Int) -> String {
+        func decision(
+            for status: String,
+            budgetFailureCount: Int,
+            budgetWarningCount: Int,
+            regressionWarningCount: Int
+        ) -> String {
             switch self {
             case .manual:
                 if status == "passed", budgetFailureCount == 0 {
@@ -143,10 +158,14 @@ enum ShippabilityGateHarness {
                 }
                 return "Feature-done bar failed. This change is not done."
             case .releaseCandidate:
-                if status == "passed", budgetFailureCount == 0 {
+                if status == "passed",
+                   budgetFailureCount == 0,
+                   budgetWarningCount == 0,
+                   regressionWarningCount == 0
+                {
                     return "Release-candidate bar passed. This build is eligible for release-candidate review."
                 }
-                return "Release-candidate bar failed. This build is not release-ready."
+                return "Release-candidate bar failed. Release candidates must have zero failures, zero budget warnings, and zero regression warnings."
             }
         }
     }
@@ -217,9 +236,9 @@ enum ShippabilityGateHarness {
         var minSelectionDragFramesPerSecond: Double
 
         static let production = GateThresholds(
-            firstWindowVisibleMilliseconds: 500,
-            firstWaveformVisibleMilliseconds: 160,
-            firstPlaybackReadyMilliseconds: 250,
+            firstWindowVisibleMilliseconds: ShippabilityTimingBudgets.windowVisible.failureMilliseconds,
+            firstWaveformVisibleMilliseconds: ShippabilityTimingBudgets.firstWaveformVisible.failureMilliseconds,
+            firstPlaybackReadyMilliseconds: ShippabilityTimingBudgets.playbackReady.failureMilliseconds,
             maxMainThreadStallMilliseconds: 16,
             maxTimelineFallbackDraws: 0,
             maxAudioUnderruns: 0,
@@ -287,6 +306,7 @@ enum ShippabilityGateHarness {
         var logPath: String?
         var stabilityReportPaths: [String]
         var outputTail: String?
+        var diagnosticHint: String? = nil
     }
 
     private struct GateTraceBundle: Codable {
@@ -296,6 +316,9 @@ enum ShippabilityGateHarness {
         var mode: String
         var productBar: String?
         var productBarDecision: String?
+        var failureCount: Int
+        var warningCount: Int
+        var primaryFailure: GateIssueSummary?
         var commandLine: String
         var reportPath: String
         var markdownReportPath: String
@@ -440,7 +463,8 @@ enum ShippabilityGateHarness {
                 report = runFixturePhase(
                     phase: phase,
                     fixtureRoot: fixtureRoot,
-                    rebuildFixtures: rebuildFixtures || usesDisposableFixtures
+                    rebuildFixtures: rebuildFixtures || usesDisposableFixtures,
+                    mode: mode
                 )
                 if report.status == "failed" {
                     shouldContinue = false
@@ -473,7 +497,11 @@ enum ShippabilityGateHarness {
         cleanupFixturesIfNeeded(rootDirectory: fixtureRoot, keepFixtures: keepFixtures)
 
         let totalDurationMilliseconds = elapsedMilliseconds(since: startedAtNanoseconds)
-        if let runtimePhase = gateRuntimePhase(mode: mode, durationMilliseconds: totalDurationMilliseconds) {
+        if let runtimePhase = gateRuntimePhase(
+            mode: mode,
+            durationMilliseconds: totalDurationMilliseconds,
+            phaseReports: phaseReports
+        ) {
             phaseReports.append(runtimePhase)
         }
 
@@ -486,12 +514,13 @@ enum ShippabilityGateHarness {
             mode: mode.rawValue,
             currentPhases: phaseReports
         )
-        let status = failedPhases.isEmpty && budgetFailureCount == 0 ? "passed" : "failed"
+        let warningBlockerCount = purpose.blocksOnWarnings ? budgetWarningCount + regressionWarnings.count : 0
+        let status = failedPhases.isEmpty && budgetFailureCount == 0 && warningBlockerCount == 0 ? "passed" : "failed"
         let failureBundleURL = status == "failed"
             ? reportRoot.appendingPathComponent("failures/\(runID)", isDirectory: true)
             : nil
         var report = GateReport(
-            schemaVersion: 5,
+            schemaVersion: gateReportSchemaVersion,
             status: status,
             generatedAt: Date(),
             durationMilliseconds: totalDurationMilliseconds,
@@ -500,7 +529,12 @@ enum ShippabilityGateHarness {
             targetRuntimeMilliseconds: mode.targetRuntimeMilliseconds,
             productBar: purpose.rawValue,
             productBarDescription: purpose.description,
-            productBarDecision: purpose.decision(for: status, budgetFailureCount: budgetFailureCount),
+            productBarDecision: purpose.decision(
+                for: status,
+                budgetFailureCount: budgetFailureCount,
+                budgetWarningCount: budgetWarningCount,
+                regressionWarningCount: regressionWarnings.count
+            ),
             productBarRule: productBarRule,
             featureDoneCommand: featureDoneProductBarCommand,
             releaseCandidateCommand: releaseCandidateProductBarCommand,
@@ -543,6 +577,9 @@ enum ShippabilityGateHarness {
         guard budgetFailureCount == 0 else {
             throw GateError.failed(artifacts.latestReportURL)
         }
+        guard warningBlockerCount == 0 else {
+            throw GateError.failed(artifacts.latestReportURL)
+        }
     }
 
     static func runSelfTestFromCommandLine(arguments: [String]) throws {
@@ -571,7 +608,7 @@ enum ShippabilityGateHarness {
         let runDirectory = reportRoot.appendingPathComponent("runs/self-test", isDirectory: true)
         let failureDirectory = reportRoot.appendingPathComponent("failures/self-test", isDirectory: true)
         var report = GateReport(
-            schemaVersion: 5,
+            schemaVersion: gateReportSchemaVersion,
             status: "failed",
             generatedAt: Date(),
             durationMilliseconds: 1,
@@ -580,7 +617,12 @@ enum ShippabilityGateHarness {
             targetRuntimeMilliseconds: nil,
             productBar: GatePurpose.featureDone.rawValue,
             productBarDescription: GatePurpose.featureDone.description,
-            productBarDecision: GatePurpose.featureDone.decision(for: "failed", budgetFailureCount: 0),
+            productBarDecision: GatePurpose.featureDone.decision(
+                for: "failed",
+                budgetFailureCount: 0,
+                budgetWarningCount: 0,
+                regressionWarningCount: 0
+            ),
             productBarRule: productBarRule,
             featureDoneCommand: featureDoneProductBarCommand,
             releaseCandidateCommand: releaseCandidateProductBarCommand,
@@ -634,9 +676,37 @@ enum ShippabilityGateHarness {
         let markdown = try String(contentsOf: artifacts.latestMarkdownURL, encoding: .utf8)
         try require(markdown.contains("## User-visible Risk"), "self-test markdown report did not include user-visible risk language")
         try require(markdown.contains("## Product Bar"), "self-test markdown report did not include product bar policy")
-        try require(decoded.schemaVersion == 5, "self-test report schema version did not round-trip")
+        try require(markdown.contains("Next:"), "self-test markdown report did not include diagnostic next-step hints")
+        try require(decoded.schemaVersion == gateReportSchemaVersion, "self-test report schema version did not round-trip")
         try require(decoded.productBar == GatePurpose.featureDone.rawValue, "self-test product bar did not round-trip")
         try require(decoded.featureDoneCommand == featureDoneProductBarCommand, "self-test feature command did not round-trip")
+        try require(
+            GatePurpose.featureDone.decision(
+                for: "passed",
+                budgetFailureCount: 0,
+                budgetWarningCount: 1,
+                regressionWarningCount: 1
+            ).contains("passed"),
+            "feature-done product bar should allow warning-only runs"
+        )
+        try require(
+            GatePurpose.releaseCandidate.decision(
+                for: "passed",
+                budgetFailureCount: 0,
+                budgetWarningCount: 1,
+                regressionWarningCount: 0
+            ).contains("failed"),
+            "release-candidate product bar should block budget warnings"
+        )
+        try require(
+            GatePurpose.releaseCandidate.decision(
+                for: "passed",
+                budgetFailureCount: 0,
+                budgetWarningCount: 0,
+                regressionWarningCount: 1
+            ).contains("failed"),
+            "release-candidate product bar should block regression warnings"
+        )
         writeFailureArtifacts(
             report: report,
             reportURL: artifacts.runReportURL,
@@ -648,6 +718,79 @@ enum ShippabilityGateHarness {
         try require(
             FileManager.default.fileExists(atPath: failureDirectory.appendingPathComponent("trace-bundle.json").path),
             "self-test failure trace bundle was not written"
+        )
+        let traceBundle = try decoder.decode(
+            GateTraceBundle.self,
+            from: Data(contentsOf: failureDirectory.appendingPathComponent("trace-bundle.json"))
+        )
+        try require(traceBundle.schemaVersion == 2, "self-test trace bundle schema version did not round-trip")
+        try require(traceBundle.failureCount == 1, "self-test trace bundle failure count was wrong")
+        try require(traceBundle.primaryFailure?.diagnosticHint != nil, "self-test trace bundle primary failure lacked a diagnostic hint")
+
+        let syntheticVisualReport = StabilitySuiteReport(
+            suiteName: "visual-invariants-smoke",
+            status: "failed",
+            generatedAt: Date(),
+            durationMilliseconds: 1,
+            checks: [
+                StabilityCheckReport(
+                    name: "blank waveform lane should fail",
+                    status: "failed",
+                    detail: nil
+                ),
+            ],
+            metadata: [
+                "checkedFirstPaintTracks": "3",
+                "checkedDrawableWaveformTracks": "2",
+                "checkedBlankWaveformTracks": "1",
+                "checkedDurationOnlyWaveformTracks": "0",
+                "checkedPlaceholderTracks": "0",
+                "checkedMinimumFirstPaintWaveformBins": "8",
+                "checkedMinimumFirstPaintSourceWaveformBins": "8",
+            ]
+        )
+        let visualFindings = visualInvariantBudgetFindings(syntheticVisualReport)
+        try require(
+            visualFindings.contains { $0.severity == "failure" && $0.metric == "checkedBlankWaveformTracks" },
+            "self-test visual invariants did not catch blank waveform lanes"
+        )
+        try require(
+            visualFindings.contains { $0.severity == "failure" && $0.metric == "checkedMinimumFirstPaintWaveformBins" },
+            "self-test visual invariants did not catch too-coarse first-frame waveforms"
+        )
+
+        let syntheticHotPathReport = StabilitySuiteReport(
+            suiteName: "hot-path-contract-smoke",
+            status: "failed",
+            generatedAt: Date(),
+            durationMilliseconds: 1,
+            checks: [],
+            metadata: [
+                "maxCPUWaveformVertices": "0",
+                "maxCPUFallbackDraws": "0",
+                "maxShaderUploads": "1",
+                "maxShaderUploadBytes": "4096",
+                "maxShaderUploadsInFlight": "0",
+                "maxHotPathViolations": "1",
+                "maxAutosaveScheduled": "1",
+                "maxLaunchSnapshotWriteScheduled": "0",
+                "maxPendingLaunchCacheWrites": "1",
+                "maxLaunchCacheWritesInFlight": "0",
+                "maxTranscriptLayoutBuilds": "2",
+                "maxMainThreadStallCount": "1",
+                "maxMainThreadStallMs": "25",
+                "maxDashboardFrameDisplayMs": "1",
+                "maxDashboardRefreshMs": "1",
+            ]
+        )
+        let hotPathFindings = hotPathContractBudgetFindings(syntheticHotPathReport)
+        try require(
+            hotPathFindings.contains { $0.severity == "failure" && $0.metric == "maxShaderUploads" },
+            "self-test hot-path contract did not catch shader uploads"
+        )
+        try require(
+            hotPathFindings.contains { $0.severity == "failure" && $0.metric == "maxPendingLaunchCacheWrites" },
+            "self-test hot-path contract did not catch pending launch cache writes"
         )
 
         let disposable = root.appendingPathComponent("disposable-fixtures", isDirectory: true)
@@ -756,6 +899,13 @@ enum ShippabilityGateHarness {
                 ])
             ),
             GatePhase(
+                name: "export",
+                detail: "Verify snapshot export, selected-region renders, stem output, compressed M4A export, mix-bus math, source leases, long-file block rendering, and export reports.",
+                kind: .commands([
+                    command("audio export smoke", ["--audio-export-smoke"]),
+                ])
+            ),
+            GatePhase(
                 name: "diagnostics",
                 detail: "Verify diagnostics accounting, trace writing, event retention, and dashboard lifecycle in full mode.",
                 kind: .commands([
@@ -837,7 +987,8 @@ enum ShippabilityGateHarness {
     private static func runFixturePhase(
         phase: GatePhase,
         fixtureRoot: URL,
-        rebuildFixtures: Bool
+        rebuildFixtures: Bool,
+        mode: GateMode
     ) -> GatePhaseReport {
         let startedAt = DispatchTime.now().uptimeNanoseconds
         var checks: [GateCheckReport] = []
@@ -849,7 +1000,7 @@ enum ShippabilityGateHarness {
             if !rebuildFixtures {
                 let verifyStartedAt = DispatchTime.now().uptimeNanoseconds
                 do {
-                    try verifyFixtureBundle(rootDirectory: fixtureRoot)
+                    try verifyFixtureBundle(rootDirectory: fixtureRoot, mode: mode)
                     checks.append(GateCheckReport(
                         label: "verify cached fixture manifest",
                         status: "passed",
@@ -872,6 +1023,8 @@ enum ShippabilityGateHarness {
                     "--build-shippability-fixtures",
                     "--fixtures-output",
                     fixtureRoot.path,
+                    "--fixture-profile",
+                    fixtureProfileArgument(for: mode),
                 ])
                 checks.append(GateCheckReport(
                     label: "build fixtures",
@@ -884,7 +1037,7 @@ enum ShippabilityGateHarness {
                 ))
 
                 let verifyStartedAt = DispatchTime.now().uptimeNanoseconds
-                try verifyFixtureBundle(rootDirectory: fixtureRoot)
+                try verifyFixtureBundle(rootDirectory: fixtureRoot, mode: mode)
                 checks.append(GateCheckReport(
                     label: "verify rebuilt fixture manifest",
                     status: "passed",
@@ -904,6 +1057,7 @@ enum ShippabilityGateHarness {
             metrics["projectTracks"] = "\(manifestSummary.projects.compactMap(\.trackCount).reduce(0, +))"
             metrics["fixtureRoot"] = fixtureRoot.path
             metrics["fixtureCache"] = didReuseFixtures ? "reused" : "rebuilt"
+            metrics["fixtureProfile"] = fixtureProfileArgument(for: mode)
 
             let ignoreResult = verifyFixtureIgnoreContract()
             metrics.merge(ignoreResult.metrics) { _, new in new }
@@ -1163,6 +1317,8 @@ enum ShippabilityGateHarness {
                 findings.append(contentsOf: startupCloseBudgetFindings(report))
             case "user-perceived-timing-smoke":
                 findings.append(contentsOf: userPerceivedTimingBudgetFindings(report))
+            case "visual-invariants-smoke":
+                findings.append(contentsOf: visualInvariantBudgetFindings(report))
             case "hot-path-contract-smoke":
                 findings.append(contentsOf: hotPathContractBudgetFindings(report))
             case "interaction-replay-smoke":
@@ -1225,32 +1381,73 @@ enum ShippabilityGateHarness {
             maxDoubleFinding(
                 report,
                 "worstWindowVisibleMilliseconds",
-                warning: 250,
+                warning: ShippabilityTimingBudgets.windowVisible.warningMilliseconds,
                 failure: GateThresholds.production.firstWindowVisibleMilliseconds,
                 unit: "ms"
             ),
             maxDoubleFinding(
                 report,
                 "worstFirstWaveformVisibleMilliseconds",
-                warning: 100,
+                warning: ShippabilityTimingBudgets.firstWaveformVisible.warningMilliseconds,
                 failure: GateThresholds.production.firstWaveformVisibleMilliseconds,
                 unit: "ms"
             ),
             maxDoubleFinding(
                 report,
                 "worstPlaybackReadyMilliseconds",
-                warning: 350,
-                failure: 600,
+                warning: ShippabilityTimingBudgets.playbackReady.warningMilliseconds,
+                failure: GateThresholds.production.firstPlaybackReadyMilliseconds,
                 unit: "ms"
             ),
-            maxDoubleFinding(report, "worstFirstPlayCommandMilliseconds", warning: 16, failure: 35, unit: "ms"),
-            maxDoubleFinding(report, "worstClickToSeekVisualMilliseconds", warning: 8, failure: 16, unit: "ms"),
-            maxDoubleFinding(report, "worstSelectionDragEdgeMilliseconds", warning: 8, failure: 16, unit: "ms"),
-            maxDoubleFinding(report, "worstDeleteAnimationStartMilliseconds", warning: 8, failure: 16, unit: "ms"),
-            maxDoubleFinding(report, "worstPasteAnimationStartMilliseconds", warning: 8, failure: 16, unit: "ms"),
-            maxDoubleFinding(report, "worstSaveLatencyMilliseconds", warning: 60, failure: 160, unit: "ms"),
-            maxDoubleFinding(report, "worstCloseLatencyMilliseconds", warning: 20, failure: 50, unit: "ms"),
+            maxDoubleFinding(report, "worstFirstPlayCommandMilliseconds", warning: ShippabilityTimingBudgets.firstPlayCommand.warningMilliseconds, failure: ShippabilityTimingBudgets.firstPlayCommand.failureMilliseconds, unit: "ms"),
+            maxDoubleFinding(report, "worstClickToSeekVisualMilliseconds", warning: ShippabilityTimingBudgets.clickToSeekVisual.warningMilliseconds, failure: ShippabilityTimingBudgets.clickToSeekVisual.failureMilliseconds, unit: "ms"),
+            maxDoubleFinding(report, "worstSelectionDragEdgeMilliseconds", warning: ShippabilityTimingBudgets.selectionDragEdge.warningMilliseconds, failure: ShippabilityTimingBudgets.selectionDragEdge.failureMilliseconds, unit: "ms"),
+            maxDoubleFinding(report, "worstDeleteAnimationStartMilliseconds", warning: ShippabilityTimingBudgets.deleteAnimationStart.warningMilliseconds, failure: ShippabilityTimingBudgets.deleteAnimationStart.failureMilliseconds, unit: "ms"),
+            maxDoubleFinding(report, "worstPasteAnimationStartMilliseconds", warning: ShippabilityTimingBudgets.pasteAnimationStart.warningMilliseconds, failure: ShippabilityTimingBudgets.pasteAnimationStart.failureMilliseconds, unit: "ms"),
+            maxDoubleFinding(report, "worstSaveLatencyMilliseconds", warning: ShippabilityTimingBudgets.saveLatency.warningMilliseconds, failure: ShippabilityTimingBudgets.saveLatency.failureMilliseconds, unit: "ms"),
+            maxDoubleFinding(report, "worstCloseLatencyMilliseconds", warning: ShippabilityTimingBudgets.closeLatency.warningMilliseconds, failure: ShippabilityTimingBudgets.closeLatency.failureMilliseconds, unit: "ms"),
         ].compactMap { $0 }
+    }
+
+    private static func visualInvariantBudgetFindings(_ report: StabilitySuiteReport) -> [GateBudgetFinding] {
+        var findings = [
+            equalIntFinding(report, "checkedDrawableWaveformTracks", equalsMetric: "checkedFirstPaintTracks", unit: "tracks"),
+            equalIntFinding(report, "checkedBlankWaveformTracks", expected: 0, unit: "tracks"),
+            equalIntFinding(report, "checkedDurationOnlyWaveformTracks", expected: 0, unit: "tracks"),
+            equalIntFinding(report, "checkedPlaceholderTracks", expected: 0, unit: "tracks"),
+            minIntFinding(report, "checkedMinimumFirstPaintWaveformBins", warning: 64, failure: 16, unit: "bins"),
+            minIntFinding(report, "checkedMinimumFirstPaintSourceWaveformBins", warning: 64, failure: 16, unit: "bins"),
+        ].compactMap { $0 }
+
+        for index in report.checks.indices {
+            let check = report.checks[index]
+            guard check.status == "failed" else {
+                continue
+            }
+            let lowercasedName = check.name.lowercased()
+            let message: String?
+            if lowercasedName.contains("blank") {
+                message = "visual invariant caught a blank waveform lane where cached audio should have painted"
+            } else if lowercasedName.contains("duration-only") {
+                message = "visual invariant caught a duration-only waveform fallback where cached waveform data should have painted"
+            } else if lowercasedName.contains("coarse") || lowercasedName.contains("fallback") {
+                message = "visual invariant caught a coarse or fallback waveform regression"
+            } else {
+                message = nil
+            }
+            if let message {
+                findings.append(finding(
+                    severity: "failure",
+                    suiteName: report.suiteName,
+                    metric: "check[\(index)].\(sanitizedFileName(check.name))",
+                    actual: check.status,
+                    threshold: "passed",
+                    unit: "check",
+                    message: message
+                ))
+            }
+        }
+        return findings
     }
 
     private static func hotPathContractBudgetFindings(_ report: StabilitySuiteReport) -> [GateBudgetFinding] {
@@ -1302,6 +1499,30 @@ enum ShippabilityGateHarness {
                 warning: 0,
                 failure: 0,
                 unit: "violations"
+            ),
+            maxIntFinding(
+                suiteName: report.suiteName,
+                metric: "maxPendingLaunchCacheWrites",
+                actual: metadataInt(report, "maxPendingLaunchCacheWrites"),
+                warning: 0,
+                failure: 0,
+                unit: "writes"
+            ),
+            maxIntFinding(
+                suiteName: report.suiteName,
+                metric: "maxLaunchCacheWritesInFlight",
+                actual: metadataInt(report, "maxLaunchCacheWritesInFlight"),
+                warning: 0,
+                failure: 0,
+                unit: "writes"
+            ),
+            maxIntFinding(
+                suiteName: report.suiteName,
+                metric: "maxTranscriptLayoutBuilds",
+                actual: metadataInt(report, "maxTranscriptLayoutBuilds"),
+                warning: 1,
+                failure: 1,
+                unit: "builds"
             ),
             maxIntFinding(
                 suiteName: report.suiteName,
@@ -1367,6 +1588,30 @@ enum ShippabilityGateHarness {
                 warning: 0,
                 failure: 0,
                 unit: "violations"
+            ),
+            maxIntFinding(
+                suiteName: report.suiteName,
+                metric: "maxPendingLaunchCacheWrites",
+                actual: metadataInt(report, "maxPendingLaunchCacheWrites"),
+                warning: 0,
+                failure: 0,
+                unit: "writes"
+            ),
+            maxIntFinding(
+                suiteName: report.suiteName,
+                metric: "maxLaunchCacheWritesInFlight",
+                actual: metadataInt(report, "maxLaunchCacheWritesInFlight"),
+                warning: 0,
+                failure: 0,
+                unit: "writes"
+            ),
+            maxIntFinding(
+                suiteName: report.suiteName,
+                metric: "maxTranscriptLayoutBuilds",
+                actual: metadataInt(report, "maxTranscriptLayoutBuilds"),
+                warning: 1,
+                failure: 1,
+                unit: "builds"
             ),
             maxIntFinding(
                 suiteName: report.suiteName,
@@ -1498,6 +1743,14 @@ enum ShippabilityGateHarness {
             maxDoubleFinding(report, "maxLoopSampleError", warning: 0.00001, failure: 0.00005, unit: "samples"),
             maxDoubleFinding(report, "graphSwapP95Milliseconds", warning: 5, failure: 8, unit: "ms"),
             maxDoubleFinding(report, "maxGraphSwapMilliseconds", warning: 14, failure: 24, unit: "ms"),
+            minIntFinding(report, "outputDeviceConfigureCount", warning: 2, failure: 2, unit: "configures"),
+            minIntFinding(report, "outputDeviceInvalidateCount", warning: 1, failure: 1, unit: "invalidations"),
+            minIntFinding(report, "outputDeviceStartCount", warning: 1, failure: 1, unit: "starts"),
+            minIntFinding(report, "seekCheckCount", warning: 13, failure: 13, unit: "checks"),
+            minIntFinding(report, "loopCapturedFrameCount", warning: 768, failure: 768, unit: "frames"),
+            minIntFinding(report, "graphSwapTrackCount", warning: 24, failure: 24, unit: "tracks"),
+            minIntFinding(report, "graphSwapUpdateCount", warning: 36, failure: 36, unit: "updates"),
+            minIntFinding(report, "graphSwapRenderBlockCount", warning: 900, failure: 900, unit: "blocks"),
         ].compactMap { $0 }
         findings.append(contentsOf: [
             minDoubleFinding(report, "minimumCorePlaybackPeak", warning: 0.001, failure: 0.0005, unit: "peak"),
@@ -1506,6 +1759,7 @@ enum ShippabilityGateHarness {
             findings.append(contentsOf: [
                 minDoubleFinding(report, "minimumImportPlaybackPeak", warning: 0.001, failure: 0.0005, unit: "peak"),
                 minIntFinding(report, "importedFormatCount", warning: 7, failure: 7, unit: "formats"),
+                minIntFinding(report, "importedFileCount", warning: 7, failure: 7, unit: "files"),
             ].compactMap { $0 })
         }
         return findings
@@ -1881,13 +2135,19 @@ enum ShippabilityGateHarness {
         return try JSONDecoder().decode(FixtureManifestSummary.self, from: data)
     }
 
-    private static func verifyFixtureBundle(rootDirectory: URL) throws {
+    private static func verifyFixtureBundle(rootDirectory: URL, mode: GateMode) throws {
         try ShippabilityFixtureBuilder.verifyFromCommandLine(arguments: [
             "Soundtime",
             "--verify-shippability-fixtures",
             "--fixtures-output",
             rootDirectory.path,
+            "--fixture-profile",
+            fixtureProfileArgument(for: mode),
         ])
+    }
+
+    private static func fixtureProfileArgument(for mode: GateMode) -> String {
+        mode == .full ? "full" : "quick"
     }
 
     private static func verifyFixtureIgnoreContract() -> (
@@ -1996,32 +2256,47 @@ enum ShippabilityGateHarness {
 
     private static func gateRuntimePhase(
         mode: GateMode,
-        durationMilliseconds: Double
+        durationMilliseconds: Double,
+        phaseReports: [GatePhaseReport]
     ) -> GatePhaseReport? {
+        let fixtureRebuildDurationMilliseconds = oneTimeFixtureRebuildDurationMilliseconds(in: phaseReports)
+        let budgetedDurationMilliseconds = max(0, durationMilliseconds - fixtureRebuildDurationMilliseconds)
         let severity: String
         let thresholdMilliseconds: Double
-        if durationMilliseconds > mode.targetRuntimeMilliseconds {
+        if budgetedDurationMilliseconds > mode.targetRuntimeMilliseconds {
             severity = "failure"
             thresholdMilliseconds = mode.targetRuntimeMilliseconds
-        } else if durationMilliseconds > mode.warningRuntimeMilliseconds {
+        } else if budgetedDurationMilliseconds > mode.warningRuntimeMilliseconds {
             severity = "warning"
             thresholdMilliseconds = mode.warningRuntimeMilliseconds
         } else {
             return nil
         }
 
-        let message = String(
-            format: "shippability gate %@ tier took %.1fs, above the %@ runtime budget of %.1fs",
-            mode.rawValue,
-            durationMilliseconds / 1_000,
-            severity == "failure" ? "hard" : "warning",
-            thresholdMilliseconds / 1_000
-        )
+        let message: String
+        if fixtureRebuildDurationMilliseconds > 0 {
+            message = String(
+                format: "shippability gate %@ tier took %.1fs after excluding %.1fs of one-time fixture rebuild work, above the %@ runtime budget of %.1fs",
+                mode.rawValue,
+                budgetedDurationMilliseconds / 1_000,
+                fixtureRebuildDurationMilliseconds / 1_000,
+                severity == "failure" ? "hard" : "warning",
+                thresholdMilliseconds / 1_000
+            )
+        } else {
+            message = String(
+                format: "shippability gate %@ tier took %.1fs, above the %@ runtime budget of %.1fs",
+                mode.rawValue,
+                durationMilliseconds / 1_000,
+                severity == "failure" ? "hard" : "warning",
+                thresholdMilliseconds / 1_000
+            )
+        }
         let finding = GateBudgetFinding(
             severity: severity,
             suiteName: "shippability-gate",
-            metric: "durationMilliseconds",
-            actual: String(format: "%.1f", durationMilliseconds),
+            metric: "budgetedDurationMilliseconds",
+            actual: String(format: "%.1f", budgetedDurationMilliseconds),
             threshold: "<= \(String(format: "%.1f", thresholdMilliseconds))",
             unit: "ms",
             message: message,
@@ -2036,6 +2311,8 @@ enum ShippabilityGateHarness {
                 "mode": mode.rawValue,
                 "tierDescription": mode.description,
                 "durationMilliseconds": String(format: "%.1f", durationMilliseconds),
+                "budgetedDurationMilliseconds": String(format: "%.1f", budgetedDurationMilliseconds),
+                "excludedFixtureRebuildDurationMilliseconds": String(format: "%.1f", fixtureRebuildDurationMilliseconds),
                 "targetRuntimeMilliseconds": String(format: "%.1f", mode.targetRuntimeMilliseconds),
             ],
             warnings: [],
@@ -2043,6 +2320,20 @@ enum ShippabilityGateHarness {
             budgetFindings: [finding],
             checks: []
         )
+    }
+
+    private static func oneTimeFixtureRebuildDurationMilliseconds(
+        in phaseReports: [GatePhaseReport]
+    ) -> Double {
+        phaseReports.reduce(0) { partialResult, phase in
+            guard
+                phase.name == "fixtures",
+                phase.metrics["fixtureCache"] == "rebuilt"
+            else {
+                return partialResult
+            }
+            return partialResult + phase.durationMilliseconds
+        }
     }
 
     private static func printTerminalSummary(report: GateReport, artifacts: GateReportArtifacts) {
@@ -2081,6 +2372,9 @@ enum ShippabilityGateHarness {
                 if let logPath = issue.logPath {
                     print("       log: \(logPath)")
                 }
+                if let diagnosticHint = issue.diagnosticHint {
+                    print("       next: \(diagnosticHint)")
+                }
             }
             if failures.count > 10 {
                 print("       ... \(failures.count - 10) more failure(s) in the markdown report")
@@ -2098,6 +2392,9 @@ enum ShippabilityGateHarness {
                     let threshold = issue.threshold.map { " threshold=\($0)" } ?? ""
                     let unit = issue.unit.map { " \($0)" } ?? ""
                     print("       metric: \(metric)\(actual)\(unit)\(threshold)")
+                }
+                if let diagnosticHint = issue.diagnosticHint {
+                    print("       next: \(diagnosticHint)")
                 }
             }
             if warnings.count > 8 {
@@ -2265,6 +2562,9 @@ enum ShippabilityGateHarness {
             if let logPath = issue.logPath {
                 lines.append("  Log: `\(logPath)`")
             }
+            if let diagnosticHint = issue.diagnosticHint {
+                lines.append("  Next: \(markdownEscape(diagnosticHint))")
+            }
         }
     }
 
@@ -2405,7 +2705,79 @@ enum ShippabilityGateHarness {
                 ))
             }
         }
-        return issues
+        return issues.map { issue in
+            var issue = issue
+            issue.diagnosticHint = diagnosticHint(for: issue)
+            return issue
+        }
+    }
+
+    private static func diagnosticHint(for issue: GateIssueSummary) -> String {
+        let text = [
+            issue.phaseName,
+            issue.checkLabel,
+            issue.suiteName,
+            issue.metric,
+            issue.message,
+        ]
+            .compactMap { $0 }
+            .joined(separator: " ")
+            .lowercased()
+
+        if text.contains("placeholder") ||
+            text.contains("firstpaint") ||
+            text.contains("firstwaveform") ||
+            text.contains("windowvisible") ||
+            text.contains("blank waveform") ||
+            text.contains("duration-only") ||
+            text.contains("coarse")
+        {
+            return "Inspect the first-frame launch packet and visual-invariants report; this usually means startup rendered before cached track/waveform state was available."
+        }
+        if text.contains("hot path") ||
+            text.contains("cpuwaveform") ||
+            text.contains("fallback") ||
+            text.contains("shaderupload") ||
+            text.contains("mainthread") ||
+            text.contains("autosave") ||
+            text.contains("launchcache")
+        {
+            return "Open the hot-path stability report and child log; look for waveform uploads, cache writes, autosave, or layout work during the named interaction."
+        }
+        if text.contains("selection") ||
+            text.contains("delete") ||
+            text.contains("paste") ||
+            text.contains("clicktoseek") ||
+            text.contains("replay") ||
+            text.contains("zoom") ||
+            text.contains("pan")
+        {
+            return "Replay the interaction from the gate log and compare pointer/playhead/selection metrics against the visual-invariants report."
+        }
+        if text.contains("audio safety") ||
+            text.contains("underrun") ||
+            text.contains("droppedcommand") ||
+            text.contains("output-device") ||
+            text.contains("seekframe") ||
+            text.contains("loop") ||
+            text.contains("import playback")
+        {
+            return "Inspect the audio-safety report first; failures here point at realtime command delivery, seek/loop math, device setup, or imported-format playback."
+        }
+        if text.contains("transcript") ||
+            text.contains("transcription")
+        {
+            return "Inspect transcript visual metrics and interaction replay logs; failures usually mean word virtualization, active-word timing, or sidecar persistence regressed."
+        }
+        if text.contains("runtime") ||
+            text.contains("durationmilliseconds")
+        {
+            return "Compare this run to the previous latest report and look for the slowest phase before drilling into child logs."
+        }
+        if let logPath = issue.logPath {
+            return "Open the child log at \(logPath) and the copied stability reports in the failure bundle."
+        }
+        return "Open the markdown report, then inspect the failure bundle's logs and stability reports for the phase named above."
     }
 
     private static func checkFailureSummary(
@@ -2625,12 +2997,15 @@ enum ShippabilityGateHarness {
             let failures = issueSummaries(in: report, severities: ["failure"])
             let warnings = issueSummaries(in: report, severities: ["warning"])
             let bundle = GateTraceBundle(
-                schemaVersion: 1,
+                schemaVersion: 2,
                 generatedAt: Date(),
                 status: report.status,
                 mode: report.mode,
                 productBar: report.productBar,
                 productBarDecision: report.productBarDecision,
+                failureCount: failures.count,
+                warningCount: warnings.count,
+                primaryFailure: failures.first,
                 commandLine: report.commandLine,
                 reportPath: copiedReportURL.path,
                 markdownReportPath: copiedMarkdownURL.path,

@@ -132,6 +132,16 @@ if CommandLine.arguments.contains("--audio-safety-smoke") {
     }
 }
 
+if CommandLine.arguments.contains("--audio-export-smoke") {
+    do {
+        try AudioExportSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        exit(0)
+    } catch {
+        fputs("Soundtime audio export smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
 if CommandLine.arguments.contains("--launch-performance-smoke") ||
     CommandLine.arguments.contains("--launch-performance-smoke-full")
 {

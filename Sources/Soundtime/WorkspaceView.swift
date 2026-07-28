@@ -691,6 +691,23 @@ final class WorkspaceView: NSView {
         let trackCount: Int
     }
 
+    private enum WorkspaceAudioExportError: LocalizedError {
+        case noAudioToExport
+        case noSelectedTrackToExport
+        case emptyExportRange
+
+        var errorDescription: String? {
+            switch self {
+            case .noAudioToExport:
+                return "There is no audio to export."
+            case .noSelectedTrackToExport:
+                return "The selected track is not available for export."
+            case .emptyExportRange:
+                return "The selected export range is empty."
+            }
+        }
+    }
+
     private final class RecordingPreviewCoalescer: @unchecked Sendable {
         private let queue = DispatchQueue(label: "Soundtime.recording.preview.coalescer", qos: .userInteractive)
         private let minimumFlushInterval: TimeInterval = 1.0 / 45.0
@@ -1201,6 +1218,21 @@ final class WorkspaceView: NSView {
     private let timelineSurface = TimelineView()
     private let addTrackButton = AddTrackButton()
     private let exportProgressOverlay = ExportProgressOverlayView()
+    private let audioExportService = AudioExportService()
+    private var audioExportWindowController: AudioExportWindowController?
+    private var activeAudioExportJobID: UUID?
+    private var latestAudioExportProgress: AudioExportProgress?
+    private let audioExportStatusButton: NSButton = {
+        let button = NSButton(title: "Export 0%", target: nil, action: nil)
+        button.bezelStyle = .rounded
+        button.font = .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+        button.contentTintColor = NSColor(white: 0.88, alpha: 1)
+        button.isBordered = true
+        button.isHidden = true
+        button.setContentCompressionResistancePriority(.required, for: .horizontal)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        return button
+    }()
     private let gainEffectOverlay = GainEffectOverlayView()
     private let denoiseProgressOverlay = DenoiseProgressOverlayView()
     private let transcriptionProgressOverlay = TranscriptionProgressOverlayView()
@@ -1493,6 +1525,9 @@ final class WorkspaceView: NSView {
         timelineSurface.onExportSelectedRegionRequested = { [weak self] in
             self?.exportSelectedRegion()
         }
+        timelineSurface.onSelectionRegionContextExportRequested = { [weak self] in
+            self?.exportSelectedRegionFromContextMenu()
+        }
         timelineSurface.onExportMixdownAndStemsRequested = { [weak self] in
             self?.exportMixdownAndStems()
         }
@@ -1630,6 +1665,14 @@ final class WorkspaceView: NSView {
         performanceDashboardButton.onPressed = { [weak self] in
             PerformanceDashboardWindowController.shared.showDashboard(relativeTo: self?.window)
         }
+        audioExportStatusButton.target = self
+        audioExportStatusButton.action = #selector(audioExportStatusButtonPressed(_:))
+        audioExportService.onProgress = { [weak self] progress in
+            self?.handleAudioExportProgress(progress)
+        }
+        audioExportService.onCompletion = { [weak self] jobID, result in
+            self?.handleAudioExportCompletion(jobID: jobID, result)
+        }
         editScopeControl.target = self
         editScopeControl.action = #selector(editScopeChanged(_:))
         editScopeControlsRow.addArrangedSubview(editScopeTitleLabel)
@@ -1700,6 +1743,7 @@ final class WorkspaceView: NSView {
         addSubview(metadataLabel)
         addSubview(framesPerSecondLabel)
         addSubview(performanceDashboardButton)
+        addSubview(audioExportStatusButton)
         addSubview(frameRateHistoryView)
         addSubview(cpuUsageHistoryView)
         addSubview(transportControlPanel)
@@ -1777,6 +1821,11 @@ final class WorkspaceView: NSView {
             performanceDashboardButton.trailingAnchor.constraint(equalTo: frameRateHistoryView.leadingAnchor, constant: -8),
             performanceDashboardButton.widthAnchor.constraint(equalToConstant: 30),
             performanceDashboardButton.heightAnchor.constraint(equalToConstant: 24),
+
+            audioExportStatusButton.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 12),
+            audioExportStatusButton.trailingAnchor.constraint(equalTo: loudnessMeter.trailingAnchor),
+            audioExportStatusButton.widthAnchor.constraint(equalToConstant: 150),
+            audioExportStatusButton.heightAnchor.constraint(equalToConstant: 24),
 
             frameRateHistoryView.bottomAnchor.constraint(equalTo: loudnessMeter.topAnchor, constant: -6),
             frameRateHistoryView.leadingAnchor.constraint(equalTo: loudnessMeter.leadingAnchor),
@@ -2325,7 +2374,9 @@ final class WorkspaceView: NSView {
         )
     }
 
-    func userPerceivedTimingSmokePrepareClipboardFromSelection() -> WorkspaceUserPerceivedTimingSmokeResult {
+    func userPerceivedTimingSmokePrepareClipboardFromSelection(
+        includePortableBuffer: Bool = false
+    ) -> WorkspaceUserPerceivedTimingSmokeResult {
         let generationBefore = deleteAnimationGeneration
         let startedAt = CACurrentMediaTime()
         guard
@@ -2353,8 +2404,11 @@ final class WorkspaceView: NSView {
             let fileTimeline = try? editableFileTimeline(forTrackAt: target.trackIndex),
             let clip = fileTimeline.clip(for: target.editSelection)
         {
+            let portableBuffer = includePortableBuffer ?
+                userPerceivedTimingSmokeClipboardBuffer(duration: clip.duration) :
+                nil
             audioClipboard = AudioClipboard(
-                buffer: nil,
+                buffer: portableBuffer,
                 waveformOverview: overview,
                 fileClipSourceURL: track.sourceURL,
                 fileClip: clip
@@ -2404,16 +2458,18 @@ final class WorkspaceView: NSView {
         )
     }
 
-    func userPerceivedTimingSmokeDeleteSelection() -> WorkspaceUserPerceivedTimingSmokeResult {
+    func userPerceivedTimingSmokeDeleteSelection(useGroupScope: Bool = false) -> WorkspaceUserPerceivedTimingSmokeResult {
         let generationBefore = deleteAnimationGeneration
         let startedAt = CACurrentMediaTime()
-        performOptimisticDelete(copyBeforeDeleting: false, scope: .track)
+        performOptimisticDelete(copyBeforeDeleting: false, scope: useGroupScope ? .group : .track)
         let elapsedMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
         let generationChanged = generationBefore != deleteAnimationGeneration
         return WorkspaceUserPerceivedTimingSmokeResult(
             accepted: generationChanged,
             elapsedMilliseconds: elapsedMilliseconds,
-            message: generationChanged ? "delete visual state submitted" : "delete visual state did not start",
+            message: generationChanged ?
+                "delete visual state submitted (\(useGroupScope ? "group" : "track") scope)" :
+                "delete visual state did not start",
             editAnimationGenerationChanged: generationChanged
         )
     }
@@ -4756,6 +4812,10 @@ final class WorkspaceView: NSView {
                     candidate.path.hasPrefix(recordingsDirectoryPath + "/"),
                     candidate.pathExtension.lowercased() == "wav"
                 else {
+                    continue
+                }
+
+                if AudioExportLeaseManager.shared.deferDeletionIfLeased(candidate) {
                     continue
                 }
 
@@ -14884,9 +14944,7 @@ final class WorkspaceView: NSView {
     }
 
     private func exportCurrentAudio() {
-        let projectMixSnapshots = projectMixTrackSnapshots()
-        let fallbackDecodedAudioBuffer = decodedAudioBuffer
-        guard !projectMixSnapshots.isEmpty || (fallbackDecodedAudioBuffer?.frameCount ?? 0) > 0 else {
+        guard canCreateAudioExportSnapshot(for: .fullMixdown) else {
             return
         }
 
@@ -14898,11 +14956,11 @@ final class WorkspaceView: NSView {
         savePanel.allowedContentTypes = [
             .wav,
             UTType(filenameExtension: "m4a") ?? .audio,
+            UTType(filenameExtension: "aac") ?? .audio,
             UTType(filenameExtension: "mp3") ?? .audio,
         ]
 
-        let completion: (NSApplication.ModalResponse) -> Void = {
-            [weak self, projectMixSnapshots, fallbackDecodedAudioBuffer] response in
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
             guard
                 response == .OK,
                 let destinationURL = savePanel.url
@@ -14910,28 +14968,26 @@ final class WorkspaceView: NSView {
                 return
             }
 
-            self?.prepareAndWriteExport(
-                projectMixSnapshots: projectMixSnapshots,
-                fallbackDecodedAudioBuffer: fallbackDecodedAudioBuffer,
-                to: destinationURL
+            self?.beginAudioExport(
+                scope: .fullMixdown,
+                destinationURL: destinationURL,
+                format: AudioExportFormat(destinationURL: destinationURL)
             )
         }
 
         if let window {
             savePanel.beginSheetModal(for: window, completionHandler: completion)
         } else if savePanel.runModal() == .OK, let destinationURL = savePanel.url {
-            prepareAndWriteExport(
-                projectMixSnapshots: projectMixSnapshots,
-                fallbackDecodedAudioBuffer: fallbackDecodedAudioBuffer,
-                to: destinationURL
+            beginAudioExport(
+                scope: .fullMixdown,
+                destinationURL: destinationURL,
+                format: AudioExportFormat(destinationURL: destinationURL)
             )
         }
     }
 
     private func exportWAVMixdown() {
-        let projectMixSnapshots = projectMixTrackSnapshots()
-        let fallbackDecodedAudioBuffer = decodedAudioBuffer
-        guard !projectMixSnapshots.isEmpty || (fallbackDecodedAudioBuffer?.frameCount ?? 0) > 0 else {
+        guard canCreateAudioExportSnapshot(for: .fullMixdown) else {
             updateStatus("load audio before exporting")
             return
         }
@@ -14943,17 +14999,15 @@ final class WorkspaceView: NSView {
         savePanel.isExtensionHidden = false
         savePanel.allowedContentTypes = [.wav]
 
-        let completion: (NSApplication.ModalResponse) -> Void = {
-            [weak self, projectMixSnapshots, fallbackDecodedAudioBuffer] response in
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
             guard response == .OK, let destinationURL = savePanel.url else {
                 return
             }
 
-            self?.prepareAndWriteWAVExport(
-                projectMixSnapshots: projectMixSnapshots,
-                fallbackDecodedAudioBuffer: fallbackDecodedAudioBuffer,
-                to: destinationURL,
-                selection: nil
+            self?.beginAudioExport(
+                scope: .fullMixdown,
+                destinationURL: destinationURL,
+                format: .wav
             )
         }
 
@@ -14973,9 +15027,30 @@ final class WorkspaceView: NSView {
             return
         }
 
-        let projectMixSnapshots = projectMixTrackSnapshots()
-        let fallbackDecodedAudioBuffer = decodedAudioBuffer
-        guard !projectMixSnapshots.isEmpty || (fallbackDecodedAudioBuffer?.frameCount ?? 0) > 0 else {
+        let scope = AudioExportScope.timeRange(selectedTimelineRange)
+        presentSelectedRegionExportPanel(scope: scope)
+    }
+
+    private func exportSelectedRegionFromContextMenu() {
+        guard
+            let selectedTimelineRange,
+            selectedTimelineRange.durationProgress > 0
+        else {
+            updateStatus("select audio to export")
+            return
+        }
+
+        let scope: AudioExportScope
+        if let trackID = selectedTimelineRange.trackID {
+            scope = .trackRange(trackID: trackID, selection: selectedTimelineRange)
+        } else {
+            scope = .timeRange(selectedTimelineRange)
+        }
+        presentSelectedRegionExportPanel(scope: scope)
+    }
+
+    private func presentSelectedRegionExportPanel(scope: AudioExportScope) {
+        guard canCreateAudioExportSnapshot(for: scope) else {
             updateStatus("load audio before exporting")
             return
         }
@@ -14985,19 +15060,22 @@ final class WorkspaceView: NSView {
         savePanel.nameFieldStringValue = suggestedSelectedRegionExportFilename()
         savePanel.canCreateDirectories = true
         savePanel.isExtensionHidden = false
-        savePanel.allowedContentTypes = [.wav]
+        savePanel.allowedContentTypes = [
+            .wav,
+            UTType(filenameExtension: "m4a") ?? .audio,
+            UTType(filenameExtension: "aac") ?? .audio,
+            UTType(filenameExtension: "mp3") ?? .audio,
+        ]
 
-        let completion: (NSApplication.ModalResponse) -> Void = {
-            [weak self, projectMixSnapshots, fallbackDecodedAudioBuffer, selectedTimelineRange] response in
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
             guard response == .OK, let destinationURL = savePanel.url else {
                 return
             }
 
-            self?.prepareAndWriteWAVExport(
-                projectMixSnapshots: projectMixSnapshots,
-                fallbackDecodedAudioBuffer: fallbackDecodedAudioBuffer,
-                to: destinationURL,
-                selection: selectedTimelineRange
+            self?.beginAudioExport(
+                scope: scope,
+                destinationURL: destinationURL,
+                format: AudioExportFormat(destinationURL: destinationURL)
             )
         }
 
@@ -15017,9 +15095,8 @@ final class WorkspaceView: NSView {
     }
 
     private func exportStemSet(includeMixdown: Bool) {
-        let stemSnapshots = projectStemTrackSnapshots()
-        let mixSnapshots = projectMixTrackSnapshots()
-        guard !stemSnapshots.isEmpty else {
+        let scope = AudioExportScope.stems(includeMixdown: includeMixdown, selection: nil)
+        guard canCreateAudioExportSnapshot(for: scope) else {
             updateStatus("load tracks before exporting stems")
             return
         }
@@ -15032,17 +15109,15 @@ final class WorkspaceView: NSView {
         openPanel.canCreateDirectories = true
         openPanel.allowsMultipleSelection = false
 
-        let completion: (NSApplication.ModalResponse) -> Void = {
-            [weak self, stemSnapshots, mixSnapshots, includeMixdown] response in
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
             guard response == .OK, let folderURL = openPanel.url else {
                 return
             }
 
-            self?.writeStemExports(
-                stemSnapshots: stemSnapshots,
-                mixSnapshots: includeMixdown ? mixSnapshots : [],
-                to: folderURL,
-                includeMixdown: includeMixdown
+            self?.beginAudioExport(
+                scope: scope,
+                destinationURL: folderURL,
+                format: .wav
             )
         }
 
@@ -15051,6 +15126,308 @@ final class WorkspaceView: NSView {
         } else {
             completion(openPanel.runModal())
         }
+    }
+
+    private func beginAudioExport(
+        scope: AudioExportScope,
+        destinationURL: URL,
+        format: AudioExportFormat
+    ) {
+        let request = AudioExportRequest(
+            projectName: suggestedProjectFilename(),
+            scope: scope,
+            format: format,
+            destinationURL: destinationURL
+        )
+
+        do {
+            let snapshot = try makeAudioExportSnapshot(request: request)
+            let initialProgress = AudioExportProgress.initial(request: request)
+            activeAudioExportJobID = request.id
+            latestAudioExportProgress = initialProgress
+            showAudioExportWindow()
+            handleAudioExportProgress(initialProgress)
+            updateStatus("exporting \(scope.displayName.lowercased()) in background")
+            audioExportService.start(snapshot: snapshot)
+            SoundtimeDiagnostics.shared.record(
+                category: .system,
+                severity: .info,
+                name: "audio-export-started",
+                message: "Audio export started from an immutable snapshot.",
+                fields: [
+                    "jobID": request.id.uuidString,
+                    "scope": scope.displayName,
+                    "format": format.displayName,
+                    "trackCount": "\(snapshot.tracks.count)",
+                    "frameCount": "\(snapshot.frameCount)",
+                ]
+            )
+        } catch {
+            activeAudioExportJobID = nil
+            updateStatus("export failed: \(error.localizedDescription)")
+            SoundtimeDiagnostics.shared.record(
+                category: .system,
+                severity: .warning,
+                name: "audio-export-start-failed",
+                message: "Audio export could not start.",
+                fields: [
+                    "scope": scope.displayName,
+                    "format": format.displayName,
+                    "error": error.localizedDescription,
+                ]
+            )
+        }
+    }
+
+    private func canCreateAudioExportSnapshot(for scope: AudioExportScope) -> Bool {
+        !audioExportTrackSnapshots(for: scope).isEmpty || fallbackAudioExportTrackSnapshot() != nil
+    }
+
+    private func makeAudioExportSnapshot(request: AudioExportRequest) throws -> AudioExportSnapshot {
+        var tracks = audioExportTrackSnapshots(for: request.scope)
+        if tracks.isEmpty, let fallbackTrack = fallbackAudioExportTrackSnapshot() {
+            tracks = [fallbackTrack]
+        }
+        guard !tracks.isEmpty else {
+            throw WorkspaceAudioExportError.noAudioToExport
+        }
+
+        let timings = tracks.map { Self.audioExportTiming(for: $0.source) }
+        guard let firstTiming = timings.first else {
+            throw WorkspaceAudioExportError.noAudioToExport
+        }
+
+        let sampleRate = firstTiming.sampleRate > 0 ? firstTiming.sampleRate : max(displayedSampleRate, 44_100)
+        let channelCount = max(timings.map(\.channelCount).max() ?? 2, 2)
+        let fullDurationFrameCount = timings.reduce(0) { result, timing in
+            let convertedFrameCount = Int((Double(timing.frameCount) / max(timing.sampleRate, 1) * sampleRate).rounded(.up))
+            return max(result, convertedFrameCount)
+        }
+        guard fullDurationFrameCount > 0 else {
+            throw WorkspaceAudioExportError.noAudioToExport
+        }
+
+        let exportFrameRange: Range<Int>
+        if let selection = request.scope.selection {
+            let lowerBound = min(
+                max(Int((selection.startProgress * Double(fullDurationFrameCount)).rounded(.down)), 0),
+                fullDurationFrameCount
+            )
+            let upperBound = min(
+                max(Int((selection.endProgress * Double(fullDurationFrameCount)).rounded(.up)), lowerBound),
+                fullDurationFrameCount
+            )
+            guard lowerBound < upperBound else {
+                throw WorkspaceAudioExportError.emptyExportRange
+            }
+            exportFrameRange = lowerBound..<upperBound
+        } else {
+            exportFrameRange = 0..<fullDurationFrameCount
+        }
+
+        return AudioExportSnapshot(
+            id: request.id,
+            createdAt: request.createdAt,
+            request: request,
+            tracks: tracks,
+            sampleRate: sampleRate,
+            channelCount: channelCount,
+            fullDurationFrameCount: fullDurationFrameCount,
+            exportFrameRange: exportFrameRange,
+            leasedURLs: Array(Set(tracks.compactMap(\.sourceURL)))
+        )
+    }
+
+    private func audioExportTrackSnapshots(for scope: AudioExportScope) -> [AudioExportTrackSnapshot] {
+        let sourceTracks: [ProjectTrack]
+        switch scope {
+        case .fullMixdown, .timeRange:
+            sourceTracks = audibleProjectTracks
+        case let .trackRange(trackID, _):
+            sourceTracks = projectTracks.filter { $0.id == trackID }
+        case .stems:
+            sourceTracks = projectTracks
+        }
+
+        return sourceTracks.compactMap(audioExportTrackSnapshot(for:))
+    }
+
+    private func audioExportTrackSnapshot(for track: ProjectTrack) -> AudioExportTrackSnapshot? {
+        let source: AudioExportTrackSource
+        if
+            let fileTimeline = track.fileTimeline,
+            let fileInfo = decodableWAVFileInfo(for: track.sourceURL),
+            fileTimeline.isCompatible(with: fileInfo)
+        {
+            source = .fileTimeline(track.sourceURL, fileInfo, fileTimeline)
+        } else if let audioTimeline = track.audioTimeline {
+            source = .timeline(audioTimeline)
+        } else if let fileInfo = decodableWAVFileInfo(for: track.sourceURL) {
+            source = .file(track.sourceURL, fileInfo)
+        } else if let decodedAudioBuffer = track.decodedAudioBuffer {
+            source = .decoded(decodedAudioBuffer)
+        } else {
+            return nil
+        }
+
+        return AudioExportTrackSnapshot(
+            id: track.id,
+            name: track.name,
+            volume: track.volume,
+            source: source
+        )
+    }
+
+    private func fallbackAudioExportTrackSnapshot() -> AudioExportTrackSnapshot? {
+        guard projectTracks.isEmpty, let decodedAudioBuffer, decodedAudioBuffer.frameCount > 0 else {
+            return nil
+        }
+
+        return AudioExportTrackSnapshot(
+            id: UUID(),
+            name: selectedAudioFile?.url.deletingPathExtension().lastPathComponent ?? "Audio",
+            volume: 1,
+            source: .decoded(decodedAudioBuffer)
+        )
+    }
+
+    private nonisolated static func audioExportTiming(
+        for source: AudioExportTrackSource
+    ) -> (sampleRate: Double, channelCount: Int, frameCount: Int) {
+        switch source {
+        case let .decoded(buffer):
+            return (buffer.sampleRate, buffer.channelCount, buffer.frameCount)
+        case let .timeline(timeline):
+            return (timeline.sourceAudioBuffer.sampleRate, timeline.sourceAudioBuffer.channelCount, timeline.frameCount)
+        case let .file(_, fileInfo):
+            return (fileInfo.sampleRate, fileInfo.channelCount, fileInfo.frameCount)
+        case let .fileTimeline(_, fileInfo, fileTimeline):
+            return (fileInfo.sampleRate, fileInfo.channelCount, fileTimeline.frameCount)
+        }
+    }
+
+    private func showAudioExportWindow() {
+        let controller: AudioExportWindowController
+        if let existingController = audioExportWindowController {
+            controller = existingController
+        } else {
+            controller = AudioExportWindowController()
+            controller.onCancel = { [weak self] in
+                guard let self else {
+                    return
+                }
+                if self.audioExportService.hasActiveExport {
+                    self.audioExportService.cancel()
+                } else {
+                    self.audioExportWindowController?.close()
+                }
+            }
+            controller.onClosed = { [weak self] in
+                self?.audioExportWindowController = nil
+                self?.updateAudioExportStatusButton()
+            }
+            audioExportWindowController = controller
+        }
+
+        if let latestAudioExportProgress {
+            controller.update(progress: latestAudioExportProgress)
+        }
+        controller.show(relativeTo: window)
+        updateAudioExportStatusButton()
+    }
+
+    private func handleAudioExportProgress(_ progress: AudioExportProgress) {
+        guard shouldAcceptAudioExportUpdate(jobID: progress.jobID) else {
+            return
+        }
+
+        latestAudioExportProgress = progress
+        audioExportWindowController?.update(progress: progress)
+        if progress.stage == .completed || progress.stage == .canceled || progress.stage == .failed {
+            activeAudioExportJobID = nil
+        }
+        updateAudioExportStatusButton()
+    }
+
+    private func handleAudioExportCompletion(jobID: UUID, _ result: Result<AudioExportResult, Error>) {
+        if !shouldAcceptAudioExportUpdate(jobID: jobID) {
+            return
+        }
+
+        switch result {
+        case let .success(exportResult):
+            updateStatus("exported \(exportResult.outputURLs.count) file\(exportResult.outputURLs.count == 1 ? "" : "s")")
+            SoundtimeDiagnostics.shared.record(
+                category: .system,
+                severity: .info,
+                name: "audio-export-completed",
+                message: "Audio export completed.",
+                fields: [
+                    "jobID": exportResult.request.id.uuidString,
+                    "fileCount": "\(exportResult.outputURLs.count)",
+                    "elapsedMs": String(format: "%.1f", exportResult.elapsedSeconds * 1_000),
+                    "renderedFrameCount": "\(exportResult.renderedFrameCount)",
+                    "peakMagnitude": String(format: "%.3f", exportResult.renderStats.peakMagnitude),
+                    "clippedSamples": "\(exportResult.renderStats.clippedSampleCount)",
+                    "report": exportResult.reportURL?.path ?? "",
+                ]
+            )
+        case let .failure(error as CancellationError):
+            updateStatus("export canceled")
+            SoundtimeDiagnostics.shared.record(
+                category: .system,
+                severity: .info,
+                name: "audio-export-canceled",
+                message: "Audio export was canceled.",
+                fields: [
+                    "error": error.localizedDescription,
+                ]
+            )
+        case let .failure(error):
+            updateStatus("export failed: \(error.localizedDescription)")
+            SoundtimeDiagnostics.shared.record(
+                category: .system,
+                severity: .warning,
+                name: "audio-export-failed",
+                message: "Audio export failed.",
+                fields: [
+                    "error": error.localizedDescription,
+                ]
+            )
+        }
+        activeAudioExportJobID = nil
+        updateAudioExportStatusButton()
+    }
+
+    private func shouldAcceptAudioExportUpdate(jobID: UUID) -> Bool {
+        if let activeAudioExportJobID {
+            return activeAudioExportJobID == jobID
+        }
+        return latestAudioExportProgress?.jobID == jobID
+    }
+
+    private func updateAudioExportStatusButton() {
+        guard let progress = latestAudioExportProgress else {
+            audioExportStatusButton.isHidden = true
+            return
+        }
+
+        let percent = Int((min(max(progress.fractionCompleted, 0), 1) * 100).rounded())
+        switch progress.stage {
+        case .completed:
+            audioExportStatusButton.title = "Export complete"
+        case .failed:
+            audioExportStatusButton.title = "Export failed"
+        case .canceled:
+            audioExportStatusButton.title = "Export canceled"
+        case .preparing, .rendering, .encoding, .finishing:
+            audioExportStatusButton.title = "Export \(percent)%"
+        }
+        audioExportStatusButton.isHidden = audioExportWindowController?.window?.isVisible == true
+    }
+
+    @objc private func audioExportStatusButtonPressed(_ sender: Any?) {
+        showAudioExportWindow()
     }
 
     private func importAudioFile() {
