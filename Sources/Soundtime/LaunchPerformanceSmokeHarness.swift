@@ -381,10 +381,15 @@ enum LaunchPerformanceSmokeHarness {
             bundledPacket.visualFingerprint == launchManifest.visualFingerprint,
             "atomic launch cache packet fingerprint mismatch"
         )
-        let bundledSnapshot = try requireValue(
-            ProjectLaunchCacheBundleStore.loadSnapshotForFirstPaintIfAvailable(for: projectURL),
-            "atomic launch cache snapshot should be available for first paint"
-        )
+        let bundledSnapshot: ProjectLaunchSnapshot
+        if (publishedGeneration.snapshotByteCount ?? 0) <= ProjectLaunchSnapshotStore.firstPaintSynchronousByteLimit {
+            bundledSnapshot = try requireValue(
+                ProjectLaunchCacheBundleStore.loadSnapshotForFirstPaintIfAvailable(for: projectURL),
+                "atomic launch cache snapshot should be available for first paint"
+            )
+        } else {
+            bundledSnapshot = try ProjectLaunchCacheBundleStore.loadSnapshot(for: projectURL)
+        }
         try require(
             bundledSnapshot.visualFingerprint == launchManifest.visualFingerprint,
             "atomic launch cache snapshot fingerprint mismatch"
@@ -573,7 +578,7 @@ enum LaunchPerformanceSmokeHarness {
             )
         )
         let restorableProjectFirstPaintFrame = try requireValue(
-            ProjectLaunchCoordinator.cachedFirstPaintFrameForRestorableProject(),
+            rememberedProjectPlan.firstPaintFrame,
             "launch coordinator did not provide remembered-project first-paint data before window construction"
         )
         try require(
@@ -649,11 +654,11 @@ enum LaunchPerformanceSmokeHarness {
             snapshot: autosaveSnapshot,
             for: autosaveURL
         )
+        let recoveredAutosavePlan = ProjectLaunchCoordinator.resolveLaunchPlan(restoresLastProject: true)
         let restorableAutosaveFirstPaintFrame = try requireValue(
-            ProjectLaunchCoordinator.cachedFirstPaintFrameForRestorableProject(),
+            recoveredAutosavePlan.firstPaintFrame,
             "launch coordinator did not provide recovered-autosave first-paint data before window construction"
         )
-        let recoveredAutosavePlan = ProjectLaunchCoordinator.resolveLaunchPlan(restoresLastProject: true)
         try require(
             recoveredAutosavePlan.restoresProject,
             "recovered autosave launch plan should restore a project"
@@ -1035,8 +1040,8 @@ enum LaunchPerformanceSmokeHarness {
                 "launchGenerationManifestBytes": "\(publishedGeneration.manifestByteCount)",
                 "launchGenerationPacketBytes": "\(publishedGeneration.firstFramePacketByteCount ?? 0)",
                 "launchGenerationSnapshotBytes": "\(publishedGeneration.snapshotByteCount ?? 0)",
-                "firstFramePacketMaxBins": "\(ProjectFirstFrameWaveformPacket.maximumOverviewBinCount)",
-                "firstPaintByteLimit": "\(ProjectLaunchSnapshotStore.firstPaintSynchronousByteLimit)",
+                "firstFramePacketMaxBins": "\(ProjectFirstFrameWaveformPacket.maximumOverviewBinCount(forTrackCount: trackCount))",
+                "firstPaintByteLimit": "\(ProjectFirstFrameWaveformPacketStore.firstPaintSynchronousByteLimit)",
                 "legacyJSONBytes": "\(legacyJSONData.count)",
                 "drawableWaveformTracks": "\(snapshotReadiness.drawableWaveformTrackCount)",
                 "packetDrawableWaveformTracks": "\(packetReadiness.drawableWaveformTrackCount)",

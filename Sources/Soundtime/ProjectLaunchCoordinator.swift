@@ -222,6 +222,36 @@ enum ProjectLaunchCoordinator {
             return plan
         }
 
+        return resolveLaunchPlan(target: target, startedAt: startedAt)
+    }
+
+    static func resolveLaunchPlanForProject(
+        projectURL: URL,
+        reason: String = "explicit-project"
+    ) -> ProjectLaunchPlan {
+        let startedAt = CACurrentMediaTime()
+        let standardizedProjectURL = projectURL.standardizedFileURL
+        guard FileManager.default.fileExists(atPath: standardizedProjectURL.path) else {
+            var plan = ProjectLaunchPlan.newProject(reason: "\(reason)-missing")
+            plan.resolveMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
+            return plan
+        }
+
+        return resolveLaunchPlan(
+            target: RestorableLaunchTarget(
+                targetProjectURL: standardizedProjectURL,
+                visualCacheURL: standardizedProjectURL,
+                usesAutosaveRecovery: true,
+                reason: reason
+            ),
+            startedAt: startedAt
+        )
+    }
+
+    private static func resolveLaunchPlan(
+        target: RestorableLaunchTarget,
+        startedAt: CFTimeInterval
+    ) -> ProjectLaunchPlan {
         let overlay = SoundtimeProjectStore.rememberedLaunchStateOverlay(for: target.targetProjectURL)
         let firstPaintFrame = (
             loadCachedFirstPaintFrame(projectURL: target.visualCacheURL) ??

@@ -2,6 +2,163 @@ import AppKit
 import QuartzCore
 import UniformTypeIdentifiers
 
+struct WorkspaceStartupCloseSmokeSnapshot: Sendable {
+    var trackCount: Int
+    var drawableWaveformTrackCount: Int
+    var durationOnlyTrackCount: Int
+    var blankTrackCount: Int
+    var placeholderTrackCount: Int
+    var mutedTrackCount: Int
+    var soloedTrackCount: Int
+    var readinessDescription: String
+    var isVisualReady: Bool
+    var playbackHasSource: Bool
+    var playbackPrimedTrackCount: Int
+    var isLaunchVisualPreviewPendingImmediateRender: Bool
+    var isDeferredProjectRestorePending: Bool
+    var isLoadingProject: Bool
+    var hasCurrentProjectURL: Bool
+    var isLaunchSnapshotWriteScheduled: Bool
+    var isLaunchCacheWriteInFlight: Bool
+    var hasPendingLaunchCacheWrite: Bool
+    var statusText: String
+}
+
+struct WorkspaceUserPerceivedTimingSmokeSnapshot: Sendable {
+    var trackCount: Int
+    var drawableWaveformTrackCount: Int
+    var playbackHasSource: Bool
+    var playbackPrimedTrackCount: Int
+    var isPlaying: Bool
+    var playheadProgress: Float
+    var selectedRangeStartProgress: Double?
+    var selectedRangeEndProgress: Double?
+    var selectedTrackID: UUID?
+    var hasClipboard: Bool
+    var editAnimationGeneration: Int
+    var projectDuration: TimeInterval
+    var currentProjectPath: String?
+    var statusText: String
+}
+
+struct WorkspaceUserPerceivedTimingSmokeResult: Sendable {
+    var accepted: Bool
+    var elapsedMilliseconds: Double
+    var message: String
+    var editAnimationGenerationChanged: Bool
+}
+
+struct WorkspaceVisualInvariantSmokeSnapshot: Codable, Sendable {
+    struct Track: Codable, Sendable {
+        var id: UUID
+        var name: String
+        var hasDrawableWaveform: Bool
+        var hasDurationHintOnly: Bool
+        var isPlaceholder: Bool
+        var isMuted: Bool
+        var isSoloed: Bool
+        var durationSeconds: TimeInterval
+        var waveformBinCount: Int
+        var sourceWaveformBinCount: Int
+        var transcriptWordCount: Int
+    }
+
+    var trackCount: Int
+    var drawableWaveformTrackCount: Int
+    var durationOnlyTrackCount: Int
+    var blankTrackCount: Int
+    var placeholderTrackCount: Int
+    var mutedTrackCount: Int
+    var soloedTrackCount: Int
+    var readinessDescription: String
+    var isVisualReady: Bool
+    var playbackHasSource: Bool
+    var playbackPrimedTrackCount: Int
+    var isLoadingProject: Bool
+    var playheadProgress: Float
+    var projectDurationSeconds: TimeInterval
+    var selectedRangeStartProgress: Double?
+    var selectedRangeEndProgress: Double?
+    var selectedTrackID: UUID?
+    var selectedDurationSeconds: TimeInterval?
+    var hasClipboard: Bool
+    var editAnimationGeneration: Int
+    var transcriptLayerVisible: Bool
+    var transcriptTrackCount: Int
+    var transcriptWordCount: Int
+    var activeTranscriptWordID: UUID?
+    var timelineViewportStartProgress: Float?
+    var timelineViewportDurationProgress: Float?
+    var currentProjectPath: String?
+    var statusText: String
+    var tracks: [Track]
+}
+
+struct WorkspaceHotPathContractFrameStatsSnapshot: Codable, Sendable {
+    var framesPerSecond: Int
+    var averageFrameTimeMilliseconds: Double
+    var worstFrameTimeMilliseconds: Double
+    var waveformRenderer: String
+    var cpuWaveformVertexCount: Int
+    var gpuWaveformDrawCount: Int
+    var shaderBufferUploadCount: Int
+    var shaderBufferUploadByteCount: Int
+    var shaderBufferUploadInFlightCount: Int
+    var cpuWaveformFallbackDrawCount: Int
+    var waveformFallbackDrawCount: Int
+    var waveformLastGoodHoldCount: Int
+    var waveformResidentMissCount: Int
+    var waveformHotPathViolationCount: Int
+    var waveformHotPathReason: String
+    var effectVertexCount: Int
+    var effectDroppedVertexCount: Int
+    var deletionEffectCount: Int
+
+    init(_ stats: TimelineFrameStats) {
+        framesPerSecond = stats.framesPerSecond
+        averageFrameTimeMilliseconds = stats.averageFrameTimeMilliseconds
+        worstFrameTimeMilliseconds = stats.worstFrameTimeMilliseconds
+        waveformRenderer = stats.waveformRenderer
+        cpuWaveformVertexCount = stats.cpuWaveformVertexCount
+        gpuWaveformDrawCount = stats.gpuWaveformDrawCount
+        shaderBufferUploadCount = stats.shaderBufferUploadCount
+        shaderBufferUploadByteCount = stats.shaderBufferUploadByteCount
+        shaderBufferUploadInFlightCount = stats.shaderBufferUploadInFlightCount
+        cpuWaveformFallbackDrawCount = stats.cpuWaveformFallbackDrawCount
+        waveformFallbackDrawCount = stats.waveformFallbackDrawCount
+        waveformLastGoodHoldCount = stats.waveformLastGoodHoldCount
+        waveformResidentMissCount = stats.waveformResidentMissCount
+        waveformHotPathViolationCount = stats.waveformHotPathViolationCount
+        waveformHotPathReason = stats.waveformHotPathReason
+        effectVertexCount = stats.effectVertexCount
+        effectDroppedVertexCount = stats.effectDroppedVertexCount
+        deletionEffectCount = stats.deletionEffectCount
+    }
+}
+
+struct WorkspaceHotPathContractSmokeSnapshot: Codable, Sendable {
+    var trackCount: Int
+    var drawableWaveformTrackCount: Int
+    var blankTrackCount: Int
+    var isLoadingProject: Bool
+    var playbackHasSource: Bool
+    var playbackPrimedTrackCount: Int
+    var isLaunchSnapshotWriteScheduled: Bool
+    var isLaunchCacheWriteInFlight: Bool
+    var hasPendingLaunchCacheWrite: Bool
+    var isAutosaveScheduled: Bool
+    var autosaveScheduleReason: String
+    var frameStats: WorkspaceHotPathContractFrameStatsSnapshot?
+    var transcriptOverlay: TimelineTranscriptOverlayDiagnosticsSnapshot
+    var performanceDashboard: PerformanceDashboardDiagnosticsSnapshot
+    var mainThreadStallCount: Int
+    var lastMainThreadStallMilliseconds: Double
+    var warningEventCount: Int
+    var severeEventCount: Int
+    var diagnosticEventNames: [String]
+    var statusText: String
+}
+
 final class WorkspaceView: NSView {
     private static var defaultDebugToolsVisible: Bool {
         #if DEBUG
@@ -613,6 +770,8 @@ final class WorkspaceView: NSView {
     private var projectPlaybackPrimedTrackIDs: Set<UUID> = []
     private var projectHydrationCompletedTrackIDs: Set<UUID> = []
     private var projectHydrationFailedTrackIDs: Set<UUID> = []
+    private var projectHydrationLaunchCacheWriteScheduled = false
+    private var lastProjectReadinessHydrationDiagnosticTime: CFTimeInterval = -Double.infinity
     private var audioClipboard: AudioClipboard? {
         didSet {
             updateEffectCommandState()
@@ -744,6 +903,15 @@ final class WorkspaceView: NSView {
     private var launchWaveformCacheRequestIDs: [String: UUID] = [:]
     private var launchSnapshotSaveWorkItem: DispatchWorkItem?
     private var launchSnapshotSaveGeneration = 0
+    private let launchCacheWriteQueue = DispatchQueue(label: "Soundtime.launch-cache-writer", qos: .utility)
+    private let closeStatePersistenceQueue = DispatchQueue(label: "Soundtime.close-state-persistence", qos: .utility)
+    private var launchCacheWriteInFlight = false
+    private var pendingLaunchCacheWriteRequest: LaunchCacheWriteRequest?
+    private var lastTimelineHotInteractionTime: CFTimeInterval = -Double.infinity
+    private var hotPathContractSmokeProtectedUntil: CFTimeInterval = -Double.infinity
+    private var lastLaunchCacheHotPathDeferralEventTimeByKey: [String: CFTimeInterval] = [:]
+    private let launchCacheHotPathQuietInterval: CFTimeInterval = 0.75
+    private let launchCacheHotPathDeferralEventInterval: CFTimeInterval = 2.0
     private let inputRecorder = AudioInputRecorder()
     private var recordingTrackID: UUID?
     private var recordingTakeWriter: StreamingWAVTakeWriter?
@@ -782,7 +950,7 @@ final class WorkspaceView: NSView {
     private let visualAudioSyncHardCorrectionThreshold: TimeInterval = 0.075
     private let visualAudioSyncResponseDuration: TimeInterval = 0.12
     private let visualAudioSyncMinimumCorrectionInterval: TimeInterval = 0.1
-    private let transportArrowSkipDuration: TimeInterval = 10
+    private let transportArrowSkipDuration: TimeInterval = 5
     private let wavPreviewLevels = [
         WAVPreviewLevel(targetBinCount: 16_384, samplesPerBin: 64),
         WAVPreviewLevel(targetBinCount: 24_576, samplesPerBin: 64),
@@ -1047,6 +1215,7 @@ final class WorkspaceView: NSView {
     private let autosaveDelay: TimeInterval = 1.5
     private var autosaveWorkItem: DispatchWorkItem?
     private var autosaveGeneration = 0
+    private var latestAutosaveScheduleReason = "none"
     private let viewportPersistenceDelay: TimeInterval = 0.2
     private var viewportPersistenceWorkItem: DispatchWorkItem?
     private var latestTimelineViewportForPersistence: SoundtimeProject.TimelineViewport?
@@ -1406,12 +1575,15 @@ final class WorkspaceView: NSView {
             self?.reapplyLastEffect()
         }
         timelineSurface.onSeekRequested = { [weak self] progress in
+            self?.markTimelineHotInteraction(reason: "seek")
             self?.seek(to: progress)
         }
         timelineSurface.onPlayFromProgress = { [weak self] progress in
+            self?.markTimelineHotInteraction(reason: "play-from-progress")
             self?.play(from: progress)
         }
         timelineSurface.onSelectionChanged = { [weak self] selection in
+            self?.markTimelineHotInteraction(reason: "selection")
             self?.updateSelection(selection)
         }
         timelineSurface.onTrimRequested = { [weak self] trimRange in
@@ -1424,9 +1596,11 @@ final class WorkspaceView: NSView {
             self?.updateFrameStats(frameStats)
         }
         timelineSurface.onViewportChanged = { [weak self] viewport in
+            self?.markTimelineHotInteraction(reason: "viewport")
             self?.timelineViewportDidChange(viewport)
         }
         timelineSurface.onTimelineInteractionBegan = { [weak self] in
+            self?.markTimelineHotInteraction(reason: "timeline-began")
             self?.clearSelectedTrack()
         }
         timelineSurface.onTrackLaneLayoutChanged = { [weak self] layout in
@@ -1437,6 +1611,9 @@ final class WorkspaceView: NSView {
         }
         timelineSurface.onLoopRangeEnabledChanged = { [weak self] isEnabled in
             self?.updateTimelineLoopRangeEnabled(isEnabled)
+        }
+        timelineSurface.onPlaybackVisualProgressChanged = { [weak self] progress in
+            self?.updateTranscriptActiveWord(progress: progress)
         }
         addTrackButton.onPressed = { [weak self] in
             self?.addEmptyTrack()
@@ -1727,14 +1904,20 @@ final class WorkspaceView: NSView {
         let startedAt = CACurrentMediaTime()
         viewportPersistenceWorkItem?.cancel()
         viewportPersistenceWorkItem = nil
+        autosaveWorkItem?.cancel()
+        autosaveWorkItem = nil
+        autosaveGeneration += 1
+        latestAutosaveScheduleReason = "window-close"
         launchSnapshotSaveWorkItem?.cancel()
         launchSnapshotSaveWorkItem = nil
         launchSnapshotSaveGeneration += 1
+        pendingLaunchCacheWriteRequest = nil
         launchWaveformCacheTasks.values.forEach { $0.cancel() }
         launchWaveformCacheTasks.removeAll()
         launchWaveformCacheRequestIDs.removeAll()
         projectHydrationQueue?.cancel()
         projectHydrationQueue = nil
+        projectHydrationLaunchCacheWriteScheduled = false
         persistLatestTimelineViewport(flushImmediately: false, schedulesLaunchSnapshot: false)
 
         let elapsedMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
@@ -1757,9 +1940,519 @@ final class WorkspaceView: NSView {
                 "tracks": "\(projectTracks.count)",
                 "launchSnapshotWrite": "false",
                 "firstFramePacketWrite": "false",
+                "canceledAutosaveWork": "true",
                 "canceledLaunchCacheWork": "true",
             ]
         )
+    }
+
+    func startupCloseSmokeSnapshot() -> WorkspaceStartupCloseSmokeSnapshot {
+        let drawableWaveformTrackCount = projectTracks.filter {
+            $0.waveformOverview?.isEmpty == false || $0.sourceWaveformOverview?.isEmpty == false
+        }.count
+        let durationOnlyTrackCount = projectTracks.filter {
+            ($0.waveformOverview?.isEmpty ?? true) &&
+                ($0.sourceWaveformOverview?.isEmpty ?? true) &&
+                ($0.durationHint ?? 0) > 0
+        }.count
+        let blankTrackCount = projectTracks.count - drawableWaveformTrackCount - durationOnlyTrackCount
+        let placeholderTrackCount = projectTracks.filter {
+            $0.sourceURL.path == "/dev/null" &&
+                ($0.waveformOverview?.isEmpty ?? true) &&
+                ($0.sourceWaveformOverview?.isEmpty ?? true)
+        }.count
+
+        let visualReady: Bool
+        switch projectReadinessState {
+        case .empty, .launchPreviewLoading, .failed:
+            visualReady = drawableWaveformTrackCount > 0 && blankTrackCount == 0
+        case .visualReady, .playbackHydrating, .playbackReady, .playbackReadyWithFailures:
+            visualReady = true
+        }
+
+        return WorkspaceStartupCloseSmokeSnapshot(
+            trackCount: projectTracks.count,
+            drawableWaveformTrackCount: drawableWaveformTrackCount,
+            durationOnlyTrackCount: durationOnlyTrackCount,
+            blankTrackCount: max(0, blankTrackCount),
+            placeholderTrackCount: placeholderTrackCount,
+            mutedTrackCount: projectTracks.filter(\.isMuted).count,
+            soloedTrackCount: projectTracks.filter(\.isSoloed).count,
+            readinessDescription: projectReadinessState.statusText,
+            isVisualReady: visualReady,
+            playbackHasSource: playbackController.hasSource,
+            playbackPrimedTrackCount: projectPlaybackPrimedTrackIDs.count,
+            isLaunchVisualPreviewPendingImmediateRender: isLaunchVisualPreviewPendingImmediateRender,
+            isDeferredProjectRestorePending: isDeferredProjectRestorePending,
+            isLoadingProject: isLoadingProject,
+            hasCurrentProjectURL: currentProjectURL != nil,
+            isLaunchSnapshotWriteScheduled: launchSnapshotSaveWorkItem != nil,
+            isLaunchCacheWriteInFlight: launchCacheWriteInFlight,
+            hasPendingLaunchCacheWrite: pendingLaunchCacheWriteRequest != nil,
+            statusText: currentPlaybackStatus
+        )
+    }
+
+    func startupCloseSmokeRequestLaunchCacheDuringHotInteraction() -> Bool {
+        markTimelineHotInteraction(reason: "startup-close-smoke")
+        return scheduleLaunchSnapshotSaveIfNeeded(reason: "startup-close-hot-path-smoke", delay: 0)
+    }
+
+    func userPerceivedTimingSmokeSnapshot() -> WorkspaceUserPerceivedTimingSmokeSnapshot {
+        let startupSnapshot = startupCloseSmokeSnapshot()
+        let playbackSnapshot = playbackController.snapshot()
+        return WorkspaceUserPerceivedTimingSmokeSnapshot(
+            trackCount: startupSnapshot.trackCount,
+            drawableWaveformTrackCount: startupSnapshot.drawableWaveformTrackCount,
+            playbackHasSource: startupSnapshot.playbackHasSource,
+            playbackPrimedTrackCount: startupSnapshot.playbackPrimedTrackCount,
+            isPlaying: playbackSnapshot.isPlaying,
+            playheadProgress: playbackSnapshot.progress,
+            selectedRangeStartProgress: selectedTimelineRange?.startProgress,
+            selectedRangeEndProgress: selectedTimelineRange?.endProgress,
+            selectedTrackID: selectedTimelineRange?.trackID,
+            hasClipboard: audioClipboard != nil,
+            editAnimationGeneration: deleteAnimationGeneration,
+            projectDuration: projectSelectionDuration,
+            currentProjectPath: currentProjectURL?.path,
+            statusText: currentPlaybackStatus
+        )
+    }
+
+    func visualInvariantSmokeSnapshot() -> WorkspaceVisualInvariantSmokeSnapshot {
+        let startupSnapshot = startupCloseSmokeSnapshot()
+        let playbackSnapshot = playbackController.snapshot()
+        let projectDuration = projectSelectionDuration
+        let selectedDuration = selectedTimelineRange.map {
+            $0.duration(in: projectDuration)
+        }
+        let timelineViewport = currentTimelineViewport()
+        let trackSnapshots = projectTracks.map { track in
+            let hasDrawableWaveform = track.waveformOverview?.isEmpty == false ||
+                track.sourceWaveformOverview?.isEmpty == false
+            let hasDurationHintOnly = !hasDrawableWaveform && (track.durationHint ?? 0) > 0
+            let isPlaceholder = track.sourceURL.path == "/dev/null" && !hasDrawableWaveform
+            return WorkspaceVisualInvariantSmokeSnapshot.Track(
+                id: track.id,
+                name: track.name,
+                hasDrawableWaveform: hasDrawableWaveform,
+                hasDurationHintOnly: hasDurationHintOnly,
+                isPlaceholder: isPlaceholder,
+                isMuted: track.isMuted,
+                isSoloed: track.isSoloed,
+                durationSeconds: trackDuration(for: track),
+                waveformBinCount: track.waveformOverview?.bins.count ?? 0,
+                sourceWaveformBinCount: track.sourceWaveformOverview?.bins.count ?? 0,
+                transcriptWordCount: track.transcript?.words.count ?? 0
+            )
+        }
+
+        return WorkspaceVisualInvariantSmokeSnapshot(
+            trackCount: startupSnapshot.trackCount,
+            drawableWaveformTrackCount: startupSnapshot.drawableWaveformTrackCount,
+            durationOnlyTrackCount: startupSnapshot.durationOnlyTrackCount,
+            blankTrackCount: startupSnapshot.blankTrackCount,
+            placeholderTrackCount: startupSnapshot.placeholderTrackCount,
+            mutedTrackCount: startupSnapshot.mutedTrackCount,
+            soloedTrackCount: startupSnapshot.soloedTrackCount,
+            readinessDescription: startupSnapshot.readinessDescription,
+            isVisualReady: startupSnapshot.isVisualReady,
+            playbackHasSource: startupSnapshot.playbackHasSource,
+            playbackPrimedTrackCount: startupSnapshot.playbackPrimedTrackCount,
+            isLoadingProject: startupSnapshot.isLoadingProject,
+            playheadProgress: playbackSnapshot.progress,
+            projectDurationSeconds: projectDuration,
+            selectedRangeStartProgress: selectedTimelineRange?.startProgress,
+            selectedRangeEndProgress: selectedTimelineRange?.endProgress,
+            selectedTrackID: selectedTimelineRange?.trackID,
+            selectedDurationSeconds: selectedDuration,
+            hasClipboard: audioClipboard != nil,
+            editAnimationGeneration: deleteAnimationGeneration,
+            transcriptLayerVisible: isTranscriptLayerVisible,
+            transcriptTrackCount: projectTracks.filter { $0.transcript != nil }.count,
+            transcriptWordCount: projectTracks.reduce(0) { $0 + ($1.transcript?.words.count ?? 0) },
+            activeTranscriptWordID: activeTranscriptWordID,
+            timelineViewportStartProgress: timelineViewport?.startProgress,
+            timelineViewportDurationProgress: timelineViewport?.durationProgress,
+            currentProjectPath: currentProjectURL?.path,
+            statusText: currentPlaybackStatus,
+            tracks: trackSnapshots
+        )
+    }
+
+    func hotPathContractSmokeResetDiagnostics() {
+        latestTimelineFrameStats = nil
+        timelineSurface.hotPathContractSmokeResetTranscriptDiagnostics()
+        PerformanceDashboardWindowController.resetDiagnosticsForSmokeTesting()
+        SoundtimeMainThreadStallMonitor.shared.resetForSmokeTesting()
+        SoundtimeDiagnostics.shared.resetForSmokeTesting()
+    }
+
+    func hotPathContractSmokeBeginFrameStatsWindow(duration: CFTimeInterval = 0.45) {
+        hotPathContractSmokeProtectedUntil = max(
+            hotPathContractSmokeProtectedUntil,
+            CACurrentMediaTime() + max(duration, 0.01) + launchCacheHotPathQuietInterval
+        )
+        timelineSurface.hotPathContractSmokeBeginFrameStatsWindow(duration: duration)
+    }
+
+    func hotPathContractSmokeHasFrameStats() -> Bool {
+        latestTimelineFrameStats != nil
+    }
+
+    func hotPathContractSmokeIsProjectFullyHydrated() -> Bool {
+        guard !projectTracks.isEmpty else {
+            return projectHydrationQueue == nil
+        }
+        return projectHydrationQueue == nil &&
+            projectHydrationCompletedTrackIDs.count + projectHydrationFailedTrackIDs.count >= projectTracks.count
+    }
+
+    func interactionReplaySmokeHasUndoState() -> Bool {
+        !editUndoStack.isEmpty
+    }
+
+    func hotPathContractSmokeZoomBurst(stepCount: Int = 8, around anchorProgress: Float = 0.5) {
+        timelineSurface.hotPathContractSmokeZoomBurst(stepCount: stepCount, around: anchorProgress)
+    }
+
+    func interactionReplaySmokePanBurst(stepCount: Int = 12, progressDistance: Float = 0.18) -> WorkspaceUserPerceivedTimingSmokeResult {
+        let generationBefore = deleteAnimationGeneration
+        let submissionMilliseconds = timelineSurface.interactionReplaySmokePanBurst(stepCount: stepCount, progressDistance: progressDistance)
+        return WorkspaceUserPerceivedTimingSmokeResult(
+            accepted: true,
+            elapsedMilliseconds: submissionMilliseconds,
+            message: "pan replay submitted",
+            editAnimationGenerationChanged: generationBefore != deleteAnimationGeneration
+        )
+    }
+
+    func interactionReplaySmokeSetLoopRange(
+        startProgress: Float,
+        durationSeconds: TimeInterval
+    ) -> WorkspaceUserPerceivedTimingSmokeResult {
+        let generationBefore = deleteAnimationGeneration
+        let startedAt = CACurrentMediaTime()
+        let projectDuration = max(projectSelectionDuration, 0.001)
+        let durationProgress = Float(max(durationSeconds / projectDuration, 0.0005))
+        let start = min(max(startProgress, 0), max(0, 1 - durationProgress))
+        let loopRange = TimelineLoopRange(startProgress: start, endProgress: min(start + durationProgress, 1))
+        updateTimelineLoopRange(loopRange)
+        updateTimelineLoopRangeEnabled(true)
+        timelineSurface.displayLoopRange(loopRange)
+        timelineSurface.displayLoopRangeEnabled(true)
+        let elapsedMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
+        return WorkspaceUserPerceivedTimingSmokeResult(
+            accepted: loopRange.durationProgress > 0,
+            elapsedMilliseconds: elapsedMilliseconds,
+            message: "loop range replay state submitted",
+            editAnimationGenerationChanged: generationBefore != deleteAnimationGeneration
+        )
+    }
+
+    func interactionReplaySmokeUndoLastEdit() -> WorkspaceUserPerceivedTimingSmokeResult {
+        let generationBefore = deleteAnimationGeneration
+        let startedAt = CACurrentMediaTime()
+        let hadUndo = !editUndoStack.isEmpty
+        undoLastEdit()
+        let elapsedMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
+        return WorkspaceUserPerceivedTimingSmokeResult(
+            accepted: hadUndo,
+            elapsedMilliseconds: elapsedMilliseconds,
+            message: hadUndo ? "undo replay completed" : "undo replay skipped without undo state",
+            editAnimationGenerationChanged: generationBefore != deleteAnimationGeneration
+        )
+    }
+
+    func interactionReplaySmokeTranscriptHoverClickSelect() -> WorkspaceUserPerceivedTimingSmokeResult {
+        let generationBefore = deleteAnimationGeneration
+        let startedAt = CACurrentMediaTime()
+        hotPathContractSmokeShowTranscriptLayerIfAvailable()
+        let accepted = timelineSurface.interactionReplaySmokeTranscriptHoverClickSelect()
+        if accepted {
+            updateTranscriptActiveWord(progress: playbackController.snapshot().progress)
+        }
+        let elapsedMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
+        return WorkspaceUserPerceivedTimingSmokeResult(
+            accepted: accepted,
+            elapsedMilliseconds: elapsedMilliseconds,
+            message: accepted ? "transcript interaction replay submitted" : "transcript interaction replay found no visible words",
+            editAnimationGenerationChanged: generationBefore != deleteAnimationGeneration
+        )
+    }
+
+    func hotPathContractSmokeShowDevelopmentConsole() {
+        PerformanceDashboardWindowController.shared.showDashboard(relativeTo: window)
+    }
+
+    func hotPathContractSmokeCloseDevelopmentConsole() {
+        PerformanceDashboardWindowController.closeIfLoaded()
+    }
+
+    func hotPathContractSmokeShowTranscriptLayerIfAvailable() {
+        guard projectTracks.contains(where: { $0.transcript != nil }) else {
+            return
+        }
+        isTranscriptLayerVisible = true
+        timelineSurface.displayTranscriptMode(.waveformOverlay)
+        refreshTranscriptActiveWordForCurrentVisualPlayhead()
+    }
+
+    func hotPathContractSmokeSnapshot() -> WorkspaceHotPathContractSmokeSnapshot {
+        let startupSnapshot = startupCloseSmokeSnapshot()
+        let diagnostics = SoundtimeDiagnostics.shared.snapshot(limit: 256)
+        return WorkspaceHotPathContractSmokeSnapshot(
+            trackCount: startupSnapshot.trackCount,
+            drawableWaveformTrackCount: startupSnapshot.drawableWaveformTrackCount,
+            blankTrackCount: startupSnapshot.blankTrackCount,
+            isLoadingProject: startupSnapshot.isLoadingProject,
+            playbackHasSource: startupSnapshot.playbackHasSource,
+            playbackPrimedTrackCount: startupSnapshot.playbackPrimedTrackCount,
+            isLaunchSnapshotWriteScheduled: startupSnapshot.isLaunchSnapshotWriteScheduled,
+            isLaunchCacheWriteInFlight: startupSnapshot.isLaunchCacheWriteInFlight,
+            hasPendingLaunchCacheWrite: startupSnapshot.hasPendingLaunchCacheWrite,
+            isAutosaveScheduled: autosaveWorkItem != nil,
+            autosaveScheduleReason: latestAutosaveScheduleReason,
+            frameStats: latestTimelineFrameStats.map(WorkspaceHotPathContractFrameStatsSnapshot.init),
+            transcriptOverlay: timelineSurface.hotPathContractSmokeTranscriptDiagnosticsSnapshot(),
+            performanceDashboard: PerformanceDashboardWindowController.diagnosticsSnapshotForSmokeTesting(),
+            mainThreadStallCount: diagnostics.mainThreadStallCount,
+            lastMainThreadStallMilliseconds: diagnostics.lastMainThreadStallMilliseconds,
+            warningEventCount: diagnostics.warningEventCount,
+            severeEventCount: diagnostics.severeEventCount,
+            diagnosticEventNames: diagnostics.events.map(\.name),
+            statusText: currentPlaybackStatus
+        )
+    }
+
+    func userPerceivedTimingSmokeStartPlayback() -> WorkspaceUserPerceivedTimingSmokeResult {
+        let generationBefore = deleteAnimationGeneration
+        let startedAt = CACurrentMediaTime()
+        if !playbackController.isPlaying {
+            togglePlayback()
+        }
+        let elapsedMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
+        let isPlaying = playbackController.snapshot().isPlaying
+        return WorkspaceUserPerceivedTimingSmokeResult(
+            accepted: isPlaying,
+            elapsedMilliseconds: elapsedMilliseconds,
+            message: isPlaying ? "playback started" : "playback did not start",
+            editAnimationGenerationChanged: generationBefore != deleteAnimationGeneration
+        )
+    }
+
+    func userPerceivedTimingSmokePausePlayback() -> WorkspaceUserPerceivedTimingSmokeResult {
+        let generationBefore = deleteAnimationGeneration
+        let startedAt = CACurrentMediaTime()
+        if playbackController.isPlaying {
+            togglePlayback()
+        }
+        let elapsedMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
+        let isPaused = !playbackController.snapshot().isPlaying
+        return WorkspaceUserPerceivedTimingSmokeResult(
+            accepted: isPaused,
+            elapsedMilliseconds: elapsedMilliseconds,
+            message: isPaused ? "playback paused" : "playback did not pause",
+            editAnimationGenerationChanged: generationBefore != deleteAnimationGeneration
+        )
+    }
+
+    func userPerceivedTimingSmokeSeek(to progress: Float) -> WorkspaceUserPerceivedTimingSmokeResult {
+        let generationBefore = deleteAnimationGeneration
+        let startedAt = CACurrentMediaTime()
+        seek(to: min(max(progress, 0), 1))
+        displayPlaybackVisuals(
+            progress: playbackController.snapshot().progress,
+            isPlaying: playbackController.snapshot().isPlaying,
+            syncPlayhead: true,
+            synchronizesRenderer: true
+        )
+        let elapsedMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
+        return WorkspaceUserPerceivedTimingSmokeResult(
+            accepted: playbackController.hasSource,
+            elapsedMilliseconds: elapsedMilliseconds,
+            message: playbackController.hasSource ? "seek visual state published" : "seek skipped without playback source",
+            editAnimationGenerationChanged: generationBefore != deleteAnimationGeneration
+        )
+    }
+
+    func userPerceivedTimingSmokeSelectRange(
+        trackIndex: Int,
+        startProgress: Double,
+        endProgress: Double,
+        velocityPixelsPerSecond: CGFloat
+    ) -> WorkspaceUserPerceivedTimingSmokeResult {
+        let generationBefore = deleteAnimationGeneration
+        let startedAt = CACurrentMediaTime()
+        guard projectTracks.indices.contains(trackIndex) else {
+            return WorkspaceUserPerceivedTimingSmokeResult(
+                accepted: false,
+                elapsedMilliseconds: (CACurrentMediaTime() - startedAt) * 1_000,
+                message: "selection target track was missing",
+                editAnimationGenerationChanged: false
+            )
+        }
+
+        let trackID = projectTracks[trackIndex].id
+        let selection = TimelineSelection(
+            startProgress: startProgress,
+            endProgress: endProgress,
+            trackID: trackID
+        )
+        activeTrackID = trackID
+        selectedTrackID = nil
+        selectedTrackIDs.removeAll()
+        trackSelectionAnchorID = nil
+        selectedTimelineRange = selection
+        mirrorTimelineSelectionToTranscript(selection)
+        publishSelectedTracksToTimeline()
+        syncActiveTrackFields()
+        timelineSurface.displayGainPreview(selection: nil, gain: 1)
+        timelineSurface.userPerceivedTimingSmokeDisplayLiveSelection(
+            selection,
+            leadingProgress: endProgress >= startProgress ? selection.endProgress : selection.startProgress,
+            velocityPixelsPerSecond: velocityPixelsPerSecond,
+            direction: endProgress >= startProgress ? 1 : -1
+        )
+        updateEffectCommandState()
+        updateStatus(currentPlaybackStatus)
+
+        return WorkspaceUserPerceivedTimingSmokeResult(
+            accepted: selection.durationProgress > 0,
+            elapsedMilliseconds: (CACurrentMediaTime() - startedAt) * 1_000,
+            message: "selection visual state published",
+            editAnimationGenerationChanged: generationBefore != deleteAnimationGeneration
+        )
+    }
+
+    func userPerceivedTimingSmokePrepareClipboardFromSelection() -> WorkspaceUserPerceivedTimingSmokeResult {
+        let generationBefore = deleteAnimationGeneration
+        let startedAt = CACurrentMediaTime()
+        guard
+            let target = currentEditableSelectionTarget(),
+            projectTracks.indices.contains(target.trackIndex)
+        else {
+            return WorkspaceUserPerceivedTimingSmokeResult(
+                accepted: false,
+                elapsedMilliseconds: (CACurrentMediaTime() - startedAt) * 1_000,
+                message: "no editable selection to copy",
+                editAnimationGenerationChanged: false
+            )
+        }
+
+        let track = projectTracks[target.trackIndex]
+        let overview = selectedWaveformOverview(
+            from: track.waveformOverview ?? track.sourceWaveformOverview,
+            selection: target.editSelection
+        ) ?? WaveformOverview(
+            duration: max(target.editSelection.duration(in: trackDuration(for: track)), 0.000_001),
+            bins: []
+        )
+
+        if
+            let fileTimeline = try? editableFileTimeline(forTrackAt: target.trackIndex),
+            let clip = fileTimeline.clip(for: target.editSelection)
+        {
+            audioClipboard = AudioClipboard(
+                buffer: nil,
+                waveformOverview: overview,
+                fileClipSourceURL: track.sourceURL,
+                fileClip: clip
+            )
+        } else if let audioTimeline = track.audioTimeline {
+            let buffer = audioTimeline.render(selection: target.editSelection)
+            audioClipboard = AudioClipboard(
+                buffer: buffer,
+                waveformOverview: overview
+            )
+        } else {
+            let fallbackBuffer = userPerceivedTimingSmokeClipboardBuffer(
+                duration: min(
+                    max(target.editSelection.duration(in: max(trackDuration(for: track), 0.000_001)), 0.05),
+                    0.25
+                )
+            )
+            audioClipboard = AudioClipboard(
+                buffer: fallbackBuffer,
+                waveformOverview: WaveformOverviewBuilder.build(from: fallbackBuffer, targetBinCount: 256)
+            )
+        }
+
+        return WorkspaceUserPerceivedTimingSmokeResult(
+            accepted: audioClipboard != nil,
+            elapsedMilliseconds: (CACurrentMediaTime() - startedAt) * 1_000,
+            message: "clipboard prepared",
+            editAnimationGenerationChanged: generationBefore != deleteAnimationGeneration
+        )
+    }
+
+    private func userPerceivedTimingSmokeClipboardBuffer(duration: TimeInterval) -> DecodedAudioBuffer {
+        let sampleRate = 48_000.0
+        let frameCount = max(Int((duration * sampleRate).rounded()), 1)
+        var samples = [Float](repeating: 0, count: frameCount)
+        for frame in 0..<frameCount {
+            let phase = Double(frame) / sampleRate
+            let envelope = Float(sin(Double.pi * Double(frame) / Double(max(frameCount - 1, 1))))
+            samples[frame] = Float(sin(phase * 2 * Double.pi * 440)) * 0.18 * envelope
+        }
+        return DecodedAudioBuffer(
+            url: URL(fileURLWithPath: "/tmp/soundtime-user-perceived-timing-clipboard.wav"),
+            sampleRate: sampleRate,
+            channelCount: 1,
+            frameCount: frameCount,
+            samplesByChannel: [samples]
+        )
+    }
+
+    func userPerceivedTimingSmokeDeleteSelection() -> WorkspaceUserPerceivedTimingSmokeResult {
+        let generationBefore = deleteAnimationGeneration
+        let startedAt = CACurrentMediaTime()
+        performOptimisticDelete(copyBeforeDeleting: false, scope: .track)
+        let elapsedMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
+        let generationChanged = generationBefore != deleteAnimationGeneration
+        return WorkspaceUserPerceivedTimingSmokeResult(
+            accepted: generationChanged,
+            elapsedMilliseconds: elapsedMilliseconds,
+            message: generationChanged ? "delete visual state submitted" : "delete visual state did not start",
+            editAnimationGenerationChanged: generationChanged
+        )
+    }
+
+    func userPerceivedTimingSmokePasteAtPlayhead() -> WorkspaceUserPerceivedTimingSmokeResult {
+        let generationBefore = deleteAnimationGeneration
+        let startedAt = CACurrentMediaTime()
+        pasteAudio()
+        let elapsedMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
+        let generationChanged = generationBefore != deleteAnimationGeneration
+        return WorkspaceUserPerceivedTimingSmokeResult(
+            accepted: generationChanged,
+            elapsedMilliseconds: elapsedMilliseconds,
+            message: generationChanged ? "paste visual state submitted" : "paste visual state did not start",
+            editAnimationGenerationChanged: generationChanged
+        )
+    }
+
+    func userPerceivedTimingSmokeWriteCompactProjectSnapshot(to url: URL) -> WorkspaceUserPerceivedTimingSmokeResult {
+        let generationBefore = deleteAnimationGeneration
+        let startedAt = CACurrentMediaTime()
+        do {
+            try prepareProjectForSerialization()
+            let project = currentProject(includeWaveformPreviews: false)
+            try SoundtimeProjectStore.save(project, to: normalizedProjectURL(url))
+            return WorkspaceUserPerceivedTimingSmokeResult(
+                accepted: true,
+                elapsedMilliseconds: (CACurrentMediaTime() - startedAt) * 1_000,
+                message: "compact project save completed",
+                editAnimationGenerationChanged: generationBefore != deleteAnimationGeneration
+            )
+        } catch {
+            return WorkspaceUserPerceivedTimingSmokeResult(
+                accepted: false,
+                elapsedMilliseconds: (CACurrentMediaTime() - startedAt) * 1_000,
+                message: "compact project save failed: \(error.localizedDescription)",
+                editAnimationGenerationChanged: generationBefore != deleteAnimationGeneration
+            )
+        }
     }
 
     private func tearDownRuntimeState() {
@@ -2526,18 +3219,18 @@ final class WorkspaceView: NSView {
             clearProjectForLoad(publishesTimeline: false)
             currentProjectURL = stateProjectURL
             applyLaunchFirstFrameIdentity(firstFrame)
+            applyProjectMasterVolume(firstFrame.masterVolume)
+            applyProjectTimelineViewport(
+                SoundtimeProjectStore.rememberedTimelineViewport(for: stateProjectURL) ??
+                    firstFrame.timelineViewport
+            )
+            applyProjectTranscriptDisplayMode(firstFrame.transcriptDisplayMode)
+            resetWaveformFisheyeTuningToDefaults()
         }
         applyWindowLayout(
             SoundtimeProjectStore.rememberedWindowLayout(for: stateProjectURL) ??
                 firstFrame.windowLayout
         )
-        applyProjectMasterVolume(firstFrame.masterVolume)
-        applyProjectTimelineViewport(
-            SoundtimeProjectStore.rememberedTimelineViewport(for: stateProjectURL) ??
-                firstFrame.timelineViewport
-        )
-        applyProjectTranscriptDisplayMode(firstFrame.transcriptDisplayMode)
-        resetWaveformFisheyeTuningToDefaults()
 
         projectTracks = firstFrame.tracks.map { track in
             launchPreviewTrack(from: track)
@@ -2953,8 +3646,12 @@ final class WorkspaceView: NSView {
             return
         }
 
+        let previousState = projectReadinessState
         projectReadinessState = state
         updateStatus(statusOverride ?? state.statusText)
+        guard shouldRecordProjectReadinessDiagnosticTransition(from: previousState, to: state) else {
+            return
+        }
         SoundtimeDiagnostics.shared.record(
             category: .system,
             severity: .info,
@@ -2962,6 +3659,33 @@ final class WorkspaceView: NSView {
             message: "Project readiness state changed.",
             fields: projectReadinessDiagnosticFields(for: state)
         )
+    }
+
+    private func shouldRecordProjectReadinessDiagnosticTransition(
+        from _: ProjectReadinessState,
+        to state: ProjectReadinessState
+    ) -> Bool {
+        switch state {
+        case let .playbackHydrating(completed, failed, total):
+            let finishedCount = completed + failed
+            if finishedCount == 0 || finishedCount >= total {
+                lastProjectReadinessHydrationDiagnosticTime = CACurrentMediaTime()
+                return true
+            }
+
+            let progressStride = max(10, total / 10)
+            let now = CACurrentMediaTime()
+            if finishedCount.isMultiple(of: progressStride) ||
+                now - lastProjectReadinessHydrationDiagnosticTime >= 0.5
+            {
+                lastProjectReadinessHydrationDiagnosticTime = now
+                return true
+            }
+            return false
+        default:
+            lastProjectReadinessHydrationDiagnosticTime = -Double.infinity
+            return true
+        }
     }
 
     private func projectReadinessDiagnosticFields(for state: ProjectReadinessState) -> [String: String] {
@@ -4188,7 +4912,9 @@ final class WorkspaceView: NSView {
             scheduleProjectTrackMixUpdate()
         }
         updateStatus(currentPlaybackStatus)
-        scheduleAutosaveIfNeeded()
+        if !isLoadingProject {
+            scheduleAutosaveIfNeeded()
+        }
     }
 
     private func reloadProjectPlaybackImmediately() {
@@ -4874,7 +5600,9 @@ final class WorkspaceView: NSView {
                 timeline: canonicalFileTimeline
             )
         }
-        scheduleAutosaveIfNeeded()
+        if !isLoadingProject {
+            scheduleAutosaveIfNeeded()
+        }
         activeTrackID = trackID
         selectedTimelineRange = nil
         updateEffectCommandState()
@@ -11981,6 +12709,7 @@ final class WorkspaceView: NSView {
     private func toggleTranscriptLayer() {
         isTranscriptLayerVisible.toggle()
         timelineSurface.displayTranscriptMode(isTranscriptLayerVisible ? .waveformOverlay : .hidden)
+        refreshTranscriptActiveWordForCurrentVisualPlayhead()
         updateStatus(isTranscriptLayerVisible ? "transcript layer shown" : "transcript layer hidden")
     }
 
@@ -12285,7 +13014,7 @@ final class WorkspaceView: NSView {
         if
             let activeRange = activeTranscriptWordProjectRange,
             projectTime >= activeRange.startTime,
-            projectTime <= activeRange.endTime
+            projectTime < activeRange.endTime
         {
             return
         }
@@ -12343,6 +13072,19 @@ final class WorkspaceView: NSView {
         }
 
         return nil
+    }
+
+    private func refreshTranscriptActiveWordForCurrentVisualPlayhead() {
+        guard displayedDuration > 0 else {
+            updateTranscriptActiveWord(progress: visualPlayheadProgress)
+            return
+        }
+
+        let progress = projectedVisualPlayheadProgress(
+            at: CACurrentMediaTime(),
+            duration: displayedDuration
+        )
+        updateTranscriptActiveWord(progress: progress)
     }
 
     private func transcribeSelectedTrack() {
@@ -14071,6 +14813,7 @@ final class WorkspaceView: NSView {
         guard playbackController.hasSource else {
             return
         }
+        markTimelineHotInteraction(reason: "keyboard-skip")
 
         let duration = projectSelectionDuration
         guard duration > 0 else {
@@ -14090,7 +14833,11 @@ final class WorkspaceView: NSView {
             refreshPlaybackProgress(
                 syncPlayheadWhenPlaying: true,
                 restartsFisheyeActivation: wasPlaying && playbackController.isPlaying,
-                restartsPlayheadKick: wasPlaying && playbackController.isPlaying
+                restartsPlayheadKick: false
+            )
+            timelineSurface.displayPlayheadJumpTrail(
+                from: Float(currentTime / duration),
+                to: targetProgress
             )
             if playbackController.isPlaying {
                 startPlaybackTimer()
@@ -14112,6 +14859,7 @@ final class WorkspaceView: NSView {
         guard playbackController.hasSource else {
             return
         }
+        markTimelineHotInteraction(reason: "play-from-progress")
 
         do {
             let wasPlaying = playbackController.isPlaying
@@ -14444,8 +15192,18 @@ final class WorkspaceView: NSView {
             advanceLaunchStateRevision()
             SoundtimeProjectStore.rememberWindowLayout(layout, for: currentProjectURL)
         }
+        var overlayPersistedSynchronously = false
+        var overlayPersistedAsynchronously = false
         if let overlay = currentLaunchStateOverlay(windowLayout: layout) {
-            SoundtimeProjectStore.rememberLaunchStateOverlay(overlay, for: currentProjectURL)
+            if projectTracks.count <= 32 {
+                SoundtimeProjectStore.rememberLaunchStateOverlay(overlay, for: currentProjectURL)
+                overlayPersistedSynchronously = true
+            } else {
+                overlayPersistedAsynchronously = true
+                closeStatePersistenceQueue.async { [overlay, currentProjectURL] in
+                    SoundtimeProjectStore.rememberLaunchStateOverlay(overlay, for: currentProjectURL)
+                }
+            }
         }
 
         let elapsedMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
@@ -14456,6 +15214,8 @@ final class WorkspaceView: NSView {
                 "tracks": "\(projectTracks.count)",
                 "launchSnapshotWrite": "false",
                 "firstFramePacketWrite": "false",
+                "launchOverlaySync": "\(overlayPersistedSynchronously)",
+                "launchOverlayAsync": "\(overlayPersistedAsynchronously)",
             ]
         )
         SoundtimeDiagnostics.shared.record(
@@ -14468,6 +15228,8 @@ final class WorkspaceView: NSView {
                 "tracks": "\(projectTracks.count)",
                 "launchSnapshotWrite": "false",
                 "firstFramePacketWrite": "false",
+                "launchOverlaySync": "\(overlayPersistedSynchronously)",
+                "launchOverlayAsync": "\(overlayPersistedAsynchronously)",
             ]
         )
     }
@@ -14484,7 +15246,11 @@ final class WorkspaceView: NSView {
 
         latestTimelineViewportForPersistence = projectViewport
         scheduleTimelineViewportPersistence()
-        scheduleAutosaveIfNeeded()
+    }
+
+    private func markTimelineHotInteraction(reason: String) {
+        _ = reason
+        lastTimelineHotInteractionTime = CACurrentMediaTime()
     }
 
     private func scheduleTimelineViewportPersistence() {
@@ -14516,11 +15282,32 @@ final class WorkspaceView: NSView {
         advanceLaunchStateRevision()
         SoundtimeProjectStore.rememberTimelineViewport(viewport, for: currentProjectURL)
         if schedulesLaunchSnapshot {
-            scheduleLaunchSnapshotSaveIfNeeded(reason: "timeline-viewport", delay: 0.5)
+            persistLaunchStateOverlayOnly(reason: "timeline-viewport")
         }
         if flushImmediately {
             UserDefaults.standard.synchronize()
         }
+    }
+
+    private func persistLaunchStateOverlayOnly(reason: String) {
+        guard
+            let currentProjectURL,
+            let overlay = currentLaunchStateOverlay(windowLayout: currentWindowLayout())
+        else {
+            return
+        }
+
+        SoundtimeProjectStore.rememberLaunchStateOverlay(overlay, for: currentProjectURL)
+        SoundtimeDiagnostics.shared.record(
+            category: .system,
+            severity: .info,
+            name: "launch-state-overlay-persisted",
+            message: "Persisted lightweight launch state without writing waveform packets.",
+            fields: [
+                "reason": reason,
+                "tracks": "\(projectTracks.count)",
+            ]
+        )
     }
 
     private func currentLaunchStateOverlay(
@@ -14547,7 +15334,10 @@ final class WorkspaceView: NSView {
         )
     }
 
-    private func scheduleAutosaveIfNeeded() {
+    private func scheduleAutosaveIfNeeded(
+        reason: String = #function,
+        minimumDelay: TimeInterval? = nil
+    ) {
         guard
             !isAutosaveSuppressed,
             !isLoadingProject,
@@ -14556,7 +15346,7 @@ final class WorkspaceView: NSView {
             return
         }
 
-        scheduleLaunchSnapshotSaveIfNeeded(reason: "autosave", delay: 0.5)
+        latestAutosaveScheduleReason = reason
         autosaveWorkItem?.cancel()
         autosaveGeneration += 1
         let generation = autosaveGeneration
@@ -14571,7 +15361,7 @@ final class WorkspaceView: NSView {
         autosaveWorkItem = workItem
         let now = CACurrentMediaTime()
         let deleteProtectedDelay = max(deleteAutosaveProtectedUntil - now + 0.08, 0)
-        let delay = max(autosaveDelay, deleteProtectedDelay)
+        let delay = max(minimumDelay ?? autosaveDelay, deleteProtectedDelay)
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 
@@ -14587,96 +15377,48 @@ final class WorkspaceView: NSView {
             scheduleAutosaveIfNeeded()
             return
         }
+        if let deferralReason = launchCacheHotPathDeferralReason() {
+            SoundtimeDiagnostics.shared.record(
+                category: .system,
+                severity: .info,
+                name: "project-autosave-deferred-hot-path",
+                message: "Project autosave deferred until the timeline is quiet.",
+                fields: [
+                    "deferral": deferralReason,
+                    "delayMs": String(format: "%.0f", launchCacheHotPathQuietInterval * 1_000),
+                ]
+            )
+            scheduleAutosaveIfNeeded(minimumDelay: launchCacheHotPathQuietInterval)
+            return
+        }
 
         let snapshotStartedAt = CACurrentMediaTime()
         let project = currentProject(includeWaveformPreviews: false)
         let projectURL = currentProjectURL
-        let launchSnapshotDraft = currentLaunchSnapshotDraft(projectURL: projectURL ?? URL(fileURLWithPath: "/"))
         let snapshotDurationMilliseconds = (CACurrentMediaTime() - snapshotStartedAt) * 1_000
+        SoundtimeDiagnostics.shared.record(
+            category: .system,
+            severity: snapshotDurationMilliseconds > 8 ? .warning : .info,
+            name: "project-autosave-main-thread-snapshot",
+            message: "Project autosave captured its main-thread value snapshot.",
+            fields: [
+                "trackCount": "\(projectTracks.count)",
+                "waveformPreviews": "false",
+                "snapshotMs": String(format: "%.2f", snapshotDurationMilliseconds),
+                "scheduleReason": latestAutosaveScheduleReason,
+            ]
+        )
         let autosaveID = autosaveID
         let trackCount = projectTracks.count
 
-        DispatchQueue.global(qos: .utility).async { [project, projectURL, autosaveID, launchSnapshotDraft] in
+        DispatchQueue.global(qos: .utility).async { [project, projectURL, autosaveID] in
             let writeStartedAt = CACurrentMediaTime()
-            let result: Result<(url: URL, launchBundleSaved: Bool, snapshotSaved: Bool, firstFramePacketSaved: Bool), Error>
-            do {
-                let autosaveURL = try SoundtimeProjectStore.saveAutosave(
+            let result = Result {
+                try SoundtimeProjectStore.saveAutosave(
                     project,
                     projectURL: projectURL,
                     autosaveID: autosaveID
                 )
-                let snapshot = ProjectLaunchSnapshot(
-                    projectURL: autosaveURL,
-                    projectID: launchSnapshotDraft.projectID,
-                    editGraphRevision: launchSnapshotDraft.editGraphRevision,
-                    visualRevision: launchSnapshotDraft.visualRevision,
-                    launchStateRevision: launchSnapshotDraft.launchStateRevision,
-                    windowLayout: launchSnapshotDraft.windowLayout,
-                    timelineViewport: launchSnapshotDraft.timelineViewport,
-                    masterVolume: launchSnapshotDraft.masterVolume,
-                    transcriptDisplayMode: launchSnapshotDraft.transcriptDisplayMode,
-                    tracks: launchSnapshotDraft.tracks
-                )
-                let packet = ProjectFirstFrameWaveformPacket(
-                    projectURL: autosaveURL,
-                    projectID: launchSnapshotDraft.projectID,
-                    editGraphRevision: launchSnapshotDraft.editGraphRevision,
-                    visualRevision: launchSnapshotDraft.visualRevision,
-                    launchStateRevision: launchSnapshotDraft.launchStateRevision,
-                    windowLayout: launchSnapshotDraft.windowLayout,
-                    timelineViewport: launchSnapshotDraft.timelineViewport,
-                    masterVolume: launchSnapshotDraft.masterVolume,
-                    transcriptDisplayMode: launchSnapshotDraft.transcriptDisplayMode,
-                    tracks: launchSnapshotDraft.tracks
-                )
-                let manifest = ProjectLaunchManifest(
-                    projectURL: autosaveURL,
-                    projectID: launchSnapshotDraft.projectID,
-                    editGraphRevision: launchSnapshotDraft.editGraphRevision,
-                    visualRevision: launchSnapshotDraft.visualRevision,
-                    launchStateRevision: launchSnapshotDraft.launchStateRevision,
-                    windowLayout: launchSnapshotDraft.windowLayout,
-                    timelineViewport: launchSnapshotDraft.timelineViewport,
-                    masterVolume: launchSnapshotDraft.masterVolume,
-                    transcriptDisplayMode: launchSnapshotDraft.transcriptDisplayMode,
-                    tracks: launchSnapshotDraft.tracks,
-                    snapshotByteCount: (try? ProjectLaunchSnapshotBinaryCodec.encode(snapshot))?.count,
-                    firstFramePacketByteCount: (try? ProjectFirstFrameWaveformPacketBinaryCodec.encode(packet))?.count,
-                    snapshotDrawable: ProjectLaunchReadinessClassifier.summarize(snapshot: snapshot).hasAnyDrawableWaveform,
-                    firstFramePacketDrawable: ProjectLaunchReadinessClassifier.summarize(packet: packet).hasAnyDrawableWaveform
-                )
-                let launchBundleSaved: Bool
-                do {
-                    try ProjectLaunchCacheBundleStore.publish(
-                        manifest: manifest,
-                        firstFramePacket: packet,
-                        snapshot: snapshot,
-                        for: autosaveURL
-                    )
-                    launchBundleSaved = true
-                } catch {
-                    launchBundleSaved = false
-                }
-                let snapshotSaved: Bool
-                let firstFramePacketSaved: Bool
-                do {
-                    try ProjectLaunchSnapshotStore.save(snapshot, for: autosaveURL)
-                    snapshotSaved = true
-                } catch {
-                    snapshotSaved = false
-                }
-                do {
-                    try ProjectFirstFrameWaveformPacketStore.save(packet, for: autosaveURL)
-                    firstFramePacketSaved = true
-                } catch {
-                    firstFramePacketSaved = false
-                }
-                if snapshotSaved || firstFramePacketSaved {
-                    try? ProjectLaunchManifestStore.save(manifest, for: autosaveURL)
-                }
-                result = .success((autosaveURL, launchBundleSaved, snapshotSaved, firstFramePacketSaved))
-            } catch {
-                result = .failure(error)
             }
             let writeDurationMilliseconds = (CACurrentMediaTime() - writeStartedAt) * 1_000
 
@@ -14690,20 +15432,21 @@ final class WorkspaceView: NSView {
                     "waveformPreviews": "false",
                     "snapshotMs": String(format: "%.2f", snapshotDurationMilliseconds),
                     "writeMs": String(format: "%.2f", writeDurationMilliseconds),
+                    "scheduleReason": self.latestAutosaveScheduleReason,
                 ]
 
                 switch result {
-                case let .success((url, launchBundleSaved, snapshotSaved, firstFramePacketSaved)):
+                case let .success(url):
                     SoundtimeDiagnostics.shared.record(
                         category: .system,
                         severity: snapshotDurationMilliseconds > 8 ? .warning : .info,
                         name: "project-autosave",
-                        message: "Project autosave was written.",
+                        message: "Project autosave was written without launch waveform sidecar work.",
                         fields: timingFields.merging([
                             "file": url.lastPathComponent,
-                            "launchBundle": launchBundleSaved ? "true" : "false",
-                            "launchSnapshot": snapshotSaved ? "true" : "false",
-                            "firstFramePacket": firstFramePacketSaved ? "true" : "false",
+                            "launchBundle": "false",
+                            "launchSnapshot": "false",
+                            "firstFramePacket": "false",
                         ]) { _, new in new }
                     )
                 case let .failure(error):
@@ -14721,21 +15464,35 @@ final class WorkspaceView: NSView {
         }
     }
 
+    @discardableResult
     private func scheduleLaunchSnapshotSaveIfNeeded(
         reason: String,
         delay: TimeInterval = 0.35,
         projectURL projectURLOverride: URL? = nil
-    ) {
+    ) -> Bool {
         guard
             !isAutosaveSuppressed,
             !isLoadingProject,
             !projectTracks.isEmpty
         else {
-            return
+            return false
         }
         let projectURL = projectURLOverride ?? currentProjectURL
         guard let projectURL else {
-            return
+            return false
+        }
+
+        let request = LaunchCacheWriteRequest(projectURL: projectURL, reason: reason)
+        if delay <= 0, let deferralReason = launchCacheHotPathDeferralReason() {
+            recordLaunchCacheHotPathDeferral(
+                request: request,
+                deferralReason: deferralReason
+            )
+            return scheduleLaunchSnapshotSaveIfNeeded(
+                reason: reason,
+                delay: launchCacheHotPathQuietInterval,
+                projectURL: projectURL
+            )
         }
 
         launchSnapshotSaveWorkItem?.cancel()
@@ -14743,36 +15500,92 @@ final class WorkspaceView: NSView {
         let generation = launchSnapshotSaveGeneration
         let workItem = DispatchWorkItem { [weak self] in
             self?.writeLaunchSnapshotIfCurrent(
-                projectURL: projectURL,
-                generation: generation,
-                reason: reason
+                request: request,
+                generation: generation
             )
         }
         launchSnapshotSaveWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+        return true
     }
 
     private func writeLaunchSnapshotIfCurrent(
-        projectURL: URL,
-        generation: Int,
-        reason: String
+        request: LaunchCacheWriteRequest,
+        generation: Int
     ) {
         guard
             generation == launchSnapshotSaveGeneration,
-            currentProjectURL == projectURL,
+            currentProjectURL == request.projectURL,
             !projectTracks.isEmpty
         else {
             return
         }
 
         launchSnapshotSaveWorkItem = nil
-        let draft = currentLaunchSnapshotDraft(projectURL: projectURL)
+        if let deferralReason = launchCacheHotPathDeferralReason() {
+            recordLaunchCacheHotPathDeferral(
+                request: request,
+                deferralReason: deferralReason
+            )
+            scheduleLaunchSnapshotSaveIfNeeded(
+                reason: request.reason,
+                delay: launchCacheHotPathQuietInterval,
+                projectURL: request.projectURL
+            )
+            return
+        }
+
+        if launchCacheWriteInFlight {
+            pendingLaunchCacheWriteRequest = request
+            SoundtimeDiagnostics.shared.record(
+                category: .system,
+                severity: .info,
+                name: "launch-cache-write-coalesced",
+                message: "Launch waveform cache write coalesced behind an in-flight write.",
+                fields: [
+                    "reason": request.reason,
+                    "file": request.projectURL.lastPathComponent,
+                ]
+            )
+            return
+        }
+
+        launchCacheWriteInFlight = true
+        SoundtimeDiagnostics.shared.record(
+            category: .render,
+            severity: .info,
+            name: "launch-cache-write-started",
+            message: "Launch waveform cache write started outside a protected interaction window.",
+            fields: [
+                "reason": request.reason,
+                "file": request.projectURL.lastPathComponent,
+                "tracks": "\(projectTracks.count)",
+            ]
+        )
+        let draftStartedAt = CACurrentMediaTime()
+        let draft = currentLaunchSnapshotDraft(projectURL: request.projectURL)
+        let draftDurationMilliseconds = (CACurrentMediaTime() - draftStartedAt) * 1_000
         let trackCount = draft.tracks.count
-        DispatchQueue.global(qos: .utility).async { [draft, projectURL, reason, trackCount] in
+        if draftDurationMilliseconds > 8 {
+            SoundtimeDiagnostics.shared.record(
+                category: .system,
+                severity: .warning,
+                name: "launch-cache-draft-main-thread-cost",
+                message: "Launch waveform cache draft took too long on the main thread.",
+                fields: [
+                    "reason": request.reason,
+                    "file": request.projectURL.lastPathComponent,
+                    "tracks": "\(trackCount)",
+                    "draftMs": String(format: "%.2f", draftDurationMilliseconds),
+                ]
+            )
+        }
+
+        launchCacheWriteQueue.async { [draft, request, trackCount, draftDurationMilliseconds] in
             let startedAt = CACurrentMediaTime()
             let result = Result { () -> (packetDrawable: Bool, launchBundleSaved: Bool) in
                 let snapshot = ProjectLaunchSnapshot(
-                    projectURL: projectURL,
+                    projectURL: request.projectURL,
                     projectID: draft.projectID,
                     editGraphRevision: draft.editGraphRevision,
                     visualRevision: draft.visualRevision,
@@ -14784,7 +15597,7 @@ final class WorkspaceView: NSView {
                     tracks: draft.tracks
                 )
                 let packet = ProjectFirstFrameWaveformPacket(
-                    projectURL: projectURL,
+                    projectURL: request.projectURL,
                     projectID: draft.projectID,
                     editGraphRevision: draft.editGraphRevision,
                     visualRevision: draft.visualRevision,
@@ -14799,7 +15612,7 @@ final class WorkspaceView: NSView {
                 let packetData = try ProjectFirstFrameWaveformPacketBinaryCodec.encode(packet)
                 let packetDrawable = ProjectLaunchReadinessClassifier.summarize(packet: packet).hasAnyDrawableWaveform
                 let manifest = ProjectLaunchManifest(
-                    projectURL: projectURL,
+                    projectURL: request.projectURL,
                     projectID: draft.projectID,
                     editGraphRevision: draft.editGraphRevision,
                     visualRevision: draft.visualRevision,
@@ -14820,20 +15633,27 @@ final class WorkspaceView: NSView {
                         manifest: manifest,
                         firstFramePacket: packet,
                         snapshot: snapshot,
-                        for: projectURL
+                        for: request.projectURL
                     )
                     launchBundleSaved = true
                 } catch {
                     launchBundleSaved = false
                 }
-                try ProjectLaunchSnapshotStore.save(snapshot, for: projectURL)
-                try ProjectFirstFrameWaveformPacketStore.save(packet, for: projectURL)
-                try ProjectLaunchManifestStore.save(manifest, for: projectURL)
+                try ProjectLaunchSnapshotStore.save(snapshot, for: request.projectURL)
+                try ProjectFirstFrameWaveformPacketStore.save(packet, for: request.projectURL)
+                try ProjectLaunchManifestStore.save(manifest, for: request.projectURL)
                 return (packetDrawable, launchBundleSaved)
             }
             let durationMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
 
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else {
+                    return
+                }
+                self.launchCacheWriteInFlight = false
+                let pendingRequest = self.pendingLaunchCacheWriteRequest
+                self.pendingLaunchCacheWriteRequest = nil
+
                 switch result {
                 case let .success((packetDrawable, launchBundleSaved)):
                     SoundtimeDiagnostics.shared.record(
@@ -14842,11 +15662,12 @@ final class WorkspaceView: NSView {
                         name: "launch-snapshot-saved",
                         message: "Project launch snapshot and first-frame waveform packet were written.",
                         fields: [
-                            "file": projectURL.lastPathComponent,
-                            "reason": reason,
+                            "file": request.projectURL.lastPathComponent,
+                            "reason": request.reason,
                             "tracks": "\(trackCount)",
                             "launchBundle": "\(launchBundleSaved)",
                             "firstFramePacketDrawable": "\(packetDrawable)",
+                            "draftMs": String(format: "%.2f", draftDurationMilliseconds),
                             "writeMs": String(format: "%.2f", durationMilliseconds),
                         ]
                     )
@@ -14857,14 +15678,77 @@ final class WorkspaceView: NSView {
                         name: "launch-snapshot-save-failed",
                         message: "Project launch snapshot could not be written.",
                         fields: [
-                            "file": projectURL.lastPathComponent,
-                            "reason": reason,
+                            "file": request.projectURL.lastPathComponent,
+                            "reason": request.reason,
                             "error": error.localizedDescription,
                         ]
                     )
                 }
+
+                guard self.window != nil, let pendingRequest else {
+                    return
+                }
+
+                self.scheduleLaunchSnapshotSaveIfNeeded(
+                    reason: pendingRequest.reason,
+                    delay: 0.15,
+                    projectURL: pendingRequest.projectURL
+                )
             }
         }
+    }
+
+    private func recordLaunchCacheHotPathDeferral(
+        request: LaunchCacheWriteRequest,
+        deferralReason: String
+    ) {
+        let now = CACurrentMediaTime()
+        let eventKey = "\(request.reason):\(deferralReason)"
+        let lastEventTime = lastLaunchCacheHotPathDeferralEventTimeByKey[eventKey] ?? -Double.infinity
+        guard now - lastEventTime >= launchCacheHotPathDeferralEventInterval else {
+            return
+        }
+
+        lastLaunchCacheHotPathDeferralEventTimeByKey[eventKey] = now
+        SoundtimeDiagnostics.shared.record(
+            category: .render,
+            severity: .info,
+            name: "launch-cache-write-deferred-hot-path",
+            message: "Launch waveform cache write deferred until the timeline is quiet.",
+            fields: [
+                "reason": request.reason,
+                "deferral": deferralReason,
+                "delayMs": String(format: "%.0f", launchCacheHotPathQuietInterval * 1_000),
+            ]
+        )
+    }
+
+    private func launchCacheHotPathDeferralReason() -> String? {
+        let now = CACurrentMediaTime()
+        if now < hotPathContractSmokeProtectedUntil {
+            return "hot-path-contract-smoke"
+        }
+        if now < deleteAutosaveProtectedUntil {
+            return "edit-animation"
+        }
+        if postDeleteRefreshWorkItem != nil {
+            return "edit-handoff"
+        }
+        if scheduledPlaybackReloadWorkItem != nil {
+            return "playback-reload"
+        }
+        if playbackController.isPlaying || visualPlaybackActive {
+            return "playback"
+        }
+        if now - lastTimelineHotInteractionTime < launchCacheHotPathQuietInterval {
+            return "timeline-interaction"
+        }
+        return nil
+    }
+
+    private struct LaunchCacheWriteRequest: Sendable {
+        var projectURL: URL
+        var reason: String
     }
 
     private struct LaunchSnapshotDraft {
@@ -14949,6 +15833,7 @@ final class WorkspaceView: NSView {
         projectPlaybackPrimedTrackIDs.removeAll()
         projectHydrationCompletedTrackIDs.removeAll()
         projectHydrationFailedTrackIDs.removeAll()
+        projectHydrationLaunchCacheWriteScheduled = false
         isLoadingProject = true
         updateStatus("opening project")
         SoundtimeDiagnostics.shared.record(
@@ -15008,6 +15893,7 @@ final class WorkspaceView: NSView {
         projectHydrationQueue = nil
         projectHydrationCompletedTrackIDs.removeAll()
         projectHydrationFailedTrackIDs.removeAll()
+        projectHydrationLaunchCacheWriteScheduled = false
         isLoadingProject = true
         updateStatus("opening recovered autosave")
 
@@ -15197,16 +16083,19 @@ final class WorkspaceView: NSView {
                 (SoundtimeProjectStore.rememberedWindowLayout(for: projectURL) ?? project.windowLayout) :
                 project.windowLayout
         )
-        applyProjectMasterVolume(project.masterVolume)
-        applyProjectTimelineViewport(
-            remembersProjectURL ?
-                (SoundtimeProjectStore.rememberedTimelineViewport(for: projectURL) ?? project.timelineViewport) :
-                project.timelineViewport
-        )
-        applyProjectTranscriptDisplayMode(project.transcriptDisplayMode)
-        resetWaveformFisheyeTuningToDefaults()
+        withoutAutosave {
+            applyProjectMasterVolume(project.masterVolume)
+            applyProjectTimelineViewport(
+                remembersProjectURL ?
+                    (SoundtimeProjectStore.rememberedTimelineViewport(for: projectURL) ?? project.timelineViewport) :
+                    project.timelineViewport
+            )
+            applyProjectTranscriptDisplayMode(project.transcriptDisplayMode)
+            resetWaveformFisheyeTuningToDefaults()
+        }
         projectHydrationCompletedTrackIDs.removeAll()
         projectHydrationFailedTrackIDs.removeAll()
+        projectHydrationLaunchCacheWriteScheduled = false
         let cachedPreviewTrackCount = project.tracks.filter { $0.waveformPreview != nil }.count
 
         isLoadingProject = true
@@ -15453,6 +16342,31 @@ final class WorkspaceView: NSView {
                 try playbackController.loadProjectTracks(result.tracks.map(\.playbackTrack))
                 projectPlaybackPrimedTrackIDs = Set(result.tracks.map(\.trackID))
                 applyLoadedProjectPlaybackPrimeTracks(result.tracks)
+                let outputWarmStartedAt = CACurrentMediaTime()
+                var outputWarmFields: [String: String] = [
+                    "tracks": "\(result.tracks.count)",
+                ]
+                do {
+                    try playbackController.warmOutputForLowLatencyPlayback()
+                    outputWarmFields["warmMs"] = String(format: "%.2f", (CACurrentMediaTime() - outputWarmStartedAt) * 1_000)
+                    SoundtimeDiagnostics.shared.record(
+                        category: .device,
+                        severity: .info,
+                        name: "project-output-device-warmed",
+                        message: "Realtime output device was started silently for low-latency playback.",
+                        fields: outputWarmFields
+                    )
+                } catch {
+                    outputWarmFields["warmMs"] = String(format: "%.2f", (CACurrentMediaTime() - outputWarmStartedAt) * 1_000)
+                    outputWarmFields["error"] = error.localizedDescription
+                    SoundtimeDiagnostics.shared.record(
+                        category: .device,
+                        severity: .warning,
+                        name: "project-output-device-warm-failed",
+                        message: "Realtime output device could not be warmed during project playback prime.",
+                        fields: outputWarmFields
+                    )
+                }
 
                 let snapshot = playbackController.snapshot()
                 displayPlaybackVisuals(
@@ -15584,6 +16498,7 @@ final class WorkspaceView: NSView {
 
         let cache = waveformOverviewDiskCache
         let expectedTrackCount = project.tracks.count
+        projectHydrationLaunchCacheWriteScheduled = false
         let hydrationQueue = ProjectHydrationQueue(
             tracks: project.tracks,
             projectURL: projectURL,
@@ -15657,6 +16572,24 @@ final class WorkspaceView: NSView {
             )
             LaunchStartupTrace.shared.mark(
                 .playbackReadyWithFailures,
+                fields: [
+                    "hydrated": "\(completedTrackCount)",
+                    "failed": "\(failedTrackCount)",
+                    "tracks": "\(expectedTrackCount)",
+                ]
+            )
+        }
+
+        if !projectHydrationLaunchCacheWriteScheduled {
+            projectHydrationLaunchCacheWriteScheduled = true
+            scheduleLaunchSnapshotSaveIfNeeded(reason: "project-hydration-complete", delay: 0.75)
+            SoundtimeDiagnostics.shared.record(
+                category: .system,
+                severity: failedTrackCount == 0 ? .info : .warning,
+                name: "project-hydration-complete",
+                message: failedTrackCount == 0 ?
+                    "Project track hydration completed." :
+                    "Project track hydration completed with missing tracks.",
                 fields: [
                     "hydrated": "\(completedTrackCount)",
                     "failed": "\(failedTrackCount)",
@@ -15809,7 +16742,6 @@ final class WorkspaceView: NSView {
                 reloadPlaybackFromProjectTracks(preserveProgress: true)
             }
             updateEffectCommandState()
-            scheduleLaunchSnapshotSaveIfNeeded(reason: "track-hydrated", delay: 0.75)
 
             let hydratedTrackCount = projectTracks.filter { $0.editableSource != nil }.count
             let completedTrackCount = projectHydrationCompletedTrackIDs.count
@@ -15829,19 +16761,25 @@ final class WorkspaceView: NSView {
                 ),
                 statusOverride: statusOverride
             )
-            SoundtimeDiagnostics.shared.record(
-                category: .system,
-                severity: .info,
-                name: "project-track-hydrated",
-                message: "Project track became ready for playback/editing.",
-                fields: [
-                    "trackID": hydration.trackID.uuidString,
-                    "file": hydration.sourceURL.lastPathComponent,
-                    "hydrated": "\(hydratedTrackCount)",
-                    "tracks": "\(expectedTrackCount)",
-                    "bins": "\(hydration.displayOverview?.bins.count ?? hydration.sourceOverview?.bins.count ?? 0)",
-                ]
+            let shouldRecordHydrationProgress = shouldRecordTrackHydratedDiagnostic(
+                completedTrackCount: completedTrackCount,
+                expectedTrackCount: expectedTrackCount
             )
+            if shouldRecordHydrationProgress {
+                SoundtimeDiagnostics.shared.record(
+                    category: .system,
+                    severity: .info,
+                    name: "project-track-hydrated",
+                    message: "Project track became ready for playback/editing.",
+                    fields: [
+                        "trackID": hydration.trackID.uuidString,
+                        "file": hydration.sourceURL.lastPathComponent,
+                        "hydrated": "\(hydratedTrackCount)",
+                        "tracks": "\(expectedTrackCount)",
+                        "bins": "\(hydration.displayOverview?.bins.count ?? hydration.sourceOverview?.bins.count ?? 0)",
+                    ]
+                )
+            }
             LaunchStartupTrace.shared.mark(
                 .playbackTrackReady,
                 fields: [
@@ -15850,7 +16788,8 @@ final class WorkspaceView: NSView {
                     "hydrated": "\(projectHydrationCompletedTrackIDs.count)",
                     "failed": "\(projectHydrationFailedTrackIDs.count)",
                     "tracks": "\(expectedTrackCount)",
-                ]
+                ],
+                recordsDiagnosticEvent: shouldRecordHydrationProgress
             )
             finishLoadedProjectHydrationIfReady(
                 expectedTrackCount: expectedTrackCount,
@@ -15882,6 +16821,20 @@ final class WorkspaceView: NSView {
                 ]
             )
         }
+    }
+
+    private func shouldRecordTrackHydratedDiagnostic(
+        completedTrackCount: Int,
+        expectedTrackCount: Int
+    ) -> Bool {
+        guard expectedTrackCount > 12 else {
+            return true
+        }
+        if completedTrackCount <= 1 || completedTrackCount >= expectedTrackCount {
+            return true
+        }
+        let stride = max(10, expectedTrackCount / 10)
+        return completedTrackCount.isMultiple(of: stride)
     }
 
     private nonisolated static func bestLaunchOverview(
@@ -15938,6 +16891,7 @@ final class WorkspaceView: NSView {
         projectHydrationQueue = nil
         projectHydrationCompletedTrackIDs.removeAll()
         projectHydrationFailedTrackIDs.removeAll()
+        projectHydrationLaunchCacheWriteScheduled = false
         projectReadinessState = .empty
         viewportPersistenceWorkItem?.cancel()
         viewportPersistenceWorkItem = nil

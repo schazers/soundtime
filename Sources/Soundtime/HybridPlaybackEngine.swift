@@ -190,6 +190,10 @@ final class HybridPlaybackEngine: PlaybackEngine {
         }
     }
 
+    func warmOutputForLowLatencyPlayback() throws {
+        try currentEngine.warmOutputForLowLatencyPlayback()
+    }
+
     @discardableResult
     func togglePlayback() throws -> Bool {
         try currentEngine.togglePlayback()

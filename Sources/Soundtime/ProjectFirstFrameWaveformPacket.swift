@@ -2,7 +2,12 @@ import Foundation
 
 struct ProjectFirstFrameWaveformPacket: Codable, Sendable {
     static let currentSchemaVersion = 2
+    static let targetFirstPaintSynchronousByteLimit = 8 * 1_024 * 1_024
     static let maximumOverviewBinCount = ProjectLaunchSnapshot.maximumOverviewBinCount
+    static let minimumOverviewBinCount = 2_048
+
+    private static let manifestAndHeaderBudgetBytes = 1 * 1_024 * 1_024
+    private static let encodedOverviewBinByteCount = 6 * MemoryLayout<UInt32>.size
 
     struct Track: Codable, Sendable {
         var id: UUID
@@ -67,10 +72,11 @@ struct ProjectFirstFrameWaveformPacket: Codable, Sendable {
         self.timelineViewport = timelineViewport
         self.masterVolume = masterVolume
         self.transcriptDisplayMode = transcriptDisplayMode
+        let maximumFirstPaintBinCount = Self.maximumOverviewBinCount(forTrackCount: tracks.count)
         self.tracks = tracks.map { draft in
             let displayOverview = ProjectLaunchSnapshot.OverviewPayload(
                 draft.displayWaveformOverview ?? draft.sourceWaveformOverview,
-                maximumBinCount: Self.maximumOverviewBinCount
+                maximumBinCount: maximumFirstPaintBinCount
             )
             let durationHint = draft.durationHint ??
                 draft.displayWaveformOverview?.duration ??
@@ -129,6 +135,22 @@ struct ProjectFirstFrameWaveformPacket: Codable, Sendable {
         self.tracks = tracks
     }
 
+    static func maximumOverviewBinCount(forTrackCount trackCount: Int) -> Int {
+        guard trackCount > 0 else {
+            return maximumOverviewBinCount
+        }
+
+        let overviewBudget = max(
+            targetFirstPaintSynchronousByteLimit - manifestAndHeaderBudgetBytes,
+            encodedOverviewBinByteCount
+        )
+        let budgetedBinsPerTrack = overviewBudget / max(trackCount, 1) / encodedOverviewBinByteCount
+        return min(
+            maximumOverviewBinCount,
+            max(minimumOverviewBinCount, budgetedBinsPerTrack)
+        )
+    }
+
     var isDrawable: Bool {
         schemaVersion == Self.currentSchemaVersion &&
             tracks.contains { $0.displayOverview != nil || $0.durationHint != nil }
@@ -168,7 +190,7 @@ struct ProjectFirstFrameWaveformPacket: Codable, Sendable {
 
 enum ProjectFirstFrameWaveformPacketStore {
     private static let fileExtension = "soundtime-first-frame-waveforms"
-    static let firstPaintSynchronousByteLimit = 8 * 1_024 * 1_024
+    static let firstPaintSynchronousByteLimit = ProjectFirstFrameWaveformPacket.targetFirstPaintSynchronousByteLimit
     static let firstPaintManifestByteLimit = 512 * 1_024
 
     static func loadForFirstPaintIfAvailable(for projectURL: URL) -> ProjectFirstFrameWaveformPacket? {

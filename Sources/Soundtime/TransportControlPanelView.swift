@@ -259,11 +259,19 @@ final class TransportControlPanelView: TimelineMetalLayerView {
 
             MainActor.assumeIsolated {
                 let now = CACurrentMediaTime()
-                guard displayLink == nil || now - lastDisplayLinkFrameTime > 0.05 else {
+                if let displayLink, now - lastDisplayLinkFrameTime > 0.05 {
+                    displayLink.invalidate()
+                    self.displayLink = nil
+                }
+
+                guard displayLink == nil else {
                     return
                 }
 
                 render(force: true)
+                if window != nil {
+                    startDisplayLink()
+                }
             }
         }
         timer.tolerance = 1 / 240

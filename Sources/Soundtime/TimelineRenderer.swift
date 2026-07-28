@@ -1178,6 +1178,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var playheadKickOriginProgress: Float?
     private var playheadKickStartTime = CFAbsoluteTimeGetCurrent()
     private var lastPlayheadKickEnergyUpdateTime = CFAbsoluteTimeGetCurrent()
+    private var playheadKickRendersWhilePaused = false
     private var playheadContactEvents: [PlayheadContactEvent] = []
     private var lastPlayheadContactEventTimestamp: CFTimeInterval?
     private var isModalBackdropActive = false
@@ -2077,12 +2078,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
     }
 
-    private func restartPlayheadKick(at progress: Float) {
+    private func restartPlayheadKick(at progress: Float, rendersWhilePaused: Bool = false) {
         let timestamp = CFAbsoluteTimeGetCurrent()
         playheadKickEnergy = 1
         playheadKickOriginProgress = min(max(progress, 0), 1)
         playheadKickStartTime = timestamp
         lastPlayheadKickEnergyUpdateTime = timestamp
+        playheadKickRendersWhilePaused = rendersWhilePaused
     }
 
     func displayViewport(_ viewport: TimelineViewport, marksInteraction: Bool = true) {
@@ -2200,6 +2202,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         markWaveformHotInteraction(at: timestamp)
         selectionCopyFlashStartTime = timestamp
+    }
+
+    func displayPlayheadJumpTrail(from originProgress: Float, to targetProgress: Float) {
+        guard abs(targetProgress - originProgress) > 0.000_001 else {
+            return
+        }
+
+        markWaveformHotInteraction()
+        restartPlayheadKick(at: originProgress, rendersWhilePaused: true)
     }
 
     func displayModalBackdropActive(_ isActive: Bool) {
@@ -10012,6 +10023,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         let decayAmount = Float(elapsedTime / playheadKickDecayDuration)
         playheadKickEnergy = max(playheadKickEnergy - decayAmount, 0)
+        if playheadKickEnergy == 0 {
+            playheadKickOriginProgress = nil
+            playheadKickRendersWhilePaused = false
+        }
     }
 
     private func makeTrimPreviewVertices(
@@ -10234,7 +10249,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         if
-            renderState.isPlaybackActive,
+            renderState.isPlaybackActive || playheadKickRendersWhilePaused,
             kickEnergy > 0.001,
             let playheadKickOriginProgress,
             renderState.hasWaveforms

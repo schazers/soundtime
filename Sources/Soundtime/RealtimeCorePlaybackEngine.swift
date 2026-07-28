@@ -214,6 +214,15 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         }
     }
 
+    func warmOutputForLowLatencyPlayback() throws {
+        guard hasSource, sampleRate > 0 else {
+            return
+        }
+
+        try configureOutputDevice(sampleRate: sampleRate)
+        try outputDevice.start()
+    }
+
     func replaceWithDecodedSource(
         _ decodedAudioBuffer: DecodedAudioBuffer,
         zeroCrossingIndex: AudioZeroCrossingIndex? = nil
@@ -436,6 +445,10 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             isPlaying: mirroredIsPlaying,
             hostTimestamp: mirroredHostTimestamp
         )
+    }
+
+    func realtimeSnapshotForSafetySmoke() -> RealtimeAudioCoreSnapshot {
+        core.detailedSnapshot()
     }
 
     private func hasCoreReachedPendingCommand(

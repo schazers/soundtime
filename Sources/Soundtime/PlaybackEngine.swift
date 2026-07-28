@@ -103,6 +103,7 @@ protocol PlaybackEngine: AnyObject {
     func loadProjectTracks(_ tracks: [ProjectPlaybackTrack]) throws
     func updateProjectTracks(_ tracks: [ProjectPlaybackTrack]) throws
     func refreshOutputDevice() throws
+    func warmOutputForLowLatencyPlayback() throws
     func replaceWithDecodedSource(
         _ decodedAudioBuffer: DecodedAudioBuffer,
         zeroCrossingIndex: AudioZeroCrossingIndex?
@@ -148,6 +149,8 @@ extension PlaybackEngine {
     }
 
     func refreshOutputDevice() throws {}
+
+    func warmOutputForLowLatencyPlayback() throws {}
 
     func pause(atProgress progress: Float) {
         pause()

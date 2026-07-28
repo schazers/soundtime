@@ -88,6 +88,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onTrackLaneLayoutChanged: ((ResolvedTimelineTrackLayout) -> Void)?
     var onLoopRangeChanged: ((TimelineLoopRange) -> Void)?
     var onLoopRangeEnabledChanged: ((Bool) -> Void)?
+    var onPlaybackVisualProgressChanged: ((Float) -> Void)?
     var onExportWAVRequested: (() -> Void)?
     var onExportSelectedRegionRequested: (() -> Void)?
     var onExportMixdownAndStemsRequested: (() -> Void)?
@@ -201,8 +202,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private let renderFlightGate = RenderFlightGate()
     private var pendingTranscriptOverlayUpdate = false
     private var pendingCursorRectInvalidation = false
+    private var hotPathContractSmokeFrameStatsEndTime: CFTimeInterval?
+    private var transcriptViewportRelayoutAllowedUntil: CFTimeInterval?
     private var lastTranscriptOverlayUpdateTime: CFTimeInterval = 0
     private let transcriptOverlayInteractionUpdateInterval: CFTimeInterval = 1.0 / 24.0
+    private let transcriptOverlayHotPathDeferralInterval: CFTimeInterval = 1.0 / 30.0
     private var transcriptInteractionState = TranscriptInteractionState.empty
     private var activeTranscriptDrag: TranscriptInteractionDrag?
     private var currentTranscriptSelection: TranscriptTokenSelection?
@@ -698,6 +702,20 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
     }
 
+    func displayPlayheadJumpTrail(from originProgress: Float, to targetProgress: Float) {
+        let clampedOrigin = min(max(originProgress, 0), 1)
+        let clampedTarget = min(max(targetProgress, 0), 1)
+        guard abs(clampedTarget - clampedOrigin) > 0.000_001 else {
+            return
+        }
+
+        updateTimelineRendererImmediately { renderer in
+            renderer.displayPlayheadJumpTrail(from: clampedOrigin, to: clampedTarget)
+        }
+        startTransientRenderPulse(duration: 0.42)
+        requestTimelineRender()
+    }
+
     func displayedPlayheadProgress(at timestamp: CFTimeInterval = CACurrentMediaTime()) -> Float? {
         timelineRenderer?.projectedPlayheadProgress(at: timestamp)
     }
@@ -830,6 +848,152 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         if schedulesRender {
             kickInteractionRenderIfPossible()
         }
+    }
+
+    func userPerceivedTimingSmokeDisplayLiveSelection(
+        _ selection: TimelineSelection,
+        leadingProgress: Double,
+        velocityPixelsPerSecond: CGFloat,
+        direction: CGFloat,
+        timestamp: CFTimeInterval = CACurrentMediaTime()
+    ) {
+        displayLiveSelection(
+            selection,
+            leadingProgress: leadingProgress,
+            velocityPixelsPerSecond: velocityPixelsPerSecond,
+            direction: direction,
+            timestamp: timestamp
+        )
+    }
+
+    func hotPathContractSmokeBeginFrameStatsWindow(duration: CFTimeInterval = 0.45) {
+        hotPathContractSmokeFrameStatsEndTime = CACurrentMediaTime() + max(duration, 0.01)
+        timelineRenderer?.noteTimelineInteraction()
+        requestTimelineRender()
+    }
+
+    func hotPathContractSmokeZoomBurst(stepCount: Int = 8, around anchorProgress: Float = 0.5) {
+        hotPathContractSmokeBeginFrameStatsWindow(duration: 0.45)
+        let count = max(stepCount, 1)
+        for index in 0..<count {
+            let direction: Float = index.isMultiple(of: 2) ? -1 : 1
+            let logScaleDelta = direction * 0.055
+            let nextViewport = viewport.zoomed(by: exp(logScaleDelta), around: anchorProgress)
+            setViewport(
+                nextViewport,
+                transcriptCadence: .coalescedInteraction,
+                invalidatesCursorRects: false,
+                renderCadence: .coalescedInteraction
+            )
+        }
+        requestTimelineRender()
+    }
+
+    func interactionReplaySmokePanBurst(stepCount: Int = 12, progressDistance: Float = 0.18) -> Double {
+        hotPathContractSmokeBeginFrameStatsWindow(duration: 0.45)
+        let count = max(stepCount, 1)
+        let stepDistance = progressDistance / Float(count)
+        var submissionMilliseconds: Double = 0
+        for index in 0..<count {
+            let direction: Float = index < (count * 2) / 3 ? 1 : -1
+            let startedAt = CACurrentMediaTime()
+            setViewport(
+                viewport.panned(byProgress: stepDistance * direction),
+                transcriptCadence: .coalescedInteraction,
+                invalidatesCursorRects: false,
+                renderCadence: .immediate
+            )
+            submissionMilliseconds = max(submissionMilliseconds, (CACurrentMediaTime() - startedAt) * 1_000)
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.004))
+        }
+        requestTimelineRender()
+        return submissionMilliseconds
+    }
+
+    func interactionReplaySmokeTranscriptHoverClickSelect() -> Bool {
+        guard isTranscriptLayerVisible else {
+            return false
+        }
+
+        var visibleRuns = transcriptOverlayView.visibleRunsSnapshot()
+        if !visibleRuns.contains(where: \.isWord) {
+            guard interactionReplaySmokePlaceTranscriptWordsInView() else {
+                return false
+            }
+            layoutSubtreeIfNeeded()
+            updateTranscriptOverlay(cadence: .immediate)
+            visibleRuns = transcriptOverlayView.visibleRunsSnapshot()
+        }
+
+        guard
+            let firstHit = visibleRuns.first(where: { $0.isWord }),
+            let lastHit = visibleRuns.dropFirst().first(where: { $0.isWord && $0.trackID == firstHit.trackID }) ??
+                visibleRuns.last(where: { $0.isWord && $0.trackID == firstHit.trackID }),
+            let context = transcriptContext(for: firstHit.trackID)
+        else {
+            return false
+        }
+
+        hotPathContractSmokeBeginFrameStatsWindow(duration: 0.45)
+        updateTranscriptHover(firstHit)
+        let selection = TranscriptInteractionModel.selection(
+            from: firstHit,
+            to: lastHit,
+            visibleRuns: visibleRuns,
+            transcript: context.transcript,
+            timeMap: context.timeMap
+        )
+        publishTranscriptSelection(selection, notifiesWorkspace: true)
+        onSeekRequested?(progress(forProjectTime: firstHit.projectRange.startTime))
+        kickInteractionRenderIfPossible()
+        return selection != nil
+    }
+
+    private func interactionReplaySmokePlaceTranscriptWordsInView() -> Bool {
+        guard timelineDuration > 0 else {
+            return false
+        }
+
+        for track in currentRenderTracks {
+            guard
+                let transcript = track.transcript,
+                let firstWord = transcript.words.first
+            else {
+                continue
+            }
+
+            let timeMap = transcript.sourceTimeMap ?? TranscriptSourceTimeMap.fromRenderTrack(track)
+            let sourceEndTime = max(firstWord.endTime, firstWord.startTime + 0.05)
+            guard let projectRange = timeMap.projectRanges(
+                forSourceRange: firstWord.startTime..<sourceEndTime
+            ).first else {
+                continue
+            }
+
+            let centerTime = (projectRange.lowerBound + projectRange.upperBound) * 0.5
+            let visibleSeconds = min(max(4.0, projectRange.upperBound - projectRange.lowerBound), timelineDuration)
+            let durationProgress = Float(min(max(visibleSeconds / timelineDuration, 0.03), 0.25))
+            let centerProgress = progress(forProjectTime: centerTime)
+            let startProgress = centerProgress - durationProgress * 0.35
+            setViewport(
+                TimelineViewport(startProgress: startProgress, durationProgress: durationProgress),
+                transcriptCadence: .immediate,
+                invalidatesCursorRects: false,
+                renderCadence: .immediate
+            )
+            requestTimelineRender()
+            return true
+        }
+
+        return false
+    }
+
+    func hotPathContractSmokeTranscriptDiagnosticsSnapshot() -> TimelineTranscriptOverlayDiagnosticsSnapshot {
+        transcriptOverlayView.diagnosticsSnapshotForSmokeTesting()
+    }
+
+    func hotPathContractSmokeResetTranscriptDiagnostics() {
+        transcriptOverlayView.resetDiagnosticsForSmokeTesting()
     }
 
     private func clearLiveSelectionDragSnapshot(clearsSelection: Bool = false) {
@@ -1385,15 +1549,15 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             needsTimelineRender = true
         }
 
-        if
-            isTimelinePlaybackActive,
-            !viewport.isFull,
-            let playheadProgress = projectedPagingPlayheadProgress(at: frame.targetPresentationTimestamp)
-        {
-            pageViewportIfNeeded(
-                forPlayheadProgress: playheadProgress,
-                renderCadence: .coalescedInteraction
-            )
+        if isTimelinePlaybackActive,
+           let playheadProgress = projectedPagingPlayheadProgress(at: frame.targetPresentationTimestamp) {
+            onPlaybackVisualProgressChanged?(playheadProgress)
+            if !viewport.isFull {
+                pageViewportIfNeeded(
+                    forPlayheadProgress: playheadProgress,
+                    renderCadence: .coalescedInteraction
+                )
+            }
         }
 
         let didSubmitRender = submitTimelineRender(frame: frame)
@@ -1447,13 +1611,23 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return false
         }
 
+        if let endTime = hotPathContractSmokeFrameStatsEndTime {
+            if CACurrentMediaTime() <= endTime {
+                return true
+            }
+            hotPathContractSmokeFrameStatsEndTime = nil
+        }
+
         return isTimelinePlaybackActive ||
             isDraggingSelection ||
             isDraggingTrim ||
             activeDragMode != nil ||
             rightPanMomentumTimer != nil ||
             zoomMomentumTimer != nil ||
-            scrollGestureMode != nil
+            scrollGestureMode != nil ||
+            isProcessingSelectionAnimationActive ||
+            hasActiveTransientRenderPulse() ||
+            hasActiveSelectionDragRenderPulse()
     }
 
     private func publishPerformanceRenderDemand() {
@@ -1463,6 +1637,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private func currentPerformanceRenderDemand() -> PerformanceRenderDemand {
         if isTimelinePlaybackActive {
             return .playback
+        }
+
+        if hotPathContractSmokeFrameStatsEndTime.map({ CACurrentMediaTime() <= $0 }) == true {
+            return .interaction
         }
 
         if hasActiveSelectionDragRenderPulse() {
@@ -3132,6 +3310,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         if marksInteraction {
             timelineRenderer?.publishInteractionViewport(nextViewport)
         }
+        if transcriptCadence != .immediate {
+            transcriptViewportRelayoutAllowedUntil = CACurrentMediaTime() + 0.18
+        }
         updateTranscriptOverlay(cadence: transcriptCadence)
         if invalidatesCursorRects {
             invalidateTimelineCursorRects()
@@ -3310,6 +3491,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        updateTranscriptOverlayLiveGeometry()
+
         let now = CACurrentMediaTime()
         let elapsed = now - lastTranscriptOverlayUpdateTime
         guard elapsed >= transcriptOverlayInteractionUpdateInterval else {
@@ -3337,6 +3520,29 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     private func performTranscriptOverlayUpdate() {
+        if transcriptOverlayView.requiresLayoutRebuild(
+            tracks: currentRenderTracks,
+            viewport: viewport,
+            trackLayout: trackLayout,
+            timelineDuration: timelineDuration,
+            displayMode: transcriptDisplayMode
+        ) {
+            let canReuseLiveGeometry = transcriptOverlayView.canReuseLayoutForLiveGeometry(
+               tracks: currentRenderTracks,
+               viewport: viewport,
+               trackLayout: trackLayout,
+               timelineDuration: timelineDuration,
+               displayMode: transcriptDisplayMode
+            )
+            if shouldDeferTranscriptOverlayLayoutForNonViewportHotPath ||
+                (shouldDeferTranscriptOverlayLayoutForHotPath &&
+                    (canReuseLiveGeometry || !isTranscriptViewportRelayoutAllowed)) {
+                updateTranscriptOverlayLiveGeometry()
+                scheduleTranscriptOverlayUpdate(after: transcriptOverlayHotPathDeferralInterval)
+                return
+            }
+        }
+
         lastTranscriptOverlayUpdateTime = CACurrentMediaTime()
         let cursorRectsChanged = transcriptOverlayView.configure(
             tracks: currentRenderTracks,
@@ -3349,6 +3555,60 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         if cursorRectsChanged {
             invalidateTimelineCursorRects()
         }
+    }
+
+    private func updateTranscriptOverlayLiveGeometry() {
+        transcriptOverlayView.updateLiveGeometry(
+            viewport: viewport,
+            trackLayout: trackLayout,
+            timelineDuration: timelineDuration,
+            displayMode: transcriptDisplayMode
+        )
+    }
+
+    private var shouldDeferTranscriptOverlayLayoutForHotPath: Bool {
+        if isTimelinePlaybackActive ||
+            isTimelineGestureActive ||
+            isProcessingSelectionAnimationActive ||
+            rightPanMomentumTimer != nil ||
+            zoomMomentumTimer != nil ||
+            scrollGestureMode != nil
+        {
+            return true
+        }
+
+        if hotPathContractSmokeFrameStatsEndTime.map({ CACurrentMediaTime() <= $0 }) == true {
+            return true
+        }
+
+        return hasActiveTransientRenderPulse() || hasActiveSelectionDragRenderPulse()
+    }
+
+    private var shouldDeferTranscriptOverlayLayoutForNonViewportHotPath: Bool {
+        isTimelinePlaybackActive ||
+            isProcessingSelectionAnimationActive ||
+            activeDragMode != nil ||
+            activeTranscriptDrag != nil ||
+            isDraggingSelection ||
+            isDraggingTrim ||
+            isDraggingLoop ||
+            hasActiveTransientRenderPulse() ||
+            hasActiveSelectionDragRenderPulse()
+    }
+
+    private var isTranscriptViewportRelayoutAllowed: Bool {
+        let now = CACurrentMediaTime()
+        if let allowedUntil = transcriptViewportRelayoutAllowedUntil {
+            if now <= allowedUntil {
+                return true
+            }
+            transcriptViewportRelayoutAllowedUntil = nil
+        }
+
+        return scrollGestureMode != nil ||
+            rightPanMomentumTimer != nil ||
+            zoomMomentumTimer != nil ||
+            rightPanPreviousPoint != nil
     }
 
     private func pageViewportIfNeeded(

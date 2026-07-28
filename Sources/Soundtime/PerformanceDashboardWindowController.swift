@@ -3,6 +3,15 @@ import Darwin
 import Metal
 import QuartzCore
 
+struct PerformanceDashboardDiagnosticsSnapshot: Codable, Sendable {
+    var frameStatsDisplayCount: Int
+    var performanceSnapshotDisplayCount: Int
+    var refreshRequestCount: Int
+    var maxFrameStatsDisplayMilliseconds: Double
+    var maxPerformanceSnapshotDisplayMilliseconds: Double
+    var maxRefreshRequestMilliseconds: Double
+}
+
 final class PerformanceDashboardWindowController: NSWindowController, NSWindowDelegate {
     private enum LifecycleSmokeError: Error, CustomStringConvertible {
         case windowDidNotClose
@@ -22,6 +31,13 @@ final class PerformanceDashboardWindowController: NSWindowController, NSWindowDe
     }
 
     private static var sharedController: PerformanceDashboardWindowController?
+    private static let diagnosticsLock = NSLock()
+    private static var diagnosticsFrameStatsDisplayCount = 0
+    private static var diagnosticsPerformanceSnapshotDisplayCount = 0
+    private static var diagnosticsRefreshRequestCount = 0
+    private static var diagnosticsMaxFrameStatsDisplayMilliseconds: Double = 0
+    private static var diagnosticsMaxPerformanceSnapshotDisplayMilliseconds: Double = 0
+    private static var diagnosticsMaxRefreshRequestMilliseconds: Double = 0
 
     static var shared: PerformanceDashboardWindowController {
         if let sharedController {
@@ -38,7 +54,9 @@ final class PerformanceDashboardWindowController: NSWindowController, NSWindowDe
             return
         }
 
+        let startedAt = CACurrentMediaTime()
         controller.display(frameStats: frameStats)
+        recordDiagnosticsWork(kind: .frameStats, elapsedMilliseconds: (CACurrentMediaTime() - startedAt) * 1_000)
     }
 
     static func displayIfVisible(performanceSnapshot snapshot: PerformanceMetricsSnapshot) {
@@ -46,7 +64,9 @@ final class PerformanceDashboardWindowController: NSWindowController, NSWindowDe
             return
         }
 
+        let startedAt = CACurrentMediaTime()
         controller.display(performanceSnapshot: snapshot)
+        recordDiagnosticsWork(kind: .performanceSnapshot, elapsedMilliseconds: (CACurrentMediaTime() - startedAt) * 1_000)
     }
 
     static func refreshIfVisible() {
@@ -54,11 +74,70 @@ final class PerformanceDashboardWindowController: NSWindowController, NSWindowDe
             return
         }
 
+        let startedAt = CACurrentMediaTime()
         controller.refresh()
+        recordDiagnosticsWork(kind: .refresh, elapsedMilliseconds: (CACurrentMediaTime() - startedAt) * 1_000)
     }
 
     static func closeIfLoaded() {
         sharedController?.closeIfVisible()
+    }
+
+    static func diagnosticsSnapshotForSmokeTesting() -> PerformanceDashboardDiagnosticsSnapshot {
+        diagnosticsLock.lock()
+        defer {
+            diagnosticsLock.unlock()
+        }
+        return PerformanceDashboardDiagnosticsSnapshot(
+            frameStatsDisplayCount: diagnosticsFrameStatsDisplayCount,
+            performanceSnapshotDisplayCount: diagnosticsPerformanceSnapshotDisplayCount,
+            refreshRequestCount: diagnosticsRefreshRequestCount,
+            maxFrameStatsDisplayMilliseconds: diagnosticsMaxFrameStatsDisplayMilliseconds,
+            maxPerformanceSnapshotDisplayMilliseconds: diagnosticsMaxPerformanceSnapshotDisplayMilliseconds,
+            maxRefreshRequestMilliseconds: diagnosticsMaxRefreshRequestMilliseconds
+        )
+    }
+
+    static func resetDiagnosticsForSmokeTesting() {
+        diagnosticsLock.lock()
+        diagnosticsFrameStatsDisplayCount = 0
+        diagnosticsPerformanceSnapshotDisplayCount = 0
+        diagnosticsRefreshRequestCount = 0
+        diagnosticsMaxFrameStatsDisplayMilliseconds = 0
+        diagnosticsMaxPerformanceSnapshotDisplayMilliseconds = 0
+        diagnosticsMaxRefreshRequestMilliseconds = 0
+        diagnosticsLock.unlock()
+    }
+
+    private enum DiagnosticsWorkKind {
+        case frameStats
+        case performanceSnapshot
+        case refresh
+    }
+
+    private static func recordDiagnosticsWork(kind: DiagnosticsWorkKind, elapsedMilliseconds: Double) {
+        diagnosticsLock.lock()
+        switch kind {
+        case .frameStats:
+            diagnosticsFrameStatsDisplayCount += 1
+            diagnosticsMaxFrameStatsDisplayMilliseconds = max(
+                diagnosticsMaxFrameStatsDisplayMilliseconds,
+                elapsedMilliseconds
+            )
+        case .performanceSnapshot:
+            diagnosticsPerformanceSnapshotDisplayCount += 1
+            diagnosticsMaxPerformanceSnapshotDisplayMilliseconds = max(
+                diagnosticsMaxPerformanceSnapshotDisplayMilliseconds,
+                elapsedMilliseconds
+            )
+        case .refresh:
+            diagnosticsRefreshRequestCount += 1
+            diagnosticsMaxRefreshRequestMilliseconds = max(
+                diagnosticsMaxRefreshRequestMilliseconds,
+                elapsedMilliseconds
+            )
+        }
+        diagnosticsLock.unlock()
     }
 
     @MainActor

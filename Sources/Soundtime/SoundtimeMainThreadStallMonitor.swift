@@ -11,6 +11,7 @@ final class SoundtimeMainThreadStallMonitor: @unchecked Sendable {
     private var timer: DispatchSourceTimer?
     private var isStarted = false
     private var lastReportedStallTime: TimeInterval = 0
+    private var generation: UInt64 = 0
 
     private init() {}
 
@@ -35,14 +36,26 @@ final class SoundtimeMainThreadStallMonitor: @unchecked Sendable {
     func stop() {
         lock.lock()
         isStarted = false
+        generation &+= 1
         let timer = timer
         self.timer = nil
         lock.unlock()
         timer?.cancel()
     }
 
+    func resetForSmokeTesting() {
+        lock.lock()
+        generation &+= 1
+        lastReportedStallTime = CACurrentMediaTime()
+        lock.unlock()
+    }
+
     private func pingMainThread() {
         let scheduledTime = CACurrentMediaTime()
+        lock.lock()
+        let scheduledGeneration = generation
+        lock.unlock()
+
         DispatchQueue.main.async { [weak self] in
             guard let self else {
                 return
@@ -54,6 +67,10 @@ final class SoundtimeMainThreadStallMonitor: @unchecked Sendable {
             }
 
             lock.lock()
+            guard scheduledGeneration == generation else {
+                lock.unlock()
+                return
+            }
             let now = CACurrentMediaTime()
             let shouldReport = now - lastReportedStallTime >= 1.0
             if shouldReport {
