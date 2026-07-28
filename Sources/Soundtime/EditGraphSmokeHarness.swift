@@ -111,6 +111,7 @@ enum EditGraphSmokeHarness {
         try requirePerOperationBudgets(operationDurationsByName)
         try runFileClipPasteSmoke(fileInfo: fileInfo)
         try runNormalizedAudioSourceEquivalenceSmoke(fileInfo: fileInfo)
+        try runSharedEditableSourceCatalogSmoke(fileInfo: fileInfo)
         try runEditGraphArrangementMutationSmoke(fileInfo: fileInfo)
         try runCurrentEditGroupModelSmoke()
         try runLinkedRippleDeleteSmoke(fileInfo: fileInfo)
@@ -126,6 +127,7 @@ enum EditGraphSmokeHarness {
                 "edit graph segment count stays bounded",
                 "file clip paste preserves edit timelines",
                 "WAV originals and MP3 proxies normalize to the same edit graph shape",
+                "shared editable sources canonicalize without duplicate-key crashes",
                 "edit graph mutations keep source identity stable while arrangements change",
                 "loaded project edit groups normalize to one linked ripple group",
                 "linked ripple delete preserves grouped track timing",
@@ -324,6 +326,59 @@ enum EditGraphSmokeHarness {
         try require(
             repeatedMP3ProxySource.id == mp3ProxySource.id,
             "editable source ID was not stable for the same normalized proxy"
+        )
+    }
+
+    private static func runSharedEditableSourceCatalogSmoke(fileInfo: WAVFileInfo) throws {
+        let source = EditableAudioSource(
+            originalURL: fileInfo.url,
+            editableURL: fileInfo.url,
+            formatOrigin: .wav,
+            fileInfo: fileInfo,
+            ownsEditableFile: false
+        )
+        let repeatedSource = EditableAudioSource(
+            importedAssetID: UUID(),
+            originalURL: fileInfo.url,
+            editableURL: fileInfo.url,
+            formatOrigin: .wav,
+            fileInfo: fileInfo,
+            ownsEditableFile: false
+        )
+        let firstTrackID = UUID()
+        let secondTrackID = UUID()
+        let firstArrangement = TrackArrangement(
+            trackID: firstTrackID,
+            sourceID: source.id,
+            timeline: AudioFileEditTimeline(fileInfo: fileInfo)
+        )
+        let secondArrangement = TrackArrangement(
+            trackID: secondTrackID,
+            sourceID: repeatedSource.id,
+            timeline: AudioFileEditTimeline(fileInfo: fileInfo)
+        )
+
+        try require(
+            repeatedSource.id == source.id,
+            "shared editable source smoke did not create matching stable IDs"
+        )
+
+        let graph = EditGraph(
+            sources: [source, repeatedSource],
+            arrangements: [firstArrangement, secondArrangement]
+        )
+        try require(graph.sources.count == 1, "shared editable source smoke did not canonicalize duplicate sources")
+        try require(
+            graph.arrangement(for: firstTrackID)?.sourceID == source.id,
+            "shared editable source smoke lost the first shared-source arrangement"
+        )
+        try require(
+            graph.arrangement(for: secondTrackID)?.sourceID == source.id,
+            "shared editable source smoke lost the second shared-source arrangement"
+        )
+        try require(
+            graph.source(for: secondTrackID)?.importedAssetID == repeatedSource.importedAssetID,
+            "shared editable source smoke did not keep the richer canonical source metadata"
         )
     }
 

@@ -176,8 +176,47 @@ struct EditGraph: Sendable {
         sources: [EditableAudioSource] = [],
         arrangements: [TrackArrangement] = []
     ) {
-        self.sources = Dictionary(uniqueKeysWithValues: sources.map { ($0.id, $0) })
-        self.arrangements = Dictionary(uniqueKeysWithValues: arrangements.map { ($0.trackID, $0) })
+        self.sources = Self.canonicalSourceCatalog(from: sources)
+        self.arrangements = Self.canonicalArrangementCatalog(from: arrangements)
+    }
+
+    private static func canonicalSourceCatalog(
+        from sources: [EditableAudioSource]
+    ) -> [EditableAudioSourceID: EditableAudioSource] {
+        var catalog: [EditableAudioSourceID: EditableAudioSource] = [:]
+        catalog.reserveCapacity(sources.count)
+        for source in sources {
+            if let existingSource = catalog[source.id] {
+                catalog[source.id] = canonicalEditableSource(existingSource, source)
+            } else {
+                catalog[source.id] = source
+            }
+        }
+        return catalog
+    }
+
+    private static func canonicalEditableSource(
+        _ lhs: EditableAudioSource,
+        _ rhs: EditableAudioSource
+    ) -> EditableAudioSource {
+        if lhs.importedAssetID == nil, rhs.importedAssetID != nil {
+            return rhs
+        }
+        if !lhs.ownsEditableFile, rhs.ownsEditableFile {
+            return rhs
+        }
+        return lhs
+    }
+
+    private static func canonicalArrangementCatalog(
+        from arrangements: [TrackArrangement]
+    ) -> [UUID: TrackArrangement] {
+        var catalog: [UUID: TrackArrangement] = [:]
+        catalog.reserveCapacity(arrangements.count)
+        for arrangement in arrangements {
+            catalog[arrangement.trackID] = arrangement
+        }
+        return catalog
     }
 
     func arrangement(for trackID: UUID) -> TrackArrangement? {
