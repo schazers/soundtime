@@ -17,13 +17,24 @@ enum RealtimeGraphPublishSmokeHarness {
 
     static func runFromCommandLine(arguments: [String]) throws {
         let startedAtNanoseconds = DispatchTime.now().uptimeNanoseconds
-        let isFull = arguments.contains("--realtime-graph-publish-full")
-        let trackCount = isFull ? 256 : 128
-        let updateCount = isFull ? 220 : 96
-        let renderBlockCount = isFull ? 10_000 : 4_000
+        let isFull = arguments.contains("--realtime-graph-publish-full") ||
+            arguments.contains("--full") ||
+            arguments.contains("--stress")
+        let isQuick = arguments.contains("--quick") && !isFull
+        let modeName: String
+        if isFull {
+            modeName = "full"
+        } else if isQuick {
+            modeName = "quick"
+        } else {
+            modeName = "standard"
+        }
+        let trackCount = isFull ? 256 : isQuick ? 48 : 128
+        let updateCount = isFull ? 220 : isQuick ? 36 : 96
+        let renderBlockCount = isFull ? 10_000 : isQuick ? 1_100 : 4_000
         let renderBlockFrameCount = 256
         let sampleRate = 48_000.0
-        let sourceFrameCount = Int(sampleRate) * 30
+        let sourceFrameCount = Int(sampleRate) * (isQuick ? 8 : 30)
         let duplicateTrackPhaseMaxError = try runDuplicateTrackPhaseSmoke(
             sampleRate: sampleRate,
             sourceFrameCount: sourceFrameCount,
@@ -42,6 +53,7 @@ enum RealtimeGraphPublishSmokeHarness {
         let fileBackedPublishSummary = try runFileBackedEditPublishSmoke(
             sampleRate: sampleRate,
             sourceFrameCount: sourceFrameCount,
+            isQuick: isQuick,
             isFull: isFull
         )
         try runLazyFileOutputRefreshSmoke(
@@ -201,7 +213,7 @@ enum RealtimeGraphPublishSmokeHarness {
                 "file-backed graph edits overlap render blocks within budget",
             ],
             metadata: [
-                "mode": isFull ? "full" : "quick",
+                "mode": modeName,
                 "trackCount": "\(trackCount)",
                 "updateCount": "\(updateCount)",
                 "renderBlockCount": "\(renderBlockCount)",
@@ -571,11 +583,12 @@ enum RealtimeGraphPublishSmokeHarness {
     private static func runFileBackedEditPublishSmoke(
         sampleRate: Double,
         sourceFrameCount: Int,
+        isQuick: Bool,
         isFull: Bool
     ) throws -> String {
-        let trackCount = isFull ? 96 : 48
-        let updateCount = isFull ? 180 : 72
-        let renderBlockCount = isFull ? 7_500 : 2_800
+        let trackCount = isFull ? 96 : isQuick ? 24 : 48
+        let updateCount = isFull ? 180 : isQuick ? 28 : 72
+        let renderBlockCount = isFull ? 7_500 : isQuick ? 900 : 2_800
         let renderBlockFrameCount = 256
         let wavURL = URL(fileURLWithPath: "/tmp/SoundtimeRealtimeFileBackedPublishSmoke.wav")
         try writeSyntheticPCM16WAV(

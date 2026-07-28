@@ -217,6 +217,7 @@ enum ProductionReadinessHarness {
                     "Quit with a loaded multitrack project and confirm the window disappears immediately without a beach ball.",
                 ],
                 smokeCommands: [
+                    SmokeCommand(label: "startup close lifecycle", arguments: ["--startup-close-lifecycle-smoke"], runsInQuickMode: true),
                     SmokeCommand(label: "launch performance smoke", arguments: ["--launch-performance-smoke"], runsInQuickMode: true),
                     SmokeCommand(label: "full launch performance smoke", arguments: ["--launch-performance-smoke-full"], runsInQuickMode: false),
                 ]

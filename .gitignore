@@ -6,3 +6,7 @@ DerivedData/
 *.xcworkspace/xcuserdata/
 *.xcuserstate
 *.DS_Store
+
+# Generated shippability fixtures. Rebuild locally with:
+# swift run Soundtime --build-shippability-fixtures
+Fixtures/Shippability/v*/

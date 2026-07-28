@@ -1,6 +1,14 @@
 import AppKit
 import Darwin
 
+private let shippabilityGateCommandFlags: Set<String> = [
+    "--shippability-gate",
+    "--product-bar",
+    "--feature-gate",
+    "--release-candidate-gate",
+    "--rc-gate",
+]
+
 if CommandLine.arguments.contains("--timeline-perf-baseline") {
     do {
         try TimelinePerfBaselineHarness.runFromCommandLine(arguments: CommandLine.arguments)
@@ -24,6 +32,106 @@ if CommandLine.arguments.contains("--production-readiness-smoke") ||
     }
 }
 
+if CommandLine.arguments.contains("--build-shippability-fixtures") {
+    do {
+        try ShippabilityFixtureBuilder.runFromCommandLine(arguments: CommandLine.arguments)
+        exit(0)
+    } catch {
+        fputs("Soundtime shippability fixture builder failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
+if CommandLine.arguments.contains("--verify-shippability-fixtures") {
+    do {
+        try ShippabilityFixtureBuilder.verifyFromCommandLine(arguments: CommandLine.arguments)
+        exit(0)
+    } catch {
+        fputs("Soundtime shippability fixture verification failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
+if CommandLine.arguments.contains(where: { shippabilityGateCommandFlags.contains($0) }) {
+    do {
+        try ShippabilityGateHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        exit(0)
+    } catch {
+        fputs("Soundtime shippability gate failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
+if CommandLine.arguments.contains("--shippability-gate-self-test") {
+    do {
+        try ShippabilityGateHarness.runSelfTestFromCommandLine(arguments: CommandLine.arguments)
+        exit(0)
+    } catch {
+        fputs("Soundtime shippability gate self-test failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
+if CommandLine.arguments.contains("--user-perceived-timing-smoke") {
+    do {
+        try MainActor.assumeIsolated {
+            try UserPerceivedTimingSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        }
+        exit(0)
+    } catch {
+        fputs("Soundtime user-perceived timing smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
+if CommandLine.arguments.contains("--visual-invariants-smoke") {
+    do {
+        try MainActor.assumeIsolated {
+            try VisualInvariantsSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        }
+        exit(0)
+    } catch {
+        fputs("Soundtime visual invariants smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
+if CommandLine.arguments.contains("--hot-path-contract-smoke") {
+    do {
+        try MainActor.assumeIsolated {
+            try HotPathContractSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        }
+        exit(0)
+    } catch {
+        fputs("Soundtime hot-path contract smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
+if CommandLine.arguments.contains("--interaction-replay-smoke") {
+    do {
+        try MainActor.assumeIsolated {
+            try InteractionReplaySmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        }
+        exit(0)
+    } catch {
+        fputs("Soundtime interaction replay smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
+if CommandLine.arguments.contains("--audio-safety-smoke") {
+    do {
+        try MainActor.assumeIsolated {
+            try AudioSafetySmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        }
+        exit(0)
+    } catch {
+        fputs("Soundtime audio safety smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
 if CommandLine.arguments.contains("--launch-performance-smoke") ||
     CommandLine.arguments.contains("--launch-performance-smoke-full")
 {
@@ -32,6 +140,18 @@ if CommandLine.arguments.contains("--launch-performance-smoke") ||
         exit(0)
     } catch {
         fputs("Soundtime launch performance smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
+if CommandLine.arguments.contains("--startup-close-lifecycle-smoke") {
+    do {
+        try MainActor.assumeIsolated {
+            try StartupCloseLifecycleSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        }
+        exit(0)
+    } catch {
+        fputs("Soundtime startup/close lifecycle smoke failed: \(error)\n", stderr)
         exit(1)
     }
 }
