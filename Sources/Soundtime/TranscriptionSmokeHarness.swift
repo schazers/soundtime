@@ -95,6 +95,7 @@ enum TranscriptionSmokeHarness {
                 "Deepgram parser preserves words, utterances, speaker metadata, and request ID",
                 "transcription scopes preserve render mode, domain, and source time maps",
                 "transcript layout aligns runs through edit-graph source remapping",
+                "transcript overlay live geometry tracks viewport changes without layout rebuilds",
                 "transcript export emits TXT, SRT, VTT, and JSON",
                 "transcript edit planning resolves word selections into audio time",
                 "transcript validity remaps edited tracks and job snapshots persist progress",
@@ -544,6 +545,7 @@ enum TranscriptionSmokeHarness {
         try require(!layout.runs.isEmpty, "transcript layout did not create text runs")
         let firstRun = try requireValue(layout.runs.first, "missing transcript run")
         try require(firstRun.rect.minX >= 345 && firstRun.rect.minX <= 355, "transcript run was not horizontally aligned through time map")
+        try verifyTranscriptLiveViewportGeometry(renderTrack: renderTrack, wordID: wordA.id)
 
         let denseTranscript = TranscriptDocument(
             trackID: trackID,
@@ -610,6 +612,77 @@ enum TranscriptionSmokeHarness {
         try require(srt.contains("-->"), "SRT export did not include cue timing")
         try require(vtt.hasPrefix("WEBVTT"), "VTT export missing header")
         try require(!json.isEmpty, "JSON export was empty")
+    }
+
+    private static func verifyTranscriptLiveViewportGeometry(
+        renderTrack: TimelineRenderState.Track,
+        wordID: UUID
+    ) throws {
+        let initialViewport = TimelineViewport.full
+        let zoomedViewport = TimelineViewport(startProgress: 0.35, durationProgress: 0.20)
+        let initialLayout = TranscriptLayoutEngine.makeLayout(TranscriptTimelineLayoutInput(
+            tracks: [renderTrack],
+            viewport: initialViewport,
+            trackLayout: .default,
+            timelineDuration: 7,
+            bounds: CGSize(width: 700, height: 160),
+            displayMode: .waveformOverlay
+        ))
+        let initialRun = try requireValue(
+            initialLayout.runs.first { $0.wordID == wordID },
+            "transcript live geometry fixture did not expose initial word run"
+        )
+        let liveRect = TranscriptViewportGeometry.displayRect(
+            for: initialRun,
+            viewport: zoomedViewport,
+            timelineDuration: 7,
+            boundsWidth: 700
+        )
+        let fullRange = TranscriptViewportGeometry.visibleProjectRange(
+            viewport: initialViewport,
+            timelineDuration: 7
+        )
+        let zoomedRange = TranscriptViewportGeometry.visibleProjectRange(
+            viewport: zoomedViewport,
+            timelineDuration: 7
+        )
+        try require(
+            TranscriptViewportGeometry.range(zoomedRange, isCoveredBy: fullRange),
+            "transcript live geometry should reuse a wider cached range when zooming in"
+        )
+        try require(
+            !TranscriptViewportGeometry.range(fullRange, isCoveredBy: zoomedRange),
+            "transcript live geometry should not reuse a narrow cached range when zooming out"
+        )
+        try require(
+            liveRect.minX > initialRun.rect.minX + 120,
+            "transcript word did not move with live viewport transform"
+        )
+        try require(
+            liveRect.width > initialRun.rect.width * 3,
+            "transcript word did not resize with live viewport transform"
+        )
+
+        let exactLayout = TranscriptLayoutEngine.makeLayout(TranscriptTimelineLayoutInput(
+            tracks: [renderTrack],
+            viewport: zoomedViewport,
+            trackLayout: .default,
+            timelineDuration: 7,
+            bounds: CGSize(width: 700, height: 160),
+            displayMode: .waveformOverlay
+        ))
+        let exactRun = try requireValue(
+            exactLayout.runs.first { $0.wordID == wordID },
+            "transcript live geometry fixture lost word after exact relayout"
+        )
+        try require(
+            abs(exactRun.rect.minX - liveRect.minX) < 1.5,
+            "transcript live x transform did not match exact relayout"
+        )
+        try require(
+            abs(exactRun.rect.width - liveRect.width) < 1.5,
+            "transcript live width transform did not match exact relayout"
+        )
     }
 
     private static func verifyTranscriptValidityAndJobSnapshot(trackID: UUID) throws {
@@ -774,6 +847,36 @@ enum TranscriptionSmokeHarness {
         try require(extendedSelection.wordIDs == selection.wordIDs, "extended transcript selection did not include the dragged word range")
         try require(transcript.word(atSourceTime: 1.2)?.id == wordA.id, "indexed transcript active-word lookup returned the wrong word")
         try require(transcript.words(overlapping: 1.2..<1.6).map(\.id) == [wordA.id, wordB.id], "indexed transcript range lookup returned the wrong words")
+
+        let adjacentWordA = TranscriptWord(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000211") ?? UUID(),
+            text: "frame",
+            startTime: 2.0,
+            endTime: 2.25
+        )
+        let adjacentWordB = TranscriptWord(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000212") ?? UUID(),
+            text: "exact",
+            startTime: 2.25,
+            endTime: 2.55
+        )
+        let adjacentTranscript = TranscriptDocument(
+            trackID: trackID,
+            sourceRevision: 1,
+            sourceDuration: 4,
+            providerIdentifier: "smoke.transcription",
+            providerDisplayName: "Smoke Transcription",
+            segments: [
+                TranscriptSegment(
+                    startTime: 2,
+                    endTime: 2.55,
+                    text: "frame exact",
+                    words: [adjacentWordA, adjacentWordB]
+                ),
+            ]
+        )
+        try require(adjacentTranscript.word(atSourceTime: 2.249)?.id == adjacentWordA.id, "active-word lookup left the first adjacent word too early")
+        try require(adjacentTranscript.word(atSourceTime: 2.25)?.id == adjacentWordB.id, "active-word lookup did not advance at an adjacent word boundary")
     }
 
     private static func verifyTranscriptSidecarPersistence(trackID: UUID) throws {

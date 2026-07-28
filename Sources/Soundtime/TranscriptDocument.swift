@@ -181,8 +181,11 @@ struct TranscriptDocument: Codable, Equatable, Identifiable, Sendable {
             if segment.startTime > sourceTime {
                 break
             }
-            if segment.endTime >= sourceTime,
-               let word = segment.words.first(where: { $0.startTime <= sourceTime && $0.endTime >= sourceTime }) {
+            if segment.endTime > sourceTime,
+               let word = segment.words.first(where: { word in
+                   let wordEndTime = max(word.endTime, word.startTime + 0.001)
+                   return word.startTime <= sourceTime && sourceTime < wordEndTime
+               }) {
                 return word
             }
             index += 1

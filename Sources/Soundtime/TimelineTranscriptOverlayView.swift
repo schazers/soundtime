@@ -1,15 +1,26 @@
 import AppKit
 
+struct TimelineTranscriptOverlayDiagnosticsSnapshot: Codable, Sendable {
+    var configureCount: Int
+    var layoutBuildCount: Int
+    var interactionOnlyUpdateCount: Int
+    var fullDirtyUpdateCount: Int
+    var fineDirtyUpdateCount: Int
+    var visibleRunCount: Int
+}
+
 final class TimelineTranscriptOverlayView: NSView {
     private struct VisibleTextRun {
         let layoutRun: TranscriptTimelineLayout.Run
+        let displayRect: CGRect?
 
-        init(layoutRun: TranscriptTimelineLayout.Run) {
+        init(layoutRun: TranscriptTimelineLayout.Run, displayRect: CGRect? = nil) {
             self.layoutRun = layoutRun
+            self.displayRect = displayRect
         }
 
         var rect: CGRect {
-            layoutRun.rect
+            displayRect ?? layoutRun.rect
         }
 
         var text: String {
@@ -27,7 +38,7 @@ final class TimelineTranscriptOverlayView: NSView {
                 segmentID: layoutRun.segmentID,
                 sourceRange: layoutRun.sourceRange,
                 projectRange: layoutRun.projectRange,
-                rect: layoutRun.rect,
+                rect: rect,
                 text: layoutRun.text,
                 isWord: layoutRun.isWord,
                 confidence: layoutRun.confidence,
@@ -38,6 +49,8 @@ final class TimelineTranscriptOverlayView: NSView {
 
     private struct CachedLayout {
         let key: String
+        let reuseKey: String
+        let visibleProjectRange: TranscriptionTimeRange
         let backgroundRects: [CGRect]
         let runs: [VisibleTextRun]
         let wordRects: [UUID: CGRect]
@@ -51,6 +64,11 @@ final class TimelineTranscriptOverlayView: NSView {
     private var displayMode = TranscriptTimelineDisplayMode.hidden
     private var interactionState = TranscriptInteractionState.empty
     private var cachedLayout: CachedLayout?
+    private var diagnosticsConfigureCount = 0
+    private var diagnosticsLayoutBuildCount = 0
+    private var diagnosticsInteractionOnlyUpdateCount = 0
+    private var diagnosticsFullDirtyUpdateCount = 0
+    private var diagnosticsFineDirtyUpdateCount = 0
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -79,6 +97,7 @@ final class TimelineTranscriptOverlayView: NSView {
         displayMode: TranscriptTimelineDisplayMode,
         interactionState: TranscriptInteractionState = .empty
     ) -> Bool {
+        diagnosticsConfigureCount += 1
         let previousKey = cachedLayout?.key
         let previousInteractionState = self.interactionState
         self.tracks = tracks
@@ -108,12 +127,14 @@ final class TimelineTranscriptOverlayView: NSView {
 
         guard previousKey != nextKey else {
             if previousInteractionState != interactionState {
+                diagnosticsInteractionOnlyUpdateCount += 1
                 markInteractionChangeDirty(from: previousInteractionState, to: interactionState)
             }
             return false
         }
 
         cachedLayout = buildLayout(key: nextKey)
+        diagnosticsLayoutBuildCount += 1
         needsDisplay = true
         return true
     }
@@ -125,7 +146,99 @@ final class TimelineTranscriptOverlayView: NSView {
 
         let previousState = self.interactionState
         self.interactionState = interactionState
+        diagnosticsInteractionOnlyUpdateCount += 1
         markInteractionChangeDirty(from: previousState, to: interactionState)
+    }
+
+    @discardableResult
+    func updateLiveGeometry(
+        viewport: TimelineViewport,
+        trackLayout: TimelineTrackLayout,
+        timelineDuration: TimeInterval,
+        displayMode: TranscriptTimelineDisplayMode
+    ) -> Bool {
+        self.viewport = viewport
+        self.trackLayout = trackLayout
+        self.timelineDuration = timelineDuration
+        self.displayMode = displayMode
+        isHidden = displayMode == .hidden
+
+        guard displayMode != .hidden, cachedLayout != nil else {
+            return false
+        }
+
+        needsDisplay = true
+        return true
+    }
+
+    func requiresLayoutRebuild(
+        tracks: [TimelineRenderState.Track],
+        viewport: TimelineViewport,
+        trackLayout: TimelineTrackLayout,
+        timelineDuration: TimeInterval,
+        displayMode: TranscriptTimelineDisplayMode
+    ) -> Bool {
+        let isVisible = displayMode != .hidden
+        guard isVisible else {
+            return cachedLayout != nil
+        }
+        return cachedLayout?.key != cacheKey(
+            tracks: tracks,
+            viewport: viewport,
+            trackLayout: trackLayout,
+            timelineDuration: timelineDuration,
+            displayMode: displayMode
+        )
+    }
+
+    func canReuseLayoutForLiveGeometry(
+        tracks: [TimelineRenderState.Track],
+        viewport: TimelineViewport,
+        trackLayout: TimelineTrackLayout,
+        timelineDuration: TimeInterval,
+        displayMode: TranscriptTimelineDisplayMode
+    ) -> Bool {
+        guard
+            displayMode != .hidden,
+            let cachedLayout
+        else {
+            return false
+        }
+
+        let nextReuseKey = layoutReuseKey(
+            tracks: tracks,
+            trackLayout: trackLayout,
+            timelineDuration: timelineDuration,
+            displayMode: displayMode
+        )
+        guard cachedLayout.reuseKey == nextReuseKey else {
+            return false
+        }
+
+        let nextVisibleRange = TranscriptViewportGeometry.visibleProjectRange(
+            viewport: viewport,
+            timelineDuration: timelineDuration
+        )
+        return TranscriptViewportGeometry.range(nextVisibleRange, isCoveredBy: cachedLayout.visibleProjectRange)
+    }
+
+    func diagnosticsSnapshotForSmokeTesting() -> TimelineTranscriptOverlayDiagnosticsSnapshot {
+        TimelineTranscriptOverlayDiagnosticsSnapshot(
+            configureCount: diagnosticsConfigureCount,
+            layoutBuildCount: diagnosticsLayoutBuildCount,
+            interactionOnlyUpdateCount: diagnosticsInteractionOnlyUpdateCount,
+            fullDirtyUpdateCount: diagnosticsFullDirtyUpdateCount,
+            fineDirtyUpdateCount: diagnosticsFineDirtyUpdateCount,
+            visibleRunCount: cachedLayout?.runs.count ?? 0
+        )
+    }
+
+    func resetDiagnosticsForSmokeTesting() {
+        diagnosticsConfigureCount = 0
+        diagnosticsLayoutBuildCount = 0
+        diagnosticsInteractionOnlyUpdateCount = 0
+        diagnosticsFullDirtyUpdateCount = 0
+        diagnosticsFineDirtyUpdateCount = 0
     }
 
     func transcriptHit(at point: CGPoint) -> TranscriptInteractionHit? {
@@ -137,7 +250,8 @@ final class TimelineTranscriptOverlayView: NSView {
         }
 
         var best: (run: VisibleTextRun, distance: CGFloat)?
-        for run in cachedLayout.runs {
+        for cachedRun in cachedLayout.runs {
+            let run = displayRun(cachedRun)
             let hitRect = run.rect.insetBy(dx: -4, dy: -5)
             guard hitRect.contains(point) else {
                 continue
@@ -163,7 +277,8 @@ final class TimelineTranscriptOverlayView: NSView {
         }
 
         var best: (run: VisibleTextRun, distance: CGFloat)?
-        for run in cachedLayout.runs where run.layoutRun.trackID == trackID {
+        for cachedRun in cachedLayout.runs where cachedRun.layoutRun.trackID == trackID {
+            let run = displayRun(cachedRun)
             let verticalHitRect = run.rect.insetBy(dx: 0, dy: -9)
             guard point.y >= verticalHitRect.minY, point.y <= verticalHitRect.maxY else {
                 continue
@@ -188,14 +303,17 @@ final class TimelineTranscriptOverlayView: NSView {
     }
 
     func visibleRunsSnapshot() -> [TranscriptInteractionHit] {
-        cachedLayout?.runs.map(\.interactionHit) ?? []
+        guard let cachedLayout else {
+            return []
+        }
+        return cachedLayout.runs.map { displayRun($0).interactionHit }
     }
 
     func transcriptCursorRects() -> [CGRect] {
         guard displayMode != .hidden, let cachedLayout else {
             return []
         }
-        return cachedLayout.runs.map { $0.rect.insetBy(dx: -4, dy: -5) }
+        return cachedLayout.runs.map { displayRun($0).rect.insetBy(dx: -4, dy: -5) }
     }
 
     private func commonInit() {
@@ -222,10 +340,11 @@ final class TimelineTranscriptOverlayView: NSView {
         for backgroundRect in cachedLayout.backgroundRects where backgroundRect.intersects(dirtyRect) {
             drawTranscriptBackground(backgroundRect)
         }
+        let visibleRuns = cachedLayout.runs.map(displayRun)
         if interactionState.alignmentDebugEnabled {
-            drawAlignmentDebug(for: cachedLayout.runs, dirtyRect: dirtyRect)
+            drawAlignmentDebug(for: visibleRuns, dirtyRect: dirtyRect)
         }
-        for run in cachedLayout.runs where run.rect.intersects(dirtyRect) {
+        for run in visibleRuns where run.rect.intersects(dirtyRect) {
             draw(run)
         }
     }
@@ -237,7 +356,23 @@ final class TimelineTranscriptOverlayView: NSView {
             bounds.width > 1,
             bounds.height > 1
         else {
-            return CachedLayout(key: key, backgroundRects: [], runs: [], wordRects: [:], segmentRects: [:])
+            return CachedLayout(
+                key: key,
+                reuseKey: layoutReuseKey(
+                    tracks: tracks,
+                    trackLayout: trackLayout,
+                    timelineDuration: timelineDuration,
+                    displayMode: displayMode
+                ),
+                visibleProjectRange: TranscriptViewportGeometry.visibleProjectRange(
+                    viewport: viewport,
+                    timelineDuration: timelineDuration
+                ),
+                backgroundRects: [],
+                runs: [],
+                wordRects: [:],
+                segmentRects: [:]
+            )
         }
 
         let layout = TranscriptLayoutEngine.makeLayout(TranscriptTimelineLayoutInput(
@@ -251,6 +386,16 @@ final class TimelineTranscriptOverlayView: NSView {
         let runs = layout.runs.map { VisibleTextRun(layoutRun: $0) }
         return CachedLayout(
             key: key,
+            reuseKey: layoutReuseKey(
+                tracks: tracks,
+                trackLayout: trackLayout,
+                timelineDuration: timelineDuration,
+                displayMode: displayMode
+            ),
+            visibleProjectRange: TranscriptViewportGeometry.visibleProjectRange(
+                viewport: viewport,
+                timelineDuration: timelineDuration
+            ),
             backgroundRects: layout.backgrounds.map(\.rect),
             runs: runs,
             wordRects: rectsByWordID(runs),
@@ -263,40 +408,47 @@ final class TimelineTranscriptOverlayView: NSView {
         to nextState: TranscriptInteractionState
     ) {
         guard let cachedLayout else {
+            diagnosticsFullDirtyUpdateCount += 1
             needsDisplay = true
             return
         }
 
         guard previousState.alignmentDebugEnabled == nextState.alignmentDebugEnabled else {
+            diagnosticsFullDirtyUpdateCount += 1
             needsDisplay = true
             return
         }
 
         var dirtyRects: [CGRect] = []
-        appendDirtyRect(for: previousState.hoveredWordID, in: cachedLayout.wordRects, to: &dirtyRects)
-        appendDirtyRect(for: nextState.hoveredWordID, in: cachedLayout.wordRects, to: &dirtyRects)
-        appendDirtyRect(for: previousState.activeWordID, in: cachedLayout.wordRects, to: &dirtyRects)
-        appendDirtyRect(for: nextState.activeWordID, in: cachedLayout.wordRects, to: &dirtyRects)
-        appendDirtyRect(for: previousState.hoveredSegmentID, in: cachedLayout.segmentRects, to: &dirtyRects)
-        appendDirtyRect(for: nextState.hoveredSegmentID, in: cachedLayout.segmentRects, to: &dirtyRects)
+        let wordRects = currentWordRects(for: cachedLayout.runs)
+        let segmentRects = currentSegmentRects(for: cachedLayout.runs)
+
+        appendDirtyRect(for: previousState.hoveredWordID, in: wordRects, to: &dirtyRects)
+        appendDirtyRect(for: nextState.hoveredWordID, in: wordRects, to: &dirtyRects)
+        appendDirtyRect(for: previousState.activeWordID, in: wordRects, to: &dirtyRects)
+        appendDirtyRect(for: nextState.activeWordID, in: wordRects, to: &dirtyRects)
+        appendDirtyRect(for: previousState.hoveredSegmentID, in: segmentRects, to: &dirtyRects)
+        appendDirtyRect(for: nextState.hoveredSegmentID, in: segmentRects, to: &dirtyRects)
 
         let changedWordIDs = previousState.selectedWordIDs.symmetricDifference(nextState.selectedWordIDs)
         let changedSegmentIDs = previousState.selectedSegmentIDs.symmetricDifference(nextState.selectedSegmentIDs)
         for wordID in changedWordIDs {
-            appendDirtyRect(for: wordID, in: cachedLayout.wordRects, to: &dirtyRects)
+            appendDirtyRect(for: wordID, in: wordRects, to: &dirtyRects)
         }
         for segmentID in changedSegmentIDs {
-            appendDirtyRect(for: segmentID, in: cachedLayout.segmentRects, to: &dirtyRects)
+            appendDirtyRect(for: segmentID, in: segmentRects, to: &dirtyRects)
         }
 
         guard !dirtyRects.isEmpty else {
             return
         }
         if dirtyRects.count > 40 {
+            diagnosticsFullDirtyUpdateCount += 1
             needsDisplay = true
             return
         }
         for rect in dirtyRects {
+            diagnosticsFineDirtyUpdateCount += 1
             setNeedsDisplay(expandedDirtyRect(rect))
         }
     }
@@ -333,6 +485,26 @@ final class TimelineTranscriptOverlayView: NSView {
             rects[run.layoutRun.segmentID] = union(rects[run.layoutRun.segmentID], run.rect)
         }
         return rects
+    }
+
+    private func currentWordRects(for runs: [VisibleTextRun]) -> [UUID: CGRect] {
+        rectsByWordID(runs.map(displayRun))
+    }
+
+    private func currentSegmentRects(for runs: [VisibleTextRun]) -> [UUID: CGRect] {
+        rectsBySegmentID(runs.map(displayRun))
+    }
+
+    private func displayRun(_ run: VisibleTextRun) -> VisibleTextRun {
+        VisibleTextRun(
+            layoutRun: run.layoutRun,
+            displayRect: TranscriptViewportGeometry.displayRect(
+                for: run.layoutRun,
+                viewport: viewport,
+                timelineDuration: timelineDuration,
+                boundsWidth: bounds.width
+            )
+        )
     }
 
     private func union(_ existing: CGRect?, _ next: CGRect) -> CGRect {
@@ -467,6 +639,34 @@ final class TimelineTranscriptOverlayView: NSView {
             "\(Int((bounds.height * 2).rounded()))",
             "\(Int((viewport.startProgress * 1_000_000).rounded()))",
             "\(Int((viewport.durationProgress * 1_000_000).rounded()))",
+            "\(Int((timelineDuration * 1_000).rounded()))",
+            "\(Int((trackLayout.scrollOffset * 10).rounded()))",
+            "\(Int((trackLayout.preferredTrackHeight * 10).rounded()))",
+            "\(Int((trackLayout.rulerLaneHeight * 10).rounded()))",
+            "\(trackLayout.insertionTrackIndex ?? -1)",
+            "\(Int((trackLayout.insertionProgress * 1_000).rounded()))",
+        ]
+        components.append(
+            layoutReuseKey(
+                tracks: tracks,
+                trackLayout: trackLayout,
+                timelineDuration: timelineDuration,
+                displayMode: displayMode
+            )
+        )
+        return components.joined(separator: "|")
+    }
+
+    private func layoutReuseKey(
+        tracks: [TimelineRenderState.Track],
+        trackLayout: TimelineTrackLayout,
+        timelineDuration: TimeInterval,
+        displayMode: TranscriptTimelineDisplayMode
+    ) -> String {
+        var components = [
+            displayMode.rawValue,
+            "\(Int((bounds.width * 2).rounded()))",
+            "\(Int((bounds.height * 2).rounded()))",
             "\(Int((timelineDuration * 1_000).rounded()))",
             "\(Int((trackLayout.scrollOffset * 10).rounded()))",
             "\(Int((trackLayout.preferredTrackHeight * 10).rounded()))",
