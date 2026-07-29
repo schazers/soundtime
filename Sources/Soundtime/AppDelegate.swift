@@ -13,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         LaunchStartupTrace.shared.mark(.appDelegateDidFinishLaunching)
+        SoundtimeProjectStore.removeAutomationArtifactsFromUserHistory()
         configureMainMenu()
 
         openProjectWindow(restoresLastProject: true)
@@ -310,6 +311,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             action: #selector(TimelineView.undoTimelineEdit(_:)),
             keyEquivalent: "z"
         ))
+        let redoItem = NSMenuItem(
+            title: "Redo",
+            action: #selector(TimelineView.redoTimelineEdit(_:)),
+            keyEquivalent: "Z"
+        )
+        redoItem.keyEquivalentModifierMask = [.command, .shift]
+        menu.addItem(redoItem)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(
             title: "Cut",

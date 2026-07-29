@@ -31,7 +31,10 @@ swift run Soundtime --shippability-gate
 swift run Soundtime --shippability-gate --quick
 ```
 
-The gate verifies `.build/shippability-fixtures/v1` before using it. If the cache is missing or invalid, it rebuilds it once; later runs reuse it. To force a clean fixture rebuild:
+The gate verifies its profile-specific cache at `.build/shippability-fixtures/v1/quick`
+or `.build/shippability-fixtures/v1/full` before using it. If a cache is missing or
+invalid, it rebuilds that profile once; later runs reuse it without invalidating
+the other gate tier. To force a clean fixture rebuild:
 
 ```sh
 swift run Soundtime --shippability-gate --rebuild-fixtures

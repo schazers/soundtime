@@ -201,8 +201,16 @@ private final class LoudnessMeterMetalView: TimelineMetalLayerView {
         var parameters: SIMD4<Float>
     }
 
+    private struct RendererResources {
+        let device: MTLDevice
+        let commandQueue: MTLCommandQueue
+        let pipelineState: MTLRenderPipelineState
+    }
+
     private var commandQueue: MTLCommandQueue?
     private var pipelineState: MTLRenderPipelineState?
+    private var rendererInitializationID = UUID()
+    private var isRendererInitializationScheduled = false
     private var vertices: [MeterVertex] = [
         MeterVertex(position: SIMD2<Float>(0, 0)),
         MeterVertex(position: SIMD2<Float>(1, 0)),
@@ -218,14 +226,24 @@ private final class LoudnessMeterMetalView: TimelineMetalLayerView {
     private var lastUpdateTime = CACurrentMediaTime()
     private var isMono = false
 
-    override init(frame frameRect: NSRect = .zero, device: MTLDevice? = MTLCreateSystemDefaultDevice()) {
+    override init(frame frameRect: NSRect = .zero, device: MTLDevice? = nil) {
         super.init(frame: frameRect, device: device)
-        configureMeter()
+        configureMeterAppearance()
+        if let device {
+            installMeterRenderer(try? Self.makeRendererResources(device: device))
+        }
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
-        configureMeter()
+        configureMeterAppearance()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window != nil {
+            scheduleMeterRendererInitializationIfNeeded()
+        }
     }
 
     func display(levels: LoudnessMeterLevels, isMono: Bool) {
@@ -235,44 +253,99 @@ private final class LoudnessMeterMetalView: TimelineMetalLayerView {
         render()
     }
 
-    private func configureMeter() {
+    private func configureMeterAppearance() {
         colorPixelFormat = .bgra8Unorm
         clearColor = MTLClearColor(red: 0.055, green: 0.055, blue: 0.055, alpha: 1)
         framebufferOnly = true
+    }
 
+    nonisolated private static func makeRendererResources(device: MTLDevice) throws -> RendererResources {
         guard
-            let device = metalDevice,
             let commandQueue = device.makeCommandQueue()
         else {
+            throw NSError(
+                domain: "Soundtime.LoudnessMeterMetalView",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Metal command queue unavailable"]
+            )
+        }
+
+        let library = try BundledMetalLibrary.load(
+            named: "LoudnessMeterShaders",
+            device: device,
+            developmentSource: Self.shaderSource
+        )
+        guard
+            let vertexFunction = library.makeFunction(name: "loudness_meter_vertex"),
+            let fragmentFunction = library.makeFunction(name: "loudness_meter_fragment")
+        else {
+            throw NSError(
+                domain: "Soundtime.LoudnessMeterMetalView",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Metal shader functions unavailable"]
+            )
+        }
+
+        let descriptor = MTLRenderPipelineDescriptor()
+        descriptor.vertexFunction = vertexFunction
+        descriptor.fragmentFunction = fragmentFunction
+        descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+        descriptor.colorAttachments[0].isBlendingEnabled = true
+        descriptor.colorAttachments[0].rgbBlendOperation = .add
+        descriptor.colorAttachments[0].alphaBlendOperation = .add
+        descriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        descriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+        descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        descriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+
+        return RendererResources(
+            device: device,
+            commandQueue: commandQueue,
+            pipelineState: try device.makeRenderPipelineState(descriptor: descriptor)
+        )
+    }
+
+    private func scheduleMeterRendererInitializationIfNeeded() {
+        guard pipelineState == nil, !isRendererInitializationScheduled else {
             return
         }
-
-        do {
-            let library = try device.makeLibrary(source: Self.shaderSource, options: nil)
-            guard
-                let vertexFunction = library.makeFunction(name: "loudness_meter_vertex"),
-                let fragmentFunction = library.makeFunction(name: "loudness_meter_fragment")
-            else {
-                return
+        isRendererInitializationScheduled = true
+        let initializationID = UUID()
+        rendererInitializationID = initializationID
+        MetalRendererInitialization.auxiliaryQueue.async {
+            let result = Result {
+                guard let device = MTLCreateSystemDefaultDevice() else {
+                    throw NSError(
+                        domain: "Soundtime.LoudnessMeterMetalView",
+                        code: 3,
+                        userInfo: [NSLocalizedDescriptionKey: "Metal device unavailable"]
+                    )
+                }
+                return try Self.makeRendererResources(device: device)
             }
-
-            let descriptor = MTLRenderPipelineDescriptor()
-            descriptor.vertexFunction = vertexFunction
-            descriptor.fragmentFunction = fragmentFunction
-            descriptor.colorAttachments[0].pixelFormat = colorPixelFormat
-            descriptor.colorAttachments[0].isBlendingEnabled = true
-            descriptor.colorAttachments[0].rgbBlendOperation = .add
-            descriptor.colorAttachments[0].alphaBlendOperation = .add
-            descriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
-            descriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
-            descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
-            descriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
-
-            self.commandQueue = commandQueue
-            pipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
-        } catch {
-            Swift.print("Soundtime could not create loudness meter renderer: \(error)")
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.rendererInitializationID == initializationID else {
+                    return
+                }
+                self.isRendererInitializationScheduled = false
+                switch result {
+                case let .success(resources):
+                    self.installMeterRenderer(resources)
+                    self.render()
+                case let .failure(error):
+                    Swift.print("Soundtime could not create loudness meter renderer: \(error)")
+                }
+            }
         }
+    }
+
+    private func installMeterRenderer(_ resources: RendererResources?) {
+        guard let resources else {
+            return
+        }
+        installMetalDevice(resources.device)
+        commandQueue = resources.commandQueue
+        pipelineState = resources.pipelineState
     }
 
     private func updateSmoothing() {
@@ -362,7 +435,7 @@ private final class LoudnessMeterMetalView: TimelineMetalLayerView {
         commandBuffer.commit()
     }
 
-    private static let shaderSource = """
+    nonisolated private static let shaderSource = """
     #include <metal_stdlib>
     using namespace metal;
 

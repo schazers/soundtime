@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <time.h>
 #include <utility>
 #include <vector>
 
@@ -175,6 +176,14 @@ struct SoundtimeAudioCoreEngine {
     std::atomic<uint64_t> lastRenderNanoseconds{0};
     std::atomic<uint64_t> maxRenderNanoseconds{0};
     std::atomic<uint64_t> renderDeadlineMissCount{0};
+    std::atomic<bool> detailedTimingEnabled{false};
+    std::atomic<uint64_t> lastRenderWorkNanoseconds{0};
+    std::atomic<uint64_t> maxRenderWorkNanoseconds{0};
+    std::atomic<uint64_t> renderWorkDeadlineMissCount{0};
+    std::atomic<uint64_t> callbackSchedulingLateCount{0};
+    std::atomic<uint64_t> maxCallbackSchedulingLatenessNanoseconds{0};
+    std::atomic<double> previousCallbackHostTimestamp{0};
+    std::atomic<uint32_t> previousCallbackFrameCount{0};
     std::atomic<uint64_t> configFrameCount{0};
     std::atomic<uint32_t> configChannelCount{0};
     std::atomic<double> configSampleRate{0};
@@ -560,6 +569,71 @@ void mark_splice_fades(RenderTrack& track) {
     }
 }
 
+template <typename TrackGainProvider>
+void mix_render_graph_frame(
+    const RenderGraph& graph,
+    const AudioRenderConfig& config,
+    uint64_t outputFrameIndex,
+    float outputGainBase,
+    float* const* outputs,
+    uint32_t channelCount,
+    uint64_t outputFrameOffset,
+    TrackGainProvider trackGainProvider
+) {
+    for (size_t trackIndex = 0; trackIndex < graph.tracks.size(); trackIndex++) {
+        const auto& track = graph.tracks[trackIndex];
+        const auto* source = track.source.get();
+        const auto trackGain = trackGainProvider(trackIndex, track);
+        if (!source || trackGain <= 0) {
+            continue;
+        }
+
+        for (const auto& segment : track.segments) {
+            if (
+                outputFrameIndex < segment.outputStartFrame ||
+                outputFrameIndex >= segment.outputStartFrame + segment.frameCount
+            ) {
+                continue;
+            }
+
+            const auto segmentFrameOffset = outputFrameIndex - segment.outputStartFrame;
+            const auto sourceChannelCount = source->channelCount;
+            const auto outputGain = outputGainBase *
+                trackGain *
+                segment_gain(segment, segmentFrameOffset) *
+                segment_splice_gain(segment, segmentFrameOffset, config);
+            for (uint32_t outputChannel = 0; outputChannel < channelCount; outputChannel++) {
+                auto* output = outputs[outputChannel];
+                if (output == nullptr) {
+                    continue;
+                }
+
+                const auto sourceChannel = sourceChannelCount == 1 ?
+                    uint32_t{0} :
+                    outputChannel;
+                if (sourceChannel >= sourceChannelCount) {
+                    continue;
+                }
+
+                const auto sourceSample = segment.usesExactSourceFrames ?
+                    sample_at(
+                        *source,
+                        segment.sourceStartFrame + segmentFrameOffset,
+                        sourceChannel
+                    ) :
+                    sample_at_linear(
+                        *source,
+                        static_cast<double>(segment.sourceStartFrame) +
+                            static_cast<double>(segmentFrameOffset) * segment.sourceFrameScale,
+                        sourceChannel
+                    );
+                output[outputFrameOffset] += sourceSample * outputGain;
+            }
+            break;
+        }
+    }
+}
+
 uint64_t output_frame_count_for_source(const AudioSource& source, double outputSampleRate) {
     if (source.frameCount == 0 || source.sampleRate <= 0 || outputSampleRate <= 0) {
         return 0;
@@ -666,6 +740,13 @@ void reset_engine_runtime(SoundtimeAudioCoreEngine& engine) {
     engine.lastRenderNanoseconds.store(0, std::memory_order_release);
     engine.maxRenderNanoseconds.store(0, std::memory_order_release);
     engine.renderDeadlineMissCount.store(0, std::memory_order_release);
+    engine.lastRenderWorkNanoseconds.store(0, std::memory_order_release);
+    engine.maxRenderWorkNanoseconds.store(0, std::memory_order_release);
+    engine.renderWorkDeadlineMissCount.store(0, std::memory_order_release);
+    engine.callbackSchedulingLateCount.store(0, std::memory_order_release);
+    engine.maxCallbackSchedulingLatenessNanoseconds.store(0, std::memory_order_release);
+    engine.previousCallbackHostTimestamp.store(0, std::memory_order_release);
+    engine.previousCallbackFrameCount.store(0, std::memory_order_release);
     engine.transportGain = 1;
     engine.transportGainTarget = 1;
     engine.transportGainStep = 0;
@@ -684,9 +765,73 @@ uint64_t ticks_to_nanoseconds(const SoundtimeAudioCoreEngine& engine, uint64_t t
     return (ticks * engine.renderTimingTimebase.numer) / engine.renderTimingTimebase.denom;
 }
 
+uint64_t current_thread_cpu_nanoseconds() {
+    timespec timestamp{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &timestamp) != 0) {
+        return 0;
+    }
+    return static_cast<uint64_t>(timestamp.tv_sec) * 1'000'000'000ULL +
+        static_cast<uint64_t>(timestamp.tv_nsec);
+}
+
+void publish_atomic_max(std::atomic<uint64_t>& target, uint64_t value) {
+    auto previousMax = target.load(std::memory_order_acquire);
+    while (
+        value > previousMax &&
+        !target.compare_exchange_weak(
+            previousMax,
+            value,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire
+        )
+    ) {}
+}
+
+void publish_callback_scheduling(
+    SoundtimeAudioCoreEngine& engine,
+    uint32_t frameCount,
+    double sampleRate,
+    double hostTimestamp
+) {
+    const auto previousHostTimestamp = engine.previousCallbackHostTimestamp.exchange(
+        hostTimestamp,
+        std::memory_order_acq_rel
+    );
+    const auto previousFrameCount = engine.previousCallbackFrameCount.exchange(
+        frameCount,
+        std::memory_order_acq_rel
+    );
+    if (
+        previousHostTimestamp <= 0 ||
+        hostTimestamp <= previousHostTimestamp ||
+        previousFrameCount == 0 ||
+        sampleRate <= 0 ||
+        !std::isfinite(sampleRate)
+    ) {
+        return;
+    }
+
+    const auto expectedInterval = static_cast<double>(previousFrameCount) / sampleRate;
+    const auto latenessSeconds = hostTimestamp - previousHostTimestamp - expectedInterval;
+    const auto toleranceSeconds = std::max(expectedInterval * 0.25, 0.001);
+    if (latenessSeconds <= toleranceSeconds) {
+        return;
+    }
+
+    const auto latenessNanoseconds = static_cast<uint64_t>(
+        latenessSeconds * 1'000'000'000.0
+    );
+    engine.callbackSchedulingLateCount.fetch_add(1, std::memory_order_acq_rel);
+    publish_atomic_max(
+        engine.maxCallbackSchedulingLatenessNanoseconds,
+        latenessNanoseconds
+    );
+}
+
 void publish_render_timing(
     SoundtimeAudioCoreEngine& engine,
     uint64_t startTicks,
+    uint64_t startWorkNanoseconds,
     uint32_t frameCount,
     double sampleRate
 ) {
@@ -694,16 +839,7 @@ void publish_render_timing(
     engine.callbackCount.fetch_add(1, std::memory_order_acq_rel);
     engine.lastRenderNanoseconds.store(elapsedNanoseconds, std::memory_order_release);
 
-    auto previousMax = engine.maxRenderNanoseconds.load(std::memory_order_acquire);
-    while (
-        elapsedNanoseconds > previousMax &&
-        !engine.maxRenderNanoseconds.compare_exchange_weak(
-            previousMax,
-            elapsedNanoseconds,
-            std::memory_order_acq_rel,
-            std::memory_order_acquire
-        )
-    ) {}
+    publish_atomic_max(engine.maxRenderNanoseconds, elapsedNanoseconds);
 
     if (sampleRate > 0 && std::isfinite(sampleRate) && frameCount > 0) {
         const auto deadlineNanoseconds = static_cast<uint64_t>(
@@ -711,6 +847,17 @@ void publish_render_timing(
         );
         if (deadlineNanoseconds > 0 && elapsedNanoseconds > deadlineNanoseconds) {
             engine.renderDeadlineMissCount.fetch_add(1, std::memory_order_acq_rel);
+        }
+        if (startWorkNanoseconds > 0) {
+            const auto endWorkNanoseconds = current_thread_cpu_nanoseconds();
+            const auto workNanoseconds = endWorkNanoseconds >= startWorkNanoseconds ?
+                endWorkNanoseconds - startWorkNanoseconds :
+                uint64_t{0};
+            engine.lastRenderWorkNanoseconds.store(workNanoseconds, std::memory_order_release);
+            publish_atomic_max(engine.maxRenderWorkNanoseconds, workNanoseconds);
+            if (deadlineNanoseconds > 0 && workNanoseconds > deadlineNanoseconds) {
+                engine.renderWorkDeadlineMissCount.fetch_add(1, std::memory_order_acq_rel);
+            }
         }
     }
 }
@@ -895,7 +1042,8 @@ std::shared_ptr<RenderGraph> make_graph_from_track_configs(
 
 std::shared_ptr<RenderGraph> make_graph_from_segmented_track_configs(
     const SoundtimeAudioCoreSegmentedTrackConfig* tracks,
-    uint32_t trackCount
+    uint32_t trackCount,
+    double requestedSampleRate = 0
 ) {
     if (tracks == nullptr || trackCount == 0) {
         return nullptr;
@@ -909,7 +1057,9 @@ std::shared_ptr<RenderGraph> make_graph_from_segmented_track_configs(
         return nullptr;
     }
 
-    const auto sampleRate = firstSource->source->sampleRate;
+    const auto sampleRate = requestedSampleRate > 0 ?
+        requestedSampleRate :
+        firstSource->source->sampleRate;
     if (sampleRate <= 0) {
         return nullptr;
     }
@@ -1214,6 +1364,17 @@ void soundtime_audio_core_reset(SoundtimeAudioCoreEngine* engine) {
     clear_render_graph(*engine, 0, 0, 0);
 }
 
+void soundtime_audio_core_set_detailed_timing_enabled(
+    SoundtimeAudioCoreEngine* engine,
+    bool isEnabled
+) {
+    if (engine == nullptr) {
+        return;
+    }
+
+    engine->detailedTimingEnabled.store(isEnabled, std::memory_order_release);
+}
+
 void soundtime_audio_core_set_source_info(
     SoundtimeAudioCoreEngine* engine,
     uint64_t frameCount,
@@ -1342,6 +1503,29 @@ bool soundtime_audio_core_set_prepared_segmented_tracks(
     return true;
 }
 
+bool soundtime_audio_core_set_prepared_segmented_tracks_at_sample_rate(
+    SoundtimeAudioCoreEngine* engine,
+    const SoundtimeAudioCoreSegmentedTrackConfig* tracks,
+    uint32_t trackCount,
+    double sampleRate
+) {
+    if (engine == nullptr || sampleRate <= 0) {
+        return false;
+    }
+
+    const auto graph = make_graph_from_segmented_track_configs(
+        tracks,
+        trackCount,
+        sampleRate
+    );
+    if (!graph) {
+        return false;
+    }
+
+    publish_graph(*engine, graph, true);
+    return true;
+}
+
 bool soundtime_audio_core_update_prepared_segmented_tracks(
     SoundtimeAudioCoreEngine* engine,
     const SoundtimeAudioCoreSegmentedTrackConfig* tracks,
@@ -1452,6 +1636,12 @@ SoundtimeAudioCoreSnapshot soundtime_audio_core_snapshot(const SoundtimeAudioCor
         .lastRenderNanoseconds = engine->lastRenderNanoseconds.load(std::memory_order_acquire),
         .maxRenderNanoseconds = engine->maxRenderNanoseconds.load(std::memory_order_acquire),
         .renderDeadlineMissCount = engine->renderDeadlineMissCount.load(std::memory_order_acquire),
+        .lastRenderWorkNanoseconds = engine->lastRenderWorkNanoseconds.load(std::memory_order_acquire),
+        .maxRenderWorkNanoseconds = engine->maxRenderWorkNanoseconds.load(std::memory_order_acquire),
+        .renderWorkDeadlineMissCount = engine->renderWorkDeadlineMissCount.load(std::memory_order_acquire),
+        .callbackSchedulingLateCount = engine->callbackSchedulingLateCount.load(std::memory_order_acquire),
+        .maxCallbackSchedulingLatenessNanoseconds =
+            engine->maxCallbackSchedulingLatenessNanoseconds.load(std::memory_order_acquire),
     };
 }
 
@@ -1556,11 +1746,28 @@ void soundtime_audio_core_render_at_host_time(
     double hostTimestamp
 ) {
     const auto renderStartTicks = engine != nullptr ? mach_absolute_time() : uint64_t{0};
+    const auto detailedTimingEnabled = engine != nullptr &&
+        engine->detailedTimingEnabled.load(std::memory_order_acquire);
+    const auto renderWorkStartNanoseconds = detailedTimingEnabled ?
+        current_thread_cpu_nanoseconds() :
+        uint64_t{0};
     if (outputs == nullptr) {
         if (engine != nullptr) {
             engine->underrunCount.fetch_add(1, std::memory_order_acq_rel);
             const auto sampleRate = engine->configSampleRate.load(std::memory_order_acquire);
-            publish_render_timing(*engine, renderStartTicks, frameCount, sampleRate);
+            publish_callback_scheduling(
+                *engine,
+                frameCount,
+                sampleRate,
+                hostTimestamp
+            );
+            publish_render_timing(
+                *engine,
+                renderStartTicks,
+                renderWorkStartNanoseconds,
+                frameCount,
+                sampleRate
+            );
         }
         return;
     }
@@ -1572,6 +1779,12 @@ void soundtime_audio_core_render_at_host_time(
         engine->renderedFrameCount.fetch_add(frameCount, std::memory_order_acq_rel);
         graph = acquire_render_graph(*engine);
         config = make_audio_render_config(*engine, graph);
+        publish_callback_scheduling(
+            *engine,
+            frameCount,
+            config.sampleRate,
+            hostTimestamp
+        );
         process_commands(*engine, config);
         blockStartFrameIndex = engine->frameIndex.load(std::memory_order_acquire);
     }
@@ -1601,7 +1814,13 @@ void soundtime_audio_core_render_at_host_time(
         );
         publish_clock_sample(*engine);
         release_render_graph(*engine);
-        publish_render_timing(*engine, renderStartTicks, frameCount, config.sampleRate);
+        publish_render_timing(
+            *engine,
+            renderStartTicks,
+            renderWorkStartNanoseconds,
+            frameCount,
+            config.sampleRate
+        );
         return;
     }
 
@@ -1620,59 +1839,18 @@ void soundtime_audio_core_render_at_host_time(
             const auto outputGainBase = config.gain * transportGain;
 
             advancedFrameCount++;
-            for (size_t trackIndex = 0; trackIndex < graph->tracks.size(); trackIndex++) {
-                const auto& track = graph->tracks[trackIndex];
-                const auto* source = track.source.get();
-                const auto trackGain = next_track_gain(engine->trackGainRamps[trackIndex]);
-                if (!source || trackGain <= 0) {
-                    continue;
+            mix_render_graph_frame(
+                *graph,
+                config,
+                outputFrameIndex,
+                outputGainBase,
+                outputs,
+                channelCount,
+                frameOffset,
+                [&](size_t trackIndex, const RenderTrack&) {
+                    return next_track_gain(engine->trackGainRamps[trackIndex]);
                 }
-
-                for (const auto& segment : track.segments) {
-                    if (
-                        outputFrameIndex < segment.outputStartFrame ||
-                        outputFrameIndex >= segment.outputStartFrame + segment.frameCount
-                    ) {
-                        continue;
-                    }
-
-                    const auto segmentFrameOffset = outputFrameIndex - segment.outputStartFrame;
-
-                    const auto sourceChannelCount = source->channelCount;
-                    const auto outputGain = outputGainBase *
-                        trackGain *
-                        segment_gain(segment, segmentFrameOffset) *
-                        segment_splice_gain(segment, segmentFrameOffset, config);
-                    for (uint32_t outputChannel = 0; outputChannel < channelCount; outputChannel++) {
-                        auto* output = outputs[outputChannel];
-                        if (output == nullptr) {
-                            continue;
-                        }
-
-                        const auto sourceChannel = sourceChannelCount == 1 ?
-                            uint32_t{0} :
-                            outputChannel;
-                        if (sourceChannel >= sourceChannelCount) {
-                            continue;
-                        }
-
-                        const auto sourceSample = segment.usesExactSourceFrames ?
-                            sample_at(
-                                *source,
-                                segment.sourceStartFrame + segmentFrameOffset,
-                                sourceChannel
-                            ) :
-                            sample_at_linear(
-                                *source,
-                                static_cast<double>(segment.sourceStartFrame) +
-                                    static_cast<double>(segmentFrameOffset) * segment.sourceFrameScale,
-                                sourceChannel
-                            );
-                        output[frameOffset] += sourceSample * outputGain;
-                    }
-                    break;
-                }
-            }
+            );
             if (!engine->isPlaying.load(std::memory_order_acquire)) {
                 break;
             }
@@ -1715,7 +1893,66 @@ void soundtime_audio_core_render_at_host_time(
     );
     publish_clock_sample(*engine);
     release_render_graph(*engine);
-    publish_render_timing(*engine, renderStartTicks, frameCount, config.sampleRate);
+    publish_render_timing(
+        *engine,
+        renderStartTicks,
+        renderWorkStartNanoseconds,
+        frameCount,
+        config.sampleRate
+    );
+}
+
+bool soundtime_audio_core_render_offline(
+    SoundtimeAudioCoreEngine* engine,
+    uint64_t startFrameIndex,
+    float* const* outputs,
+    uint32_t channelCount,
+    uint32_t frameCount
+) {
+    if (engine == nullptr || outputs == nullptr || channelCount == 0) {
+        return false;
+    }
+
+    for (uint32_t channelIndex = 0; channelIndex < channelCount; channelIndex++) {
+        auto* output = outputs[channelIndex];
+        if (output != nullptr) {
+            std::fill(output, output + frameCount, 0.0f);
+        }
+    }
+
+    const auto* graph = acquire_render_graph(*engine);
+    if (graph == nullptr) {
+        release_render_graph(*engine);
+        return false;
+    }
+
+    const auto config = AudioRenderConfig{
+        .frameCount = graph->frameCount,
+        .channelCount = graph->channelCount,
+        .sampleRate = graph->sampleRate,
+        .gain = 1,
+    };
+    const auto renderableFrameCount = startFrameIndex < graph->frameCount ?
+        std::min<uint64_t>(frameCount, graph->frameCount - startFrameIndex) :
+        0;
+
+    for (uint64_t frameOffset = 0; frameOffset < renderableFrameCount; frameOffset++) {
+        mix_render_graph_frame(
+            *graph,
+            config,
+            startFrameIndex + frameOffset,
+            1,
+            outputs,
+            channelCount,
+            frameOffset,
+            [](size_t, const RenderTrack& track) {
+                return track.gain;
+            }
+        );
+    }
+
+    release_render_graph(*engine);
+    return true;
 }
 
 SoundtimeAudioCoreRecordingRing* soundtime_audio_core_recording_ring_create(

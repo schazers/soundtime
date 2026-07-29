@@ -15,6 +15,10 @@ struct AudioZeroCrossingIndex: Sendable {
         crossings.isEmpty
     }
 
+    var persistedCrossings: [Int] {
+        crossings
+    }
+
     func nearestFrame(to frame: Int) -> Int {
         guard !crossings.isEmpty else {
             return min(max(frame, 0), frameCount)

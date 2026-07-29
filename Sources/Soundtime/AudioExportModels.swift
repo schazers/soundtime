@@ -1,3 +1,5 @@
+import AudioToolbox
+import Darwin
 import Foundation
 
 enum AudioExportFormat: String, CaseIterable, Sendable {
@@ -35,6 +37,118 @@ enum AudioExportFormat: String, CaseIterable, Sendable {
     init(destinationURL: URL) {
         self = Self(rawValue: destinationURL.pathExtension.lowercased()) ?? .wav
     }
+
+    var isSystemEncoderAvailable: Bool {
+        let formatID: AudioFormatID
+        switch self {
+        case .wav:
+            return true
+        case .m4a, .aac:
+            formatID = kAudioFormatMPEG4AAC
+        case .mp3:
+            formatID = kAudioFormatMPEGLayer3
+        }
+
+        var requestedFormatID = formatID
+        var propertySize: UInt32 = 0
+        let infoStatus = withUnsafePointer(to: &requestedFormatID) { formatPointer in
+            AudioFormatGetPropertyInfo(
+                kAudioFormatProperty_Encoders,
+                UInt32(MemoryLayout<AudioFormatID>.size),
+                formatPointer,
+                &propertySize
+            )
+        }
+        guard infoStatus == noErr else {
+            return false
+        }
+        let count = Int(propertySize) / MemoryLayout<AudioClassDescription>.stride
+        guard count > 0 else {
+            return false
+        }
+        var encoders = [AudioClassDescription](
+            repeating: AudioClassDescription(),
+            count: count
+        )
+        let propertyStatus = withUnsafePointer(to: &requestedFormatID) { formatPointer in
+            AudioFormatGetProperty(
+                kAudioFormatProperty_Encoders,
+                UInt32(MemoryLayout<AudioFormatID>.size),
+                formatPointer,
+                &propertySize,
+                &encoders
+            )
+        }
+        guard propertyStatus == noErr else {
+            return false
+        }
+        return !encoders.isEmpty
+    }
+}
+
+enum AudioExportWAVEncoding: String, CaseIterable, Codable, Sendable {
+    case pcm16
+    case pcm24
+    case float32
+
+    var displayName: String {
+        switch self {
+        case .pcm16:
+            return "16-bit PCM"
+        case .pcm24:
+            return "24-bit PCM"
+        case .float32:
+            return "32-bit Float"
+        }
+    }
+
+    var bytesPerSample: Int {
+        switch self {
+        case .pcm16:
+            return 2
+        case .pcm24:
+            return 3
+        case .float32:
+            return 4
+        }
+    }
+}
+
+enum AudioExportCompressedQuality: Int, CaseIterable, Codable, Sendable {
+    case compact = 128_000
+    case standard = 192_000
+    case high = 256_000
+
+    var displayName: String {
+        switch self {
+        case .compact:
+            return "Compact (128 kbps)"
+        case .standard:
+            return "Standard (192 kbps)"
+        case .high:
+            return "High (256 kbps)"
+        }
+    }
+}
+
+struct AudioExportStemOptions: Sendable, Equatable {
+    enum TrackInclusion: String, Sendable {
+        case allTracks
+        case audibleTracks
+    }
+
+    enum GainPosition: String, Sendable {
+        case preFader
+        case postFader
+    }
+
+    let trackInclusion: TrackInclusion
+    let gainPosition: GainPosition
+
+    static let v1Default = AudioExportStemOptions(
+        trackInclusion: .allTracks,
+        gainPosition: .postFader
+    )
 }
 
 enum AudioExportScope: Sendable {
@@ -87,7 +201,9 @@ struct AudioExportRequest: Sendable {
     let scope: AudioExportScope
     let format: AudioExportFormat
     let destinationURL: URL
-    let appliesPodcastMastering: Bool
+    let wavEncoding: AudioExportWAVEncoding
+    let compressedQuality: AudioExportCompressedQuality
+    let stemOptions: AudioExportStemOptions
 
     init(
         id: UUID = UUID(),
@@ -96,7 +212,9 @@ struct AudioExportRequest: Sendable {
         scope: AudioExportScope,
         format: AudioExportFormat,
         destinationURL: URL,
-        appliesPodcastMastering: Bool = false
+        wavEncoding: AudioExportWAVEncoding = .pcm24,
+        compressedQuality: AudioExportCompressedQuality = .standard,
+        stemOptions: AudioExportStemOptions = .v1Default
     ) {
         self.id = id
         self.createdAt = createdAt
@@ -104,7 +222,9 @@ struct AudioExportRequest: Sendable {
         self.scope = scope
         self.format = format
         self.destinationURL = destinationURL
-        self.appliesPodcastMastering = appliesPodcastMastering
+        self.wavEncoding = wavEncoding
+        self.compressedQuality = compressedQuality
+        self.stemOptions = stemOptions
     }
 }
 
@@ -112,6 +232,8 @@ enum AudioExportStage: String, Sendable {
     case preparing
     case rendering
     case encoding
+    case validating
+    case committing
     case finishing
     case completed
     case canceled
@@ -125,6 +247,10 @@ enum AudioExportStage: String, Sendable {
             return "Rendering"
         case .encoding:
             return "Encoding"
+        case .validating:
+            return "Validating"
+        case .committing:
+            return "Saving"
         case .finishing:
             return "Finishing"
         case .completed:
@@ -163,6 +289,7 @@ struct AudioExportResult: Sendable {
     let elapsedSeconds: TimeInterval
     let renderedFrameCount: Int
     let renderStats: AudioExportRenderStats
+    let validations: [AudioExportOutputValidator.Validation]
     let reportURL: URL?
 }
 
@@ -187,6 +314,7 @@ struct AudioExportRenderStats: Sendable, Codable, Equatable {
 struct AudioExportCompletedWrite: Sendable {
     let outputURLs: [URL]
     let renderStats: AudioExportRenderStats
+    let validations: [AudioExportOutputValidator.Validation]
     let reportURL: URL?
 }
 
@@ -199,8 +327,10 @@ protocol AudioExportSampleWriter: AnyObject {
 
 enum AudioExportTrackSource: Sendable {
     case decoded(DecodedAudioBuffer)
+    case decodedSegments(DecodedAudioBuffer, [AudioEditTimeline.PlaybackSegment])
     case timeline(AudioEditTimeline)
     case file(URL, WAVFileInfo)
+    case fileSegments(URL, WAVFileInfo, [AudioEditTimeline.PlaybackSegment])
     case fileTimeline(URL, WAVFileInfo, AudioFileEditTimeline)
 }
 
@@ -208,19 +338,84 @@ struct AudioExportTrackSnapshot: Sendable {
     let id: UUID
     let name: String
     let volume: Float
+    let isMuted: Bool
+    let isSoloed: Bool
     let source: AudioExportTrackSource
+    let sourceFingerprint: AudioExportSourceFingerprint?
+
+    init(
+        id: UUID,
+        name: String,
+        volume: Float,
+        isMuted: Bool = false,
+        isSoloed: Bool = false,
+        source: AudioExportTrackSource
+    ) {
+        self.id = id
+        self.name = name
+        self.volume = volume
+        self.isMuted = isMuted
+        self.isSoloed = isSoloed
+        self.source = source
+        sourceFingerprint = AudioExportSourceFingerprint.capture(
+            url: Self.sourceURL(for: source)
+        )
+    }
 
     var sourceURL: URL? {
+        Self.sourceURL(for: source)
+    }
+
+    private static func sourceURL(for source: AudioExportTrackSource) -> URL? {
         switch source {
         case let .decoded(buffer):
+            return buffer.url
+        case let .decodedSegments(buffer, _):
             return buffer.url
         case let .timeline(timeline):
             return timeline.sourceAudioBuffer.url
         case let .file(url, _):
             return url
+        case let .fileSegments(url, _, _):
+            return url
         case let .fileTimeline(url, _, _):
             return url
         }
+    }
+}
+
+struct AudioExportSourceFingerprint: Sendable, Codable, Equatable {
+    let canonicalPath: String
+    let fileSize: Int64
+    let modificationNanoseconds: Int64
+    let deviceID: UInt64
+    let inode: UInt64
+
+    static func capture(url: URL?) -> AudioExportSourceFingerprint? {
+        guard let url else {
+            return nil
+        }
+        var metadata = stat()
+        let status = url.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else {
+                return -1
+            }
+            return Darwin.lstat(path, &metadata)
+        }
+        guard status == 0 else {
+            return nil
+        }
+        let canonicalURL = url.standardizedFileURL.resolvingSymlinksInPath()
+        let modificationNanoseconds =
+            Int64(metadata.st_mtimespec.tv_sec) * 1_000_000_000 +
+            Int64(metadata.st_mtimespec.tv_nsec)
+        return AudioExportSourceFingerprint(
+            canonicalPath: canonicalURL.path,
+            fileSize: Int64(metadata.st_size),
+            modificationNanoseconds: modificationNanoseconds,
+            deviceID: UInt64(metadata.st_dev),
+            inode: UInt64(metadata.st_ino)
+        )
     }
 }
 

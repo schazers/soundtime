@@ -27,6 +27,9 @@ let package = Package(
                 "SoundtimeAudioCore",
                 .product(name: "Sparkle", package: "Sparkle"),
             ],
+            resources: [
+                .process("Resources"),
+            ],
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("AudioToolbox"),

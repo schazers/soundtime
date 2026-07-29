@@ -1,6 +1,23 @@
 import AppKit
 import Metal
 
+struct TimelineSelectionDragSmokeSnapshot: Sendable {
+    var leadingProgress: Float
+    var viewportDurationProgress: Float
+    var boundsWidth: CGFloat
+
+    func edgeErrorPixels(expectedLeadingProgress: Double) -> Double {
+        let progressError = abs(Double(leadingProgress) - expectedLeadingProgress)
+        let visibleDuration = max(Double(viewportDurationProgress), 0.000_001)
+        return progressError / visibleDuration * Double(max(boundsWidth, 1))
+    }
+}
+
+struct TimelineDeletionEffectRequest: Sendable {
+    let selection: TimelineSelection
+    let sourceSelection: TimelineSelection?
+}
+
 final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private static let timelineRenderQueueSpecificKey = DispatchSpecificKey<Bool>()
 
@@ -50,6 +67,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onSelectTimeAcrossLinkedTracksRequested: (() -> Void)?
     var onSelectAllClipsOnTrackRequested: (() -> Void)?
     var onUndo: (() -> Void)?
+    var onRedo: (() -> Void)?
     var onExportRequested: (() -> Void)?
     var onSelectionRegionContextExportRequested: (() -> Void)?
     var onImportAudioFileRequested: (() -> Void)?
@@ -139,6 +157,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     private var timelineRenderer: TimelineRenderer?
+    private let bootstrapWaveformView = TimelineBootstrapWaveformView()
+    private var rendererInitializationID = UUID()
+    private var isRendererInitializationScheduled = false
+    private var isAwaitingFirstMetalFrame = true
     private var currentTrackIDs: [UUID] = []
     private var currentRenderTracks: [TimelineRenderState.Track] = []
     private let transcriptOverlayView = TimelineTranscriptOverlayView()
@@ -249,18 +271,15 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var selectionDragWaveformTuning = SelectionDragWaveformTuning.defaultValue
 
     init() {
-        let metalDevice = MTLCreateSystemDefaultDevice()
-        super.init(frame: .zero, device: metalDevice)
+        super.init(frame: .zero, device: nil)
         timelineRenderQueue.setSpecific(key: Self.timelineRenderQueueSpecificKey, value: true)
         configure()
-        configureRenderer(with: metalDevice)
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         timelineRenderQueue.setSpecific(key: Self.timelineRenderQueueSpecificKey, value: true)
         configure()
-        configureRenderer(with: metalDevice)
     }
 
     override var acceptsFirstResponder: Bool {
@@ -277,6 +296,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {
         if newWindow == nil {
+            rendererInitializationID = UUID()
+            isRendererInitializationScheduled = false
             tearDownTimelineAnimation()
         }
         super.viewWillMove(toWindow: newWindow)
@@ -291,6 +312,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         window.makeFirstResponder(self)
         window.acceptsMouseMovedEvents = true
+        scheduleRendererInitializationAfterFirstPaint()
         configureDisplayLinkIfNeeded()
         updatePreferredFrameRate()
         requestTimelineRender()
@@ -383,8 +405,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             setViewport(pendingRestoredViewport, kicksImmediateRender: false, marksInteraction: false)
         }
         updateTrackLayoutForCurrentBounds(requestRender: false)
-        updateTranscriptOverlay()
         let drawableMetrics = currentTimelineDrawableMetricsForPrewarm()
+        updateBootstrapWaveformView()
         let rendererUpdate: @Sendable (TimelineRenderer) -> Void = { renderer in
             renderer.updatePrewarmViewportSize(
                 drawableMetrics.viewportSize,
@@ -502,7 +524,6 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         let wasSelectionEnabled = isSelectionEnabled
         isSelectionEnabled = Self.hasInteractiveTimelineContent(mergedTracks)
         updateTrackLayoutForCurrentBounds(requestRender: false)
-        updateTranscriptOverlay()
         updateTimelineRenderer { renderer in
             renderer.displayTrackMixSettings(mergedTracks)
         }
@@ -867,10 +888,30 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         )
     }
 
+    func userPerceivedTimingSmokeSelectionDragSnapshot() -> TimelineSelectionDragSmokeSnapshot? {
+        guard let liveSelectionDragSnapshot else {
+            return nil
+        }
+        return TimelineSelectionDragSmokeSnapshot(
+            leadingProgress: liveSelectionDragSnapshot.leadingProgress,
+            viewportDurationProgress: viewport.durationProgress,
+            boundsWidth: bounds.width
+        )
+    }
+
     func hotPathContractSmokeBeginFrameStatsWindow(duration: CFTimeInterval = 0.45) {
-        hotPathContractSmokeFrameStatsEndTime = CACurrentMediaTime() + max(duration, 0.01)
+        let requestedEndTime = CACurrentMediaTime() + max(duration, 0.01)
+        hotPathContractSmokeFrameStatsEndTime = max(
+            hotPathContractSmokeFrameStatsEndTime ?? 0,
+            requestedEndTime
+        )
+        timelineRenderer?.resetFrameRateMeasurement()
         timelineRenderer?.noteTimelineInteraction()
         requestTimelineRender()
+    }
+
+    func hotPathContractSmokeIsRendererReady() -> Bool {
+        timelineRenderer != nil && !isAwaitingFirstMetalFrame
     }
 
     func hotPathContractSmokeZoomBurst(stepCount: Int = 8, around anchorProgress: Float = 0.5) {
@@ -888,6 +929,26 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             )
         }
         requestTimelineRender()
+    }
+
+    func interactionReplaySmokeZoomStep(
+        direction: Float,
+        around anchorProgress: Float = 0.5
+    ) -> Double {
+        let startedAt = CACurrentMediaTime()
+        let sanitizedDirection: Float = direction < 0 ? -1 : 1
+        let nextViewport = viewport.zoomed(
+            by: exp(sanitizedDirection * 0.055),
+            around: anchorProgress
+        )
+        setViewport(
+            nextViewport,
+            transcriptCadence: .coalescedInteraction,
+            invalidatesCursorRects: false,
+            renderCadence: .coalescedInteraction
+        )
+        requestTimelineRender()
+        return (CACurrentMediaTime() - startedAt) * 1_000
     }
 
     func interactionReplaySmokePanBurst(stepCount: Int = 12, progressDistance: Float = 0.18) -> Double {
@@ -991,6 +1052,18 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     func hotPathContractSmokeTranscriptDiagnosticsSnapshot() -> TimelineTranscriptOverlayDiagnosticsSnapshot {
         transcriptOverlayView.diagnosticsSnapshotForSmokeTesting()
+    }
+
+    func hotPathContractSmokeLayoutSignature() -> String {
+        [
+            "\(Int((bounds.width * 2).rounded()))",
+            "\(Int((bounds.height * 2).rounded()))",
+            "\(Int((trackLayout.scrollOffset * 10).rounded()))",
+            "\(Int((trackLayout.preferredTrackHeight * 10).rounded()))",
+            "\(Int((trackLayout.rulerLaneHeight * 10).rounded()))",
+            "\(trackLayout.insertionTrackIndex ?? -1)",
+            "\(Int((trackLayout.insertionProgress * 1_000).rounded()))",
+        ].joined(separator: "|")
     }
 
     func hotPathContractSmokeResetTranscriptDiagnostics() {
@@ -1131,8 +1204,20 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     func triggerDeletionEffect(selection: TimelineSelection, sourceSelection: TimelineSelection? = nil) {
+        triggerDeletionEffects([
+            TimelineDeletionEffectRequest(
+                selection: selection,
+                sourceSelection: sourceSelection
+            ),
+        ])
+    }
+
+    func triggerDeletionEffects(_ requests: [TimelineDeletionEffectRequest]) {
+        guard !requests.isEmpty else {
+            return
+        }
         updateTimelineRendererImmediately { renderer in
-            renderer.triggerDeletionEffect(selection: selection, sourceSelection: sourceSelection)
+            renderer.triggerDeletionEffects(requests)
         }
         requestTimelineRender()
         startTransientRenderPulse(duration: deletionEffectRenderPulseDuration)
@@ -1168,7 +1253,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         layer?.cornerRadius = 8
         layer?.masksToBounds = true
         configureDropPreviewLayer()
+        bootstrapWaveformView.translatesAutoresizingMaskIntoConstraints = false
         transcriptOverlayView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(bootstrapWaveformView)
         addSubview(transcriptOverlayView)
 
         registerForDraggedTypes([.fileURL])
@@ -1176,8 +1263,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     override func layout() {
         super.layout()
+        bootstrapWaveformView.frame = bounds
         transcriptOverlayView.frame = bounds
         updateTrackLayoutForCurrentBounds(requestRender: false)
+        updateBootstrapWaveformView()
         updateDropPreviewLayout()
         updateTranscriptOverlay()
         requestTimelineRender()
@@ -1206,39 +1295,114 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         addTrackingArea(trackingArea)
     }
 
-    private func configureRenderer(with metalDevice: MTLDevice?) {
-        guard let metalDevice else {
-            Swift.print("Soundtime could not create a Metal device.")
+    private func beginRendererInitialization() {
+        let initializationID = UUID()
+        rendererInitializationID = initializationID
+        let pixelFormat = colorPixelFormat
+        MetalRendererInitialization.timelineQueue.async {
+            let result: Result<(MTLDevice, TimelineRenderer), Error> = Result {
+                guard let backgroundDevice = MTLCreateSystemDefaultDevice() else {
+                    throw NSError(
+                        domain: "Soundtime.TimelineRenderer",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "Metal device unavailable"]
+                    )
+                }
+                return (
+                    backgroundDevice,
+                    try TimelineRenderer(device: backgroundDevice, pixelFormat: pixelFormat)
+                )
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard
+                    let self,
+                    self.window != nil,
+                    self.rendererInitializationID == initializationID
+                else {
+                    return
+                }
+                switch result {
+                case let .success((device, renderer)):
+                    self.installMetalDevice(device)
+                    self.installTimelineRenderer(renderer)
+                case let .failure(error):
+                    Swift.print("Soundtime could not create the timeline renderer: \(error)")
+                }
+            }
+        }
+    }
+
+    private func scheduleRendererInitializationAfterFirstPaint() {
+        guard timelineRenderer == nil, !isRendererInitializationScheduled else {
             return
         }
-
-        do {
-            let renderer = try TimelineRenderer(device: metalDevice, pixelFormat: colorPixelFormat)
-            timelineRenderer = renderer
-            renderer.onFrameStatsChanged = { [weak self] frameStats in
-                Task { @MainActor [weak self] in
-                    self?.onFrameStatsChanged?(frameStats)
-                }
+        isRendererInitializationScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
+            guard let self, self.window != nil else {
+                return
             }
-            renderer.onRenderDataPrepared = { [weak self] in
-                Task { @MainActor [weak self] in
-                    self?.scheduleRenderDataPreparedRender()
-                }
-            }
-            let initialViewport = viewport
-            let initialTrackLayout = trackLayout
-            let initialLoopRange = loopRange
-            let initialLoopRangeEnabled = isLoopRangeEnabled
-            updateTimelineRenderer { renderer in
-                renderer.displayViewport(initialViewport, marksInteraction: false)
-                renderer.displayTrackLayout(initialTrackLayout, marksInteraction: false)
-                renderer.displayLoopRange(initialLoopRange)
-                renderer.displayLoopRangeEnabled(initialLoopRangeEnabled)
-            }
-            requestTimelineRender()
-        } catch {
-            Swift.print("Soundtime could not create the timeline renderer: \(error)")
+            self.beginRendererInitialization()
         }
+    }
+
+    private func installTimelineRenderer(_ renderer: TimelineRenderer) {
+        timelineRenderer = renderer
+        renderer.onFrameStatsChanged = { [weak self] frameStats in
+            Task { @MainActor [weak self] in
+                self?.onFrameStatsChanged?(frameStats)
+            }
+        }
+        renderer.onRenderDataPrepared = { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.scheduleRenderDataPreparedRender()
+            }
+        }
+
+        let tracks = currentRenderTracks
+        let currentViewport = viewport
+        let currentTrackLayout = trackLayout
+        let currentLoopRange = loopRange
+        let currentLoopRangeEnabled = isLoopRangeEnabled
+        let currentSelection = currentSelection
+        let currentPlayheadProgress = pagingPlayheadProgress
+        let playbackActive = isTimelinePlaybackActive
+        let drawableMetrics = currentTimelineDrawableMetricsForPrewarm()
+        timelineRenderQueue.async { [renderer] in
+            renderer.updatePrewarmViewportSize(
+                drawableMetrics.viewportSize,
+                backingScale: drawableMetrics.backingScale
+            )
+            renderer.displayViewport(currentViewport, marksInteraction: false)
+            renderer.displayTrackLayout(currentTrackLayout, marksInteraction: false)
+            renderer.displayLoopRange(currentLoopRange)
+            renderer.displayLoopRangeEnabled(currentLoopRangeEnabled)
+            renderer.displayTracks(
+                tracks,
+                animateWaveformTransition: false,
+                allowImmediateWaveformPrewarm: true,
+                allowImmediateInteractiveWaveformPrewarm: false
+            )
+            renderer.displaySelection(currentSelection, marksInteraction: false)
+            renderer.displayPlayheadProgress(
+                currentPlayheadProgress,
+                force: true,
+                resetsTouchStart: false
+            )
+            renderer.displayPlaybackActive(playbackActive)
+        }
+        isAwaitingFirstMetalFrame = true
+        requestTimelineRender()
+    }
+
+    private func updateBootstrapWaveformView() {
+        guard isAwaitingFirstMetalFrame else {
+            return
+        }
+        bootstrapWaveformView.display(
+            tracks: currentRenderTracks,
+            viewport: viewport,
+            trackLayout: trackLayout
+        )
     }
 
     private func configureDropPreviewLayer() {
@@ -1435,7 +1599,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     private func scheduleRenderDataPreparedRender() {
-        guard !isRenderDataPreparedRenderPending else {
+        guard window != nil, !isRenderDataPreparedRenderPending else {
             return
         }
 
@@ -1446,12 +1610,19 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             }
 
             isRenderDataPreparedRenderPending = false
+            guard self.window != nil else {
+                return
+            }
             requestTimelineRender()
         }
     }
 
     private func configureDisplayLinkIfNeeded() {
-        guard timelineDisplayLink == nil, let timelineMetalLayer else {
+        guard
+            timelineDisplayLink == nil,
+            metalDevice != nil,
+            let timelineMetalLayer
+        else {
             return
         }
 
@@ -1468,6 +1639,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     private func startTimelineDisplayLink() {
+        guard window != nil else {
+            return
+        }
         configureDisplayLinkIfNeeded()
         timelineDisplayLink?.start()
     }
@@ -1478,13 +1652,18 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             !isTimelinePlaybackActive,
             !isProcessingSelectionAnimationActive,
             !hasActiveTransientRenderPulse(),
-            !hasActiveSelectionDragRenderPulse()
+            !hasActiveSelectionDragRenderPulse(),
+            !isHotPathContractSmokeFrameStatsActive
         else {
             return
         }
 
         timelineDisplayLink?.stop()
         publishPerformanceRenderDemand()
+    }
+
+    private var isHotPathContractSmokeFrameStatsActive: Bool {
+        hotPathContractSmokeFrameStatsEndTime.map { CACurrentMediaTime() <= $0 } == true
     }
 
     private var isTimelineGestureActive: Bool {
@@ -1538,7 +1717,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             isTimelinePlaybackActive ||
             isProcessingSelectionAnimationActive ||
             hasActiveTransientRenderPulse() ||
-            hasActiveSelectionDragRenderPulse()
+            hasActiveSelectionDragRenderPulse() ||
+            isHotPathContractSmokeFrameStatsActive
 
         guard shouldRender else {
             timelineDisplayLink?.stop()
@@ -1564,6 +1744,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         let didSubmitRender = submitTimelineRender(frame: frame)
         if didSubmitRender {
             needsTimelineRender = false
+            finishBootstrapWaveformHandoffAfterSubmittedFrame()
         }
         stopTimelineDisplayLinkIfIdle()
     }
@@ -1593,6 +1774,19 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             self?.renderFlightGate.finish()
         }
         return true
+    }
+
+    private func finishBootstrapWaveformHandoffAfterSubmittedFrame() {
+        guard isAwaitingFirstMetalFrame else {
+            return
+        }
+        isAwaitingFirstMetalFrame = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / Double(targetFramesPerSecond)) { [weak self] in
+            guard let self, !self.isAwaitingFirstMetalFrame else {
+                return
+            }
+            self.bootstrapWaveformView.isHidden = true
+        }
     }
 
     private func finishPendingRenderSubmittedCallbacks(submittedAt: CFTimeInterval) {
@@ -1865,7 +2059,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         if event.keyCode == 6, event.modifierFlags.contains(.command) {
-            onUndo?()
+            if event.modifierFlags.contains(.shift) {
+                onRedo?()
+            } else {
+                onUndo?()
+            }
             return
         }
 
@@ -2069,12 +2267,18 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
-        for rect in transcriptOverlayView.transcriptCursorRects() {
+        let startedAt = CACurrentMediaTime()
+        let cursorRects = transcriptOverlayView.transcriptCursorRects()
+        for rect in cursorRects {
             guard rect.width > 1, rect.height > 1 else {
                 continue
             }
             addCursorRect(rect, cursor: .iBeam)
         }
+        transcriptOverlayView.recordCursorRectResetForDiagnostics(
+            durationMilliseconds: (CACurrentMediaTime() - startedAt) * 1_000,
+            rectCount: cursorRects.count
+        )
     }
 
     private func addLoopHandleCursorRects() {
@@ -2150,6 +2354,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     @objc func undoTimelineEdit(_ sender: Any?) {
         onUndo?()
+    }
+
+    @objc func redoTimelineEdit(_ sender: Any?) {
+        onRedo?()
     }
 
     @objc func cutTimelineSelection(_ sender: Any?) {
@@ -3367,6 +3575,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         viewport = nextViewport
+        updateBootstrapWaveformView()
         onViewportChanged?(nextViewport)
         if marksInteraction {
             timelineRenderer?.publishInteractionViewport(nextViewport)
@@ -3491,12 +3700,15 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             viewportHeight: Float(max(bounds.height, 1))
         )
         trackLayout = clampedLayout
+        updateBootstrapWaveformView()
         let resolvedLayout = resolvedTrackLayoutForCurrentBounds()
         if lastPublishedTrackLayout != resolvedLayout {
             lastPublishedTrackLayout = resolvedLayout
             onTrackLaneLayoutChanged?(resolvedLayout)
         }
-        updateTranscriptOverlay()
+        if transcriptDisplayMode != .hidden {
+            updateTranscriptOverlay()
+        }
         updateTimelineRendererImmediately { renderer in
             renderer.displayTrackLayout(clampedLayout, marksInteraction: requestRender)
         }
@@ -3620,12 +3832,16 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                tracks: currentRenderTracks,
                viewport: viewport,
                trackLayout: trackLayout,
-               timelineDuration: timelineDuration,
-               displayMode: transcriptDisplayMode
+                timelineDuration: timelineDuration,
+                displayMode: transcriptDisplayMode
             )
+            if canReuseLiveGeometry {
+                updateTranscriptOverlayLiveGeometry()
+                return
+            }
             if shouldDeferTranscriptOverlayLayoutForNonViewportHotPath ||
                 (shouldDeferTranscriptOverlayLayoutForHotPath &&
-                    (canReuseLiveGeometry || !isTranscriptViewportRelayoutAllowed)) {
+                    !isTranscriptViewportRelayoutAllowed) {
                 updateTranscriptOverlayLiveGeometry()
                 scheduleTranscriptOverlayUpdate(after: transcriptOverlayHotPathDeferralInterval)
                 return

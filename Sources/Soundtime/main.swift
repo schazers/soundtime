@@ -1,6 +1,8 @@
 import AppKit
 import Darwin
 
+SoundtimeProjectStore.configurePersistenceForCommandLine(arguments: CommandLine.arguments)
+
 private let shippabilityGateCommandFlags: Set<String> = [
     "--shippability-gate",
     "--product-bar",
@@ -150,6 +152,20 @@ if CommandLine.arguments.contains("--audio-export-smoke") {
         exit(0)
     } catch {
         fputs("Soundtime audio export smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
+if CommandLine.arguments.contains("--audio-export-ui-smoke") {
+    do {
+        try MainActor.assumeIsolated {
+            try AudioExportUIContractSmokeHarness.runFromCommandLine(
+                arguments: CommandLine.arguments
+            )
+        }
+        exit(0)
+    } catch {
+        fputs("Soundtime audio export UI contract smoke failed: \(error)\n", stderr)
         exit(1)
     }
 }
@@ -390,6 +406,18 @@ if CommandLine.arguments.contains("--edit-graph-smoke") {
         exit(0)
     } catch {
         fputs("Soundtime edit graph smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
+if CommandLine.arguments.contains("--edit-transaction-smoke") ||
+    CommandLine.arguments.contains("--edit-transaction-smoke-quick")
+{
+    do {
+        try EditTransactionSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        exit(0)
+    } catch {
+        fputs("Soundtime edit transaction smoke failed: \(error)\n", stderr)
         exit(1)
     }
 }

@@ -210,6 +210,12 @@ enum HotPathContractSmokeHarness {
                 !snapshot.isLoadingProject &&
                 workspace.hotPathContractSmokeIsProjectFullyHydrated()
         }
+        try waitUntil(
+            timeoutMilliseconds: 8_000,
+            description: "\(manifestProject.id) Metal renderer did not become ready before hot-path smoke"
+        ) {
+            workspace.hotPathContractSmokeIsRendererReady()
+        }
 
         let hasTranscript = project.tracks.contains { $0.transcript != nil }
         if hasTranscript {
@@ -385,6 +391,15 @@ enum HotPathContractSmokeHarness {
         record(forbiddenSeen.isEmpty, "forbidden hot-path events occurred: \(forbiddenSeen.joined(separator: ","))")
 
         if scenario.contains("transcript") || snapshot.transcriptOverlay.visibleRunCount > 0 {
+            record(
+                snapshot.transcriptOverlay.runLayerCount == snapshot.transcriptOverlay.visibleRunCount,
+                "transcript compositor layer tree did not match cached transcript runs"
+            )
+            record(
+                snapshot.transcriptOverlay.visibleRunLayerCount ==
+                    snapshot.transcriptOverlay.expectedVisibleRunLayerCount,
+                "transcript compositor visible layers did not match displayable transcript runs"
+            )
             let layoutLimit = scenario == "zoom" ? 1 : 0
             record(
                 snapshot.transcriptOverlay.layoutBuildCount <= layoutLimit,
@@ -567,7 +582,6 @@ enum HotPathContractSmokeHarness {
             if workspace.hotPathContractSmokeHasFrameStats() {
                 return true
             }
-            workspace.hotPathContractSmokeBeginFrameStatsWindow(duration: 0.12)
             runMainLoop(milliseconds: 8)
         }
         return workspace.hotPathContractSmokeHasFrameStats()

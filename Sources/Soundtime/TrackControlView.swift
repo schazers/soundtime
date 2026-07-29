@@ -7,9 +7,11 @@ final class TrackControlView: NSView {
     var onVolumeChanged: ((Float) -> Void)?
     var onVolumeEditingEnded: (() -> Void)?
     var onTrackSelected: ((NSEvent.ModifierFlags) -> Void)?
+    var onCancelImport: (() -> Void)?
 
     private let panelView = NSView()
     private let selectedAccentView = NSView()
+    private let importProgressView = TrackImportProgressView()
     private let contentStack = NSStackView()
     private let titleLabel = NSTextField(labelWithString: "")
     private let volumeSlider = HorizontalTrackVolumeSliderView()
@@ -18,6 +20,7 @@ final class TrackControlView: NSView {
     private let recordButton = TrackIconButton(systemSymbolName: "mic.fill")
     private let buttonStack = NSStackView()
     private var trackingArea: NSTrackingArea?
+    private var canCancelImport = false
 
     private var isHovered = false {
         didSet {
@@ -117,13 +120,33 @@ final class TrackControlView: NSView {
         onTrackSelected?(event.modifierFlags)
     }
 
+    override func menu(for event: NSEvent) -> NSMenu? {
+        guard canCancelImport else {
+            return super.menu(for: event)
+        }
+        let menu = NSMenu()
+        let item = NSMenuItem(
+            title: "Cancel Import",
+            action: #selector(cancelImportFromMenu),
+            keyEquivalent: ""
+        )
+        item.target = self
+        menu.addItem(item)
+        return menu
+    }
+
+    @objc private func cancelImportFromMenu() {
+        onCancelImport?()
+    }
+
     func configure(
         title: String,
         isMuted: Bool,
         isSoloed: Bool,
         volume: Float,
         isTrackSelected: Bool,
-        isRecording: Bool
+        isRecording: Bool,
+        importProgress: Double? = nil
     ) {
         if titleLabel.stringValue != title {
             titleLabel.stringValue = title
@@ -133,6 +156,8 @@ final class TrackControlView: NSView {
         self.volume = volume
         self.isTrackSelected = isTrackSelected
         self.isRecording = isRecording
+        canCancelImport = importProgress != nil
+        importProgressView.progress = importProgress
     }
 
     private func configure() {
@@ -145,6 +170,7 @@ final class TrackControlView: NSView {
         selectedAccentView.wantsLayer = true
         selectedAccentView.layer?.backgroundColor = NSColor(red: 0.15, green: 0.82, blue: 0.92, alpha: 1).cgColor
         selectedAccentView.translatesAutoresizingMaskIntoConstraints = false
+        importProgressView.translatesAutoresizingMaskIntoConstraints = false
         updateAppearance()
 
         titleLabel.font = .systemFont(ofSize: 11, weight: .semibold)
@@ -195,6 +221,7 @@ final class TrackControlView: NSView {
 
         addSubview(panelView)
         panelView.addSubview(selectedAccentView)
+        panelView.addSubview(importProgressView)
         panelView.addSubview(contentStack)
 
         NSLayoutConstraint.activate([
@@ -207,6 +234,11 @@ final class TrackControlView: NSView {
             selectedAccentView.topAnchor.constraint(equalTo: panelView.topAnchor),
             selectedAccentView.bottomAnchor.constraint(equalTo: panelView.bottomAnchor),
             selectedAccentView.widthAnchor.constraint(equalToConstant: 3),
+
+            importProgressView.leadingAnchor.constraint(equalTo: panelView.leadingAnchor, constant: 3),
+            importProgressView.trailingAnchor.constraint(equalTo: panelView.trailingAnchor),
+            importProgressView.bottomAnchor.constraint(equalTo: panelView.bottomAnchor),
+            importProgressView.heightAnchor.constraint(equalToConstant: 2),
 
             contentStack.centerYAnchor.constraint(equalTo: panelView.centerYAnchor),
             contentStack.topAnchor.constraint(greaterThanOrEqualTo: panelView.topAnchor, constant: 10),
@@ -242,6 +274,43 @@ final class TrackControlView: NSView {
         ).cgColor
         panelView.layer?.borderWidth = 1
         selectedAccentView.isHidden = !isTrackSelected
+    }
+}
+
+private final class TrackImportProgressView: NSView {
+    var progress: Double? {
+        didSet {
+            isHidden = progress == nil
+            needsDisplay = true
+        }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        isHidden = true
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard let progress else {
+            return
+        }
+        NSColor(white: 0.22, alpha: 1).setFill()
+        bounds.fill()
+        let clampedProgress = min(max(progress, 0), 1)
+        let fillRect = NSRect(
+            x: bounds.minX,
+            y: bounds.minY,
+            width: bounds.width * clampedProgress,
+            height: bounds.height
+        )
+        NSColor(calibratedRed: 0.15, green: 0.82, blue: 0.92, alpha: 1).setFill()
+        fillRect.fill()
     }
 }
 

@@ -70,6 +70,7 @@ enum DiagnosticsSmokeHarness {
     private static func verifyFrameStatsEscalation(_ diagnostics: SoundtimeDiagnostics) throws {
         diagnostics.recordFrameStats(TimelineFrameStats(
             framesPerSecond: 144,
+            displayRefreshFramesPerSecond: 144,
             averageFrameTimeMilliseconds: 6.9,
             frameTimeJitterMilliseconds: 0.2,
             worstFrameTimeMilliseconds: 8.1,
@@ -105,6 +106,7 @@ enum DiagnosticsSmokeHarness {
 
         diagnostics.recordFrameStats(TimelineFrameStats(
             framesPerSecond: 78,
+            displayRefreshFramesPerSecond: 144,
             averageFrameTimeMilliseconds: 11.5,
             frameTimeJitterMilliseconds: 2.4,
             worstFrameTimeMilliseconds: 18.2,
@@ -137,6 +139,7 @@ enum DiagnosticsSmokeHarness {
         ))
         diagnostics.recordFrameStats(TimelineFrameStats(
             framesPerSecond: 55,
+            displayRefreshFramesPerSecond: 144,
             averageFrameTimeMilliseconds: 18.5,
             frameTimeJitterMilliseconds: 5.4,
             worstFrameTimeMilliseconds: 34.0,
@@ -191,7 +194,12 @@ enum DiagnosticsSmokeHarness {
             callbackCount: 1,
             lastRenderNanoseconds: 150_000,
             maxRenderNanoseconds: 150_000,
-            renderDeadlineMissCount: 0
+            renderDeadlineMissCount: 0,
+            lastRenderWorkNanoseconds: 120_000,
+            maxRenderWorkNanoseconds: 120_000,
+            renderWorkDeadlineMissCount: 0,
+            callbackSchedulingLateCount: 0,
+            maxCallbackSchedulingLatenessNanoseconds: 0
         ))
         diagnostics.recordAudioCoreSnapshot(RealtimeAudioCoreSnapshot(
             frameIndex: 256,
@@ -205,7 +213,12 @@ enum DiagnosticsSmokeHarness {
             callbackCount: 2,
             lastRenderNanoseconds: 2_800_000,
             maxRenderNanoseconds: 2_800_000,
-            renderDeadlineMissCount: 1
+            renderDeadlineMissCount: 1,
+            lastRenderWorkNanoseconds: 2_600_000,
+            maxRenderWorkNanoseconds: 2_600_000,
+            renderWorkDeadlineMissCount: 1,
+            callbackSchedulingLateCount: 1,
+            maxCallbackSchedulingLatenessNanoseconds: 3_000_000
         ))
 
         let snapshot = diagnostics.snapshot(limit: 64)
@@ -213,6 +226,14 @@ enum DiagnosticsSmokeHarness {
         try require(snapshot.events.contains { $0.name == "audio-underrun" }, "audio underrun event missing")
         try require(snapshot.events.contains { $0.name == "audio-dropped-command" }, "audio dropped-command event missing")
         try require(snapshot.events.contains { $0.name == "audio-callback-deadline-miss" }, "audio deadline event missing")
+        try require(snapshot.events.contains { $0.name == "audio-render-work-deadline-miss" }, "audio work deadline event missing")
+        try require(snapshot.events.contains { $0.name == "audio-callback-scheduling-late" }, "audio scheduling event missing")
+        try require(
+            snapshot.events.contains {
+                $0.name == "audio-callback-deadline-miss" && $0.fields["workMissTotal"] == "1"
+            },
+            "audio deadline event did not distinguish render work"
+        )
     }
 
     private static func verifyTraceWriting(_ diagnostics: SoundtimeDiagnostics) throws {

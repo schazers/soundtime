@@ -47,10 +47,17 @@ struct EditableAudioSource: Equatable, Codable, Sendable {
         ownsEditableFile: Bool
     ) {
         self.id = Self.stableID(
+            importedAssetID: importedAssetID,
             originalURL: originalURL,
             editableURL: editableURL,
             formatOrigin: formatOrigin,
-            fileInfo: fileInfo
+            sourceFrameCount: fileInfo.frameCount,
+            sourceSampleRate: fileInfo.sampleRate,
+            channelCount: fileInfo.channelCount,
+            fileDiscriminator: [
+                "\(fileInfo.bitsPerSample)",
+                "\(fileInfo.dataRange.count)",
+            ].joined(separator: "|")
         )
         self.importedAssetID = importedAssetID
         self.originalURL = originalURL.standardizedFileURL
@@ -59,6 +66,36 @@ struct EditableAudioSource: Equatable, Codable, Sendable {
         self.sourceFrameCount = fileInfo.frameCount
         self.sourceSampleRate = fileInfo.sampleRate
         self.channelCount = fileInfo.channelCount
+        self.ownsEditableFile = ownsEditableFile
+    }
+
+    init(
+        importedAssetID: UUID,
+        originalURL: URL,
+        editableURL: URL,
+        formatOrigin: AudioAssetFormat,
+        sourceFrameCount: Int,
+        sourceSampleRate: Double,
+        channelCount: Int,
+        ownsEditableFile: Bool
+    ) {
+        self.id = Self.stableID(
+            importedAssetID: importedAssetID,
+            originalURL: originalURL,
+            editableURL: editableURL,
+            formatOrigin: formatOrigin,
+            sourceFrameCount: sourceFrameCount,
+            sourceSampleRate: sourceSampleRate,
+            channelCount: channelCount,
+            fileDiscriminator: nil
+        )
+        self.importedAssetID = importedAssetID
+        self.originalURL = originalURL.standardizedFileURL
+        self.editableURL = editableURL.standardizedFileURL
+        self.formatOrigin = formatOrigin
+        self.sourceFrameCount = sourceFrameCount
+        self.sourceSampleRate = sourceSampleRate
+        self.channelCount = channelCount
         self.ownsEditableFile = ownsEditableFile
     }
 
@@ -79,27 +116,57 @@ struct EditableAudioSource: Equatable, Codable, Sendable {
     }
 
     static func stableID(
+        importedAssetID: UUID? = nil,
         originalURL: URL,
         editableURL: URL,
         formatOrigin: AudioAssetFormat,
         fileInfo: WAVFileInfo
     ) -> EditableAudioSourceID {
-        let originalPath = originalURL.standardizedFileURL.path
-        let editablePath = editableURL.standardizedFileURL.path
-        let sampleRate = String(format: "%.3f", fileInfo.sampleRate)
-        return EditableAudioSourceID(
-            rawValue: [
-                "source",
-                formatOrigin.rawValue,
-                originalPath,
-                editablePath,
-                "\(fileInfo.frameCount)",
-                sampleRate,
-                "\(fileInfo.channelCount)",
+        stableID(
+            importedAssetID: importedAssetID,
+            originalURL: originalURL,
+            editableURL: editableURL,
+            formatOrigin: formatOrigin,
+            sourceFrameCount: fileInfo.frameCount,
+            sourceSampleRate: fileInfo.sampleRate,
+            channelCount: fileInfo.channelCount,
+            fileDiscriminator: [
                 "\(fileInfo.bitsPerSample)",
                 "\(fileInfo.dataRange.count)",
             ].joined(separator: "|")
         )
+    }
+
+    private static func stableID(
+        importedAssetID: UUID?,
+        originalURL: URL,
+        editableURL: URL,
+        formatOrigin: AudioAssetFormat,
+        sourceFrameCount: Int,
+        sourceSampleRate: Double,
+        channelCount: Int,
+        fileDiscriminator: String?
+    ) -> EditableAudioSourceID {
+        if let importedAssetID {
+            return EditableAudioSourceID(rawValue: "imported-asset|\(importedAssetID.uuidString.lowercased())")
+        }
+
+        let originalPath = originalURL.standardizedFileURL.path
+        let editablePath = editableURL.standardizedFileURL.path
+        let sampleRate = String(format: "%.3f", sourceSampleRate)
+        var components = [
+            "source",
+            formatOrigin.rawValue,
+            originalPath,
+            editablePath,
+            "\(sourceFrameCount)",
+            sampleRate,
+            "\(channelCount)",
+        ]
+        if let fileDiscriminator {
+            components.append(fileDiscriminator)
+        }
+        return EditableAudioSourceID(rawValue: components.joined(separator: "|"))
     }
 }
 

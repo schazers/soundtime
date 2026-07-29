@@ -1,71 +1,163 @@
-# Soundtime Export Readiness
+# Soundtime V1 Export Release Contract
 
-This document is the release contract for v1 export. Export is done only when the automated smoke and the manual acceptance matrix both pass.
+Export is release-ready only when the automated commands and the manual audio
+acceptance matrix in this document pass on the release build.
 
-## V1 Contract
+## Product Semantics
 
-- Export runs from an immutable snapshot of the edit graph.
-- The user can keep editing while a background export continues rendering the original snapshot.
-- Export never blocks the realtime audio callback.
-- Export never requires waveform cache rebuilds.
-- Source assets referenced by an export snapshot stay alive until the export completes or is canceled.
-- Mixdown sums tracks on an unclipped internal bus and clips only at the final file boundary.
-- WAV, selected-range WAV, stems, and compressed M4A are covered by the automated export smoke.
-- Export progress reflects the current stage: preparing, rendering, encoding, finishing, completed, canceled, or failed.
-- Closing the export window does not cancel the export.
-- The top-bar export chip reopens the export window while a job is active.
-- Export completion writes a structured `.soundtime-export.json` report next to the output.
+- Export captures an immutable edit-graph snapshot and renders that snapshot in
+  the background.
+- Editing and playback may continue while export runs. Later edits never change
+  an in-flight export.
+- Only one export job may run per project window. Starting another job presents
+  an explicit keep-or-cancel choice.
+- Closing the export progress window does not cancel the job. The top-bar export
+  chip reopens it.
+- Cancel removes staged output and never replaces a previously successful file.
+- Source files referenced by the snapshot are leased until completion or
+  cancellation. Project cleanup defers deleting leased files.
+- An interrupted process may leave hidden staging artifacts. Artifacts older
+  than 24 hours are removed during the next export preflight.
 
-## Automated Coverage
+## Audio Contract
+
+- Offline export uses the same C++ segment/mix renderer as realtime playback.
+- The internal mix bus is floating point and is not clipped per track.
+- Integer WAV and compressed formats clamp only at the final encoding boundary.
+- 32-bit float WAV preserves headroom above 0 dBFS.
+- Full and selected-range mixdowns honor mute, solo, track gain, timeline edits,
+  segment fades, project time, and source sample-rate conversion.
+- Explicit single-track range export renders the selected track even when that
+  track is muted.
+- An all-muted mixdown is a valid silent file.
+- Stem defaults are all tracks and post-fader gain. The UI also exposes audible
+  tracks and pre-fader gain.
+
+## Formats
+
+- WAV: 16-bit PCM, 24-bit PCM (default), and 32-bit float.
+- M4A/AAC: 128, 192 (default), or 256 kbps.
+- MP3: exposed only when the current macOS installation reports an MP3 encoder.
+- Standard RIFF WAV is limited to 4 GB. V1 rejects larger WAV jobs with an
+  actionable message instead of writing a corrupt file.
+- Compressed output is streamed through the system encoder; Soundtime does not
+  hold a full rendered file in memory.
+
+## Output Safety
+
+Before rendering, Soundtime checks:
+
+- destination/source collisions;
+- source identity and modification metadata;
+- destination writability;
+- conservative free-space capacity;
+- WAV RIFF capacity;
+- system encoder availability and writer creation.
+
+Audio is written to a sibling hidden staging file. Soundtime validates that file
+for decodability, frame count, sample rate, channel count, and finite first/last
+samples. The source identity is checked again immediately before an atomic
+rename publishes the final file.
+
+Stem files are built in a hidden staging directory. A commit failure rolls back
+newly published files. Stem names are sanitized, length bounded, and unique
+under case- and diacritic-insensitive comparison.
+
+## Progress, Errors, And Reports
+
+Progress stages are preparing, rendering/encoding, validating, committing,
+completed, canceled, and failed. Cancellation visibly enters a non-interactive
+`Canceling...` state while partial output is removed.
+
+Stage transitions and failures are recorded in the Development Console. A
+successful export attempts to write a structured `.soundtime-export.json`
+diagnostic report containing:
+
+- Soundtime version/build;
+- job, scope, format, WAV encoding, compressed bitrate, and stem policy;
+- sample rate, channels, frame range, and rendered frame count;
+- source fingerprints;
+- output validation results;
+- peak and over-range sample statistics;
+- output paths and elapsed time.
+
+The report is diagnostic metadata, not the user's audio deliverable. A report
+write failure is logged but does not discard already validated audio.
+
+## Automated Gate
 
 Run:
 
 ```sh
+swift build
+swift test
+swift run Soundtime --audio-export-ui-smoke
 swift run Soundtime --audio-export-smoke
 swift run Soundtime --shippability-gate --quick
 ```
 
-The export smoke covers:
+Before a release candidate, also run:
 
-- Full WAV mixdown.
-- Selected-range WAV export.
-- WAV stems with sanitized filenames.
-- Mix-bus summing correctness without per-track clamp distortion.
-- Streaming compressed M4A export.
-- Long-file block rendering shape.
-- Export report creation and contents.
-- Export source asset lease acquire/release.
-- Deferred source deletion while an export lease is active.
+```sh
+swift run Soundtime --product-bar
+swift run Soundtime --shippability-gate --full
+```
 
-## Manual Acceptance Matrix
+The dedicated export suites cover:
 
-Run these against the golden fixture projects before release candidate sign-off:
+- all WAV encodings;
+- every compressed encoder reported available on the test Mac;
+- every advertised compressed quality;
+- full mix, selected range, edited timelines, stems, and mixdown plus stems;
+- mute, solo, gain, all-muted, explicit-track, and resampling semantics;
+- realtime/offline renderer differential behavior;
+- floating-point mix-bus headroom;
+- long block-based rendering;
+- transactional replacement and rollback;
+- cancellation preserving an existing output and removing partial output;
+- source mutation and source/destination collision rejection;
+- output validation and diagnostic reports;
+- source leases, symlink aliases, deferred deletion, and lease release;
+- stale partial recovery;
+- case-insensitive stem naming;
+- export option defaults and progress-window terminal/canceling states.
 
-- Export full mixdown from `short_wav.soundtime`; output duration and audible content match the timeline.
-- Export selected range from the timeline context menu; output starts exactly at the selected region and contains no leading gap.
-- Export selected range from the File menu; output matches the context-menu export.
-- Export stems from `three_track_edit.soundtime`; every track produces one WAV with a readable sanitized filename.
-- Export mixdown plus stems; folder contains the mixdown and each track stem.
-- Export M4A full mixdown; output is playable in Finder/QuickTime.
-- Start a long export, close the export window, then reopen it from the top-bar chip; progress continues.
-- Cancel a long export; partial output is removed or unusable partial files are not surfaced as successful outputs.
-- Export while editing the project; the output matches the snapshot from export start, not later edits.
-- Delete clips while an export is running; the export completes without missing-source errors.
-- Export a project with muted tracks; muted tracks do not appear in the mixdown.
-- Export after undo/redo cycles; output matches the current audible timeline.
-- Export after importing MP3/M4A/AIFF/FLAC; output plays and matches the imported audio.
-- Export with no audio selected via selected-region command; command is disabled or shows a clear error.
-- Export to a read-only or invalid location; UI shows a clear failure and the Development Console records the provider error.
+## Manual Release Acceptance
 
-## Blockers
+Run these on a signed release build using the golden fixture projects:
 
-Do not call export production-ready if any of these are true:
+1. Export full WAV and compressed mixdowns from short and long projects. Listen
+   to the beginning, an edit boundary, and the end.
+2. Export a selected region from the File menu and the timeline context menu.
+   Confirm sample-aligned duration and no leading gap.
+3. Export stems and mixdown-plus-stems from the three-track project. Confirm
+   naming, all/audible policy, and pre/post-fader behavior.
+4. Export after delete, paste, split, undo, and redo. Compare the output to
+   realtime playback at the same positions.
+5. Export projects imported from WAV, MP3, M4A/AAC, AIFF, and FLAC.
+6. Start a long export, continue seeking/editing/playing, close the progress
+   window, and reopen it from the top bar. Confirm UI and audio remain smooth.
+7. Cancel a long export over an existing destination. Confirm the previous file
+   remains unchanged and no visible partial file remains.
+8. Delete an app-owned clip source while its snapshot export is running. Confirm
+   the export finishes and cleanup occurs after the lease releases.
+9. Try an invalid/read-only destination, insufficient-space volume, changed
+   source, and oversized WAV plan. Confirm actionable errors and no published
+   partial output.
+10. Verify exported files in Finder/QuickTime and at least one independent audio
+    application. Confirm duration, channels, sample rate, and audible content.
 
-- Export blocks pointer interactions or playback.
-- Export mutates the live timeline while rendering.
-- Export can lose source files after a user edit.
-- Progress freezes without a visible stage change.
-- Selected-region export has leading/trailing timing drift.
-- Mixdowns audibly differ from playback semantics.
-- Compressed export requires full rendered audio in memory.
-- Reports are missing for successful exports.
+## Deliberate V1 Limits
+
+- No RF64/W64 output above 4 GB.
+- No plug-in/effect-state checkpointing yet; the snapshot currently covers the
+  edit graph and audio behavior implemented by Soundtime's canonical renderer.
+- Codec availability is determined by macOS. MP3 may be unavailable and is then
+  hidden rather than emulated by an unshipped third-party encoder.
+- Loudness normalization, metadata/tag editing, dithering controls beyond the
+  deterministic integer-WAV path, and batch export presets are future product
+  features, not hidden V1 behavior.
+
+Any automated gate failure is a release blocker. Any audible mismatch,
+realtime interruption, published corrupt file, or snapshot/source lifetime
+failure in the manual matrix is also a release blocker.

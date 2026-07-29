@@ -54,6 +54,8 @@ final class SoundtimeDiagnostics: @unchecked Sendable {
     private var lastUnderrunCount = 0
     private var lastDroppedCommandCount = 0
     private var lastRenderDeadlineMissCount = 0
+    private var lastRenderWorkDeadlineMissCount = 0
+    private var lastCallbackSchedulingLateCount = 0
     private var lastTraceWriteByName: [String: TimeInterval] = [:]
     private var lastFrameDropEventTime: TimeInterval = -Double.infinity
     private var lastFrameDropEventSeverity: SoundtimeDiagnosticSeverity?
@@ -162,14 +164,32 @@ final class SoundtimeDiagnostics: @unchecked Sendable {
         let underrunDelta: Int
         let droppedCommandDelta: Int
         let renderDeadlineMissDelta: Int
+        let renderWorkDeadlineMissDelta: Int
+        let callbackSchedulingLateDelta: Int
         lock.lock()
         latestAudioSnapshot = snapshot
         underrunDelta = max(snapshot.underrunCount - lastUnderrunCount, 0)
         droppedCommandDelta = max(snapshot.droppedCommandCount - lastDroppedCommandCount, 0)
         renderDeadlineMissDelta = max(snapshot.renderDeadlineMissCount - lastRenderDeadlineMissCount, 0)
+        renderWorkDeadlineMissDelta = max(
+            snapshot.renderWorkDeadlineMissCount - lastRenderWorkDeadlineMissCount,
+            0
+        )
+        callbackSchedulingLateDelta = max(
+            snapshot.callbackSchedulingLateCount - lastCallbackSchedulingLateCount,
+            0
+        )
         lastUnderrunCount = max(lastUnderrunCount, snapshot.underrunCount)
         lastDroppedCommandCount = max(lastDroppedCommandCount, snapshot.droppedCommandCount)
         lastRenderDeadlineMissCount = max(lastRenderDeadlineMissCount, snapshot.renderDeadlineMissCount)
+        lastRenderWorkDeadlineMissCount = max(
+            lastRenderWorkDeadlineMissCount,
+            snapshot.renderWorkDeadlineMissCount
+        )
+        lastCallbackSchedulingLateCount = max(
+            lastCallbackSchedulingLateCount,
+            snapshot.callbackSchedulingLateCount
+        )
         lock.unlock()
 
         if underrunDelta > 0 {
@@ -186,6 +206,8 @@ final class SoundtimeDiagnostics: @unchecked Sendable {
                     "callbacks": "\(snapshot.callbackCount)",
                     "lastRenderMs": String(format: "%.3f", Double(snapshot.lastRenderNanoseconds) / 1_000_000),
                     "maxRenderMs": String(format: "%.3f", Double(snapshot.maxRenderNanoseconds) / 1_000_000),
+                    "lastRenderWorkMs": String(format: "%.3f", Double(snapshot.lastRenderWorkNanoseconds) / 1_000_000),
+                    "maxRenderWorkMs": String(format: "%.3f", Double(snapshot.maxRenderWorkNanoseconds) / 1_000_000),
                     "sampleRate": String(format: "%.1f", snapshot.sampleRate),
                     "isPlaying": "\(snapshot.isPlaying)",
                 ]
@@ -209,15 +231,57 @@ final class SoundtimeDiagnostics: @unchecked Sendable {
         if renderDeadlineMissDelta > 0 {
             record(
                 category: .audio,
-                severity: .severe,
+                severity: .warning,
                 name: "audio-callback-deadline-miss",
-                message: "Realtime audio callback exceeded its render block deadline.",
+                message: "Realtime audio callback wall occupancy exceeded its block deadline.",
                 fields: [
                     "delta": "\(renderDeadlineMissDelta)",
                     "total": "\(snapshot.renderDeadlineMissCount)",
+                    "workMissDelta": "\(renderWorkDeadlineMissDelta)",
+                    "workMissTotal": "\(snapshot.renderWorkDeadlineMissCount)",
                     "callbacks": "\(snapshot.callbackCount)",
                     "lastRenderMs": String(format: "%.3f", Double(snapshot.lastRenderNanoseconds) / 1_000_000),
                     "maxRenderMs": String(format: "%.3f", Double(snapshot.maxRenderNanoseconds) / 1_000_000),
+                    "lastRenderWorkMs": String(format: "%.3f", Double(snapshot.lastRenderWorkNanoseconds) / 1_000_000),
+                    "maxRenderWorkMs": String(format: "%.3f", Double(snapshot.maxRenderWorkNanoseconds) / 1_000_000),
+                    "frameCount": "\(snapshot.frameCount)",
+                    "frameIndex": "\(snapshot.frameIndex)",
+                ]
+            )
+        }
+
+        if renderWorkDeadlineMissDelta > 0 {
+            record(
+                category: .audio,
+                severity: .severe,
+                name: "audio-render-work-deadline-miss",
+                message: "Realtime audio CPU work exceeded its render block deadline.",
+                fields: [
+                    "delta": "\(renderWorkDeadlineMissDelta)",
+                    "total": "\(snapshot.renderWorkDeadlineMissCount)",
+                    "callbacks": "\(snapshot.callbackCount)",
+                    "lastRenderWorkMs": String(format: "%.3f", Double(snapshot.lastRenderWorkNanoseconds) / 1_000_000),
+                    "maxRenderWorkMs": String(format: "%.3f", Double(snapshot.maxRenderWorkNanoseconds) / 1_000_000),
+                    "frameCount": "\(snapshot.frameCount)",
+                    "frameIndex": "\(snapshot.frameIndex)",
+                ]
+            )
+        }
+
+        if callbackSchedulingLateDelta > 0 {
+            record(
+                category: .audio,
+                severity: .warning,
+                name: "audio-callback-scheduling-late",
+                message: "Audio callback delivery arrived later than its expected host-time interval.",
+                fields: [
+                    "delta": "\(callbackSchedulingLateDelta)",
+                    "total": "\(snapshot.callbackSchedulingLateCount)",
+                    "maxLatenessMs": String(
+                        format: "%.3f",
+                        Double(snapshot.maxCallbackSchedulingLatenessNanoseconds) / 1_000_000
+                    ),
+                    "callbacks": "\(snapshot.callbackCount)",
                     "frameCount": "\(snapshot.frameCount)",
                     "frameIndex": "\(snapshot.frameIndex)",
                 ]

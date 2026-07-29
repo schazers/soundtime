@@ -41,6 +41,11 @@ enum StartupCloseLifecycleSmokeHarness {
             )
         }
 
+        try require(
+            SoundtimeProjectStore.usesIsolatedAutomationPersistence,
+            "startup/close smoke is using the human user's project-history persistence domain"
+        )
+        try verifyAutosavePreservesSavedProjectIdentity(fixture)
         try installLaunchCaches(for: fixture)
         SoundtimeProjectStore.clearRecentProjectURLs()
         SoundtimeProjectStore.rememberLastProjectURL(fixture.projectURL)
@@ -149,6 +154,22 @@ enum StartupCloseLifecycleSmokeHarness {
             "launch cache hot-path request was not deferred/coalesced"
         )
 
+        controller.prepareForImmediateWindowClose()
+        let closePrepared = workspace.startupCloseSmokeSnapshot()
+        try require(
+            closePrepared.pendingDeferredEditWorkCount == 0,
+            "close preparation left deferred edit work alive: \(closePrepared)"
+        )
+        try require(
+            closePrepared.pendingDeferredWorkspaceWorkCount == 0,
+            "close preparation left deferred workspace work alive: \(closePrepared)"
+        )
+        try require(
+            !closePrepared.isLaunchSnapshotWriteScheduled &&
+                !closePrepared.hasPendingLaunchCacheWrite,
+            "close preparation left launch-cache work scheduled: \(closePrepared)"
+        )
+
         let closeStartedAt = CACurrentMediaTime()
         window.close()
         runMainLoop(milliseconds: 20)
@@ -166,13 +187,18 @@ enum StartupCloseLifecycleSmokeHarness {
                 "opened final-size window with final track count",
                 "first paint showed every cached waveform with mute/solo state",
                 "playback primed after visual first paint",
+                "autosave recovery preserved the canonical saved-project identity",
+                "smoke persistence was isolated from the human recent-project list",
                 "launch cache writes deferred during hot timeline interaction",
+                "close preparation canceled all deferred edit and workspace work",
                 "close path did not synchronously write waveform caches",
             ],
             metadata: [
                 "project": fixture.projectURL.path,
                 "firstPaintTracks": "\(firstPaint.trackCount)",
                 "firstPaintDrawableWaveforms": "\(firstPaint.drawableWaveformTrackCount)",
+                "closePreparedDeferredEditWork": "\(closePrepared.pendingDeferredEditWorkCount)",
+                "closePreparedDeferredWorkspaceWork": "\(closePrepared.pendingDeferredWorkspaceWorkCount)",
                 "closeElapsedMs": String(format: "%.2f", closeElapsedMilliseconds),
                 "closeTraceElapsedMs": closeTraceElapsedMilliseconds.map { String(format: "%.2f", $0) } ?? "missing",
             ],
@@ -182,6 +208,50 @@ enum StartupCloseLifecycleSmokeHarness {
         }
 
         print("Soundtime startup/close lifecycle smoke passed")
+    }
+
+    private static func verifyAutosavePreservesSavedProjectIdentity(_ fixture: Fixture) throws {
+        let autosaveID = UUID()
+        defer {
+            SoundtimeProjectStore.removeAutosave(
+                projectURL: fixture.projectURL,
+                autosaveID: autosaveID
+            )
+        }
+
+        let autosaveURL = try SoundtimeProjectStore.saveAutosave(
+            fixture.project,
+            projectURL: fixture.projectURL,
+            autosaveID: autosaveID
+        )
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(1)],
+            ofItemAtPath: autosaveURL.path
+        )
+        let recovered = try SoundtimeProjectStore.loadRecoveredAutosave(from: autosaveURL)
+        try require(
+            recovered.project.projectID == fixture.project.projectID,
+            "autosave envelope did not preserve the project contents"
+        )
+        try require(
+            recovered.canonicalProjectURL == fixture.projectURL.standardizedFileURL,
+            "autosave envelope did not preserve the saved project URL"
+        )
+
+        SoundtimeProjectStore.clearRecentProjectURLs()
+        let launchPlan = ProjectLaunchCoordinator.resolveLaunchPlan(restoresLastProject: true)
+        try require(
+            launchPlan.targetProjectURL == fixture.projectURL.standardizedFileURL,
+            "standalone autosave discovery did not restore the canonical saved project"
+        )
+        try require(
+            launchPlan.visualCacheURL == autosaveURL.standardizedFileURL,
+            "standalone autosave discovery did not use the autosave as its visual source"
+        )
+        try require(
+            launchPlan.usesAutosaveRecovery,
+            "standalone autosave discovery did not route through saved-project recovery"
+        )
     }
 
     private static func makeFixture() throws -> Fixture {

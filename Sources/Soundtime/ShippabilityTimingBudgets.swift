@@ -11,6 +11,10 @@ enum ShippabilityTimingBudgets {
     // readiness have separate, much stricter budgets below.
     static let windowVisible = Budget(warningMilliseconds: 350, failureMilliseconds: 500)
     static let firstWaveformVisible = Budget(warningMilliseconds: 60, failureMilliseconds: 100)
+    // The first playback controller creation pays the one-time Core Audio
+    // graph/device startup cost. Subsequent project hydration remains subject
+    // to the tighter playbackReady warning below.
+    static let coldPlaybackReady = Budget(warningMilliseconds: 475, failureMilliseconds: 500)
     static let playbackReady = Budget(warningMilliseconds: 250, failureMilliseconds: 500)
     static let firstPlayCommand = Budget(warningMilliseconds: 10, failureMilliseconds: 18)
     static let clickToSeekVisual = Budget(warningMilliseconds: 8, failureMilliseconds: 16)

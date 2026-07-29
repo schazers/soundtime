@@ -31,6 +31,9 @@ final class TransportControlPanelView: TimelineMetalLayerView {
     }
 
     private var renderer: TransportControlPanelRenderer?
+    private let bootstrapView = TransportControlBootstrapView()
+    private var rendererInitializationID = UUID()
+    private var isRendererInitializationScheduled = false
     private var displayLink: TimelineDisplayLink?
     private var animationWatchdogTimer: Timer?
     private var lastDisplayLinkFrameTime = CACurrentMediaTime()
@@ -59,7 +62,7 @@ final class TransportControlPanelView: TimelineMetalLayerView {
         return layer
     }
 
-    override init(frame frameRect: NSRect = .zero, device: MTLDevice? = MTLCreateSystemDefaultDevice()) {
+    override init(frame frameRect: NSRect = .zero, device: MTLDevice? = nil) {
         super.init(frame: frameRect, device: device)
         configure()
     }
@@ -81,6 +84,7 @@ final class TransportControlPanelView: TimelineMetalLayerView {
         if window == nil {
             stopDisplayLink()
         } else {
+            scheduleRendererInitializationIfNeeded()
             startDisplayLink()
             render()
         }
@@ -88,6 +92,7 @@ final class TransportControlPanelView: TimelineMetalLayerView {
 
     override func layout() {
         super.layout()
+        bootstrapView.frame = bounds
         render()
     }
 
@@ -183,14 +188,58 @@ final class TransportControlPanelView: TimelineMetalLayerView {
         clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
         timelineMetalLayer?.isOpaque = false
         preferredFramesPerSecond = 144
-        guard let metalDevice else {
+        bootstrapView.translatesAutoresizingMaskIntoConstraints = true
+        bootstrapView.autoresizingMask = [.width, .height]
+        addSubview(bootstrapView)
+
+        if let metalDevice {
+            renderer = try? TransportControlPanelRenderer(
+                device: metalDevice,
+                pixelFormat: colorPixelFormat
+            )
+            bootstrapView.isHidden = renderer != nil
+        }
+    }
+
+    private func scheduleRendererInitializationIfNeeded() {
+        guard renderer == nil, !isRendererInitializationScheduled else {
             return
         }
-
-        do {
-            renderer = try TransportControlPanelRenderer(device: metalDevice, pixelFormat: colorPixelFormat)
-        } catch {
-            Swift.print("Soundtime could not create the transport control renderer: \(error)")
+        isRendererInitializationScheduled = true
+        let initializationID = UUID()
+        rendererInitializationID = initializationID
+        let pixelFormat = colorPixelFormat
+        MetalRendererInitialization.auxiliaryQueue.async {
+            let result: Result<(MTLDevice, TransportControlPanelRenderer), Error> = Result {
+                guard let device = MTLCreateSystemDefaultDevice() else {
+                    throw NSError(
+                        domain: "Soundtime.TransportControlPanelView",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "Metal device unavailable"]
+                    )
+                }
+                return (
+                    device,
+                    try TransportControlPanelRenderer(device: device, pixelFormat: pixelFormat)
+                )
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.rendererInitializationID == initializationID else {
+                    return
+                }
+                self.isRendererInitializationScheduled = false
+                switch result {
+                case let .success((device, renderer)):
+                    self.installMetalDevice(device)
+                    self.renderer = renderer
+                    self.startDisplayLink()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                        self?.bootstrapView.isHidden = true
+                    }
+                case let .failure(error):
+                    Swift.print("Soundtime could not create the transport control renderer: \(error)")
+                }
+            }
         }
     }
 
@@ -355,6 +404,36 @@ final class TransportControlPanelView: TimelineMetalLayerView {
     }
 }
 
+private final class TransportControlBootstrapView: NSView {
+    override var isOpaque: Bool {
+        false
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let diameter: CGFloat = 68
+        let rect = CGRect(
+            x: bounds.midX - diameter * 0.5,
+            y: bounds.midY - diameter * 0.5,
+            width: diameter,
+            height: diameter
+        )
+        NSColor(white: 0.12, alpha: 1).setFill()
+        NSBezierPath(ovalIn: rect).fill()
+
+        NSColor(white: 0.60, alpha: 1).setFill()
+        let icon = NSBezierPath()
+        icon.move(to: CGPoint(x: rect.midX - 6, y: rect.midY - 10))
+        icon.line(to: CGPoint(x: rect.midX + 10, y: rect.midY))
+        icon.line(to: CGPoint(x: rect.midX - 6, y: rect.midY + 10))
+        icon.close()
+        icon.fill()
+    }
+}
+
 private final class TransportControlPanelRenderer {
     struct State {
         let isPlaying: Bool
@@ -407,7 +486,11 @@ private final class TransportControlPanelRenderer {
             throw RendererError.quadBufferUnavailable
         }
 
-        let library = try device.makeLibrary(source: Self.shaderSource, options: nil)
+        let library = try BundledMetalLibrary.load(
+            named: "TransportControlShaders",
+            device: device,
+            developmentSource: Self.shaderSource
+        )
         guard
             let vertexFunction = library.makeFunction(name: "transport_vertex"),
             let fragmentFunction = library.makeFunction(name: "transport_fragment")

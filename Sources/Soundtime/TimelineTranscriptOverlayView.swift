@@ -6,10 +6,31 @@ struct TimelineTranscriptOverlayDiagnosticsSnapshot: Codable, Sendable {
     var interactionOnlyUpdateCount: Int
     var fullDirtyUpdateCount: Int
     var fineDirtyUpdateCount: Int
+    var drawCount: Int
+    var maxDrawMilliseconds: Double
+    var maxDrawnRunCount: Int
+    var cursorRectResetCount: Int
+    var maxCursorRectResetMilliseconds: Double
+    var maxCursorRectCount: Int
     var visibleRunCount: Int
+    var runLayerCount: Int
+    var expectedVisibleRunLayerCount: Int
+    var visibleRunLayerCount: Int
+    var lastLayoutBuildReason: String?
 }
 
 final class TimelineTranscriptOverlayView: NSView {
+    private final class RunLayerBundle {
+        let layoutRun: TranscriptTimelineLayout.Run
+        let containerLayer = CALayer()
+        let backgroundLayer = CALayer()
+        let textLayer = CATextLayer()
+
+        init(layoutRun: TranscriptTimelineLayout.Run) {
+            self.layoutRun = layoutRun
+        }
+    }
+
     private struct VisibleTextRun {
         let layoutRun: TranscriptTimelineLayout.Run
         let displayRect: CGRect?
@@ -49,7 +70,7 @@ final class TimelineTranscriptOverlayView: NSView {
 
     private struct CachedLayout {
         let key: String
-        let reuseKey: String
+        let reuseKeyComponents: [String]
         let visibleProjectRange: TranscriptionTimeRange
         let backgroundRects: [CGRect]
         let runs: [VisibleTextRun]
@@ -64,11 +85,22 @@ final class TimelineTranscriptOverlayView: NSView {
     private var displayMode = TranscriptTimelineDisplayMode.hidden
     private var interactionState = TranscriptInteractionState.empty
     private var cachedLayout: CachedLayout?
+    private let transcriptBackgroundLayer = CALayer()
+    private let transcriptRunLayer = CALayer()
+    private var transcriptBandLayers: [CALayer] = []
+    private var transcriptRunLayers: [RunLayerBundle] = []
     private var diagnosticsConfigureCount = 0
     private var diagnosticsLayoutBuildCount = 0
     private var diagnosticsInteractionOnlyUpdateCount = 0
     private var diagnosticsFullDirtyUpdateCount = 0
     private var diagnosticsFineDirtyUpdateCount = 0
+    private var diagnosticsDrawCount = 0
+    private var diagnosticsMaxDrawMilliseconds: Double = 0
+    private var diagnosticsMaxDrawnRunCount = 0
+    private var diagnosticsCursorRectResetCount = 0
+    private var diagnosticsMaxCursorRectResetMilliseconds: Double = 0
+    private var diagnosticsMaxCursorRectCount = 0
+    private var diagnosticsLastLayoutBuildReason: String?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -119,6 +151,7 @@ final class TimelineTranscriptOverlayView: NSView {
         guard isVisible else {
             if cachedLayout != nil || previousKey != nextKey {
                 cachedLayout = nil
+                rebuildLayerTree()
                 needsDisplay = true
                 return true
             }
@@ -133,9 +166,25 @@ final class TimelineTranscriptOverlayView: NSView {
             return false
         }
 
+        let nextReuseKeyComponents = layoutReuseKeyComponents(
+            tracks: tracks,
+            trackLayout: trackLayout,
+            timelineDuration: timelineDuration,
+            displayMode: displayMode
+        )
+        if let cachedLayout {
+            diagnosticsLastLayoutBuildReason = cachedLayout.reuseKeyComponents == nextReuseKeyComponents
+                ? "viewport-uncovered"
+                : layoutReuseDifferenceReason(
+                    previous: cachedLayout.reuseKeyComponents,
+                    next: nextReuseKeyComponents
+                )
+        } else {
+            diagnosticsLastLayoutBuildReason = "cache-missing"
+        }
         cachedLayout = buildLayout(key: nextKey)
+        rebuildLayerTree()
         diagnosticsLayoutBuildCount += 1
-        needsDisplay = true
         return true
     }
 
@@ -167,7 +216,10 @@ final class TimelineTranscriptOverlayView: NSView {
             return false
         }
 
-        needsDisplay = true
+        updateLayerGeometry()
+        if interactionState.alignmentDebugEnabled {
+            needsDisplay = true
+        }
         return true
     }
 
@@ -205,13 +257,13 @@ final class TimelineTranscriptOverlayView: NSView {
             return false
         }
 
-        let nextReuseKey = layoutReuseKey(
+        let nextReuseKeyComponents = layoutReuseKeyComponents(
             tracks: tracks,
             trackLayout: trackLayout,
             timelineDuration: timelineDuration,
             displayMode: displayMode
         )
-        guard cachedLayout.reuseKey == nextReuseKey else {
+        guard cachedLayout.reuseKeyComponents == nextReuseKeyComponents else {
             return false
         }
 
@@ -229,7 +281,17 @@ final class TimelineTranscriptOverlayView: NSView {
             interactionOnlyUpdateCount: diagnosticsInteractionOnlyUpdateCount,
             fullDirtyUpdateCount: diagnosticsFullDirtyUpdateCount,
             fineDirtyUpdateCount: diagnosticsFineDirtyUpdateCount,
-            visibleRunCount: cachedLayout?.runs.count ?? 0
+            drawCount: diagnosticsDrawCount,
+            maxDrawMilliseconds: diagnosticsMaxDrawMilliseconds,
+            maxDrawnRunCount: diagnosticsMaxDrawnRunCount,
+            cursorRectResetCount: diagnosticsCursorRectResetCount,
+            maxCursorRectResetMilliseconds: diagnosticsMaxCursorRectResetMilliseconds,
+            maxCursorRectCount: diagnosticsMaxCursorRectCount,
+            visibleRunCount: cachedLayout?.runs.count ?? 0,
+            runLayerCount: transcriptRunLayers.count,
+            expectedVisibleRunLayerCount: expectedVisibleRunLayerCountForDiagnostics(),
+            visibleRunLayerCount: transcriptRunLayers.lazy.filter { !$0.containerLayer.isHidden }.count,
+            lastLayoutBuildReason: diagnosticsLastLayoutBuildReason
         )
     }
 
@@ -239,6 +301,35 @@ final class TimelineTranscriptOverlayView: NSView {
         diagnosticsInteractionOnlyUpdateCount = 0
         diagnosticsFullDirtyUpdateCount = 0
         diagnosticsFineDirtyUpdateCount = 0
+        diagnosticsDrawCount = 0
+        diagnosticsMaxDrawMilliseconds = 0
+        diagnosticsMaxDrawnRunCount = 0
+        diagnosticsCursorRectResetCount = 0
+        diagnosticsMaxCursorRectResetMilliseconds = 0
+        diagnosticsMaxCursorRectCount = 0
+        diagnosticsLastLayoutBuildReason = nil
+    }
+
+    func recordCursorRectResetForDiagnostics(
+        durationMilliseconds: Double,
+        rectCount: Int
+    ) {
+        diagnosticsCursorRectResetCount += 1
+        diagnosticsMaxCursorRectResetMilliseconds = max(
+            diagnosticsMaxCursorRectResetMilliseconds,
+            durationMilliseconds
+        )
+        diagnosticsMaxCursorRectCount = max(diagnosticsMaxCursorRectCount, rectCount)
+    }
+
+    private func expectedVisibleRunLayerCountForDiagnostics() -> Int {
+        guard let cachedLayout else {
+            return 0
+        }
+        return cachedLayout.runs.lazy.filter { run in
+            let rect = self.displayRun(run).rect.intersection(self.bounds).insetBy(dx: 3, dy: 0)
+            return !rect.isNull && rect.width > 2 && rect.height > 2
+        }.count
     }
 
     func transcriptHit(at point: CGPoint) -> TranscriptInteractionHit? {
@@ -318,11 +409,248 @@ final class TimelineTranscriptOverlayView: NSView {
 
     private func commonInit() {
         wantsLayer = true
-        layer?.backgroundColor = NSColor.clear.cgColor
+        guard let layer else {
+            return
+        }
+        layer.backgroundColor = NSColor.clear.cgColor
+        layer.masksToBounds = true
+        layer.isGeometryFlipped = true
+        transcriptBackgroundLayer.masksToBounds = true
+        transcriptRunLayer.masksToBounds = true
+        transcriptBackgroundLayer.isGeometryFlipped = true
+        transcriptRunLayer.isGeometryFlipped = true
+        layer.addSublayer(transcriptBackgroundLayer)
+        layer.addSublayer(transcriptRunLayer)
         isHidden = true
     }
 
+    private func rebuildLayerTree() {
+        withDisabledLayerActions {
+            for layer in transcriptBandLayers {
+                layer.removeFromSuperlayer()
+            }
+            for bundle in transcriptRunLayers {
+                bundle.containerLayer.removeFromSuperlayer()
+            }
+            transcriptBandLayers.removeAll(keepingCapacity: true)
+            transcriptRunLayers.removeAll(keepingCapacity: true)
+
+            guard displayMode != .hidden, let cachedLayout else {
+                return
+            }
+
+            transcriptBandLayers.reserveCapacity(cachedLayout.backgroundRects.count)
+            for _ in cachedLayout.backgroundRects {
+                let bandLayer = CALayer()
+                bandLayer.backgroundColor = NSColor.black.withAlphaComponent(0.28).cgColor
+                bandLayer.borderColor = NSColor.white.withAlphaComponent(0.055).cgColor
+                bandLayer.borderWidth = 1
+                bandLayer.cornerRadius = 9
+                transcriptBackgroundLayer.addSublayer(bandLayer)
+                transcriptBandLayers.append(bandLayer)
+            }
+
+            let contentsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+            transcriptRunLayers.reserveCapacity(cachedLayout.runs.count)
+            for run in cachedLayout.runs {
+                let bundle = RunLayerBundle(layoutRun: run.layoutRun)
+                bundle.containerLayer.masksToBounds = true
+                bundle.containerLayer.isGeometryFlipped = true
+                bundle.backgroundLayer.isGeometryFlipped = true
+                bundle.textLayer.isGeometryFlipped = true
+                bundle.textLayer.contentsScale = contentsScale
+                bundle.textLayer.alignmentMode = .center
+                bundle.textLayer.truncationMode = .end
+                bundle.textLayer.isWrapped = false
+                bundle.textLayer.masksToBounds = true
+                bundle.containerLayer.addSublayer(bundle.backgroundLayer)
+                bundle.containerLayer.addSublayer(bundle.textLayer)
+                transcriptRunLayer.addSublayer(bundle.containerLayer)
+                transcriptRunLayers.append(bundle)
+            }
+
+            updateLayerGeometryWithoutTransaction()
+            updateAllRunLayerStylesWithoutTransaction()
+        }
+    }
+
+    private func updateLayerGeometry() {
+        withDisabledLayerActions {
+            updateLayerGeometryWithoutTransaction()
+        }
+    }
+
+    private func updateLayerGeometryWithoutTransaction() {
+        transcriptBackgroundLayer.frame = bounds
+        transcriptRunLayer.frame = bounds
+
+        if let cachedLayout {
+            for (index, bandLayer) in transcriptBandLayers.enumerated() {
+                guard cachedLayout.backgroundRects.indices.contains(index) else {
+                    bandLayer.isHidden = true
+                    continue
+                }
+                let rect = cachedLayout.backgroundRects[index].intersection(bounds)
+                bandLayer.isHidden = rect.isNull || rect.width <= 0 || rect.height <= 0
+                if !bandLayer.isHidden {
+                    bandLayer.frame = rect
+                }
+            }
+        } else {
+            for bandLayer in transcriptBandLayers {
+                bandLayer.isHidden = true
+            }
+        }
+
+        for bundle in transcriptRunLayers {
+            let displayRect = TranscriptViewportGeometry.displayRect(
+                for: bundle.layoutRun,
+                viewport: viewport,
+                timelineDuration: timelineDuration,
+                boundsWidth: bounds.width
+            )
+            let clippedRect = displayRect.intersection(bounds).insetBy(dx: 3, dy: 0)
+            guard
+                !clippedRect.isNull,
+                clippedRect.width > 2,
+                clippedRect.height > 2
+            else {
+                bundle.containerLayer.isHidden = true
+                continue
+            }
+
+            bundle.containerLayer.isHidden = false
+            bundle.containerLayer.frame = clippedRect
+            let localBounds = CGRect(origin: .zero, size: clippedRect.size)
+            bundle.backgroundLayer.frame = localBounds
+            bundle.backgroundLayer.cornerRadius = bundle.layoutRun.isWord
+                ? clippedRect.height * 0.46
+                : 8
+            let verticalTextInset = max((clippedRect.height - 14) * 0.5, 1)
+            bundle.textLayer.frame = localBounds.insetBy(dx: 5, dy: verticalTextInset)
+        }
+    }
+
+    private func updateAllRunLayerStyles() {
+        withDisabledLayerActions {
+            updateAllRunLayerStylesWithoutTransaction()
+        }
+    }
+
+    private func updateAllRunLayerStylesWithoutTransaction() {
+        for bundle in transcriptRunLayers {
+            updateRunLayerStyle(bundle)
+        }
+    }
+
+    private func updateRunLayerStyles(
+        wordIDs: Set<UUID>,
+        segmentIDs: Set<UUID>
+    ) {
+        guard !wordIDs.isEmpty || !segmentIDs.isEmpty else {
+            return
+        }
+        withDisabledLayerActions {
+            for bundle in transcriptRunLayers {
+                let layoutRun = bundle.layoutRun
+                let shouldUpdate = layoutRun.wordID.map(wordIDs.contains) == true ||
+                    segmentIDs.contains(layoutRun.segmentID)
+                if shouldUpdate {
+                    updateRunLayerStyle(bundle)
+                }
+            }
+        }
+    }
+
+    private func updateRunLayerStyle(_ bundle: RunLayerBundle) {
+        let run = bundle.layoutRun
+        let isSelected = run.wordID.map { interactionState.selectedWordIDs.contains($0) } == true ||
+            interactionState.selectedSegmentIDs.contains(run.segmentID)
+        let isHovered = run.wordID.map { interactionState.hoveredWordID == $0 } == true ||
+            (run.wordID == nil && interactionState.hoveredSegmentID == run.segmentID)
+        let isActive = run.wordID.map { interactionState.activeWordID == $0 } == true
+
+        if run.isWord {
+            let fillAlpha: CGFloat
+            if isSelected {
+                fillAlpha = 0.34
+            } else if isActive {
+                fillAlpha = 0.28
+            } else if isHovered {
+                fillAlpha = 0.22
+            } else {
+                fillAlpha = 0.14
+            }
+            bundle.backgroundLayer.backgroundColor = NSColor(
+                calibratedRed: 0.14,
+                green: 0.86,
+                blue: 0.94,
+                alpha: fillAlpha
+            ).cgColor
+            if isSelected || isHovered || isActive {
+                bundle.backgroundLayer.borderColor = NSColor.white
+                    .withAlphaComponent(isSelected ? 0.28 : 0.16)
+                    .cgColor
+                bundle.backgroundLayer.borderWidth = isSelected ? 1.2 : 0.8
+            } else {
+                bundle.backgroundLayer.borderColor = NSColor.clear.cgColor
+                bundle.backgroundLayer.borderWidth = 0
+            }
+        } else if isSelected || isHovered {
+            bundle.backgroundLayer.backgroundColor = NSColor(
+                calibratedRed: 0.14,
+                green: 0.86,
+                blue: 0.94,
+                alpha: isSelected ? 0.24 : 0.13
+            ).cgColor
+            bundle.backgroundLayer.borderColor = NSColor.clear.cgColor
+            bundle.backgroundLayer.borderWidth = 0
+        } else {
+            bundle.backgroundLayer.backgroundColor = NSColor.clear.cgColor
+            bundle.backgroundLayer.borderColor = NSColor.clear.cgColor
+            bundle.backgroundLayer.borderWidth = 0
+        }
+
+        bundle.textLayer.string = attributedText(
+            for: VisibleTextRun(layoutRun: run),
+            isSelected: isSelected,
+            isHovered: isHovered,
+            isActive: isActive
+        )
+    }
+
+    private func withDisabledLayerActions(_ update: () -> Void) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        update()
+        CATransaction.commit()
+    }
+
+    override func layout() {
+        super.layout()
+        updateLayerGeometry()
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        for bundle in transcriptRunLayers {
+            bundle.textLayer.contentsScale = scale
+        }
+    }
+
     override func draw(_ dirtyRect: NSRect) {
+        let startedAt = CACurrentMediaTime()
+        var drawnRunCount = 0
+        defer {
+            diagnosticsDrawCount += 1
+            diagnosticsMaxDrawMilliseconds = max(
+                diagnosticsMaxDrawMilliseconds,
+                (CACurrentMediaTime() - startedAt) * 1_000
+            )
+            diagnosticsMaxDrawnRunCount = max(diagnosticsMaxDrawnRunCount, drawnRunCount)
+        }
+
         guard
             displayMode != .hidden,
             timelineDuration > 0,
@@ -336,17 +664,14 @@ final class TimelineTranscriptOverlayView: NSView {
             return
         }
 
+        guard interactionState.alignmentDebugEnabled else {
+            return
+        }
+
         NSGraphicsContext.current?.shouldAntialias = true
-        for backgroundRect in cachedLayout.backgroundRects where backgroundRect.intersects(dirtyRect) {
-            drawTranscriptBackground(backgroundRect)
-        }
         let visibleRuns = cachedLayout.runs.map(displayRun)
-        if interactionState.alignmentDebugEnabled {
-            drawAlignmentDebug(for: visibleRuns, dirtyRect: dirtyRect)
-        }
-        for run in visibleRuns where run.rect.intersects(dirtyRect) {
-            draw(run)
-        }
+        drawnRunCount = visibleRuns.count
+        drawAlignmentDebug(for: visibleRuns, dirtyRect: dirtyRect)
     }
 
     private func buildLayout(key: String) -> CachedLayout {
@@ -358,7 +683,7 @@ final class TimelineTranscriptOverlayView: NSView {
         else {
             return CachedLayout(
                 key: key,
-                reuseKey: layoutReuseKey(
+                reuseKeyComponents: layoutReuseKeyComponents(
                     tracks: tracks,
                     trackLayout: trackLayout,
                     timelineDuration: timelineDuration,
@@ -382,6 +707,7 @@ final class TimelineTranscriptOverlayView: NSView {
         let layout = TranscriptLayoutEngine.makeLayout(TranscriptTimelineLayoutInput(
             tracks: tracks,
             viewport: layoutViewport,
+            densityViewport: viewport,
             trackLayout: trackLayout,
             timelineDuration: timelineDuration,
             bounds: bounds.size,
@@ -390,7 +716,7 @@ final class TimelineTranscriptOverlayView: NSView {
         let runs = layout.runs.map { VisibleTextRun(layoutRun: $0) }
         return CachedLayout(
             key: key,
-            reuseKey: layoutReuseKey(
+            reuseKeyComponents: layoutReuseKeyComponents(
                 tracks: tracks,
                 trackLayout: trackLayout,
                 timelineDuration: timelineDuration,
@@ -419,6 +745,7 @@ final class TimelineTranscriptOverlayView: NSView {
 
         guard previousState.alignmentDebugEnabled == nextState.alignmentDebugEnabled else {
             diagnosticsFullDirtyUpdateCount += 1
+            updateAllRunLayerStyles()
             needsDisplay = true
             return
         }
@@ -446,15 +773,27 @@ final class TimelineTranscriptOverlayView: NSView {
         guard !dirtyRects.isEmpty else {
             return
         }
+        updateRunLayerStyles(
+            wordIDs: Set(
+                [
+                    previousState.hoveredWordID,
+                    nextState.hoveredWordID,
+                    previousState.activeWordID,
+                    nextState.activeWordID,
+                ].compactMap { $0 }
+            ).union(changedWordIDs),
+            segmentIDs: Set(
+                [
+                    previousState.hoveredSegmentID,
+                    nextState.hoveredSegmentID,
+                ].compactMap { $0 }
+            ).union(changedSegmentIDs)
+        )
         if dirtyRects.count > 40 {
             diagnosticsFullDirtyUpdateCount += 1
-            needsDisplay = true
             return
         }
-        for rect in dirtyRects {
-            diagnosticsFineDirtyUpdateCount += 1
-            setNeedsDisplay(expandedDirtyRect(rect))
-        }
+        diagnosticsFineDirtyUpdateCount += dirtyRects.count
     }
 
     private func appendDirtyRect(
@@ -650,23 +989,46 @@ final class TimelineTranscriptOverlayView: NSView {
             "\(trackLayout.insertionTrackIndex ?? -1)",
             "\(Int((trackLayout.insertionProgress * 1_000).rounded()))",
         ]
-        components.append(
-            layoutReuseKey(
-                tracks: tracks,
-                trackLayout: trackLayout,
-                timelineDuration: timelineDuration,
-                displayMode: displayMode
-            )
-        )
+        components.append(contentsOf: layoutReuseKeyComponents(
+            tracks: tracks,
+            trackLayout: trackLayout,
+            timelineDuration: timelineDuration,
+            displayMode: displayMode
+        ))
         return components.joined(separator: "|")
     }
 
-    private func layoutReuseKey(
+    private func layoutReuseDifferenceReason(
+        previous: [String],
+        next: [String]
+    ) -> String {
+        let labels = [
+            "display-mode",
+            "bounds-width",
+            "bounds-height",
+            "timeline-duration",
+            "track-scroll-offset",
+            "track-height",
+            "ruler-height",
+            "insertion-track",
+            "insertion-progress",
+        ]
+        let sharedCount = min(previous.count, next.count)
+        if let differenceIndex = (0..<sharedCount).first(where: { previous[$0] != next[$0] }) {
+            if labels.indices.contains(differenceIndex) {
+                return "layout-\(labels[differenceIndex])-changed-\(previous[differenceIndex])-to-\(next[differenceIndex])"
+            }
+            return "track-content-changed"
+        }
+        return previous.count == next.count ? "content-or-layout-changed" : "track-count-changed"
+    }
+
+    private func layoutReuseKeyComponents(
         tracks: [TimelineRenderState.Track],
         trackLayout: TimelineTrackLayout,
         timelineDuration: TimeInterval,
         displayMode: TranscriptTimelineDisplayMode
-    ) -> String {
+    ) -> [String] {
         var components = [
             displayMode.rawValue,
             "\(Int((bounds.width * 2).rounded()))",
@@ -678,7 +1040,7 @@ final class TimelineTranscriptOverlayView: NSView {
             "\(trackLayout.insertionTrackIndex ?? -1)",
             "\(Int((trackLayout.insertionProgress * 1_000).rounded()))",
         ]
-        components.reserveCapacity(components.count + tracks.count * 4)
+        components.reserveCapacity(components.count + tracks.count * 10)
         for track in tracks {
             components.append(track.id.uuidString)
             components.append(track.transcript?.id.uuidString ?? "-")
@@ -702,6 +1064,6 @@ final class TimelineTranscriptOverlayView: NSView {
                 components.append("\(Int((lastSegment.sourceEndProgress * 1_000_000).rounded()))")
             }
         }
-        return components.joined(separator: "|")
+        return components
     }
 }

@@ -26,10 +26,17 @@ final class AudioExportStreamingWAVWriter: AudioExportSampleWriter, @unchecked S
     private let fileHandle: FileHandle
     private let sampleRate: Double
     private let channelCount: Int
+    private let encoding: AudioExportWAVEncoding
     private var frameCount = 0
     private var isFinished = false
+    private var ditherState: UInt64 = 0x9E37_79B9_7F4A_7C15
 
-    init(url: URL, sampleRate: Double, channelCount: Int) throws {
+    init(
+        url: URL,
+        sampleRate: Double,
+        channelCount: Int,
+        encoding: AudioExportWAVEncoding = .pcm24
+    ) throws {
         guard
             sampleRate.isFinite,
             sampleRate > 0,
@@ -43,8 +50,13 @@ final class AudioExportStreamingWAVWriter: AudioExportSampleWriter, @unchecked S
         self.url = url.pathExtension.isEmpty ? url.appendingPathExtension("wav") : url
         self.sampleRate = sampleRate
         self.channelCount = channelCount
+        self.encoding = encoding
 
-        try FileManager.default.removeItemIfPresentForExport(at: self.url)
+        guard !FileManager.default.fileExists(atPath: self.url.path) else {
+            throw WriterError.writeFailed(
+                CocoaError(.fileWriteFileExists)
+            )
+        }
         guard FileManager.default.createFile(atPath: self.url.path, contents: nil) else {
             throw WAVFileWriter.WriteError.couldNotCreateFile
         }
@@ -53,6 +65,7 @@ final class AudioExportStreamingWAVWriter: AudioExportSampleWriter, @unchecked S
         try fileHandle.write(contentsOf: Self.makeHeader(
             sampleRate: UInt32(sampleRate.rounded()),
             channelCount: UInt16(channelCount),
+            encoding: encoding,
             dataByteCount: 0
         ))
     }
@@ -74,7 +87,7 @@ final class AudioExportStreamingWAVWriter: AudioExportSampleWriter, @unchecked S
             return
         }
 
-        let bytesPerFrame = channelCount * 2
+        let bytesPerFrame = channelCount * encoding.bytesPerSample
         guard
             bytesPerFrame <= Int(UInt16.max),
             (frameCount + chunkFrameCount) <= Int(UInt32.max) / bytesPerFrame
@@ -89,7 +102,14 @@ final class AudioExportStreamingWAVWriter: AudioExportSampleWriter, @unchecked S
                 let sourceChannel = channelIndex < samplesByChannel.count ? channelIndex : samplesByChannel.count - 1
                 let samples = samplesByChannel[sourceChannel]
                 let sample = frameIndex < samples.count ? samples[frameIndex] : 0
-                data.appendExportInt16LE(Self.quantizeSample(sample))
+                switch encoding {
+                case .pcm16:
+                    data.appendExportInt16LE(quantizePCM16(sample))
+                case .pcm24:
+                    data.appendExportInt24LE(quantizePCM24(sample))
+                case .float32:
+                    data.appendExportFloat32LE(sample.isFinite ? sample : 0)
+                }
             }
         }
 
@@ -111,6 +131,7 @@ final class AudioExportStreamingWAVWriter: AudioExportSampleWriter, @unchecked S
         }
 
         try patchHeader()
+        try fileHandle.synchronize()
         try fileHandle.close()
         isFinished = true
         return url
@@ -126,7 +147,7 @@ final class AudioExportStreamingWAVWriter: AudioExportSampleWriter, @unchecked S
     }
 
     private func patchHeader() throws {
-        let dataByteCount = frameCount * channelCount * 2
+        let dataByteCount = frameCount * channelCount * encoding.bytesPerSample
         guard dataByteCount <= Int(UInt32.max) else {
             throw WriterError.fileTooLarge
         }
@@ -135,6 +156,7 @@ final class AudioExportStreamingWAVWriter: AudioExportSampleWriter, @unchecked S
         try fileHandle.write(contentsOf: Self.makeHeader(
             sampleRate: UInt32(sampleRate.rounded()),
             channelCount: UInt16(channelCount),
+            encoding: encoding,
             dataByteCount: UInt32(dataByteCount)
         ))
     }
@@ -142,11 +164,13 @@ final class AudioExportStreamingWAVWriter: AudioExportSampleWriter, @unchecked S
     private static func makeHeader(
         sampleRate: UInt32,
         channelCount: UInt16,
+        encoding: AudioExportWAVEncoding,
         dataByteCount: UInt32
     ) -> Data {
-        let bytesPerSample: UInt16 = 2
+        let bytesPerSample = UInt16(encoding.bytesPerSample)
         let bitsPerSample = bytesPerSample * 8
         let blockAlign = channelCount * bytesPerSample
+        let formatTag: UInt16 = encoding == .float32 ? 3 : 1
 
         var data = Data()
         data.reserveCapacity(44)
@@ -155,7 +179,7 @@ final class AudioExportStreamingWAVWriter: AudioExportSampleWriter, @unchecked S
         data.appendExportASCII("WAVE")
         data.appendExportASCII("fmt ")
         data.appendExportUInt32LE(16)
-        data.appendExportUInt16LE(1)
+        data.appendExportUInt16LE(formatTag)
         data.appendExportUInt16LE(channelCount)
         data.appendExportUInt32LE(sampleRate)
         data.appendExportUInt32LE(sampleRate * UInt32(blockAlign))
@@ -166,20 +190,35 @@ final class AudioExportStreamingWAVWriter: AudioExportSampleWriter, @unchecked S
         return data
     }
 
-    private static func quantizeSample(_ sample: Float) -> Int16 {
-        let clippedSample = min(max(sample, -1), 1)
+    private func quantizePCM16(_ sample: Float) -> Int16 {
+        let dithered = sample + triangularDither(lsbScale: 1.0 / 32_768.0)
+        let clippedSample = min(max(dithered, -1), 1)
         let scaledSample = clippedSample < 0 ? clippedSample * 32_768 : clippedSample * 32_767
         let roundedSample = Int(scaledSample.rounded())
         return Int16(min(max(roundedSample, Int(Int16.min)), Int(Int16.max)))
     }
-}
 
-private extension FileManager {
-    func removeItemIfPresentForExport(at url: URL) throws {
-        guard fileExists(atPath: url.path) else {
-            return
-        }
-        try removeItem(at: url)
+    private func quantizePCM24(_ sample: Float) -> Int32 {
+        let dithered = sample + triangularDither(lsbScale: 1.0 / 8_388_608.0)
+        let clippedSample = min(max(dithered, -1), 1)
+        let scaledSample = clippedSample < 0 ?
+            clippedSample * 8_388_608 :
+            clippedSample * 8_388_607
+        return Int32(min(max(Int64(scaledSample.rounded()), -8_388_608), 8_388_607))
+    }
+
+    private func triangularDither(lsbScale: Float) -> Float {
+        let first = nextDitherUnit()
+        let second = nextDitherUnit()
+        return (first - second) * lsbScale
+    }
+
+    private func nextDitherUnit() -> Float {
+        ditherState ^= ditherState << 13
+        ditherState ^= ditherState >> 7
+        ditherState ^= ditherState << 17
+        let mantissa = UInt32(truncatingIfNeeded: ditherState >> 40)
+        return Float(mantissa) / Float(1 << 24)
     }
 }
 
@@ -200,6 +239,18 @@ private extension Data {
 
     mutating func appendExportInt16LE(_ value: Int16) {
         var littleEndianValue = value.littleEndian
+        appendExportBytes(of: &littleEndianValue)
+    }
+
+    mutating func appendExportInt24LE(_ value: Int32) {
+        let bitPattern = UInt32(bitPattern: value)
+        append(UInt8(truncatingIfNeeded: bitPattern))
+        append(UInt8(truncatingIfNeeded: bitPattern >> 8))
+        append(UInt8(truncatingIfNeeded: bitPattern >> 16))
+    }
+
+    mutating func appendExportFloat32LE(_ value: Float) {
+        var littleEndianValue = value.bitPattern.littleEndian
         appendExportBytes(of: &littleEndianValue)
     }
 

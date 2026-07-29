@@ -67,7 +67,15 @@ final class ImportWorkBudget: @unchecked Sendable {
         work: () throws -> T
     ) throws -> T {
         try waitIfPlaybackActive(workClass)
-        heavyWorkSemaphore.wait()
+        while heavyWorkSemaphore.wait(timeout: .now() + .milliseconds(20)) != .success {
+            if Task.isCancelled {
+                throw CancellationError()
+            }
+        }
+        if Task.isCancelled {
+            heavyWorkSemaphore.signal()
+            throw CancellationError()
+        }
         markExclusiveWorkStarted()
         defer {
             markExclusiveWorkFinished()

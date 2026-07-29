@@ -147,18 +147,25 @@ struct AudioFileEditTimeline: Sendable {
     private var timelineFrameCount: Int
 
     init(fileInfo: WAVFileInfo) {
-        sourceFrameCount = fileInfo.frameCount
-        sourceSampleRate = fileInfo.sampleRate
-        if fileInfo.frameCount > 0 {
+        self.init(
+            sourceFrameCount: fileInfo.frameCount,
+            sourceSampleRate: fileInfo.sampleRate
+        )
+    }
+
+    init(sourceFrameCount: Int, sourceSampleRate: Double) {
+        self.sourceFrameCount = max(sourceFrameCount, 0)
+        self.sourceSampleRate = sourceSampleRate
+        if sourceFrameCount > 0, sourceSampleRate.isFinite, sourceSampleRate > 0 {
             segments = [
                 Segment(
                     sourceStartFrame: 0,
-                    frameCount: fileInfo.frameCount,
+                    frameCount: sourceFrameCount,
                     gainStart: 1,
                     gainEnd: 1
                 ),
             ]
-            timelineFrameCount = fileInfo.frameCount
+            timelineFrameCount = sourceFrameCount
         } else {
             segments = []
             timelineFrameCount = 0
@@ -290,6 +297,52 @@ struct AudioFileEditTimeline: Sendable {
         }
     }
 
+    func remapped(
+        toSourceFrameCount destinationSourceFrameCount: Int,
+        sampleRate destinationSampleRate: Double
+    ) -> AudioFileEditTimeline? {
+        guard
+            sourceSampleRate.isFinite,
+            sourceSampleRate > 0,
+            destinationSampleRate.isFinite,
+            destinationSampleRate > 0,
+            destinationSourceFrameCount >= 0
+        else {
+            return nil
+        }
+
+        let rateScale = destinationSampleRate / sourceSampleRate
+        let remappedSegments = playbackSegments.map { segment in
+            let sourceStartFrame = min(
+                max(Int((Double(segment.sourceStartFrame) * rateScale).rounded()), 0),
+                destinationSourceFrameCount
+            )
+            let sourceEndFrame = min(
+                max(
+                    Int((Double(segment.sourceStartFrame + segment.frameCount) * rateScale).rounded()),
+                    sourceStartFrame
+                ),
+                destinationSourceFrameCount
+            )
+            return AudioEditTimeline.PlaybackSegment(
+                outputStartFrame: 0,
+                sourceStartFrame: sourceStartFrame,
+                frameCount: max(sourceEndFrame - sourceStartFrame, 0),
+                sourceFrameScale: 0,
+                gainStart: segment.gainStart,
+                gainEnd: segment.gainEnd,
+                startsNewClip: segment.startsNewClip
+            )
+        }
+        .filter { $0.frameCount > 0 }
+
+        return AudioFileEditTimeline(
+            sourceFrameCount: destinationSourceFrameCount,
+            sourceSampleRate: destinationSampleRate,
+            playbackSegments: remappedSegments
+        )
+    }
+
     var clipRanges: [ClipRange] {
         guard timelineFrameCount > 0 else {
             return []
@@ -355,7 +408,32 @@ struct AudioFileEditTimeline: Sendable {
         )
     }
 
+    func clip(for frameRange: Range<Int>) -> Clip? {
+        let selectedSegments = segments(in: clampedFrameRange(frameRange))
+        guard !selectedSegments.isEmpty else {
+            return nil
+        }
+
+        return Clip(
+            sourceFrameCount: sourceFrameCount,
+            sourceSampleRate: sourceSampleRate,
+            segments: selectedSegments.map { segment in
+                PersistentSegment(
+                    sourceStartFrame: segment.sourceStartFrame,
+                    frameCount: segment.frameCount,
+                    gainStart: segment.gainStart,
+                    gainEnd: segment.gainEnd,
+                    startsNewClip: segment.startsNewClip ? true : nil
+                )
+            }
+        )
+    }
+
     mutating func replace(_ selection: TimelineSelection, with clip: Clip) -> Int? {
+        replace(frameRange: clampedFrameRange(for: selection), with: clip)
+    }
+
+    mutating func replace(frameRange: Range<Int>, with clip: Clip) -> Int? {
         guard isCompatible(with: clip) else {
             return nil
         }
@@ -376,13 +454,18 @@ struct AudioFileEditTimeline: Sendable {
             return nil
         }
 
-        let replacementRange = clampedFrameRange(for: selection)
+        let replacementRange = clampedFrameRange(frameRange)
         let beforeSegments = segments(in: 0..<replacementRange.lowerBound)
         let afterSegments = segments(in: replacementRange.upperBound..<frameCount)
         segments = Self.coalescedSegments(beforeSegments + replacementSegments + afterSegments)
         let replacementFrameCount = Self.totalFrameCount(replacementSegments)
         timelineFrameCount = timelineFrameCount - replacementRange.count + replacementFrameCount
         return replacementFrameCount
+    }
+
+    mutating func insert(_ clip: Clip, atFrame frame: Int) -> Int? {
+        let insertionFrame = min(max(frame, 0), frameCount)
+        return replace(frameRange: insertionFrame..<insertionFrame, with: clip)
     }
 
     func waveformOverview(from sourceOverview: WaveformOverview) -> WaveformOverview {
@@ -758,8 +841,12 @@ struct AudioFileEditTimeline: Sendable {
     private func clampedFrameRange(for selection: TimelineSelection) -> Range<Int> {
         let startFrame = Int((selection.startProgress * Double(frameCount)).rounded(.down))
         let endFrame = Int((selection.endProgress * Double(frameCount)).rounded(.up))
-        let lowerBound = min(max(startFrame, 0), frameCount)
-        let upperBound = min(max(endFrame, lowerBound), frameCount)
+        return clampedFrameRange(startFrame..<max(endFrame, startFrame))
+    }
+
+    private func clampedFrameRange(_ frameRange: Range<Int>) -> Range<Int> {
+        let lowerBound = min(max(frameRange.lowerBound, 0), frameCount)
+        let upperBound = min(max(frameRange.upperBound, lowerBound), frameCount)
         return lowerBound..<upperBound
     }
 

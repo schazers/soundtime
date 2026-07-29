@@ -3,7 +3,7 @@ import Metal
 import QuartzCore
 
 class TimelineMetalLayerView: NSView {
-    let metalDevice: MTLDevice?
+    private(set) var metalDevice: MTLDevice?
     var preferredFramesPerSecond = 60
     var drawableBackingScaleOverride: CGFloat? {
         didSet {
@@ -56,9 +56,15 @@ class TimelineMetalLayerView: NSView {
     }
 
     required init?(coder: NSCoder) {
-        metalDevice = MTLCreateSystemDefaultDevice()
+        metalDevice = nil
         super.init(coder: coder)
         configureLayerHosting()
+    }
+
+    func installMetalDevice(_ device: MTLDevice) {
+        metalDevice = device
+        timelineMetalLayer?.device = device
+        updateDrawableSize()
     }
 
     override func makeBackingLayer() -> CALayer {
@@ -125,6 +131,7 @@ class TimelineMetalLayerView: NSView {
 
     private func makeRenderTarget() -> TimelineRenderTarget? {
         guard
+            metalDevice != nil,
             bounds.width > 0,
             bounds.height > 0,
             let metalLayer = timelineMetalLayer

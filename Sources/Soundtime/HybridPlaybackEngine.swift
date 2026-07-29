@@ -176,6 +176,27 @@ final class HybridPlaybackEngine: PlaybackEngine {
             }
         }
 
+        if activeEngine == .multitrack, let realtimeEngine {
+            let previousSnapshot = multitrackEngine.snapshot()
+            do {
+                try realtimeEngine.loadProjectTracks(tracks)
+                realtimeEngine.setPerceptualVolume(perceptualVolume)
+                try realtimeEngine.seekExactly(toProgress: previousSnapshot.progress)
+                if previousSnapshot.isPlaying {
+                    multitrackEngine.pause()
+                    try realtimeEngine.play()
+                }
+                multitrackEngine.clear()
+                activeEngine = .realtime
+                return
+            } catch {
+                realtimeEngine.clear()
+                try multitrackEngine.updateProjectTracks(tracks)
+                multitrackEngine.setPerceptualVolume(perceptualVolume)
+                return
+            }
+        }
+
         try loadProjectTracks(tracks)
     }
 

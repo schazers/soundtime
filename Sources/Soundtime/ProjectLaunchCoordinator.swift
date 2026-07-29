@@ -414,6 +414,16 @@ enum ProjectLaunchCoordinator {
             return nil
         }
         let standardizedRecoveryURL = recoveryURL.standardizedFileURL
+        if let canonicalProjectURL = SoundtimeProjectStore.canonicalProjectURL(
+            forAutosaveAt: standardizedRecoveryURL
+        ) {
+            return RestorableLaunchTarget(
+                targetProjectURL: canonicalProjectURL,
+                visualCacheURL: standardizedRecoveryURL,
+                usesAutosaveRecovery: true,
+                reason: "autosave-provenance-restored-project"
+            )
+        }
         return RestorableLaunchTarget(
             targetProjectURL: standardizedRecoveryURL,
             visualCacheURL: standardizedRecoveryURL,

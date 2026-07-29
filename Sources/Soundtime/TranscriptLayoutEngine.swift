@@ -11,6 +11,7 @@ enum TranscriptTimelineDisplayMode: String, Codable, CaseIterable, Sendable {
 struct TranscriptTimelineLayoutInput: Sendable {
     var tracks: [TimelineRenderState.Track]
     var viewport: TimelineViewport
+    var densityViewport: TimelineViewport
     var trackLayout: TimelineTrackLayout
     var timelineDuration: TimeInterval
     var bounds: CGSize
@@ -19,6 +20,7 @@ struct TranscriptTimelineLayoutInput: Sendable {
     init(
         tracks: [TimelineRenderState.Track],
         viewport: TimelineViewport,
+        densityViewport: TimelineViewport? = nil,
         trackLayout: TimelineTrackLayout,
         timelineDuration: TimeInterval,
         bounds: CGSize,
@@ -26,6 +28,7 @@ struct TranscriptTimelineLayoutInput: Sendable {
     ) {
         self.tracks = tracks
         self.viewport = viewport
+        self.densityViewport = densityViewport ?? viewport
         self.trackLayout = trackLayout
         self.timelineDuration = timelineDuration
         self.bounds = bounds
@@ -56,8 +59,11 @@ struct TranscriptTimelineLayout: Sendable {
 }
 
 enum TranscriptLayoutEngine {
-    static let maximumVisibleWordRuns = 120
-    static let maximumVisibleSegmentRuns = 70
+    // These limits bound the prefetched cache, not just the pixels currently
+    // visible. They are intentionally large enough for several screens of
+    // spoken audio so a normal pan does not synchronously rebuild text.
+    static let maximumVisibleWordRuns = 512
+    static let maximumVisibleSegmentRuns = 160
 
     static func makeLayout(_ input: TranscriptTimelineLayoutInput) -> TranscriptTimelineLayout {
         guard
@@ -87,7 +93,11 @@ enum TranscriptLayoutEngine {
             viewport: input.viewport,
             timelineDuration: input.timelineDuration
         )
-        let secondsPerPixel = visibleOutputRange.duration / max(TimeInterval(input.bounds.width), 1)
+        let densityOutputRange = visibleProjectRange(
+            viewport: input.densityViewport,
+            timelineDuration: input.timelineDuration
+        )
+        let secondsPerPixel = densityOutputRange.duration / max(TimeInterval(input.bounds.width), 1)
         let useWordRuns = secondsPerPixel < 0.035
 
         for trackIndex in visibleTrackRange where input.tracks.indices.contains(trackIndex) {

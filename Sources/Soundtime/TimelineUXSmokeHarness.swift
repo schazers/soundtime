@@ -917,6 +917,18 @@ enum TimelineUXSmokeHarness {
             label: "loop wrap"
         )
 
+        // Frame diagnostics intentionally publish over a short sample window.
+        // Exercise enough wrapped playback frames to produce a representative
+        // hot-path sample instead of relying on stats left by an earlier check.
+        for frameIndex in 1...12 {
+            _ = try renderCurrentTimeline(
+                renderer: renderer,
+                displayTimestamp: wrappedTimestamp + Double(frameIndex) / 120,
+                texture: texture,
+                viewportSize: viewportSize,
+                backingScale: backingScale
+            )
+        }
         let playbackStats = frameStatsBox.samples.filter { $0.waveformHotPathReason == "playback" }
         try require(!playbackStats.isEmpty, "loop-wrap playback did not publish frame stats")
         let hotPathViolations = playbackStats.filter {

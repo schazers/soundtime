@@ -657,7 +657,64 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         )
     }
 
+    private func canReusePreparedArrangement(
+        _ preparedTrack: PreparedProjectTrack,
+        for track: ProjectPlaybackTrack
+    ) -> Bool {
+        guard
+            preparedTrack.id == track.id,
+            preparedTrack.sourceRevision == track.sourceRevision
+        else {
+            return false
+        }
+
+        switch track.source {
+        case let .decoded(buffer, _):
+            return preparedTrack.sourceIdentity == nil &&
+                preparedTrack.sourceID == nil &&
+                preparedTrack.source.frameCount == buffer.frameCount &&
+                preparedTrack.source.channelCount == buffer.channelCount &&
+                preparedTrack.source.sampleRate == buffer.sampleRate
+        case .file, .fileTimeline:
+            return preparedTrack.sourceIdentity == sourceIdentity(for: track.source)
+        case let .timeline(audioTimeline, _):
+            return preparedTrack.sourceID == audioTimeline.sourceID
+        }
+    }
+
+    private func replacingMix(
+        of preparedTrack: PreparedProjectTrack,
+        with track: ProjectPlaybackTrack
+    ) -> PreparedProjectTrack {
+        var result = preparedTrack
+        result.volume = track.volume
+        result.isMuted = track.isMuted
+        result.isSoloed = track.isSoloed
+        return result
+    }
+
     private func prepareProjectTracks(_ tracks: [ProjectPlaybackTrack]) throws -> [PreparedProjectTrack] {
+        if
+            tracks.count == preparedProjectTracks.count,
+            tracks.indices.allSatisfy({ tracks[$0].id == preparedProjectTracks[$0].id })
+        {
+            var result: [PreparedProjectTrack] = []
+            result.reserveCapacity(tracks.count)
+            for index in tracks.indices {
+                let track = tracks[index]
+                let existingTrack = preparedProjectTracks[index]
+                if canReusePreparedArrangement(existingTrack, for: track) {
+                    result.append(replacingMix(of: existingTrack, with: track))
+                } else {
+                    result.append(try preparedProjectTrack(
+                        from: track,
+                        existingPreparedTrack: existingTrack
+                    ))
+                }
+            }
+            return result
+        }
+
         let existingTracksByID = Dictionary(uniqueKeysWithValues: preparedProjectTracks.map { ($0.id, $0) })
         var reusableTracksBySourceIdentity: [String: PreparedProjectTrack] = [:]
         reusableTracksBySourceIdentity.reserveCapacity(preparedProjectTracks.count + tracks.count)

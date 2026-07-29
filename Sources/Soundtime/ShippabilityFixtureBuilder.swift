@@ -1,4 +1,5 @@
 import AVFoundation
+import CryptoKit
 import Foundation
 
 enum ShippabilityFixtureBuilder {
@@ -43,6 +44,7 @@ enum ShippabilityFixtureBuilder {
         var path: String
         var trackCount: Int
         var durationSeconds: Double
+        var transcriptWordCount: Int
     }
 
     private enum FixtureProfile: String {
@@ -82,9 +84,16 @@ enum ShippabilityFixtureBuilder {
         var url: URL
         var trackCount: Int
         var duration: TimeInterval
+        var transcriptWordCount: Int
+        var relatedURLs: [URL]
     }
 
     private struct FixtureManifest: Codable {
+        struct FileDigest: Codable {
+            var path: String
+            var sha256: String
+        }
+
         struct Entry: Codable {
             var id: String
             var role: String
@@ -94,6 +103,9 @@ enum ShippabilityFixtureBuilder {
             var trackCount: Int?
             var projectReady: Bool?
             var importExpectation: FixtureImportExpectation?
+            var transcriptWordCount: Int?
+            var sha256: String
+            var relatedFiles: [FileDigest]
         }
 
         var schemaVersion: Int
@@ -239,56 +251,64 @@ enum ShippabilityFixtureBuilder {
             role: "One short WAV track with launch preview",
             path: "projects/st-ship-project-001-short-wav-launch.soundtime",
             trackCount: 1,
-            durationSeconds: 12
+            durationSeconds: 12,
+            transcriptWordCount: 0
         ),
         ExpectedProjectFixture(
             id: "st-ship-project-002",
             role: "One long WAV track with compact first-frame preview",
             path: "projects/st-ship-project-002-long-wav-startup.soundtime",
             trackCount: 1,
-            durationSeconds: 180
+            durationSeconds: 180,
+            transcriptWordCount: 0
         ),
         ExpectedProjectFixture(
             id: "st-ship-project-003",
             role: "Compressed MP3 source represented by editable WAV proxy",
             path: "projects/st-ship-project-003-mp3-import-proxy.soundtime",
             trackCount: 1,
-            durationSeconds: 45
+            durationSeconds: 45,
+            transcriptWordCount: 0
         ),
         ExpectedProjectFixture(
             id: "st-ship-project-004",
             role: "Three-track mixed session with mute/solo state and shared edit group",
             path: "projects/st-ship-project-004-three-track-session.soundtime",
             trackCount: 3,
-            durationSeconds: 180
+            durationSeconds: 180,
+            transcriptWordCount: 0
         ),
         ExpectedProjectFixture(
             id: "st-ship-project-005",
             role: "Edited track fixture with non-trivial file timeline",
             path: "projects/st-ship-project-005-edited-delete-paste.soundtime",
             trackCount: 1,
-            durationSeconds: 85.35
+            durationSeconds: 85.35,
+            transcriptWordCount: 0
         ),
         ExpectedProjectFixture(
             id: "st-ship-project-006",
             role: "Podcast track with deterministic transcript document",
             path: "projects/st-ship-project-006-transcribed-podcast.soundtime",
             trackCount: 1,
-            durationSeconds: 180
+            durationSeconds: 180,
+            transcriptWordCount: 311
         ),
         ExpectedProjectFixture(
             id: "st-ship-project-007",
             role: "100 tracks sharing one compact source for layout/render stress",
             path: "projects/st-ship-project-007-stress-100-tracks.soundtime",
             trackCount: 100,
-            durationSeconds: 12
+            durationSeconds: 12,
+            transcriptWordCount: 0
         ),
         ExpectedProjectFixture(
             id: "st-ship-project-008",
             role: "True 30-minute WAV project for full release startup coverage",
             path: "projects/st-ship-project-008-true-long-wav-release.soundtime",
             trackCount: 1,
-            durationSeconds: 1_800
+            durationSeconds: 1_800,
+            transcriptWordCount: 0
         ),
     ]
 
@@ -918,10 +938,24 @@ enum ShippabilityFixtureBuilder {
         project: SoundtimeProject
     ) throws -> GeneratedProject {
         let url = directory.appendingPathComponent("\(id)-\(slug).soundtime")
+        let storedProject = try TranscriptSidecarStore.projectWithSidecarReferences(
+            project,
+            projectURL: url
+        )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(project).write(to: url, options: [.atomic])
+        try encoder.encode(storedProject).write(to: url, options: [.atomic])
         try setStableModificationDate(at: url, offset: Int(id.suffix(3)) ?? 0)
+        let relatedURLs = try storedProject.tracks.compactMap { track -> URL? in
+            guard let reference = track.transcript?.storageReference else {
+                return nil
+            }
+            let relatedURL = directory
+                .appendingPathComponent(reference.path)
+                .standardizedFileURL
+            try setStableModificationDate(at: relatedURL, offset: Int(id.suffix(3)) ?? 0)
+            return relatedURL
+        }
         return GeneratedProject(
             id: id,
             role: role,
@@ -929,7 +963,11 @@ enum ShippabilityFixtureBuilder {
             trackCount: project.tracks.count,
             duration: project.tracks
                 .compactMap { trackDuration($0) }
-                .max() ?? 0
+                .max() ?? 0,
+            transcriptWordCount: project.tracks.reduce(0) {
+                $0 + ($1.transcript?.words.count ?? 0)
+            },
+            relatedURLs: relatedURLs
         )
     }
 
@@ -1419,14 +1457,14 @@ enum ShippabilityFixtureBuilder {
         projects: [GeneratedProject]
     ) throws {
         let manifest = FixtureManifest(
-            schemaVersion: 1,
+            schemaVersion: 2,
             fixtureVersion: "v1",
             profile: profile.rawValue,
             generatedBy: "Soundtime ShippabilityFixtureBuilder",
             namingScheme: expectedNamingScheme,
             supportedImportFormatsCovered: expectedSupportedImportFormatsCovered,
             recognizedUnsupportedFormatsCovered: expectedRecognizedUnsupportedFormatsCovered,
-            audio: audio.map { item in
+            audio: try audio.map { item in
                 FixtureManifest.Entry(
                     id: item.id,
                     role: item.role,
@@ -1435,10 +1473,13 @@ enum ShippabilityFixtureBuilder {
                     durationSeconds: item.duration,
                     trackCount: nil,
                     projectReady: item.projectReady,
-                    importExpectation: item.importExpectation
+                    importExpectation: item.importExpectation,
+                    transcriptWordCount: nil,
+                    sha256: try sha256(of: item.url),
+                    relatedFiles: []
                 )
             },
-            projects: projects.map { project in
+            projects: try projects.map { project in
                 FixtureManifest.Entry(
                     id: project.id,
                     role: project.role,
@@ -1447,7 +1488,15 @@ enum ShippabilityFixtureBuilder {
                     durationSeconds: project.duration,
                     trackCount: project.trackCount,
                     projectReady: true,
-                    importExpectation: nil
+                    importExpectation: nil,
+                    transcriptWordCount: project.transcriptWordCount,
+                    sha256: try sha256(of: project.url),
+                    relatedFiles: try project.relatedURLs.map {
+                        FixtureManifest.FileDigest(
+                            path: relativePath($0, from: rootDirectory),
+                            sha256: try sha256(of: $0)
+                        )
+                    }
                 )
             }
         )
@@ -1485,7 +1534,7 @@ enum ShippabilityFixtureBuilder {
         let manifestData = try Data(contentsOf: manifestURL)
         let manifest = try JSONDecoder().decode(FixtureManifest.self, from: manifestData)
 
-        try require(manifest.schemaVersion == 1, "unexpected fixture manifest schema \(manifest.schemaVersion)")
+        try require(manifest.schemaVersion == 2, "unexpected fixture manifest schema \(manifest.schemaVersion)")
         try require(manifest.fixtureVersion == "v1", "unexpected fixture version \(manifest.fixtureVersion)")
         try require(manifest.profile == profile.rawValue, "fixture profile drifted: \(manifest.profile)")
         try require(manifest.namingScheme == expectedNamingScheme, "fixture naming scheme drifted")
@@ -1528,9 +1577,12 @@ enum ShippabilityFixtureBuilder {
                 approximately(entry.durationSeconds ?? -1, expected.durationSeconds, tolerance: 0.75),
                 "\(expected.id) duration drifted: \(entry.durationSeconds ?? -1)"
             )
+            try require(entry.transcriptWordCount == nil, "\(expected.id) unexpectedly has transcript metadata")
+            try require(entry.relatedFiles.isEmpty, "\(expected.id) unexpectedly has related files")
 
             let url = rootDirectory.appendingPathComponent(entry.path)
             try require(FileManager.default.fileExists(atPath: url.path), "missing \(url.lastPathComponent)")
+            try require(try sha256(of: url) == entry.sha256, "\(url.lastPathComponent) checksum drifted")
             switch expected.importExpectation {
             case .importable:
                 try require(AudioAssetImporter.canImport(url), "\(url.lastPathComponent) should be importable")
@@ -1582,11 +1634,26 @@ enum ShippabilityFixtureBuilder {
                 approximately(entry.durationSeconds ?? -1, expected.durationSeconds, tolerance: 0.05),
                 "\(expected.id) duration drifted: \(entry.durationSeconds ?? -1)"
             )
+            try require(
+                entry.transcriptWordCount == expected.transcriptWordCount,
+                "\(expected.id) transcript word count drifted"
+            )
 
             let url = rootDirectory.appendingPathComponent(entry.path)
             try require(FileManager.default.fileExists(atPath: url.path), "missing \(url.lastPathComponent)")
+            try require(try sha256(of: url) == entry.sha256, "\(url.lastPathComponent) checksum drifted")
+            for relatedFile in entry.relatedFiles {
+                let relatedURL = rootDirectory.appendingPathComponent(relatedFile.path)
+                try require(FileManager.default.fileExists(atPath: relatedURL.path), "missing \(relatedFile.path)")
+                try require(try sha256(of: relatedURL) == relatedFile.sha256, "\(relatedFile.path) checksum drifted")
+            }
             let loaded = try SoundtimeProjectStore.loadLaunchPreview(from: url)
             try require(loaded.tracks.count == expected.trackCount, "\(url.lastPathComponent) track count mismatch")
+            let hydrated = try SoundtimeProjectStore.load(from: url)
+            try require(
+                hydrated.tracks.reduce(0) { $0 + ($1.transcript?.words.count ?? 0) } == expected.transcriptWordCount,
+                "\(url.lastPathComponent) transcript payload drifted"
+            )
             try require(
                 loaded.tracks.allSatisfy { $0.waveformPreview != nil },
                 "\(url.lastPathComponent) has tracks without launch waveform previews"
@@ -1600,6 +1667,23 @@ enum ShippabilityFixtureBuilder {
         tolerance: Double
     ) -> Bool {
         abs(lhs - rhs) <= tolerance
+    }
+
+    private static func sha256(of url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer {
+            try? handle.close()
+        }
+
+        var hasher = SHA256()
+        while true {
+            let data = try handle.read(upToCount: 1_048_576) ?? Data()
+            guard !data.isEmpty else {
+                break
+            }
+            hasher.update(data: data)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     private static func relativePath(_ url: URL, from rootDirectory: URL) -> String {

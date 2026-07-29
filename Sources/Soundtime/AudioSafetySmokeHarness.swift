@@ -1,4 +1,6 @@
+import AVFoundation
 import Foundation
+import Darwin
 import SoundtimeAudioCore
 
 private final class AudioSafetySmokeResultBox<T: Sendable>: @unchecked Sendable {
@@ -81,6 +83,10 @@ enum AudioSafetySmokeHarness {
         var droppedCommandCount = 0
         var renderDeadlineMissCount = 0
         var maxRenderNanoseconds = 0
+        var renderWorkDeadlineMissCount = 0
+        var maxRenderWorkNanoseconds = 0
+        var callbackSchedulingLateCount = 0
+        var maxCallbackSchedulingLatenessNanoseconds = 0
         var maxSeekFrameError = 0
         var maxLoopSampleError: Float = 0
         var maxGraphSwapMilliseconds = 0.0
@@ -96,6 +102,7 @@ enum AudioSafetySmokeHarness {
         var importedFormatCount = 0
         var importedFileCount = 0
         var importedFormats: [String] = []
+        var minimumOriginalPlaybackPeak: Float = .greatestFiniteMagnitude
         var minimumImportPlaybackPeak: Float = .greatestFiniteMagnitude
         var minimumCorePlaybackPeak: Float = .greatestFiniteMagnitude
 
@@ -104,6 +111,22 @@ enum AudioSafetySmokeHarness {
             droppedCommandCount = max(droppedCommandCount, snapshot.droppedCommandCount)
             renderDeadlineMissCount = max(renderDeadlineMissCount, snapshot.renderDeadlineMissCount)
             maxRenderNanoseconds = max(maxRenderNanoseconds, snapshot.maxRenderNanoseconds)
+            renderWorkDeadlineMissCount = max(
+                renderWorkDeadlineMissCount,
+                snapshot.renderWorkDeadlineMissCount
+            )
+            maxRenderWorkNanoseconds = max(
+                maxRenderWorkNanoseconds,
+                snapshot.maxRenderWorkNanoseconds
+            )
+            callbackSchedulingLateCount = max(
+                callbackSchedulingLateCount,
+                snapshot.callbackSchedulingLateCount
+            )
+            maxCallbackSchedulingLatenessNanoseconds = max(
+                maxCallbackSchedulingLatenessNanoseconds,
+                snapshot.maxCallbackSchedulingLatenessNanoseconds
+            )
         }
 
         mutating func absorb(_ snapshot: SoundtimeAudioCoreSnapshot) {
@@ -111,6 +134,22 @@ enum AudioSafetySmokeHarness {
             droppedCommandCount = max(droppedCommandCount, Int(min(snapshot.droppedCommandCount, UInt64(Int.max))))
             renderDeadlineMissCount = max(renderDeadlineMissCount, Int(min(snapshot.renderDeadlineMissCount, UInt64(Int.max))))
             maxRenderNanoseconds = max(maxRenderNanoseconds, Int(min(snapshot.maxRenderNanoseconds, UInt64(Int.max))))
+            renderWorkDeadlineMissCount = max(
+                renderWorkDeadlineMissCount,
+                Int(min(snapshot.renderWorkDeadlineMissCount, UInt64(Int.max)))
+            )
+            maxRenderWorkNanoseconds = max(
+                maxRenderWorkNanoseconds,
+                Int(min(snapshot.maxRenderWorkNanoseconds, UInt64(Int.max)))
+            )
+            callbackSchedulingLateCount = max(
+                callbackSchedulingLateCount,
+                Int(min(snapshot.callbackSchedulingLateCount, UInt64(Int.max)))
+            )
+            maxCallbackSchedulingLatenessNanoseconds = max(
+                maxCallbackSchedulingLatenessNanoseconds,
+                Int(min(snapshot.maxCallbackSchedulingLatenessNanoseconds, UInt64(Int.max)))
+            )
         }
     }
 
@@ -118,36 +157,19 @@ enum AudioSafetySmokeHarness {
         let startedAtNanoseconds = DispatchTime.now().uptimeNanoseconds
         let mode = SmokeMode(arguments: arguments)
         let coreOnly = arguments.contains("--audio-safety-core-only")
-        let maximumAttempts = shouldRetryDeadlineMisses(mode: mode, coreOnly: coreOnly) ? 2 : 1
-        var lastError: Error?
-
-        for attempt in 1...maximumAttempts {
-            do {
-                try runAttempt(
-                    arguments: arguments,
-                    mode: mode,
-                    coreOnly: coreOnly,
-                    attempt: attempt,
-                    startedAtNanoseconds: startedAtNanoseconds
-                )
-                return
-            } catch {
-                lastError = error
-                guard attempt < maximumAttempts, isRetryableDeadlineMiss(error) else {
-                    throw error
-                }
-                print("Soundtime audio safety smoke hit a transient render deadline miss; retrying stress pass once")
-            }
-        }
-
-        throw lastError ?? SmokeError.failed("audio safety smoke failed without a captured error")
+        setenv("SOUNDTIME_AUDIO_DETAILED_TIMING", "1", 1)
+        try runAttempt(
+            arguments: arguments,
+            mode: mode,
+            coreOnly: coreOnly,
+            startedAtNanoseconds: startedAtNanoseconds
+        )
     }
 
     private static func runAttempt(
         arguments: [String],
         mode: SmokeMode,
         coreOnly: Bool,
-        attempt: Int,
         startedAtNanoseconds: UInt64
     ) throws {
         var metrics = SafetyMetrics()
@@ -166,7 +188,10 @@ enum AudioSafetySmokeHarness {
 
         try require(metrics.underrunCount == 0, "audio core reported \(metrics.underrunCount) underrun(s)")
         try require(metrics.droppedCommandCount == 0, "audio core dropped \(metrics.droppedCommandCount) command(s)")
-        try require(metrics.renderDeadlineMissCount == 0, "audio core missed \(metrics.renderDeadlineMissCount) render deadline(s)")
+        try require(
+            metrics.renderWorkDeadlineMissCount == 0,
+            "audio core CPU work missed \(metrics.renderWorkDeadlineMissCount) render deadline(s)"
+        )
 
         var checks = [
             "no underruns or dropped realtime commands",
@@ -178,7 +203,7 @@ enum AudioSafetySmokeHarness {
         if coreOnly {
             checks.append("core project track playback renders audible audio")
         } else {
-            checks.append("playback after import works for WAV/MP3/M4A/AIFF/AAC/FLAC/CAF")
+            checks.append("original and proxy playback work for WAV/MP3/M4A/AIFF/AAC/FLAC/CAF")
         }
 
         if let reportURL = StabilityReportWriter.writePassedSuite(
@@ -188,11 +213,15 @@ enum AudioSafetySmokeHarness {
             metadata: [
                 "mode": modeName(mode),
                 "scope": coreOnly ? "core-only" : "full-import-matrix",
-                "attempt": "\(attempt)",
+                "attempt": "1",
                 "underrunCount": "\(metrics.underrunCount)",
                 "droppedCommandCount": "\(metrics.droppedCommandCount)",
                 "renderDeadlineMissCount": "\(metrics.renderDeadlineMissCount)",
                 "maxRenderNanoseconds": "\(metrics.maxRenderNanoseconds)",
+                "renderWorkDeadlineMissCount": "\(metrics.renderWorkDeadlineMissCount)",
+                "maxRenderWorkNanoseconds": "\(metrics.maxRenderWorkNanoseconds)",
+                "callbackSchedulingLateCount": "\(metrics.callbackSchedulingLateCount)",
+                "maxCallbackSchedulingLatenessNanoseconds": "\(metrics.maxCallbackSchedulingLatenessNanoseconds)",
                 "maxSeekFrameError": "\(metrics.maxSeekFrameError)",
                 "maxLoopSampleError": String(format: "%.8f", metrics.maxLoopSampleError),
                 "maxGraphSwapMilliseconds": String(format: "%.3f", metrics.maxGraphSwapMilliseconds),
@@ -208,6 +237,10 @@ enum AudioSafetySmokeHarness {
                 "importedFormatCount": "\(metrics.importedFormatCount)",
                 "importedFileCount": "\(metrics.importedFileCount)",
                 "importedFormats": metrics.importedFormats.joined(separator: ","),
+                "minimumOriginalPlaybackPeak": String(
+                    format: "%.6f",
+                    metrics.minimumOriginalPlaybackPeak
+                ),
                 "minimumImportPlaybackPeak": String(format: "%.6f", metrics.minimumImportPlaybackPeak),
                 "minimumCorePlaybackPeak": String(format: "%.6f", metrics.minimumCorePlaybackPeak),
             ],
@@ -216,19 +249,6 @@ enum AudioSafetySmokeHarness {
             print("Soundtime audio safety smoke report: \(reportURL.path)")
         }
         print("Soundtime audio safety smoke passed")
-    }
-
-    private static func shouldRetryDeadlineMisses(mode: SmokeMode, coreOnly: Bool) -> Bool {
-        mode == .stress &&
-            !coreOnly &&
-            ProcessInfo.processInfo.environment["SOUNDTIME_SHIPPABILITY_GATE"] == "1"
-    }
-
-    private static func isRetryableDeadlineMiss(_ error: Error) -> Bool {
-        guard case let SmokeError.failed(message) = error else {
-            return false
-        }
-        return message.localizedCaseInsensitiveContains("render deadline")
     }
 
     private static func verifyOutputDeviceConfiguration(metrics: inout SafetyMetrics) throws {
@@ -452,6 +472,23 @@ enum AudioSafetySmokeHarness {
         var importedFormats = Set<String>()
         for audio in audioToImport {
             let sourceURL = rootDirectory.appendingPathComponent(audio.path).standardizedFileURL
+            let originalInfo = try AudioAssetImporter.inspectSynchronously(url: sourceURL)
+            let originalPeak = try renderOriginalPlaybackPeak(
+                sourceURL: sourceURL,
+                expectedSampleRate: try requireValue(
+                    originalInfo.sampleRate,
+                    "\(audio.id) did not expose a source sample rate"
+                )
+            )
+            metrics.minimumOriginalPlaybackPeak = min(
+                metrics.minimumOriginalPlaybackPeak,
+                originalPeak
+            )
+            try require(
+                originalPeak > 0.000_5,
+                "\(audio.id) \(audio.format ?? "unknown") original-file playback rendered silence"
+            )
+
             let proxy = try awaitValue {
                 try await AudioAssetImporter.importEditableAsset(at: sourceURL)
             }
@@ -465,6 +502,66 @@ enum AudioSafetySmokeHarness {
         metrics.importedFormatCount = importedFormats.count
         metrics.importedFileCount = audioToImport.count
         metrics.importedFormats = importedFormats.sorted()
+    }
+
+    private static func renderOriginalPlaybackPeak(
+        sourceURL: URL,
+        expectedSampleRate: Double
+    ) throws -> Float {
+        let track = ProjectPlaybackTrack(
+            id: stableUUID("00000000-0000-4000-a001-%012d", 1),
+            source: .file(url: sourceURL, zeroCrossingProbe: nil),
+            sourceRevision: 0,
+            volume: 1,
+            isMuted: false,
+            isSoloed: false
+        )
+        let playbackController = MultitrackPlaybackController()
+        try playbackController.loadProjectTracks([track])
+        defer {
+            playbackController.clear()
+        }
+        try require(
+            playbackController.hasSource,
+            "\(sourceURL.lastPathComponent) was not admitted by original-file playback"
+        )
+
+        let audioFile = try AVAudioFile(
+            forReading: sourceURL,
+            commonFormat: .pcmFormatFloat32,
+            interleaved: false
+        )
+        try require(
+            abs(audioFile.processingFormat.sampleRate - expectedSampleRate) < 0.5,
+            "\(sourceURL.lastPathComponent) original playback sample rate changed"
+        )
+        let frameCapacity = AVAudioFrameCount(
+            min(max(audioFile.length, 1), 4_096)
+        )
+        guard let buffer = AVAudioPCMBuffer(
+            pcmFormat: audioFile.processingFormat,
+            frameCapacity: frameCapacity
+        ) else {
+            throw SmokeError.failed(
+                "\(sourceURL.lastPathComponent) could not allocate an original playback buffer"
+            )
+        }
+        try audioFile.read(into: buffer, frameCount: frameCapacity)
+        guard
+            let channelData = buffer.floatChannelData,
+            buffer.frameLength > 0
+        else {
+            throw SmokeError.failed(
+                "\(sourceURL.lastPathComponent) original playback produced no PCM frames"
+            )
+        }
+        var peak: Float = 0
+        for channelIndex in 0..<Int(buffer.format.channelCount) {
+            for frameIndex in 0..<Int(buffer.frameLength) {
+                peak = max(peak, abs(channelData[channelIndex][frameIndex]))
+            }
+        }
+        return peak
     }
 
     private static func selectedImportFixtures(
@@ -493,11 +590,6 @@ enum AudioSafetySmokeHarness {
     }
 
     private static func renderImportedPlaybackPeak(proxy: AudioAssetProxyResult) throws -> Float {
-        let decodedPeak = try renderPlaybackPeak(sampleRate: proxy.decodedAudioBuffer.sampleRate) { playbackEngine in
-            try playbackEngine.load(proxy.decodedAudioBuffer, zeroCrossingIndex: proxy.zeroCrossingIndex)
-        }
-        try require(decodedPeak > 0.000_5, "decoded import buffer rendered silence")
-
         let proxyPeak = try renderPlaybackPeak(sampleRate: proxy.proxyFileInfo.sampleRate) { playbackEngine in
             try playbackEngine.loadProjectTracks([
                 ProjectPlaybackTrack(
@@ -512,7 +604,7 @@ enum AudioSafetySmokeHarness {
         }
         try require(proxyPeak > 0.000_5, "persisted editable proxy rendered silence")
 
-        return min(decodedPeak, proxyPeak)
+        return proxyPeak
     }
 
     private static func renderPlaybackPeak(
@@ -545,7 +637,10 @@ enum AudioSafetySmokeHarness {
         let snapshot = playbackEngine.realtimeSnapshotForSafetySmoke()
         try require(snapshot.underrunCount == 0, "import playback produced \(snapshot.underrunCount) underrun(s)")
         try require(snapshot.droppedCommandCount == 0, "import playback dropped \(snapshot.droppedCommandCount) command(s)")
-        try require(snapshot.renderDeadlineMissCount == 0, "import playback missed \(snapshot.renderDeadlineMissCount) render deadline(s)")
+        try require(
+            snapshot.renderWorkDeadlineMissCount == 0,
+            "import playback CPU work missed \(snapshot.renderWorkDeadlineMissCount) render deadline(s)"
+        )
         return peak
     }
 

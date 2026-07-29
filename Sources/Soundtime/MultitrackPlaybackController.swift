@@ -6,14 +6,14 @@ import QuartzCore
 final class MultitrackPlaybackController: PlaybackEngine {
     private enum PlaybackSource {
         case decoded(DecodedAudioBuffer)
-        case file(AVAudioFile)
+        case file(AVAudioFile, timeline: AudioFileEditTimeline?)
 
         var frameCount: Int {
             switch self {
             case let .decoded(decodedAudioBuffer):
                 decodedAudioBuffer.frameCount
-            case let .file(audioFile):
-                Int(audioFile.length)
+            case let .file(audioFile, timeline):
+                timeline?.frameCount ?? Int(audioFile.length)
             }
         }
 
@@ -21,7 +21,7 @@ final class MultitrackPlaybackController: PlaybackEngine {
             switch self {
             case let .decoded(decodedAudioBuffer):
                 decodedAudioBuffer.sampleRate
-            case let .file(audioFile):
+            case let .file(audioFile, _):
                 audioFile.processingFormat.sampleRate
             }
         }
@@ -422,13 +422,13 @@ final class MultitrackPlaybackController: PlaybackEngine {
             zeroCrossingProbe = nil
         case let .file(url, sourceZeroCrossingProbe):
             let audioFile = try AVAudioFile(forReading: url)
-            source = .file(audioFile)
+            source = .file(audioFile, timeline: nil)
             format = audioFile.processingFormat
             zeroCrossingIndex = nil
             zeroCrossingProbe = sourceZeroCrossingProbe
-        case let .fileTimeline(url, _, sourceZeroCrossingProbe):
+        case let .fileTimeline(url, timeline, sourceZeroCrossingProbe):
             let audioFile = try AVAudioFile(forReading: url)
-            source = .file(audioFile)
+            source = .file(audioFile, timeline: timeline)
             format = audioFile.processingFormat
             zeroCrossingIndex = nil
             zeroCrossingProbe = sourceZeroCrossingProbe
@@ -567,13 +567,131 @@ final class MultitrackPlaybackController: PlaybackEngine {
                     buffer: playbackBuffer
                 ))
                 player.playerNode.scheduleBuffer(playbackBuffer, at: nil)
-            case let .file(audioFile):
-                player.playerNode.scheduleSegment(
-                    audioFile,
-                    startingFrame: AVAudioFramePosition(sourceStartFrame),
-                    frameCount: AVAudioFrameCount(sourceFrameCount),
-                    at: nil
+            case let .file(audioFile, timeline):
+                if let timeline {
+                    let buffers = try makePlaybackBuffers(
+                        from: audioFile,
+                        timeline: timeline,
+                        outputStartFrame: sourceStartFrame,
+                        frameCount: sourceFrameCount
+                    )
+                    for buffer in buffers {
+                        scheduledDecodedBuffers.append((
+                            endProjectFrame: projectStartFrame + projectFrameCount,
+                            buffer: buffer
+                        ))
+                        player.playerNode.scheduleBuffer(buffer, at: nil)
+                    }
+                } else {
+                    player.playerNode.scheduleSegment(
+                        audioFile,
+                        startingFrame: AVAudioFramePosition(sourceStartFrame),
+                        frameCount: AVAudioFrameCount(sourceFrameCount),
+                        at: nil
+                    )
+                }
+            }
+        }
+    }
+
+    private func makePlaybackBuffers(
+        from audioFile: AVAudioFile,
+        timeline: AudioFileEditTimeline,
+        outputStartFrame: Int,
+        frameCount: Int
+    ) throws -> [AVAudioPCMBuffer] {
+        let outputEndFrame = min(outputStartFrame + frameCount, timeline.frameCount)
+        guard outputEndFrame > outputStartFrame else {
+            return []
+        }
+
+        var buffers: [AVAudioPCMBuffer] = []
+        for segment in timeline.playbackSegments {
+            let segmentStart = segment.outputStartFrame
+            let segmentEnd = segment.outputStartFrame + segment.frameCount
+            let overlapStart = max(outputStartFrame, segmentStart)
+            let overlapEnd = min(outputEndFrame, segmentEnd)
+            guard overlapEnd > overlapStart else {
+                continue
+            }
+
+            let segmentOffset = overlapStart - segmentStart
+            let requestedFrameCount = overlapEnd - overlapStart
+            let sourceFrameScale = segment.sourceFrameScale > 0 ? segment.sourceFrameScale : 1
+            let sourceStart = segment.sourceStartFrame +
+                Int((Double(segmentOffset) * sourceFrameScale).rounded(.down))
+            let sourceEnd = min(
+                segment.sourceStartFrame +
+                    Int((Double(segmentOffset + requestedFrameCount) * sourceFrameScale).rounded(.up)),
+                Int(audioFile.length)
+            )
+            let readableFrameCount = max(sourceEnd - sourceStart, 0)
+            guard readableFrameCount > 0 else {
+                continue
+            }
+
+            let format = audioFile.processingFormat
+            guard let readBuffer = AVAudioPCMBuffer(
+                pcmFormat: format,
+                frameCapacity: AVAudioFrameCount(readableFrameCount)
+            ) else {
+                throw PlaybackError.bufferCreationFailed
+            }
+            audioFile.framePosition = AVAudioFramePosition(sourceStart)
+            try audioFile.read(
+                into: readBuffer,
+                frameCount: AVAudioFrameCount(readableFrameCount)
+            )
+            guard readBuffer.frameLength > 0 else {
+                continue
+            }
+            applyGain(
+                to: readBuffer,
+                segment: segment,
+                segmentOffset: segmentOffset,
+                requestedOutputFrameCount: requestedFrameCount
+            )
+            buffers.append(readBuffer)
+        }
+        return buffers
+    }
+
+    private func applyGain(
+        to buffer: AVAudioPCMBuffer,
+        segment: AudioEditTimeline.PlaybackSegment,
+        segmentOffset: Int,
+        requestedOutputFrameCount: Int
+    ) {
+        guard
+            let channels = buffer.floatChannelData,
+            buffer.frameLength > 0
+        else {
+            return
+        }
+
+        let frameLength = Int(buffer.frameLength)
+        let channelCount = Int(buffer.format.channelCount)
+        let segmentFrameCount = max(segment.frameCount, 1)
+        for frame in 0..<frameLength {
+            let outputOffset = segmentOffset +
+                min(
+                    Int(
+                        (
+                            Double(frame) /
+                                Double(max(frameLength, 1)) *
+                                Double(max(requestedOutputFrameCount, 1))
+                        ).rounded(.down)
+                    ),
+                    max(requestedOutputFrameCount - 1, 0)
                 )
+            let gainProgress = min(
+                max(Float(outputOffset) / Float(max(segmentFrameCount - 1, 1)), 0),
+                1
+            )
+            let gain = segment.gainStart +
+                (segment.gainEnd - segment.gainStart) * gainProgress
+            for channel in 0..<channelCount {
+                channels[channel][frame] *= gain
             }
         }
     }

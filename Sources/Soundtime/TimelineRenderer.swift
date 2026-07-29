@@ -5,6 +5,7 @@ import simd
 
 struct TimelineFrameStats: Equatable, Sendable {
     let framesPerSecond: Int
+    let displayRefreshFramesPerSecond: Int
     let averageFrameTimeMilliseconds: Double
     let frameTimeJitterMilliseconds: Double
     let worstFrameTimeMilliseconds: Double
@@ -185,6 +186,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     private enum RendererError: Error {
         case commandQueueUnavailable
+        case shaderLibraryUnavailable
         case shaderFunctionUnavailable
         case dynamicVertexBufferUnavailable
         case waveformQuadBufferUnavailable
@@ -1194,6 +1196,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let transientParticleScoreProfileLock = NSLock()
     private var frameRateWindowStartTime = CFAbsoluteTimeGetCurrent()
     private var previousFrameTime: CFTimeInterval?
+    private var previousTargetPresentationTime: CFTimeInterval?
+    private var targetPresentationCalibrationIntervals: [CFTimeInterval] = []
+    private var targetPresentationIntervalEstimate: CFTimeInterval?
     private var frameRateFrameCount = 0
     private var frameIntervalCount = 0
     private var frameIntervalSum: Double = 0
@@ -1286,7 +1291,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let deletionEffectDuration: CFTimeInterval = 0.14
     private let deletionEffectLifetimePadding: CFTimeInterval = 0.04
     private let deletionHandoffWaveformDemotionHoldDuration: CFTimeInterval = 0.18
-    private let deletionEffectMaximumCount = 8
+    private let deletionEffectMaximumCount = 128
     private let deletionEffectMaximumCapturedBins = 512
     private let selectionCopyFlashDuration: CFTimeInterval = 0.20
     private let loopRangeFlashDuration: CFTimeInterval = 0.35
@@ -1377,7 +1382,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
         deletionPlaceholderBinBuffer.label = "Timeline deletion placeholder bin"
 
-        let library = try device.makeLibrary(source: Self.shaderSource, options: nil)
+        let library = try Self.makeShaderLibrary(device: device)
         guard
             let vertexFunction = library.makeFunction(name: "timeline_vertex"),
             let fragmentFunction = library.makeFunction(name: "timeline_fragment"),
@@ -1510,8 +1515,21 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         loopRegionPipelineState = try device.makeRenderPipelineState(descriptor: loopRegionDescriptor)
         selectionDragEffectPipelineState = try device.makeRenderPipelineState(descriptor: selectionDragEffectDescriptor)
         deletionEffectPipelineState = try device.makeRenderPipelineState(descriptor: deletionEffectDescriptor)
+        targetPresentationCalibrationIntervals.reserveCapacity(8)
 
         super.init()
+    }
+
+    private static func makeShaderLibrary(device: MTLDevice) throws -> MTLLibrary {
+        do {
+            return try BundledMetalLibrary.load(
+                named: "TimelineShaders",
+                device: device,
+                developmentSource: shaderSource
+            )
+        } catch {
+            throw RendererError.shaderLibraryUnavailable
+        }
     }
 
     func displayWaveform(_ waveformOverview: WaveformOverview?) {
@@ -1564,17 +1582,31 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         waveformMipLevelStateLock.unlock()
         var nextTrackWaveformMipLevels: [UUID: [WaveformMipLevel]] = [:]
         var nextTrackWaveformMipKeys: [UUID: WaveformMipCacheKey] = [:]
+        var waveformDataChanged = false
         if !defersWaveformResolutionForDeletion {
             for track in tracks {
                 let sourceTrack = waveformSourceTrack(for: track)
+                let nextKey = waveformMipCacheKey(for: sourceTrack)
+                if
+                    let nextKey,
+                    existingTrackWaveformMipKeys[track.id] == nextKey,
+                    let existingLevels = existingTrackWaveformMipLevels[track.id],
+                    !existingLevels.isEmpty
+                {
+                    nextTrackWaveformMipLevels[track.id] = existingLevels
+                    nextTrackWaveformMipKeys[track.id] = nextKey
+                    continue
+                }
+
                 let mipLevels = cachedWaveformMipLevels(
                     for: sourceTrack,
                     priorityRenderState: nextRenderState
                 )
                 nextTrackWaveformMipLevels[track.id] = mipLevels
-                if let key = waveformMipCacheKey(for: sourceTrack) {
-                    nextTrackWaveformMipKeys[track.id] = key
+                if let nextKey {
+                    nextTrackWaveformMipKeys[track.id] = nextKey
                 }
+                waveformDataChanged = true
             }
         }
         let previousTrackIDsInOrder = previousTracks.map(\.id)
@@ -1730,6 +1762,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         waveformShaderPrewarmGeneration += 1
         if
             allowImmediateWaveformPrewarm,
+            waveformDataChanged,
             !waveformMipSwapIsHot,
             !canReuseResidentWaveformsForDeletion,
             !defersWaveformResolutionForDeletion
@@ -2016,6 +2049,16 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     func noteTimelineInteraction(at timestamp: CFTimeInterval = CACurrentMediaTime()) {
         markWaveformHotInteraction(at: timestamp)
+    }
+
+    func resetFrameRateMeasurement(at timestamp: CFTimeInterval = CFAbsoluteTimeGetCurrent()) {
+        previousFrameTime = nil
+        previousTargetPresentationTime = nil
+        targetPresentationCalibrationIntervals.removeAll(keepingCapacity: true)
+        targetPresentationIntervalEstimate = nil
+        resetFrameRateWindow(startingAt: timestamp)
+        lastFrameStats = nil
+        lastImmediateHotPathFrameStatsPublishTime = timestamp
     }
 
     func displayPlaybackActive(_ isActive: Bool) {
@@ -2422,33 +2465,45 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
 
     func triggerDeletionEffect(selection: TimelineSelection, sourceSelection: TimelineSelection? = nil) {
-        guard selection.durationProgress > 0 else {
+        triggerDeletionEffects([
+            TimelineDeletionEffectRequest(
+                selection: selection,
+                sourceSelection: sourceSelection
+            ),
+        ])
+    }
+
+    func triggerDeletionEffects(_ requests: [TimelineDeletionEffectRequest]) {
+        let validRequests = requests.filter { $0.selection.durationProgress > 0 }
+        guard !validRequests.isEmpty else {
             return
         }
 
-        let capturedSelection = sourceSelection ?? selection
-        var seed = UInt64(bitPattern: Int64(selection.trackID?.hashValue ?? 0))
-        seed &+= UInt64((capturedSelection.startProgress * 1_000_000).rounded(.down))
-        seed &*= 0x9E37_79B9_7F4A_7C15
-        seed &+= UInt64((capturedSelection.endProgress * 1_000_000).rounded(.down))
         let displayTimestamp = CACurrentMediaTime()
-        let visualAnchor = deletionEffectVisualAnchor(
-            for: selection,
-            displayTimestamp: displayTimestamp
-        )
-        let effect = DeletionEffect(
-            selection: selection,
-            visualAnchor: visualAnchor,
-            capturedBinBuffer: deletionPlaceholderBinBuffer,
-            capturedBinCount: 1,
-            capturedEnergySamples: [],
-            birthTimestamp: -1,
-            seed: seed,
-            kind: .deletion
-        )
+        let effects = validRequests.map { request in
+            let selection = request.selection
+            let capturedSelection = request.sourceSelection ?? selection
+            var seed = UInt64(bitPattern: Int64(selection.trackID?.hashValue ?? 0))
+            seed &+= UInt64((capturedSelection.startProgress * 1_000_000).rounded(.down))
+            seed &*= 0x9E37_79B9_7F4A_7C15
+            seed &+= UInt64((capturedSelection.endProgress * 1_000_000).rounded(.down))
+            return DeletionEffect(
+                selection: selection,
+                visualAnchor: deletionEffectVisualAnchor(
+                    for: selection,
+                    displayTimestamp: displayTimestamp
+                ),
+                capturedBinBuffer: deletionPlaceholderBinBuffer,
+                capturedBinCount: 1,
+                capturedEnergySamples: [],
+                birthTimestamp: -1,
+                seed: seed,
+                kind: .deletion
+            )
+        }
 
         deletionEffectLock.lock()
-        deletionEffects.append(effect)
+        deletionEffects.append(contentsOf: effects)
         if deletionEffects.count > deletionEffectMaximumCount {
             deletionEffects.removeFirst(deletionEffects.count - deletionEffectMaximumCount)
         }
@@ -3120,7 +3175,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             displayTimestamp: displayTimestamp
         )
         if publishesFrameStats {
-            recordFrameRate()
+            recordFrameRate(targetPresentationTime: displayTimestamp)
         }
     }
 
@@ -6011,8 +6066,16 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
     }
 
-    private func recordFrameRate() {
+    private func recordFrameRate(targetPresentationTime: CFTimeInterval) {
         let currentTime = CFAbsoluteTimeGetCurrent()
+        if let previousTargetPresentationTime {
+            let targetInterval = targetPresentationTime - previousTargetPresentationTime
+            if targetInterval > 0, targetInterval < 0.25 {
+                recordTargetPresentationInterval(targetInterval)
+            }
+        }
+        previousTargetPresentationTime = targetPresentationTime
+
         guard let previousFrameTime else {
             resetFrameRateWindow(startingAt: currentTime)
             self.previousFrameTime = currentTime
@@ -6044,7 +6107,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return
         }
 
-        let framesPerSecond = Int((Double(frameRateFrameCount) / elapsedTime).rounded())
+        let framesPerSecond = Int((Double(frameIntervalCount) / elapsedTime).rounded())
         let averageFrameInterval = frameIntervalCount > 0 ?
             frameIntervalSum / Double(frameIntervalCount) :
             0
@@ -6081,10 +6144,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         guard reasonChanged || currentTime - lastImmediateHotPathFrameStatsPublishTime >= 0.10 else {
             return
         }
+        guard frameIntervalCount >= 8 else {
+            return
+        }
 
         lastImmediateHotPathFrameStatsPublishTime = currentTime
         let elapsed = max(currentTime - frameRateWindowStartTime, 0.000_001)
-        let estimatedFramesPerSecond = max(Int((Double(max(frameRateFrameCount, 1)) / elapsed).rounded()), 0)
+        let estimatedFramesPerSecond = max(Int((Double(frameIntervalCount) / elapsed).rounded()), 0)
         let averageFrameInterval = frameIntervalCount > 0 ?
             frameIntervalSum / Double(frameIntervalCount) :
             0
@@ -6114,6 +6180,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let waveformBufferDiagnostics = waveformShaderBufferStore.diagnostics()
         return TimelineFrameStats(
             framesPerSecond: framesPerSecond,
+            displayRefreshFramesPerSecond: targetPresentationIntervalEstimate.map {
+                max(Int((1 / $0).rounded()), 0)
+            } ?? 0,
             averageFrameTimeMilliseconds: averageFrameTimeMilliseconds,
             frameTimeJitterMilliseconds: frameTimeJitterMilliseconds,
             worstFrameTimeMilliseconds: worstFrameTimeMilliseconds,
@@ -6190,6 +6259,28 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         frameIntervalSum = 0
         frameIntervalSquareSum = 0
         worstFrameInterval = 0
+    }
+
+    private func recordTargetPresentationInterval(_ interval: CFTimeInterval) {
+        if let estimate = targetPresentationIntervalEstimate {
+            guard interval >= estimate * 0.75, interval <= estimate * 1.25 else {
+                return
+            }
+            targetPresentationIntervalEstimate = estimate * 0.95 + interval * 0.05
+            return
+        }
+
+        targetPresentationCalibrationIntervals.append(interval)
+        guard targetPresentationCalibrationIntervals.count >= 8 else {
+            return
+        }
+
+        targetPresentationCalibrationIntervals.sort()
+        let midpoint = targetPresentationCalibrationIntervals.count / 2
+        targetPresentationIntervalEstimate =
+            (targetPresentationCalibrationIntervals[midpoint - 1] +
+                targetPresentationCalibrationIntervals[midpoint]) * 0.5
+        targetPresentationCalibrationIntervals.removeAll(keepingCapacity: true)
     }
 
     private func resolvedTrackLayout(

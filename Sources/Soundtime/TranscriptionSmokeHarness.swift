@@ -101,6 +101,7 @@ enum TranscriptionSmokeHarness {
                 "transcript validity remaps edited tracks and job snapshots persist progress",
                 "transcript interaction maps hover/drag text selection to audio time",
                 "project transcript sidecars save metadata-only project JSON and resolve on load",
+                "transcript sidecars preserve edit, reopen, undo, and redo snapshots without cross-run contamination",
                 "transcription chunk recovery reuses matching chunks and rejects stale revisions",
             ],
             metadata: [
@@ -1037,6 +1038,49 @@ enum TranscriptionSmokeHarness {
         let loadedTranscript = try requireValue(loaded.tracks.first?.transcript, "sidecar load dropped transcript")
         try require(loadedTranscript.words.count == transcript.words.count, "sidecar load did not restore words")
         try require(loadedTranscript.segments.count == transcript.segments.count, "sidecar load did not restore segments")
+
+        var editedTranscript = transcript
+        editedTranscript.segments = [
+            TranscriptSegment(
+                startTime: 0.5,
+                endTime: 0.8,
+                text: "sidecar",
+                words: [transcript.words[0]]
+            ),
+        ]
+        let editedProject = projectReplacingTranscript(in: project, with: editedTranscript)
+        try SoundtimeProjectStore.save(editedProject, to: projectURL)
+        let reopenedEdited = try SoundtimeProjectStore.load(from: projectURL)
+        try require(
+            reopenedEdited.tracks.first?.transcript?.words.count == 1,
+            "reopened transcript edit did not preserve its sidecar snapshot"
+        )
+
+        try SoundtimeProjectStore.save(project, to: projectURL)
+        let reopenedUndo = try SoundtimeProjectStore.load(from: projectURL)
+        try require(
+            reopenedUndo.tracks.first?.transcript?.words.count == transcript.words.count,
+            "transcript undo snapshot did not restore the original sidecar"
+        )
+
+        try SoundtimeProjectStore.save(editedProject, to: projectURL)
+        let reopenedRedo = try SoundtimeProjectStore.load(from: projectURL)
+        try require(
+            reopenedRedo.tracks.first?.transcript?.words.count == 1,
+            "transcript redo snapshot did not restore the edited sidecar"
+        )
+    }
+
+    private static func projectReplacingTranscript(
+        in project: SoundtimeProject,
+        with transcript: TranscriptDocument
+    ) -> SoundtimeProject {
+        var updated = project
+        guard !updated.tracks.isEmpty else {
+            return updated
+        }
+        updated.tracks[0].transcript = transcript
+        return updated
     }
 
     private static func verifyTranscriptionChunkRecovery(trackID: UUID) throws {

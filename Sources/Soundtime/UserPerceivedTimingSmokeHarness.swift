@@ -47,6 +47,32 @@ enum UserPerceivedTimingSmokeHarness {
         var id: String
         var path: String
         var trackCount: Int
+        var launchPlanResolutionMilliseconds: Double
+        var windowFrameSelectionMilliseconds: Double
+        var nativeWindowCreationMilliseconds: Double
+        var workspacePropertyInitializationMilliseconds: Double
+        var workspaceConfigurationMilliseconds: Double
+        var workspaceFirstPaintProjectClearMilliseconds: Double
+        var workspaceFirstPaintViewStateMilliseconds: Double
+        var workspaceFirstPaintTrackPreparationMilliseconds: Double
+        var workspaceFirstPaintStateFinalizationMilliseconds: Double
+        var workspaceFirstPaintStatePreparationMilliseconds: Double
+        var workspaceFirstPaintTimelinePublicationMilliseconds: Double
+        var workspaceFirstPaintControlPublicationMilliseconds: Double
+        var workspaceFirstPaintDisplayTimingUpdateMilliseconds: Double
+        var workspaceFirstPaintActiveTrackSynchronizationMilliseconds: Double
+        var workspaceFirstPaintCommandStateUpdateMilliseconds: Double
+        var workspaceFirstPaintContentSynchronizationMilliseconds: Double
+        var workspaceFirstPaintVisualReadinessRecordingMilliseconds: Double
+        var workspaceFirstPaintSourceRecordingMilliseconds: Double
+        var workspaceFirstPaintFinalizationMilliseconds: Double
+        var workspaceFirstPaintApplicationMilliseconds: Double
+        var workspaceInstallationMilliseconds: Double
+        var windowControllerConstructionMilliseconds: Double
+        var firstPaintToWindowShowMilliseconds: Double
+        var windowOrderingMilliseconds: Double
+        var cachedWaveformPaintMilliseconds: Double
+        var playbackHydrationMilliseconds: Double
         var windowVisibleMilliseconds: Double
         var firstWaveformVisibleMilliseconds: Double
         var playbackReadyMilliseconds: Double
@@ -240,6 +266,127 @@ enum UserPerceivedTimingSmokeHarness {
                 snapshot.playbackPrimedTrackCount == expectedTrackCount &&
                 !snapshot.isLoadingProject
         }
+        let startupEvents = LaunchStartupTrace.shared.snapshot()
+        let launchPlanResolutionMilliseconds = phaseMilliseconds(
+            events: startupEvents,
+            from: .processEntry,
+            to: .launchPlanResolved
+        )
+        let windowControllerConstructionMilliseconds = phaseMilliseconds(
+            events: startupEvents,
+            from: .mainWindowControllerInitStart,
+            to: .workspaceFirstPaintInstalled
+        )
+        let windowFrameSelectionMilliseconds = phaseMilliseconds(
+            events: startupEvents,
+            from: .workspaceFirstPaintInstalled,
+            to: .windowFrameChosen
+        )
+        let nativeWindowCreationMilliseconds = phaseMilliseconds(
+            events: startupEvents,
+            from: .windowFrameChosen,
+            to: .mainWindowCreated
+        )
+        let workspacePropertyInitializationMilliseconds = phaseMilliseconds(
+            events: startupEvents,
+            from: .mainWindowControllerInitStart,
+            to: .workspacePropertiesInitialized
+        )
+        let workspaceConfigurationMilliseconds = phaseMilliseconds(
+            events: startupEvents,
+            from: .workspacePropertiesInitialized,
+            to: .workspaceConfigured
+        )
+        let workspaceFirstPaintApplicationMilliseconds = phaseMilliseconds(
+            events: startupEvents,
+            from: .workspaceConfigured,
+            to: .workspaceFirstPaintInstalled
+        )
+        let workspaceFirstPaintStatePreparationMilliseconds = phaseMilliseconds(
+            events: startupEvents,
+            from: .workspaceConfigured,
+            to: .workspaceFirstPaintStatePrepared
+        )
+        let workspaceFirstPaintProjectClearMilliseconds = phaseMilliseconds(
+            events: startupEvents,
+            from: .workspaceConfigured,
+            to: .workspaceFirstPaintProjectCleared
+        )
+        let workspaceFirstPaintViewStateMilliseconds = phaseMilliseconds(
+            events: startupEvents,
+            from: .workspaceFirstPaintProjectCleared,
+            to: .workspaceFirstPaintViewStateApplied
+        )
+        let workspaceFirstPaintTrackPreparationMilliseconds = phaseMilliseconds(
+            events: startupEvents,
+            from: .workspaceFirstPaintViewStateApplied,
+            to: .workspaceFirstPaintTracksPrepared
+        )
+        let workspaceFirstPaintStateFinalizationMilliseconds = phaseMilliseconds(
+            events: startupEvents,
+            from: .workspaceFirstPaintTracksPrepared,
+            to: .workspaceFirstPaintStatePrepared
+        )
+        let workspaceFirstPaintTimelinePublicationMilliseconds = phaseMilliseconds(
+            events: startupEvents,
+            from: .workspaceFirstPaintStatePrepared,
+            to: .workspaceFirstPaintTimelinePublished
+        )
+        let workspaceFirstPaintControlPublicationMilliseconds = phaseMilliseconds(
+            events: startupEvents,
+            from: .workspaceFirstPaintTimelinePublished,
+            to: .workspaceFirstPaintControlsPublished
+        )
+        let workspaceFirstPaintContentSynchronizationMilliseconds = phaseMilliseconds(
+            events: startupEvents,
+            from: .workspaceFirstPaintControlsPublished,
+            to: .workspaceFirstPaintContentSynchronized
+        )
+        let workspaceFirstPaintDisplayTimingUpdateMilliseconds = phaseMilliseconds(
+            events: startupEvents,
+            from: .workspaceFirstPaintControlsPublished,
+            to: .workspaceFirstPaintDisplayTimingUpdated
+        )
+        let workspaceFirstPaintActiveTrackSynchronizationMilliseconds = phaseMilliseconds(
+            events: startupEvents,
+            from: .workspaceFirstPaintDisplayTimingUpdated,
+            to: .workspaceFirstPaintActiveTrackSynchronized
+        )
+        let workspaceFirstPaintCommandStateUpdateMilliseconds = phaseMilliseconds(
+            events: startupEvents,
+            from: .workspaceFirstPaintActiveTrackSynchronized,
+            to: .workspaceFirstPaintContentSynchronized
+        )
+        let workspaceFirstPaintVisualReadinessRecordingMilliseconds = phaseMilliseconds(
+            events: startupEvents,
+            from: .workspaceFirstPaintContentSynchronized,
+            to: .workspaceFirstPaintVisualReadinessRecorded
+        )
+        let workspaceFirstPaintSourceRecordingMilliseconds = phaseMilliseconds(
+            events: startupEvents,
+            from: .workspaceFirstPaintVisualReadinessRecorded,
+            to: .workspaceFirstPaintSourceRecorded
+        )
+        let workspaceFirstPaintFinalizationMilliseconds = phaseMilliseconds(
+            events: startupEvents,
+            from: .workspaceFirstPaintSourceRecorded,
+            to: .workspaceFirstPaintInstalled
+        )
+        let workspaceInstallationMilliseconds = phaseMilliseconds(
+            events: startupEvents,
+            from: .mainWindowControllerInitStart,
+            to: .workspaceFirstPaintInstalled
+        )
+        let firstPaintToWindowShowMilliseconds = phaseMilliseconds(
+            events: startupEvents,
+            from: .workspaceFirstPaintInstalled,
+            to: .windowShowRequested
+        )
+        let windowOrderingMilliseconds = phaseMilliseconds(
+            events: startupEvents,
+            from: .windowShowRequested,
+            to: .windowVisible
+        )
 
         let playResult = workspace.userPerceivedTimingSmokeStartPlayback()
         try require(playResult.accepted, "\(manifestProject.id) first play command failed: \(playResult.message)")
@@ -269,7 +416,7 @@ enum UserPerceivedTimingSmokeHarness {
         try require(pasteResult.accepted, "\(manifestProject.id) paste animation did not start: \(pasteResult.message)")
         runMainLoop(milliseconds: 210)
 
-        let saveURL = rootDirectory
+        let saveURL = writableSmokeRoot(fallbackFixtureRoot: rootDirectory)
             .appendingPathComponent("timing-scratch", isDirectory: true)
             .appendingPathComponent("\(manifestProject.id)-compact-save.soundtime")
         try? FileManager.default.createDirectory(
@@ -290,14 +437,42 @@ enum UserPerceivedTimingSmokeHarness {
             id: manifestProject.id,
             path: projectURL.path,
             trackCount: expectedTrackCount,
+            launchPlanResolutionMilliseconds: launchPlanResolutionMilliseconds,
+            windowFrameSelectionMilliseconds: windowFrameSelectionMilliseconds,
+            nativeWindowCreationMilliseconds: nativeWindowCreationMilliseconds,
+            workspacePropertyInitializationMilliseconds: workspacePropertyInitializationMilliseconds,
+            workspaceConfigurationMilliseconds: workspaceConfigurationMilliseconds,
+            workspaceFirstPaintProjectClearMilliseconds: workspaceFirstPaintProjectClearMilliseconds,
+            workspaceFirstPaintViewStateMilliseconds: workspaceFirstPaintViewStateMilliseconds,
+            workspaceFirstPaintTrackPreparationMilliseconds: workspaceFirstPaintTrackPreparationMilliseconds,
+            workspaceFirstPaintStateFinalizationMilliseconds: workspaceFirstPaintStateFinalizationMilliseconds,
+            workspaceFirstPaintStatePreparationMilliseconds: workspaceFirstPaintStatePreparationMilliseconds,
+            workspaceFirstPaintTimelinePublicationMilliseconds: workspaceFirstPaintTimelinePublicationMilliseconds,
+            workspaceFirstPaintControlPublicationMilliseconds: workspaceFirstPaintControlPublicationMilliseconds,
+            workspaceFirstPaintDisplayTimingUpdateMilliseconds: workspaceFirstPaintDisplayTimingUpdateMilliseconds,
+            workspaceFirstPaintActiveTrackSynchronizationMilliseconds: workspaceFirstPaintActiveTrackSynchronizationMilliseconds,
+            workspaceFirstPaintCommandStateUpdateMilliseconds: workspaceFirstPaintCommandStateUpdateMilliseconds,
+            workspaceFirstPaintContentSynchronizationMilliseconds: workspaceFirstPaintContentSynchronizationMilliseconds,
+            workspaceFirstPaintVisualReadinessRecordingMilliseconds: workspaceFirstPaintVisualReadinessRecordingMilliseconds,
+            workspaceFirstPaintSourceRecordingMilliseconds: workspaceFirstPaintSourceRecordingMilliseconds,
+            workspaceFirstPaintFinalizationMilliseconds: workspaceFirstPaintFinalizationMilliseconds,
+            workspaceFirstPaintApplicationMilliseconds: workspaceFirstPaintApplicationMilliseconds,
+            workspaceInstallationMilliseconds: workspaceInstallationMilliseconds,
+            windowControllerConstructionMilliseconds: windowControllerConstructionMilliseconds,
+            firstPaintToWindowShowMilliseconds: firstPaintToWindowShowMilliseconds,
+            windowOrderingMilliseconds: windowOrderingMilliseconds,
+            cachedWaveformPaintMilliseconds: firstWaveformVisibleMilliseconds,
+            playbackHydrationMilliseconds: playbackReadyMilliseconds,
             windowVisibleMilliseconds: windowVisibleMilliseconds,
             firstWaveformVisibleMilliseconds: firstWaveformVisibleMilliseconds,
             playbackReadyMilliseconds: playbackReadyMilliseconds,
             firstPlayCommandMilliseconds: playResult.elapsedMilliseconds,
             clickToSeekVisualMilliseconds: seekResult.elapsedMilliseconds,
             selectionDragEdgeMilliseconds: selectionResult.elapsedMilliseconds,
-            deleteAnimationStartMilliseconds: deleteResult.elapsedMilliseconds,
-            pasteAnimationStartMilliseconds: pasteResult.elapsedMilliseconds,
+            deleteAnimationStartMilliseconds:
+                deleteResult.visualResponseMilliseconds ?? deleteResult.elapsedMilliseconds,
+            pasteAnimationStartMilliseconds:
+                pasteResult.visualResponseMilliseconds ?? pasteResult.elapsedMilliseconds,
             saveLatencyMilliseconds: saveResult.elapsedMilliseconds,
             closeLatencyMilliseconds: closeLatencyMilliseconds
         )
@@ -428,6 +603,18 @@ enum UserPerceivedTimingSmokeHarness {
         throw SmokeError.failed("missing fixture root; pass --fixtures-output or SOUNDTIME_SHIPPABILITY_FIXTURE_ROOT")
     }
 
+    private static func writableSmokeRoot(fallbackFixtureRoot: URL) -> URL {
+        if
+            let sandboxPath = ProcessInfo.processInfo.environment["SOUNDTIME_GATE_SANDBOX_ROOT"],
+            !sandboxPath.isEmpty
+        {
+            return URL(fileURLWithPath: sandboxPath, isDirectory: true)
+                .appendingPathComponent("work", isDirectory: true)
+                .standardizedFileURL
+        }
+        return fallbackFixtureRoot
+    }
+
     private static func readManifest(rootDirectory: URL) throws -> FixtureManifest {
         let manifestURL = rootDirectory.appendingPathComponent("fixtures-manifest.json")
         let data = try Data(contentsOf: manifestURL)
@@ -443,6 +630,9 @@ enum UserPerceivedTimingSmokeHarness {
             "mode": "\(mode)",
             "fixtureRoot": fixtureRoot.path,
             "projectCount": "\(timings.count)",
+            "timingExecutionMode": "prebuilt-child-binary",
+            "timingExecutable": URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.path,
+            "binaryBuildConfiguration": Self.binaryBuildConfiguration,
         ]
         for keyPath in timingMetricKeyPaths {
             let worstTiming = timings.max { lhs, rhs in
@@ -454,11 +644,60 @@ enum UserPerceivedTimingSmokeHarness {
             )
             metadata["worst\(keyPath.name.capitalizedFirst)Project"] = worstTiming?.id ?? "none"
         }
+        if let coldTiming = timings.first {
+            metadata["worstColdPlaybackReadyMilliseconds"] = String(
+                format: "%.3f",
+                coldTiming.playbackReadyMilliseconds
+            )
+            metadata["worstColdPlaybackReadyMillisecondsProject"] = coldTiming.id
+        }
+        let worstWarmTiming = timings.dropFirst().max {
+            $0.playbackReadyMilliseconds < $1.playbackReadyMilliseconds
+        }
+        metadata["worstWarmPlaybackReadyMilliseconds"] = String(
+            format: "%.3f",
+            worstWarmTiming?.playbackReadyMilliseconds ?? 0
+        )
+        metadata["worstWarmPlaybackReadyMillisecondsProject"] = worstWarmTiming?.id ?? "none"
         metadata["projects"] = timings.map(\.id).joined(separator: ",")
         return metadata
     }
 
+    private static var binaryBuildConfiguration: String {
+        #if DEBUG
+        "debug"
+        #else
+        "release"
+        #endif
+    }
+
     private static let timingMetricKeyPaths: [(name: String, value: (ProjectTiming) -> Double)] = [
+        ("launchPlanResolutionMilliseconds", \.launchPlanResolutionMilliseconds),
+        ("windowFrameSelectionMilliseconds", \.windowFrameSelectionMilliseconds),
+        ("nativeWindowCreationMilliseconds", \.nativeWindowCreationMilliseconds),
+        ("workspacePropertyInitializationMilliseconds", \.workspacePropertyInitializationMilliseconds),
+        ("workspaceConfigurationMilliseconds", \.workspaceConfigurationMilliseconds),
+        ("workspaceFirstPaintProjectClearMilliseconds", \.workspaceFirstPaintProjectClearMilliseconds),
+        ("workspaceFirstPaintViewStateMilliseconds", \.workspaceFirstPaintViewStateMilliseconds),
+        ("workspaceFirstPaintTrackPreparationMilliseconds", \.workspaceFirstPaintTrackPreparationMilliseconds),
+        ("workspaceFirstPaintStateFinalizationMilliseconds", \.workspaceFirstPaintStateFinalizationMilliseconds),
+        ("workspaceFirstPaintStatePreparationMilliseconds", \.workspaceFirstPaintStatePreparationMilliseconds),
+        ("workspaceFirstPaintTimelinePublicationMilliseconds", \.workspaceFirstPaintTimelinePublicationMilliseconds),
+        ("workspaceFirstPaintControlPublicationMilliseconds", \.workspaceFirstPaintControlPublicationMilliseconds),
+        ("workspaceFirstPaintDisplayTimingUpdateMilliseconds", \.workspaceFirstPaintDisplayTimingUpdateMilliseconds),
+        ("workspaceFirstPaintActiveTrackSynchronizationMilliseconds", \.workspaceFirstPaintActiveTrackSynchronizationMilliseconds),
+        ("workspaceFirstPaintCommandStateUpdateMilliseconds", \.workspaceFirstPaintCommandStateUpdateMilliseconds),
+        ("workspaceFirstPaintContentSynchronizationMilliseconds", \.workspaceFirstPaintContentSynchronizationMilliseconds),
+        ("workspaceFirstPaintVisualReadinessRecordingMilliseconds", \.workspaceFirstPaintVisualReadinessRecordingMilliseconds),
+        ("workspaceFirstPaintSourceRecordingMilliseconds", \.workspaceFirstPaintSourceRecordingMilliseconds),
+        ("workspaceFirstPaintFinalizationMilliseconds", \.workspaceFirstPaintFinalizationMilliseconds),
+        ("workspaceFirstPaintApplicationMilliseconds", \.workspaceFirstPaintApplicationMilliseconds),
+        ("workspaceInstallationMilliseconds", \.workspaceInstallationMilliseconds),
+        ("windowControllerConstructionMilliseconds", \.windowControllerConstructionMilliseconds),
+        ("firstPaintToWindowShowMilliseconds", \.firstPaintToWindowShowMilliseconds),
+        ("windowOrderingMilliseconds", \.windowOrderingMilliseconds),
+        ("cachedWaveformPaintMilliseconds", \.cachedWaveformPaintMilliseconds),
+        ("playbackHydrationMilliseconds", \.playbackHydrationMilliseconds),
         ("windowVisibleMilliseconds", \.windowVisibleMilliseconds),
         ("firstWaveformVisibleMilliseconds", \.firstWaveformVisibleMilliseconds),
         ("playbackReadyMilliseconds", \.playbackReadyMilliseconds),
@@ -470,6 +709,20 @@ enum UserPerceivedTimingSmokeHarness {
         ("saveLatencyMilliseconds", \.saveLatencyMilliseconds),
         ("closeLatencyMilliseconds", \.closeLatencyMilliseconds),
     ]
+
+    private static func phaseMilliseconds(
+        events: [LaunchStartupTraceEvent],
+        from start: LaunchStartupMilestone,
+        to end: LaunchStartupMilestone
+    ) -> Double {
+        guard
+            let startTimestamp = events.first(where: { $0.milestone == start })?.timestamp,
+            let endTimestamp = events.first(where: { $0.milestone == end })?.timestamp
+        else {
+            return 0
+        }
+        return max((endTimestamp - startTimestamp) * 1_000, 0)
+    }
 
     private static func failingBudgetMessages(for timing: ProjectTiming) -> [String] {
         timingMetricKeyPaths.compactMap { metric in

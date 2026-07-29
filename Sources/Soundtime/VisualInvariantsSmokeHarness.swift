@@ -38,6 +38,7 @@ enum VisualInvariantsSmokeHarness {
             var path: String
             var durationSeconds: Double?
             var trackCount: Int?
+            var transcriptWordCount: Int?
         }
 
         var projects: [Project]
@@ -143,7 +144,8 @@ enum VisualInvariantsSmokeHarness {
         let expectedTrackCount = manifestProject.trackCount ?? project.tracks.count
         let expectedMutedTrackCount = project.tracks.filter(\.isMuted).count
         let expectedSoloedTrackCount = project.tracks.filter(\.isSoloed).count
-        let expectedTranscriptWordCount = project.tracks.reduce(0) { $0 + ($1.transcript?.words.count ?? 0) }
+        let expectedTranscriptWordCount = manifestProject.transcriptWordCount ??
+            project.tracks.reduce(0) { $0 + ($1.transcript?.words.count ?? 0) }
 
         SoundtimeProjectStore.clearRecentProjectURLs()
         SoundtimeProjectStore.rememberLastProjectURL(projectURL)

@@ -21,6 +21,8 @@ struct WorkspaceStartupCloseSmokeSnapshot: Sendable {
     var isLaunchSnapshotWriteScheduled: Bool
     var isLaunchCacheWriteInFlight: Bool
     var hasPendingLaunchCacheWrite: Bool
+    var pendingDeferredEditWorkCount: Int
+    var pendingDeferredWorkspaceWorkCount: Int
     var statusText: String
 }
 
@@ -46,6 +48,38 @@ struct WorkspaceUserPerceivedTimingSmokeResult: Sendable {
     var elapsedMilliseconds: Double
     var message: String
     var editAnimationGenerationChanged: Bool
+    var visualResponseMilliseconds: Double? = nil
+    var expectedLeadingProgress: Double? = nil
+    var renderedLeadingProgress: Double? = nil
+    var selectionEdgeErrorPixels: Double? = nil
+    var motionDirection: Double? = nil
+    var isIntentionalSelectionCollapse = false
+}
+
+private struct EditTransactionStageTimings {
+    var planMilliseconds = 0.0
+    var prepareMilliseconds = 0.0
+    var effectsMilliseconds = 0.0
+    var commitMilliseconds = 0.0
+    var finalizeMilliseconds = 0.0
+}
+
+private struct EditCommitStageTimings {
+    var captureMilliseconds = 0.0
+    var mutationMilliseconds = 0.0
+    var renderProjectionMilliseconds = 0.0
+    var playbackProjectionMilliseconds = 0.0
+    var playbackMilliseconds = 0.0
+    var historyMilliseconds = 0.0
+}
+
+private struct EditHistoryRestoreStageTimings {
+    var indexMilliseconds = 0.0
+    var tracksMilliseconds = 0.0
+    var modelMilliseconds = 0.0
+    var timelineMilliseconds = 0.0
+    var playbackMilliseconds = 0.0
+    var finalizeMilliseconds = 0.0
 }
 
 struct WorkspaceVisualInvariantSmokeSnapshot: Codable, Sendable {
@@ -96,7 +130,9 @@ struct WorkspaceVisualInvariantSmokeSnapshot: Codable, Sendable {
 
 struct WorkspaceHotPathContractFrameStatsSnapshot: Codable, Sendable {
     var framesPerSecond: Int
+    var displayRefreshFramesPerSecond: Int
     var averageFrameTimeMilliseconds: Double
+    var frameTimeJitterMilliseconds: Double
     var worstFrameTimeMilliseconds: Double
     var waveformRenderer: String
     var cpuWaveformVertexCount: Int
@@ -116,7 +152,9 @@ struct WorkspaceHotPathContractFrameStatsSnapshot: Codable, Sendable {
 
     init(_ stats: TimelineFrameStats) {
         framesPerSecond = stats.framesPerSecond
+        displayRefreshFramesPerSecond = stats.displayRefreshFramesPerSecond
         averageFrameTimeMilliseconds = stats.averageFrameTimeMilliseconds
+        frameTimeJitterMilliseconds = stats.frameTimeJitterMilliseconds
         worstFrameTimeMilliseconds = stats.worstFrameTimeMilliseconds
         waveformRenderer = stats.waveformRenderer
         cpuWaveformVertexCount = stats.cpuWaveformVertexCount
@@ -156,13 +194,19 @@ struct WorkspaceHotPathContractSmokeSnapshot: Codable, Sendable {
     var warningEventCount: Int
     var severeEventCount: Int
     var diagnosticEventNames: [String]
+    var latestUndoRestoreStageMilliseconds: [String: Double]
+    var lastPlaybackReloadErrorDescription: String?
     var statusText: String
 }
 
 final class WorkspaceView: NSView {
     private static var defaultDebugToolsVisible: Bool {
         #if DEBUG
-        true
+        let isAutomatedInteractionReplay =
+            CommandLine.arguments.contains("--interaction-replay-smoke")
+        return
+            ProcessInfo.processInfo.environment["SOUNDTIME_SHIPPABILITY_GATE"] != "1" &&
+            !isAutomatedInteractionReplay
         #else
         false
         #endif
@@ -249,11 +293,19 @@ final class WorkspaceView: NSView {
         var importID: UUID
         var editRevision: Int
         var transcript: TranscriptDocument? = nil
+        var importedAssetID: UUID? = nil
+        var importSessionID: UUID? = nil
+        var importStage: AudioImportStage? = nil
+        var importProgress: Double = 1
+        var importFingerprint: AudioImportFingerprint? = nil
+        var importPreviewIsProgressive = false
     }
 
     private struct ProjectTrackUndoSnapshot {
         var tracks: [ProjectTrack]
         var editGraph: EditGraph? = nil
+        var renderTracks: [TimelineRenderState.Track]? = nil
+        var playbackTracks: [ProjectPlaybackTrack]? = nil
         var activeTrackID: UUID?
         var selectedTrackID: UUID?
         var selectedTrackIDs: Set<UUID> = []
@@ -261,14 +313,122 @@ final class WorkspaceView: NSView {
         var restoreProgress: Float?
     }
 
+    private struct ProjectEditTransactionState {
+        let revision: EditRevision
+        var tracksByID: [UUID: ProjectTrack]
+        let trackIndexesByID: [UUID: Int]
+        let projectTrackIDs: [UUID]
+        let projectDuration: TimeInterval
+        let displayedSampleRate: Double
+        let displayedFrameCount: Int
+        let editGraph: EditGraph
+        let renderTracks: [TimelineRenderState.Track]
+        let playbackTracks: [ProjectPlaybackTrack]
+        let activeTrackID: UUID?
+        let selectedTrackID: UUID?
+        let selectedTrackIDs: Set<UUID>
+        let selectedTimelineRange: TimelineSelection?
+        let playheadTime: ProjectTime
+        let clipboard: AudioClipboard?
+    }
+
+    private struct ProjectEditTransactionRecord {
+        let command: EditCommand
+        var before: ProjectEditTransactionState
+        var after: ProjectEditTransactionState
+    }
+
+    private struct PreparedProjectEditCommit {
+        let plan: EditPlan
+        let tracksByID: [UUID: ProjectTrack]
+        var trackIndexesByID: [UUID: Int] = [:]
+        let editGraph: EditGraph
+        let selectedTimelineRange: TimelineSelection?
+        let clipboard: AudioClipboard?
+    }
+
+    private struct PortablePasteRenderedAsset: Sendable {
+        let url: URL
+        let fileInfo: WAVFileInfo
+    }
+
+    private enum PortablePasteSource: Sendable {
+        case decoded(
+            DecodedAudioBuffer,
+            [AudioEditTimeline.PlaybackSegment],
+            Float
+        )
+        case file(
+            URL,
+            WAVFileInfo,
+            [AudioEditTimeline.PlaybackSegment],
+            Float
+        )
+
+        var sampleRate: Double {
+            switch self {
+            case let .decoded(buffer, _, _):
+                buffer.sampleRate
+            case let .file(_, fileInfo, _, _):
+                fileInfo.sampleRate
+            }
+        }
+
+        var segments: [AudioEditTimeline.PlaybackSegment] {
+            switch self {
+            case let .decoded(_, segments, _), let .file(_, _, segments, _):
+                segments
+            }
+        }
+
+        var gain: Float {
+            switch self {
+            case let .decoded(_, _, gain), let .file(_, _, _, gain):
+                gain
+            }
+        }
+    }
+
+    private enum PortablePastePreparationResult: Sendable {
+        case success(PortablePasteRenderedAsset)
+        case failure(String)
+        case canceled
+    }
+
+    private final class PortablePastePreparationJob: @unchecked Sendable {
+        private let lock = NSLock()
+        private var isCanceled = false
+
+        func cancel() {
+            lock.lock()
+            isCanceled = true
+            lock.unlock()
+        }
+
+        func checkCancellation() throws {
+            lock.lock()
+            let canceled = isCanceled
+            lock.unlock()
+            if canceled {
+                throw CancellationError()
+            }
+        }
+    }
+
     private struct AudioImportPrewarm {
         let url: URL
-        let task: Task<AudioAssetProxyResult, Error>
+        let admissionTask: Task<AudioImportAdmission, Error>
+        let previewTask: Task<AudioAssetPreviewResult, Error>
+    }
+
+    private struct AudioImportPreviewOperation {
+        let token: UUID
+        let task: Task<Void, Never>
     }
 
     private enum NativeAudioPreview {
-        static let targetBinCount = 4_096
-        static let samplesPerBin = 128
+        static let targetBinCount = 512
+        static let samplesPerBin = 32
     }
 
     private enum LaunchWaveformCache {
@@ -434,9 +594,632 @@ final class WorkspaceView: NSView {
         }
     }
 
+    private func projectEditRevision() -> EditRevision {
+        EditRevision(rawValue: max(currentEditGraphRevision, 1))
+    }
+
+    private func currentProjectPlayheadTime() -> ProjectTime {
+        let snapshot = playbackController.snapshot()
+        let duration = max(projectSelectionDuration, displayedDuration, 0)
+        return ProjectTime(seconds: Double(snapshot.progress) * duration)
+    }
+
+    private func captureProjectEditTransactionState(
+        trackIDs: Set<UUID>,
+        trackIndexesByID providedTrackIndexesByID: [UUID: Int]? = nil,
+        playheadTime: ProjectTime? = nil,
+        projectDuration providedProjectDuration: TimeInterval? = nil,
+        renderTracks: [TimelineRenderState.Track]? = nil,
+        playbackTracks: [ProjectPlaybackTrack]? = nil
+    ) -> ProjectEditTransactionState {
+        let targetTracks: [(Int, ProjectTrack)]
+        if let providedTrackIndexesByID {
+            targetTracks = providedTrackIndexesByID.values.sorted().compactMap { index in
+                guard projectTracks.indices.contains(index) else {
+                    return nil
+                }
+                let track = projectTracks[index]
+                return trackIDs.contains(track.id) ? (index, track) : nil
+            }
+        } else {
+            targetTracks = projectTracks.enumerated().compactMap { index, track in
+                trackIDs.contains(track.id) ? (index, track) : nil
+            }
+        }
+        let projectDuration = providedProjectDuration ?? projectSelectionDuration
+        let sampleRate = displayedSampleRate > 0 ?
+            displayedSampleRate :
+            projectTracks.compactMap {
+                $0.fileTimeline?.sourceSampleRate ??
+                    $0.audioTimeline?.sourceAudioBuffer.sampleRate ??
+                    $0.decodedAudioBuffer?.sampleRate
+            }.first ?? 0
+        return ProjectEditTransactionState(
+            revision: projectEditRevision(),
+            tracksByID: Dictionary(
+                uniqueKeysWithValues: targetTracks.map { ($0.1.id, $0.1) }
+            ),
+            trackIndexesByID: Dictionary(
+                uniqueKeysWithValues: targetTracks.map { ($0.1.id, $0.0) }
+            ),
+            projectTrackIDs: projectTracks.map(\.id),
+            projectDuration: projectDuration,
+            displayedSampleRate: sampleRate,
+            displayedFrameCount: projectDuration > 0 && sampleRate > 0 ?
+                Int((projectDuration * sampleRate).rounded(.up)) :
+                0,
+            editGraph: projectEditGraph,
+            renderTracks: renderTracks ??
+                (publishedTimelineRenderTracks.count == projectTracks.count ?
+                    publishedTimelineRenderTracks :
+                    timelineRenderTracks()),
+            playbackTracks: playbackTracks ??
+                (publishedProjectPlaybackTracks.count == projectTracks.count ?
+                    publishedProjectPlaybackTracks :
+                    projectPlaybackTracks()),
+            activeTrackID: activeTrackID,
+            selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
+            selectedTimelineRange: selectedTimelineRange,
+            playheadTime: playheadTime ?? currentProjectPlayheadTime(),
+            clipboard: audioClipboard
+        )
+    }
+
+    private func transactionRenderTracks(
+        replacing changedTrackIDs: Set<UUID>
+    ) -> [TimelineRenderState.Track] {
+        guard publishedTimelineRenderTracks.count == projectTracks.count else {
+            return timelineRenderTracks()
+        }
+        var tracks = publishedTimelineRenderTracks
+        for index in projectTracks.indices {
+            let projectTrack = projectTracks[index]
+            guard
+                changedTrackIDs.contains(projectTrack.id) ||
+                tracks[index].id != projectTrack.id
+            else {
+                continue
+            }
+            tracks[index] = timelineRenderTrack(
+                for: projectTrack,
+                reusing: tracks[index]
+            )
+        }
+        return tracks
+    }
+
+    private func transactionPlaybackTracks(
+        replacing changedTrackIDs: Set<UUID>
+    ) -> [ProjectPlaybackTrack] {
+        guard publishedProjectPlaybackTracks.count == projectTracks.count else {
+            return projectPlaybackTracks()
+        }
+        var tracks = publishedProjectPlaybackTracks
+        for index in projectTracks.indices.reversed() {
+            let projectTrack = projectTracks[index]
+            guard
+                changedTrackIDs.contains(projectTrack.id) ||
+                tracks[index].id != projectTrack.id
+            else {
+                continue
+            }
+            if let playbackTrack = projectPlaybackTrack(for: projectTrack) {
+                tracks[index] = playbackTrack
+            } else {
+                tracks.remove(at: index)
+            }
+        }
+        return tracks
+    }
+
+    private func editTrackDescriptor(for track: ProjectTrack) -> EditTrackDescriptor {
+        let sampleRate: Double
+        let frameCount: Int
+        if let fileTimeline = track.fileTimeline {
+            sampleRate = fileTimeline.sourceSampleRate
+            frameCount = fileTimeline.frameCount
+        } else if let audioTimeline = track.audioTimeline {
+            sampleRate = audioTimeline.sourceAudioBuffer.sampleRate
+            frameCount = audioTimeline.frameCount
+        } else if let buffer = track.decodedAudioBuffer {
+            sampleRate = buffer.sampleRate
+            frameCount = buffer.frameCount
+        } else if let fileInfo = decodableWAVFileInfo(for: track.sourceURL) {
+            sampleRate = fileInfo.sampleRate
+            frameCount = fileInfo.frameCount
+        } else {
+            sampleRate = 0
+            frameCount = 0
+        }
+        return EditTrackDescriptor(
+            trackID: track.id,
+            sampleRate: sampleRate,
+            frameCount: frameCount,
+            isEditable: hasEditableTimelineState(track)
+        )
+    }
+
+    private func editTrackDescriptors(for command: EditCommand) -> [EditTrackDescriptor] {
+        let targetTrackIDs = Set(command.targetTrackIDs)
+        return projectTracks.compactMap { track in
+            targetTrackIDs.contains(track.id) ? editTrackDescriptor(for: track) : nil
+        }
+    }
+
+    private func projectEditRange(
+        from displaySelection: TimelineSelection
+    ) -> ProjectEditRange? {
+        guard
+            displaySelection.durationProgress > 0,
+            projectSelectionDuration.isFinite,
+            projectSelectionDuration > 0
+        else {
+            return nil
+        }
+        return ProjectEditRange(
+            start: ProjectTime(seconds: displaySelection.startProgress * projectSelectionDuration),
+            end: ProjectTime(seconds: displaySelection.endProgress * projectSelectionDuration)
+        )
+    }
+
+    private func displaySelection(
+        for range: ProjectEditRange,
+        trackID: UUID,
+        projectDuration: TimeInterval? = nil
+    ) -> TimelineSelection {
+        let duration = max(
+            projectDuration ?? projectSelectionDuration,
+            range.end.seconds,
+            0.000_001
+        )
+        return TimelineSelection(
+            startProgress: min(max(range.start.seconds / duration, 0), 1),
+            endProgress: min(max(range.end.seconds / duration, 0), 1),
+            trackID: trackID
+        )
+    }
+
+    private func transactionScope(_ scope: EditScope) -> EditCommandScope {
+        switch scope {
+        case .track:
+            return .track
+        case .selected:
+            return .selected
+        case .group:
+            return .group
+        case .all:
+            return .all
+        }
+    }
+
+    private func makeRangeEditCommand(
+        kind: EditCommandKind,
+        target: EditableSelectionTarget,
+        scope: EditScope
+    ) throws -> EditCommand {
+        guard
+            projectTracks.indices.contains(target.trackIndex),
+            let range = projectEditRange(from: target.displaySelection)
+        else {
+            throw EditTransactionError.missingRange
+        }
+
+        let anchorTrackID = projectTracks[target.trackIndex].id
+        let targetTrackIDs = scopedTrackIndices(
+            anchorTrackIndex: target.trackIndex,
+            scope: scope
+        ).compactMap { trackIndex in
+            projectTracks.indices.contains(trackIndex) ? projectTracks[trackIndex].id : nil
+        }
+
+        return EditCommand(
+            baseRevision: projectEditRevision(),
+            kind: kind,
+            scope: transactionScope(scope),
+            anchorTrackID: anchorTrackID,
+            targetTrackIDs: targetTrackIDs,
+            range: range,
+            wasPlaying: playbackController.isPlaying
+        )
+    }
+
+    private func makePasteCommand(
+        trackID: UUID,
+        insertionTime: ProjectTime,
+        clipboardID: UUID
+    ) -> EditCommand {
+        EditCommand(
+            baseRevision: projectEditRevision(),
+            kind: .paste,
+            scope: .track,
+            anchorTrackID: trackID,
+            targetTrackIDs: [trackID],
+            insertionTime: insertionTime,
+            clipboardID: clipboardID,
+            wasPlaying: playbackController.isPlaying
+        )
+    }
+
+    private func prepareRangeEditCommit(
+        command: EditCommand,
+        clipboard: AudioClipboard?,
+        precomputedPlan: EditPlan? = nil
+    ) throws -> PreparedProjectEditCommit {
+        let plan = try precomputedPlan ?? EditTransactionPlanner.plan(
+            command: command,
+            currentRevision: projectEditRevision(),
+            tracks: editTrackDescriptors(for: command)
+        )
+        var nextTracksByID: [UUID: ProjectTrack] = [:]
+        nextTracksByID.reserveCapacity(plan.trackEdits.count)
+        var nextGraph = currentEditGraph()
+        let targetTrackIDs = Set(plan.trackEdits.map(\.trackID))
+        let targetTrackIndexes = Dictionary(
+            uniqueKeysWithValues: projectTracks.enumerated().compactMap { index, track in
+                targetTrackIDs.contains(track.id) ? (track.id, index) : nil
+            }
+        )
+        guard targetTrackIndexes.count == targetTrackIDs.count else {
+            throw EditTransactionError.missingTrack(plan.command.anchorTrackID)
+        }
+
+        for trackEdit in plan.trackEdits {
+            guard
+                let trackIndex = targetTrackIndexes[trackEdit.trackID],
+                projectTracks.indices.contains(trackIndex)
+            else {
+                throw EditTransactionError.missingTrack(trackEdit.trackID)
+            }
+            let currentTrack = projectTracks[trackIndex]
+            var nextTrack = currentTrack
+            let changedFrameCount: Int
+
+            if var fileTimeline = nextGraph.arrangement(for: trackEdit.trackID)?.timeline ?? currentTrack.fileTimeline {
+                switch trackEdit.mutation {
+                case let .delete(frameRange):
+                    changedFrameCount = fileTimeline.delete(frameRange: frameRange)
+                case let .clear(frameRange):
+                    changedFrameCount = fileTimeline.clear(frameRange: frameRange)
+                case let .insert(frame):
+                    guard let clipboard else {
+                        throw EditTransactionError.missingClipboard
+                    }
+                    guard command.clipboardID == clipboard.id else {
+                        throw EditTransactionError.clipboardIDMismatch
+                    }
+                    guard
+                        let clipboardSourceID = clipboard.fileClipSourceID,
+                        let fileClip = clipboard.fileClip
+                    else {
+                        throw EditTransactionError.missingFileClipboardClip
+                    }
+                    let destinationSourceID =
+                        nextGraph.arrangement(for: trackEdit.trackID)?.sourceID ??
+                        currentTrack.editableSource?.id
+                    guard clipboardSourceID == destinationSourceID else {
+                        throw EditTransactionError.incompatibleClipboardSource
+                    }
+                    guard let insertedFrameCount = fileTimeline.insert(fileClip, atFrame: frame) else {
+                        throw EditTransactionError.incompatibleClipboardClip
+                    }
+                    changedFrameCount = insertedFrameCount
+                }
+
+                if case let .delete(frameRange) = trackEdit.mutation {
+                    try validateChangedFrameCount(
+                        trackID: trackEdit.trackID,
+                        expected: frameRange.count,
+                        actual: changedFrameCount
+                    )
+                } else if case let .clear(frameRange) = trackEdit.mutation {
+                    try validateChangedFrameCount(
+                        trackID: trackEdit.trackID,
+                        expected: frameRange.count,
+                        actual: changedFrameCount
+                    )
+                }
+
+                nextTrack.fileTimeline = fileTimeline
+                nextTrack.audioTimeline = nil
+                nextTrack.decodedAudioBuffer = nil
+                nextTrack.durationHint = fileTimeline.duration
+                if let bestSourceOverview = bestSourceWaveformOverview(
+                    sourceOverview: currentTrack.sourceWaveformOverview,
+                    fallbackOverview: currentTrack.waveformOverview,
+                    fileTimeline: fileTimeline
+                ) {
+                    nextTrack.sourceWaveformOverview = bestSourceOverview
+                    nextTrack.waveformOverview = bestSourceOverview
+                }
+                guard let source = currentTrack.editableSource ?? nextGraph.source(for: trackEdit.trackID) else {
+                    throw EditTransactionError.uneditableTrack(trackEdit.trackID)
+                }
+                nextTrack.editableSource = source
+                nextGraph.upsert(
+                    source: source,
+                    trackID: trackEdit.trackID,
+                    timeline: fileTimeline
+                )
+            } else if var audioTimeline = currentTrack.audioTimeline {
+                switch trackEdit.mutation {
+                case let .delete(frameRange):
+                    changedFrameCount = audioTimeline.delete(frameRange: frameRange)
+                case let .clear(frameRange):
+                    changedFrameCount = audioTimeline.clear(frameRange: frameRange)
+                case let .insert(frame):
+                    guard let clipboard else {
+                        throw EditTransactionError.missingClipboard
+                    }
+                    guard command.clipboardID == clipboard.id else {
+                        throw EditTransactionError.clipboardIDMismatch
+                    }
+                    guard let audioClip = clipboard.audioClip else {
+                        throw EditTransactionError.missingMemoryClipboardClip
+                    }
+                    guard let insertedFrameCount = audioTimeline.insert(audioClip, atFrame: frame) else {
+                        throw EditTransactionError.incompatibleClipboardClip
+                    }
+                    changedFrameCount = insertedFrameCount
+                }
+
+                if case let .delete(frameRange) = trackEdit.mutation {
+                    try validateChangedFrameCount(
+                        trackID: trackEdit.trackID,
+                        expected: frameRange.count,
+                        actual: changedFrameCount
+                    )
+                } else if case let .clear(frameRange) = trackEdit.mutation {
+                    try validateChangedFrameCount(
+                        trackID: trackEdit.trackID,
+                        expected: frameRange.count,
+                        actual: changedFrameCount
+                    )
+                }
+
+                nextTrack.audioTimeline = audioTimeline
+                nextTrack.fileTimeline = nil
+                nextTrack.editableSource = nil
+                nextTrack.decodedAudioBuffer = audioTimeline.sourceAudioBuffer
+                nextTrack.durationHint = audioTimeline.duration
+                if
+                    let sourceOverview = currentTrack.sourceWaveformOverview ?? currentTrack.waveformOverview,
+                    abs(sourceOverview.duration - audioTimeline.sourceAudioBuffer.duration) <=
+                        max(0.01, audioTimeline.sourceAudioBuffer.duration * 0.000_01)
+                {
+                    nextTrack.sourceWaveformOverview = sourceOverview
+                    nextTrack.waveformOverview = sourceOverview
+                }
+                nextGraph.removeArrangement(for: trackEdit.trackID)
+            } else {
+                throw EditTransactionError.uneditableTrack(trackEdit.trackID)
+            }
+
+            nextTrack.editRevision += 1
+            nextTracksByID[trackEdit.trackID] = nextTrack
+        }
+
+        let resultingSelection: TimelineSelection?
+        if command.kind == .paste,
+           let insertionTime = command.insertionTime,
+           let clipboard,
+           let insertedDuration = clipboardDuration(clipboard),
+           let range = ProjectEditRange(
+               start: insertionTime,
+               end: insertionTime + ProjectTime(seconds: insertedDuration)
+           )
+        {
+            let nextDuration = nextTracksByID.values.reduce(projectSelectionDuration) {
+                max($0, trackDuration(for: $1))
+            }
+            resultingSelection = displaySelection(
+                for: range,
+                trackID: command.anchorTrackID,
+                projectDuration: nextDuration
+            )
+        } else {
+            resultingSelection = nil
+        }
+
+        return PreparedProjectEditCommit(
+            plan: plan,
+            tracksByID: nextTracksByID,
+            trackIndexesByID: targetTrackIndexes,
+            editGraph: nextGraph,
+            selectedTimelineRange: resultingSelection,
+            clipboard: clipboard
+        )
+    }
+
+    private func validateChangedFrameCount(
+        trackID: UUID,
+        expected: Int,
+        actual: Int
+    ) throws {
+        guard expected == actual else {
+            throw EditTransactionError.changedFrameCount(
+                trackID: trackID,
+                expected: expected,
+                actual: actual
+            )
+        }
+    }
+
+    private func clipboardDuration(_ clipboard: AudioClipboard) -> TimeInterval? {
+        if let fileClip = clipboard.fileClip {
+            return fileClip.duration
+        }
+        if let audioClip = clipboard.audioClip {
+            return audioClip.duration
+        }
+        if let buffer = clipboard.buffer {
+            return buffer.duration
+        }
+        return clipboard.waveformOverview.duration > 0 ? clipboard.waveformOverview.duration : nil
+    }
+
+    private func commitPreparedProjectEdit(
+        _ preparedCommit: PreparedProjectEditCommit,
+        keepsTransitionVisual: Bool
+    ) throws -> ProjectEditTransactionRecord {
+        let commitStartedAt = CACurrentMediaTime()
+        let plan = preparedCommit.plan
+        guard projectEditRevision() == plan.command.baseRevision else {
+            throw EditTransactionError.staleRevision(
+                expected: plan.command.baseRevision,
+                actual: projectEditRevision()
+            )
+        }
+
+        let targetTrackIDs = Set(plan.trackEdits.map(\.trackID))
+        guard Set(preparedCommit.tracksByID.keys) == targetTrackIDs else {
+            throw EditTransactionError.missingTrack(plan.command.anchorTrackID)
+        }
+        let targetTrackIndexes: [UUID: Int]
+        if preparedCommit.trackIndexesByID.count == targetTrackIDs.count {
+            targetTrackIndexes = preparedCommit.trackIndexesByID
+        } else {
+            targetTrackIndexes = try Dictionary(
+                uniqueKeysWithValues: targetTrackIDs.map { trackID in
+                    guard let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }) else {
+                        throw EditTransactionError.missingTrack(trackID)
+                    }
+                    return (trackID, trackIndex)
+                }
+            )
+        }
+        let before = captureProjectEditTransactionState(
+            trackIDs: targetTrackIDs,
+            trackIndexesByID: targetTrackIndexes,
+            playheadTime: plan.playheadTime
+        )
+        let capturedAt = CACurrentMediaTime()
+
+        for trackID in targetTrackIDs {
+            guard
+                let nextTrack = preparedCommit.tracksByID[trackID],
+                let trackIndex = targetTrackIndexes[trackID]
+            else {
+                throw EditTransactionError.missingTrack(trackID)
+            }
+            projectTracks[trackIndex] = nextTrack
+        }
+        let mutatedAt = CACurrentMediaTime()
+
+        projectEditGraph = preparedCommit.editGraph
+        currentEditGraphRevision = plan.nextRevision.rawValue
+        selectedTimelineRange = preparedCommit.selectedTimelineRange
+        audioClipboard = preparedCommit.clipboard
+        syncActiveTrackFields()
+        let nextRenderTracks = transactionRenderTracks(replacing: targetTrackIDs)
+        let renderProjectedAt = CACurrentMediaTime()
+        let nextPlaybackTracks = transactionPlaybackTracks(replacing: targetTrackIDs)
+        let projectedAt = CACurrentMediaTime()
+
+        if keepsTransitionVisual {
+            publishedTimelineEditRevision = plan.nextRevision.rawValue
+        } else {
+            updateProjectDisplayTiming()
+            publishedTimelineRenderTracks = nextRenderTracks
+            timelineSurface.displayTracks(
+                nextRenderTracks,
+                animateWaveformTransition: false,
+                allowImmediateWaveformPrewarm: false,
+                allowImmediateInteractiveWaveformPrewarm: false
+            )
+            publishSelectedTracksToTimeline()
+            publishedTimelineEditRevision = plan.nextRevision.rawValue
+        }
+
+        let nextDuration = max(
+            projectTracks.reduce(TimeInterval(0)) { duration, track in
+                max(duration, trackDuration(for: track))
+            },
+            plan.playheadTime.seconds,
+            0.000_001
+        )
+        reloadPlaybackFromProjectTracks(
+            preserveProgress: false,
+            targetProgress: Float(min(max(plan.playheadTime.seconds / nextDuration, 0), 1)),
+            resumeIfPlaying: plan.command.wasPlaying,
+            playbackTracksOverride: nextPlaybackTracks,
+            publishesVisualState: false
+        )
+        publishedPlaybackEditRevision = plan.nextRevision.rawValue
+        snapPlayheadVisuals(
+            toTimelineTime: plan.playheadTime.seconds,
+            isPlaying: playbackController.isPlaying,
+            synchronizesRenderer: true
+        )
+        updateTransportControlState(isPlaying: playbackController.isPlaying)
+        let playbackPublishedAt = CACurrentMediaTime()
+
+        let after = captureProjectEditTransactionState(
+            trackIDs: targetTrackIDs,
+            trackIndexesByID: targetTrackIndexes,
+            playheadTime: plan.playheadTime,
+            projectDuration: nextDuration,
+            renderTracks: nextRenderTracks,
+            playbackTracks: nextPlaybackTracks
+        )
+        let record = ProjectEditTransactionRecord(
+            command: plan.command,
+            before: before,
+            after: after
+        )
+        editUndoStack.append(.transaction(record))
+        assertPublishedEditRevisionsMatch(context: plan.command.kind.rawValue)
+        recordEditTransactionCommit(plan)
+        let finishedAt = CACurrentMediaTime()
+        latestEditCommitStageTimings = EditCommitStageTimings(
+            captureMilliseconds: (capturedAt - commitStartedAt) * 1_000,
+            mutationMilliseconds: (mutatedAt - capturedAt) * 1_000,
+            renderProjectionMilliseconds: (renderProjectedAt - mutatedAt) * 1_000,
+            playbackProjectionMilliseconds: (projectedAt - renderProjectedAt) * 1_000,
+            playbackMilliseconds: (playbackPublishedAt - projectedAt) * 1_000,
+            historyMilliseconds: (finishedAt - playbackPublishedAt) * 1_000
+        )
+        return record
+    }
+
+    private func assertPublishedEditRevisionsMatch(context: String) {
+        guard publishedTimelineEditRevision == publishedPlaybackEditRevision else {
+            SoundtimeDiagnostics.shared.record(
+                category: .edit,
+                severity: .severe,
+                name: "edit-publication-revision-mismatch",
+                message: "Timeline and playback published different edit revisions.",
+                fields: [
+                    "context": context,
+                    "projectRevision": "\(currentEditGraphRevision)",
+                    "timelineRevision": "\(publishedTimelineEditRevision)",
+                    "playbackRevision": "\(publishedPlaybackEditRevision)",
+                ]
+            )
+            return
+        }
+    }
+
+    private func recordEditTransactionCommit(_ plan: EditPlan) {
+        SoundtimeDiagnostics.shared.record(
+            category: .edit,
+            severity: .info,
+            name: "edit-transaction-committed",
+            message: "Committed an atomic project edit transaction.",
+            fields: [
+                "transactionID": plan.command.transactionID.description,
+                "kind": plan.command.kind.rawValue,
+                "beforeRevision": plan.command.baseRevision.description,
+                "afterRevision": plan.nextRevision.description,
+                "trackCount": "\(plan.trackEdits.count)",
+            ]
+        )
+    }
+
     private enum UndoAction {
         case timeline(trackID: UUID?, timeline: AudioEditTimeline)
         case projectTracks(ProjectTrackUndoSnapshot)
+        case transaction(ProjectEditTransactionRecord)
     }
 
     private enum ProjectReadinessState: Equatable {
@@ -473,6 +1256,8 @@ final class WorkspaceView: NSView {
         let id: UUID
         let buffer: DecodedAudioBuffer?
         let waveformOverview: WaveformOverview
+        let audioClip: AudioEditTimeline.Clip?
+        let fileClipSourceID: EditableAudioSourceID?
         let fileClipSourceURL: URL?
         let fileClip: AudioFileEditTimeline.Clip?
 
@@ -480,12 +1265,16 @@ final class WorkspaceView: NSView {
             id: UUID = UUID(),
             buffer: DecodedAudioBuffer?,
             waveformOverview: WaveformOverview,
+            audioClip: AudioEditTimeline.Clip? = nil,
+            fileClipSourceID: EditableAudioSourceID? = nil,
             fileClipSourceURL: URL? = nil,
             fileClip: AudioFileEditTimeline.Clip? = nil
         ) {
             self.id = id
             self.buffer = buffer
             self.waveformOverview = waveformOverview
+            self.audioClip = audioClip
+            self.fileClipSourceID = fileClipSourceID
             self.fileClipSourceURL = fileClipSourceURL
             self.fileClip = fileClip
         }
@@ -497,33 +1286,18 @@ final class WorkspaceView: NSView {
         let editSelection: TimelineSelection
     }
 
-    private struct RippleDeleteTrackEdit {
-        enum TimelineKind: String {
-            case file
-            case memory
-        }
-
-        let trackIndex: Int
-        let trackID: UUID
-        let displaySelection: TimelineSelection
-        let editSelection: TimelineSelection
-        let timelineKind: TimelineKind
-        let originalFrameCount: Int
-        let originalDuration: TimeInterval
-        let selectedFrameRange: Range<Int>
-        let expectedDeletedFrameCount: Int
-        let actualDeletedFrameCount: Int
-        let deletedDuration: TimeInterval
-        let editedDuration: TimeInterval
-        let editedAudioTimeline: AudioEditTimeline?
-        let editedFileTimeline: AudioFileEditTimeline?
-    }
-
     private struct DeleteTimingTrace {
+        static let isDetailedTracingEnabled =
+            ProcessInfo.processInfo.environment["SOUNDTIME_DETAILED_EDIT_TRACING"] == "1"
+
         let id = UUID()
         let operation: String
         let startedAt = CACurrentMediaTime()
         var lastMarkAt: CFTimeInterval
+
+        var recordsDetailedTiming: Bool {
+            Self.isDetailedTracingEnabled
+        }
 
         init(operation: String) {
             self.operation = operation
@@ -534,8 +1308,12 @@ final class WorkspaceView: NSView {
             _ phase: String,
             message: String,
             severity: SoundtimeDiagnosticSeverity = .info,
-            fields: [String: String] = [:]
+            fields: @autoclosure () -> [String: String] = [:]
         ) {
+            guard Self.isDetailedTracingEnabled || severity != .info else {
+                return
+            }
+
             let now = CACurrentMediaTime()
             let elapsedMilliseconds = (now - startedAt) * 1_000
             let deltaMilliseconds = (now - lastMarkAt) * 1_000
@@ -551,7 +1329,7 @@ final class WorkspaceView: NSView {
                     "operation": operation,
                     "elapsedMs": String(format: "%.3f", elapsedMilliseconds),
                     "deltaMs": String(format: "%.3f", deltaMilliseconds),
-                ].merging(fields) { _, new in new }
+                ].merging(fields()) { _, new in new }
             )
         }
 
@@ -559,8 +1337,12 @@ final class WorkspaceView: NSView {
             phase: String,
             message: String,
             submittedAt: CFTimeInterval,
-            fields: [String: String] = [:]
+            fields: @autoclosure () -> [String: String] = [:]
         ) {
+            guard Self.isDetailedTracingEnabled else {
+                return
+            }
+
             SoundtimeDiagnostics.shared.record(
                 category: .edit,
                 severity: .info,
@@ -570,19 +1352,9 @@ final class WorkspaceView: NSView {
                     "traceID": id.uuidString,
                     "operation": operation,
                     "elapsedMs": String(format: "%.3f", (submittedAt - startedAt) * 1_000),
-                ].merging(fields) { _, new in new }
+                ].merging(fields()) { _, new in new }
             )
         }
-    }
-
-    private struct ClearTrackEdit {
-        let trackIndex: Int
-        let trackID: UUID
-        let editSelection: TimelineSelection
-        let clearedDuration: TimeInterval
-        let editedDuration: TimeInterval
-        let editedAudioTimeline: AudioEditTimeline?
-        let editedFileTimeline: AudioFileEditTimeline?
     }
 
     private struct DenoiseProcessingResult: Sendable {
@@ -772,6 +1544,8 @@ final class WorkspaceView: NSView {
     private var currentProjectURL: URL?
     private var currentProjectID = UUID()
     private var currentEditGraphRevision: UInt64 = 1
+    private var publishedTimelineEditRevision: UInt64 = 1
+    private var publishedPlaybackEditRevision: UInt64 = 1
     private var currentVisualRevision: UInt64 = 1
     private var currentLaunchStateRevision: UInt64 = 1
     private var hasRestoredLastProject = false
@@ -779,6 +1553,10 @@ final class WorkspaceView: NSView {
     private var isLoadingProject = false
     private var projectReadinessState: ProjectReadinessState = .empty
     private var projectLoadGeneration = 0
+    private let projectCriticalLoadQueue = DispatchQueue(
+        label: "com.soundtime.project-critical-load",
+        qos: .userInitiated
+    )
     private var launchPreviewLoadGeneration = 0
     private var isLaunchPreviewLoadInFlight = false
     private var pendingHydrationAfterLaunchPreviewLoad = false
@@ -788,6 +1566,7 @@ final class WorkspaceView: NSView {
     private var projectHydrationCompletedTrackIDs: Set<UUID> = []
     private var projectHydrationFailedTrackIDs: Set<UUID> = []
     private var projectHydrationLaunchCacheWriteScheduled = false
+    private var projectHydrationImprovedLaunchWaveforms = false
     private var lastProjectReadinessHydrationDiagnosticTime: CFTimeInterval = -Double.infinity
     private var audioClipboard: AudioClipboard? {
         didSet {
@@ -797,15 +1576,21 @@ final class WorkspaceView: NSView {
     private var activeImportID = UUID()
     private var activeImportOperationIDs: Set<UUID> = []
     private var audioImportPrewarm: AudioImportPrewarm?
+    private var audioImportPreviewOperations: [UUID: AudioImportPreviewOperation] = [:]
     private var selectedAudioFile: AudioFileMetadata?
     private var decodedAudioBuffer: DecodedAudioBuffer?
     private var audioTimeline: AudioEditTimeline?
     private let waveformOverviewDiskCache = WaveformOverviewDiskCacheStore()
     private var editUndoStack: [UndoAction] = [] {
         didSet {
+            if !isNavigatingEditHistory, editUndoStack.count > oldValue.count {
+                editRedoStack.removeAll(keepingCapacity: true)
+            }
             scheduleAutosaveIfNeeded()
         }
     }
+    private var editRedoStack: [UndoAction] = []
+    private var isNavigatingEditHistory = false
     private var loadedAudioSummary: String?
     private var selectedTimelineRange: TimelineSelection?
 
@@ -894,11 +1679,11 @@ final class WorkspaceView: NSView {
     private var scheduledProjectTrackMixWorkItem: DispatchWorkItem?
     private var lastProjectTrackMixPublishTimestamp = CACurrentMediaTime()
     private var scheduledPlaybackReloadWorkItem: DispatchWorkItem?
+    private var ownedSourceCleanupWorkItem: DispatchWorkItem?
+    private var pendingOwnedSourceCleanupURLs: Set<URL> = []
     private var postDeleteRefreshWorkItem: DispatchWorkItem?
     private var deleteAnimationGeneration = 0
     private var deleteAutosaveProtectedUntil: CFTimeInterval = 0
-    private let deleteVisualCommitDeferral: TimeInterval = 1.0 / 120.0
-    private let pasteVisualCommitDeferral: TimeInterval = 0.14
     private var keyDownMonitor: Any?
     private var audioDevicePreferencesObserver: NSObjectProtocol?
     private var debugToolsVisible = false
@@ -913,6 +1698,11 @@ final class WorkspaceView: NSView {
     private let editWaveformRefinementDelay: TimeInterval = 0.20
     private var editMaterializationTasks: [UUID: Task<Void, Never>] = [:]
     private var editMaterializationRequestIDs: [UUID: UUID] = [:]
+    private var portablePastePreparationJobs: [UUID: PortablePastePreparationJob] = [:]
+    private let portablePastePreparationQueue = DispatchQueue(
+        label: "Soundtime.portable-paste-preparation",
+        qos: .userInitiated
+    )
     private var optimisticDeleteWaveformTasks: [UUID: Task<Void, Never>] = [:]
     private var optimisticDeleteWaveformRequestIDs: [UUID: UUID] = [:]
     private var editWaveformRefinementTasks: [UUID: Task<Void, Never>] = [:]
@@ -921,8 +1711,9 @@ final class WorkspaceView: NSView {
     private var launchWaveformCacheRequestIDs: [String: UUID] = [:]
     private var launchSnapshotSaveWorkItem: DispatchWorkItem?
     private var launchSnapshotSaveGeneration = 0
+    private var workspaceLifecycleGeneration = 0
     private let launchCacheWriteQueue = DispatchQueue(label: "Soundtime.launch-cache-writer", qos: .utility)
-    private let closeStatePersistenceQueue = DispatchQueue(label: "Soundtime.close-state-persistence", qos: .utility)
+    private let statePersistenceQueue = DispatchQueue(label: "Soundtime.state-persistence", qos: .utility)
     private var launchCacheWriteInFlight = false
     private var pendingLaunchCacheWriteRequest: LaunchCacheWriteRequest?
     private var lastTimelineHotInteractionTime: CFTimeInterval = -Double.infinity
@@ -930,7 +1721,15 @@ final class WorkspaceView: NSView {
     private var lastLaunchCacheHotPathDeferralEventTimeByKey: [String: CFTimeInterval] = [:]
     private let launchCacheHotPathQuietInterval: CFTimeInterval = 0.75
     private let launchCacheHotPathDeferralEventInterval: CFTimeInterval = 2.0
-    private let inputRecorder = AudioInputRecorder()
+    private var inputRecorderStorage: AudioInputRecorder?
+    private var inputRecorder: AudioInputRecorder {
+        if let recorder = inputRecorderStorage {
+            return recorder
+        }
+        let recorder = AudioInputRecorder()
+        inputRecorderStorage = recorder
+        return recorder
+    }
     private var recordingTrackID: UUID?
     private var recordingTakeWriter: StreamingWAVTakeWriter?
     private var recordingStartUndoSnapshot: ProjectTrackUndoSnapshot?
@@ -949,7 +1748,16 @@ final class WorkspaceView: NSView {
         preferredTrackHeight: TimelineTrackLayout.defaultPreferredTrackHeight,
         requestedScrollOffset: 0
     )
-    private let playbackController: PlaybackEngine = PlaybackEngineFactory.makeDefault()
+    private var playbackControllerStorage: PlaybackEngine?
+    private var playbackController: PlaybackEngine {
+        if let controller = playbackControllerStorage {
+            return controller
+        }
+        let controller = PlaybackEngineFactory.makeDefault()
+        controller.setPerceptualVolume(volumeControl.perceptualVolume)
+        playbackControllerStorage = controller
+        return controller
+    }
     private var timelineLoopIsEnabled = true
     private var playbackRefreshRate: TimeInterval {
         timelineLoopIsEnabled && timelineLoopRange.durationProgress < 0.999 ? 60 : 10
@@ -1098,91 +1906,91 @@ final class WorkspaceView: NSView {
     }()
     private let agentCommandController = AgentCommandController()
     private let agentCommandBar = AgentCommandBarView()
-    private let fisheyeRadiusControl = TimelineTuningSliderView(
+    private lazy var fisheyeRadiusControl = TimelineTuningSliderView(
         title: "Fish Radius",
         value: FisheyeDefaults.radius,
         range: 0.02...0.20,
         valueFormat: "%.3f"
     )
-    private let fisheyePowerControl = TimelineTuningSliderView(
+    private lazy var fisheyePowerControl = TimelineTuningSliderView(
         title: "Fish Power",
         value: FisheyeDefaults.power,
         range: 0.30...0.95,
         valueFormat: "%.2f"
     )
-    private let fisheyeStartControl = TimelineTuningSliderView(
+    private lazy var fisheyeStartControl = TimelineTuningSliderView(
         title: "Fish Start",
         value: FisheyeDefaults.start,
         range: 0...180,
         valueFormat: "%.0fs"
     )
-    private let fisheyeFullControl = TimelineTuningSliderView(
+    private lazy var fisheyeFullControl = TimelineTuningSliderView(
         title: "Fish Full",
         value: FisheyeDefaults.full,
         range: 60...600,
         valueFormat: "%.0fs"
     )
-    private let fisheyeCurveControl = TimelineTuningSliderView(
+    private lazy var fisheyeCurveControl = TimelineTuningSliderView(
         title: "Fish Curve",
         value: FisheyeDefaults.curve,
         range: 0.35...3.00,
         valueFormat: "%.2f"
     )
-    private let fisheyeActivateDurationControl = TimelineTuningSliderView(
+    private lazy var fisheyeActivateDurationControl = TimelineTuningSliderView(
         title: "Fish Activate Dur",
         value: FisheyeDefaults.activationMilliseconds,
         range: 40...1_200,
         valueFormat: "%.0fms"
     )
-    private let selectionDragMinimumSpeedControl = TimelineTuningSliderView(
+    private lazy var selectionDragMinimumSpeedControl = TimelineTuningSliderView(
         title: "Tickle Min",
         value: Double(SelectionDragTuningDefaults.value.minimumSpeedPixelsPerSecond),
         range: 0...800,
         valueFormat: "%.0f"
     )
-    private let selectionDragFullSpeedControl = TimelineTuningSliderView(
+    private lazy var selectionDragFullSpeedControl = TimelineTuningSliderView(
         title: "Tickle Full",
         value: Double(SelectionDragTuningDefaults.value.fullSpeedPixelsPerSecond),
         range: 300...3_600,
         valueFormat: "%.0f"
     )
-    private let selectionDragLifetimeControl = TimelineTuningSliderView(
+    private lazy var selectionDragLifetimeControl = TimelineTuningSliderView(
         title: "Fade",
         value: SelectionDragTuningDefaults.value.contactLifetime * 1_000,
         range: 80...240,
         valueFormat: "%.0fms"
     )
-    private let selectionDragRadiusControl = TimelineTuningSliderView(
+    private lazy var selectionDragRadiusControl = TimelineTuningSliderView(
         title: "Front",
         value: Double(SelectionDragTuningDefaults.value.frontRadiusPixels),
         range: 1...48,
         valueFormat: "%.0fpx"
     )
-    private let selectionDragExtraRadiusControl = TimelineTuningSliderView(
+    private lazy var selectionDragExtraRadiusControl = TimelineTuningSliderView(
         title: "Back",
         value: Double(SelectionDragTuningDefaults.value.backRadiusPixels),
         range: 1...90,
         valueFormat: "%.0fpx"
     )
-    private let selectionDragCoreRadiusControl = TimelineTuningSliderView(
+    private lazy var selectionDragCoreRadiusControl = TimelineTuningSliderView(
         title: "Core",
         value: Double(SelectionDragTuningDefaults.value.contactCoreRadiusPixels),
         range: 1...18,
         valueFormat: "%.0fpx"
     )
-    private let selectionDragExpansionControl = TimelineTuningSliderView(
+    private lazy var selectionDragExpansionControl = TimelineTuningSliderView(
         title: "Lift",
         value: Double(SelectionDragTuningDefaults.value.maximumExpansion),
         range: 0...1.1,
         valueFormat: "%.2f"
     )
-    private let selectionDragWhiteningControl = TimelineTuningSliderView(
+    private lazy var selectionDragWhiteningControl = TimelineTuningSliderView(
         title: "White",
         value: Double(SelectionDragTuningDefaults.value.maximumWhitening),
         range: 0...1,
         valueFormat: "%.2f"
     )
-    private let selectionDragParticleLimitControl = TimelineTuningSliderView(
+    private lazy var selectionDragParticleLimitControl = TimelineTuningSliderView(
         title: "Contacts",
         value: Double(SelectionDragTuningDefaults.value.maximumContactCount),
         range: 0...4,
@@ -1218,11 +2026,30 @@ final class WorkspaceView: NSView {
     }()
     private let timelineSurface = TimelineView()
     private let addTrackButton = AddTrackButton()
-    private let exportProgressOverlay = ExportProgressOverlayView()
-    private let audioExportService = AudioExportService()
+    private var exportProgressOverlayStorage: ExportProgressOverlayView?
+    private var exportProgressOverlay: ExportProgressOverlayView {
+        if let overlay = exportProgressOverlayStorage {
+            return overlay
+        }
+        let overlay = ExportProgressOverlayView()
+        installFullScreenOverlay(overlay)
+        exportProgressOverlayStorage = overlay
+        return overlay
+    }
+    private lazy var audioExportService: AudioExportService = {
+        let service = AudioExportService()
+        service.onProgress = { [weak self] progress in
+            self?.handleAudioExportProgress(progress)
+        }
+        service.onCompletion = { [weak self] jobID, result in
+            self?.handleAudioExportCompletion(jobID: jobID, result)
+        }
+        return service
+    }()
     private var audioExportWindowController: AudioExportWindowController?
     private var activeAudioExportJobID: UUID?
     private var latestAudioExportProgress: AudioExportProgress?
+    private var lastDiagnosedAudioExportStage: AudioExportStage?
     private let audioExportStatusButton: NSButton = {
         let button = NSButton(title: "Export 0%", target: nil, action: nil)
         button.bezelStyle = .rounded
@@ -1234,11 +2061,84 @@ final class WorkspaceView: NSView {
         button.translatesAutoresizingMaskIntoConstraints = false
         return button
     }()
-    private let gainEffectOverlay = GainEffectOverlayView()
-    private let denoiseProgressOverlay = DenoiseProgressOverlayView()
-    private let transcriptionProgressOverlay = TranscriptionProgressOverlayView()
-    private let denoiseReviewOverlay = DenoiseReviewOverlayView()
-    private let stemSeparationReviewOverlay = StemSeparationReviewOverlayView()
+    private var gainEffectOverlayStorage: GainEffectOverlayView?
+    private var gainEffectOverlay: GainEffectOverlayView {
+        if let overlay = gainEffectOverlayStorage {
+            return overlay
+        }
+        let overlay = GainEffectOverlayView()
+        overlay.onGainChanged = { [weak self] _, gain in
+            self?.previewSelectedGain(gain)
+        }
+        overlay.onConfirm = { [weak self] decibels, gain in
+            self?.confirmSelectedGain(decibels: decibels, gain: gain)
+        }
+        overlay.onCancel = { [weak self] in
+            self?.cancelSelectedGainPreview()
+        }
+        installFullScreenOverlay(overlay)
+        gainEffectOverlayStorage = overlay
+        return overlay
+    }
+    private var denoiseProgressOverlayStorage: DenoiseProgressOverlayView?
+    private var denoiseProgressOverlay: DenoiseProgressOverlayView {
+        if let overlay = denoiseProgressOverlayStorage {
+            return overlay
+        }
+        let overlay = DenoiseProgressOverlayView()
+        overlay.onCancel = { [weak self] in
+            self?.cancelActiveDenoiseProcessing()
+        }
+        installFullScreenOverlay(overlay)
+        denoiseProgressOverlayStorage = overlay
+        return overlay
+    }
+    private var transcriptionProgressOverlayStorage: TranscriptionProgressOverlayView?
+    private var transcriptionProgressOverlay: TranscriptionProgressOverlayView {
+        if let overlay = transcriptionProgressOverlayStorage {
+            return overlay
+        }
+        let overlay = TranscriptionProgressOverlayView()
+        overlay.onCancel = { [weak self] in
+            self?.cancelActiveTranscription()
+        }
+        installFullScreenOverlay(overlay)
+        transcriptionProgressOverlayStorage = overlay
+        return overlay
+    }
+    private var denoiseReviewOverlayStorage: DenoiseReviewOverlayView?
+    private var denoiseReviewOverlay: DenoiseReviewOverlayView {
+        if let overlay = denoiseReviewOverlayStorage {
+            return overlay
+        }
+        let overlay = DenoiseReviewOverlayView()
+        overlay.onAccept = { [weak self] in
+            self?.acceptPendingDenoiseReview()
+        }
+        overlay.onReject = { [weak self] in
+            self?.rejectPendingDenoiseReview()
+        }
+        installFullScreenOverlay(overlay)
+        denoiseReviewOverlayStorage = overlay
+        return overlay
+    }
+    private var stemSeparationReviewOverlayStorage: StemSeparationReviewOverlayView?
+    private var stemSeparationReviewOverlay: StemSeparationReviewOverlayView {
+        if let overlay = stemSeparationReviewOverlayStorage {
+            return overlay
+        }
+        let overlay = StemSeparationReviewOverlayView()
+        overlay.onAccept = { [weak self] in
+            self?.acceptPendingStemSeparationReview()
+        }
+        overlay.onReject = { [weak self] in
+            self?.rejectPendingStemSeparationReview()
+        }
+        installFullScreenOverlay(overlay)
+        stemSeparationReviewOverlayStorage = overlay
+        return overlay
+    }
+    private var debugTuningControlsConfigured = false
     private var framesPerSecondWidthConstraint: NSLayoutConstraint?
     private var trackControlsBelowDebugConstraint: NSLayoutConstraint?
     private var trackControlsBelowSelectionDragDebugConstraint: NSLayoutConstraint?
@@ -1256,12 +2156,28 @@ final class WorkspaceView: NSView {
     private var isAutosaveSuppressed = false
     private var wavFileInfoCache: [URL: WAVFileInfo] = [:]
     private var invalidWAVFileInfoCache: Set<URL> = []
+    private var waveformTileSourceCache: [URL: WaveformTileBuildSource] = [:]
+    private var publishedTimelineRenderTracks: [TimelineRenderState.Track] = []
+    private var publishedProjectPlaybackTracks: [ProjectPlaybackTrack] = []
+    private var lastPlaybackReloadErrorDescription: String?
+    private var latestUndoRestoreStageMilliseconds: [String: Double] = [:]
+    private var latestEditTransactionStageTimings = EditTransactionStageTimings()
+    private var latestEditCommitStageTimings = EditCommitStageTimings()
+    private var latestTransactionHistoryRestoreStageTimings = EditHistoryRestoreStageTimings()
     private let launchPlan: ProjectLaunchPlan
 
     override init(frame frameRect: NSRect) {
         launchPlan = .newProject()
         super.init(frame: frameRect)
+        LaunchStartupTrace.shared.mark(
+            .workspacePropertiesInitialized,
+            recordsDiagnosticEvent: false
+        )
         configure()
+        LaunchStartupTrace.shared.mark(
+            .workspaceConfigured,
+            recordsDiagnosticEvent: false
+        )
     }
 
     init(
@@ -1270,7 +2186,15 @@ final class WorkspaceView: NSView {
     ) {
         self.launchPlan = launchPlan
         super.init(frame: frameRect)
+        LaunchStartupTrace.shared.mark(
+            .workspacePropertiesInitialized,
+            recordsDiagnosticEvent: false
+        )
         configure()
+        LaunchStartupTrace.shared.mark(
+            .workspaceConfigured,
+            recordsDiagnosticEvent: false
+        )
         applyInitialLaunchPlanIfAvailable()
     }
 
@@ -1314,7 +2238,15 @@ final class WorkspaceView: NSView {
     required init?(coder: NSCoder) {
         launchPlan = .newProject(reason: "coder")
         super.init(coder: coder)
+        LaunchStartupTrace.shared.mark(
+            .workspacePropertiesInitialized,
+            recordsDiagnosticEvent: false
+        )
         configure()
+        LaunchStartupTrace.shared.mark(
+            .workspaceConfigured,
+            recordsDiagnosticEvent: false
+        )
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -1341,39 +2273,43 @@ final class WorkspaceView: NSView {
         }
 
         if
-            !stemSeparationReviewOverlay.isHidden,
-            stemSeparationReviewOverlay.alphaValue > 0.01,
-            stemSeparationReviewOverlay.frame.contains(point)
+            let overlay = stemSeparationReviewOverlayStorage,
+            !overlay.isHidden,
+            overlay.alphaValue > 0.01,
+            overlay.frame.contains(point)
         {
-            let overlayPoint = stemSeparationReviewOverlay.convert(point, from: self)
-            return stemSeparationReviewOverlay.hitTest(overlayPoint) ?? stemSeparationReviewOverlay
+            let overlayPoint = overlay.convert(point, from: self)
+            return overlay.hitTest(overlayPoint) ?? overlay
         }
 
         if
-            !denoiseReviewOverlay.isHidden,
-            denoiseReviewOverlay.alphaValue > 0.01,
-            denoiseReviewOverlay.frame.contains(point)
+            let overlay = denoiseReviewOverlayStorage,
+            !overlay.isHidden,
+            overlay.alphaValue > 0.01,
+            overlay.frame.contains(point)
         {
-            let overlayPoint = denoiseReviewOverlay.convert(point, from: self)
-            return denoiseReviewOverlay.hitTest(overlayPoint) ?? denoiseReviewOverlay
+            let overlayPoint = overlay.convert(point, from: self)
+            return overlay.hitTest(overlayPoint) ?? overlay
         }
 
         if
-            !denoiseProgressOverlay.isHidden,
-            denoiseProgressOverlay.alphaValue > 0.01,
-            denoiseProgressOverlay.frame.contains(point)
+            let overlay = denoiseProgressOverlayStorage,
+            !overlay.isHidden,
+            overlay.alphaValue > 0.01,
+            overlay.frame.contains(point)
         {
-            let overlayPoint = denoiseProgressOverlay.convert(point, from: self)
-            return denoiseProgressOverlay.hitTest(overlayPoint) ?? denoiseProgressOverlay
+            let overlayPoint = overlay.convert(point, from: self)
+            return overlay.hitTest(overlayPoint) ?? overlay
         }
 
         if
-            !transcriptionProgressOverlay.isHidden,
-            transcriptionProgressOverlay.alphaValue > 0.01,
-            transcriptionProgressOverlay.frame.contains(point)
+            let overlay = transcriptionProgressOverlayStorage,
+            !overlay.isHidden,
+            overlay.alphaValue > 0.01,
+            overlay.frame.contains(point)
         {
-            let overlayPoint = transcriptionProgressOverlay.convert(point, from: self)
-            if let overlayHitView = transcriptionProgressOverlay.hitTest(overlayPoint) {
+            let overlayPoint = overlay.convert(point, from: self)
+            if let overlayHitView = overlay.hitTest(overlayPoint) {
                 return overlayHitView
             }
         }
@@ -1447,6 +2383,17 @@ final class WorkspaceView: NSView {
             }
         }
         return nil
+    }
+
+    private func installFullScreenOverlay(_ overlay: NSView) {
+        overlay.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(overlay)
+        NSLayoutConstraint.activate([
+            overlay.topAnchor.constraint(equalTo: topAnchor),
+            overlay.leadingAnchor.constraint(equalTo: leadingAnchor),
+            overlay.trailingAnchor.constraint(equalTo: trailingAnchor),
+            overlay.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
     }
 
     private func configure() {
@@ -1550,6 +2497,9 @@ final class WorkspaceView: NSView {
         }
         timelineSurface.onUndo = { [weak self] in
             self?.undoLastEdit()
+        }
+        timelineSurface.onRedo = { [weak self] in
+            self?.redoLastEdit()
         }
         timelineSurface.onExportRequested = { [weak self] in
             self?.exportCurrentAudio()
@@ -1705,12 +2655,6 @@ final class WorkspaceView: NSView {
         }
         audioExportStatusButton.target = self
         audioExportStatusButton.action = #selector(audioExportStatusButtonPressed(_:))
-        audioExportService.onProgress = { [weak self] progress in
-            self?.handleAudioExportProgress(progress)
-        }
-        audioExportService.onCompletion = { [weak self] jobID, result in
-            self?.handleAudioExportCompletion(jobID: jobID, result)
-        }
         editScopeControl.target = self
         editScopeControl.action = #selector(editScopeChanged(_:))
         editScopeControlsRow.addArrangedSubview(editScopeTitleLabel)
@@ -1746,36 +2690,7 @@ final class WorkspaceView: NSView {
         agentCommandController.onResult = { [weak self] result in
             self?.updateStatus(result.message)
         }
-        configureFisheyeTuningControls()
-        configureSelectionDragTuningControls()
         installAudioDevicePreferencesObserver()
-        gainEffectOverlay.onGainChanged = { [weak self] _, gain in
-            self?.previewSelectedGain(gain)
-        }
-        gainEffectOverlay.onConfirm = { [weak self] decibels, gain in
-            self?.confirmSelectedGain(decibels: decibels, gain: gain)
-        }
-        gainEffectOverlay.onCancel = { [weak self] in
-            self?.cancelSelectedGainPreview()
-        }
-        denoiseProgressOverlay.onCancel = { [weak self] in
-            self?.cancelActiveDenoiseProcessing()
-        }
-        transcriptionProgressOverlay.onCancel = { [weak self] in
-            self?.cancelActiveTranscription()
-        }
-        denoiseReviewOverlay.onAccept = { [weak self] in
-            self?.acceptPendingDenoiseReview()
-        }
-        denoiseReviewOverlay.onReject = { [weak self] in
-            self?.rejectPendingDenoiseReview()
-        }
-        stemSeparationReviewOverlay.onAccept = { [weak self] in
-            self?.acceptPendingStemSeparationReview()
-        }
-        stemSeparationReviewOverlay.onReject = { [weak self] in
-            self?.rejectPendingStemSeparationReview()
-        }
 
         addSubview(titleLabel)
         addSubview(metadataLabel)
@@ -1794,12 +2709,6 @@ final class WorkspaceView: NSView {
         addSubview(addTrackButton)
         addSubview(timelineSurface)
         addSubview(agentCommandBar)
-        addSubview(exportProgressOverlay)
-        addSubview(gainEffectOverlay)
-        addSubview(denoiseProgressOverlay)
-        addSubview(transcriptionProgressOverlay)
-        addSubview(denoiseReviewOverlay)
-        addSubview(stemSeparationReviewOverlay)
 
         let fisheyeTrailingConstraint = fisheyeControlsStack.trailingAnchor.constraint(
             lessThanOrEqualTo: loudnessMeter.leadingAnchor,
@@ -1928,43 +2837,15 @@ final class WorkspaceView: NSView {
             agentCommandBar.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -28),
             agentCommandBarWidthConstraint,
 
-            exportProgressOverlay.topAnchor.constraint(equalTo: topAnchor),
-            exportProgressOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
-            exportProgressOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
-            exportProgressOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
-
-            gainEffectOverlay.topAnchor.constraint(equalTo: topAnchor),
-            gainEffectOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
-            gainEffectOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
-            gainEffectOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
-
-            denoiseProgressOverlay.topAnchor.constraint(equalTo: topAnchor),
-            denoiseProgressOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
-            denoiseProgressOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
-            denoiseProgressOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
-
-            transcriptionProgressOverlay.topAnchor.constraint(equalTo: topAnchor),
-            transcriptionProgressOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
-            transcriptionProgressOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
-            transcriptionProgressOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
-
-            denoiseReviewOverlay.topAnchor.constraint(equalTo: topAnchor),
-            denoiseReviewOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
-            denoiseReviewOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
-            denoiseReviewOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
-
-            stemSeparationReviewOverlay.topAnchor.constraint(equalTo: topAnchor),
-            stemSeparationReviewOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
-            stemSeparationReviewOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
-            stemSeparationReviewOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
 
         updateEffectCommandState()
-        updateWaveformFisheyeTuning()
-        updateSelectionDragWaveformTuning()
+        applyDefaultWaveformInteractionTuning()
         setDebugToolsVisible(Self.defaultDebugToolsVisible)
-        updateLoudnessMeter()
-        updateTransportControlState(isPlaying: false)
+        loudnessMeter.display(levels: .silence)
+        transportControlPanel.displayOutputActivity(levels: .silence)
+        transportControlPanel.isPlaying = false
+        transportControlPanel.isTransportEnabled = false
         startLoudnessMeterTimer()
         startPerformanceMeterTimer()
     }
@@ -1989,22 +2870,7 @@ final class WorkspaceView: NSView {
 
     func prepareForImmediateWindowClose() {
         let startedAt = CACurrentMediaTime()
-        viewportPersistenceWorkItem?.cancel()
-        viewportPersistenceWorkItem = nil
-        autosaveWorkItem?.cancel()
-        autosaveWorkItem = nil
-        autosaveGeneration += 1
-        latestAutosaveScheduleReason = "window-close"
-        launchSnapshotSaveWorkItem?.cancel()
-        launchSnapshotSaveWorkItem = nil
-        launchSnapshotSaveGeneration += 1
-        pendingLaunchCacheWriteRequest = nil
-        launchWaveformCacheTasks.values.forEach { $0.cancel() }
-        launchWaveformCacheTasks.removeAll()
-        launchWaveformCacheRequestIDs.removeAll()
-        projectHydrationQueue?.cancel()
-        projectHydrationQueue = nil
-        projectHydrationLaunchCacheWriteScheduled = false
+        cancelDeferredWorkspaceWorkForTeardown(reason: "window-close")
         persistLatestTimelineViewport(flushImmediately: false, schedulesLaunchSnapshot: false)
 
         let elapsedMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
@@ -2057,6 +2923,27 @@ final class WorkspaceView: NSView {
             visualReady = true
         }
 
+        let pendingDeferredEditWorkCount =
+            editMaterializationTasks.count +
+            optimisticDeleteWaveformTasks.count +
+            editWaveformRefinementTasks.count +
+            (postDeleteRefreshWorkItem == nil ? 0 : 1) +
+            (scheduledPlaybackReloadWorkItem == nil ? 0 : 1)
+        let pendingDeferredWorkspaceWorkCount =
+            pendingDeferredEditWorkCount +
+            launchWaveformCacheTasks.count +
+            activeImportOperationIDs.count +
+            (audioImportPrewarm == nil ? 0 : 1) +
+            (projectHydrationQueue == nil ? 0 : 1) +
+            (viewportPersistenceWorkItem == nil ? 0 : 1) +
+            (autosaveWorkItem == nil ? 0 : 1) +
+            (launchSnapshotSaveWorkItem == nil ? 0 : 1) +
+            (pendingLaunchCacheWriteRequest == nil ? 0 : 1) +
+            (scheduledProjectTrackMixWorkItem == nil ? 0 : 1) +
+            (deadAirAuditionStopTask == nil ? 0 : 1) +
+            (denoiseHighlightFadeTask == nil ? 0 : 1) +
+            (transcriptionHighlightFadeTask == nil ? 0 : 1)
+
         return WorkspaceStartupCloseSmokeSnapshot(
             trackCount: projectTracks.count,
             drawableWaveformTrackCount: drawableWaveformTrackCount,
@@ -2067,7 +2954,7 @@ final class WorkspaceView: NSView {
             soloedTrackCount: projectTracks.filter(\.isSoloed).count,
             readinessDescription: projectReadinessState.statusText,
             isVisualReady: visualReady,
-            playbackHasSource: playbackController.hasSource,
+            playbackHasSource: playbackControllerStorage?.hasSource ?? false,
             playbackPrimedTrackCount: projectPlaybackPrimedTrackIDs.count,
             isLaunchVisualPreviewPendingImmediateRender: isLaunchVisualPreviewPendingImmediateRender,
             isDeferredProjectRestorePending: isDeferredProjectRestorePending,
@@ -2076,6 +2963,8 @@ final class WorkspaceView: NSView {
             isLaunchSnapshotWriteScheduled: launchSnapshotSaveWorkItem != nil,
             isLaunchCacheWriteInFlight: launchCacheWriteInFlight,
             hasPendingLaunchCacheWrite: pendingLaunchCacheWriteRequest != nil,
+            pendingDeferredEditWorkCount: pendingDeferredEditWorkCount,
+            pendingDeferredWorkspaceWorkCount: pendingDeferredWorkspaceWorkCount,
             statusText: currentPlaybackStatus
         )
     }
@@ -2169,6 +3058,7 @@ final class WorkspaceView: NSView {
 
     func hotPathContractSmokeResetDiagnostics() {
         latestTimelineFrameStats = nil
+        latestUndoRestoreStageMilliseconds = [:]
         timelineSurface.hotPathContractSmokeResetTranscriptDiagnostics()
         PerformanceDashboardWindowController.resetDiagnosticsForSmokeTesting()
         SoundtimeMainThreadStallMonitor.shared.resetForSmokeTesting()
@@ -2187,6 +3077,10 @@ final class WorkspaceView: NSView {
         latestTimelineFrameStats != nil
     }
 
+    func hotPathContractSmokeIsRendererReady() -> Bool {
+        timelineSurface.hotPathContractSmokeIsRendererReady()
+    }
+
     func hotPathContractSmokeIsProjectFullyHydrated() -> Bool {
         guard !projectTracks.isEmpty else {
             return projectHydrationQueue == nil
@@ -2199,8 +3093,29 @@ final class WorkspaceView: NSView {
         !editUndoStack.isEmpty
     }
 
+    func interactionReplaySmokeUndoDepth() -> Int {
+        editUndoStack.count
+    }
+
     func hotPathContractSmokeZoomBurst(stepCount: Int = 8, around anchorProgress: Float = 0.5) {
         timelineSurface.hotPathContractSmokeZoomBurst(stepCount: stepCount, around: anchorProgress)
+    }
+
+    func interactionReplaySmokeZoomStep(
+        direction: Float,
+        around anchorProgress: Float = 0.5
+    ) -> WorkspaceUserPerceivedTimingSmokeResult {
+        let generationBefore = deleteAnimationGeneration
+        let elapsedMilliseconds = timelineSurface.interactionReplaySmokeZoomStep(
+            direction: direction,
+            around: anchorProgress
+        )
+        return WorkspaceUserPerceivedTimingSmokeResult(
+            accepted: true,
+            elapsedMilliseconds: elapsedMilliseconds,
+            message: "zoom step submitted",
+            editAnimationGenerationChanged: generationBefore != deleteAnimationGeneration
+        )
     }
 
     func interactionReplaySmokePanBurst(stepCount: Int = 12, progressDistance: Float = 0.18) -> WorkspaceUserPerceivedTimingSmokeResult {
@@ -2246,7 +3161,25 @@ final class WorkspaceView: NSView {
         return WorkspaceUserPerceivedTimingSmokeResult(
             accepted: hadUndo,
             elapsedMilliseconds: elapsedMilliseconds,
-            message: hadUndo ? "undo replay completed" : "undo replay skipped without undo state",
+            message: hadUndo ?
+                "undo replay completed \(transactionHistoryRestoreStageSummary())" :
+                "undo replay skipped without undo state",
+            editAnimationGenerationChanged: generationBefore != deleteAnimationGeneration
+        )
+    }
+
+    func interactionReplaySmokeRedoLastEdit() -> WorkspaceUserPerceivedTimingSmokeResult {
+        let generationBefore = deleteAnimationGeneration
+        let startedAt = CACurrentMediaTime()
+        let hadRedo = !editRedoStack.isEmpty
+        redoLastEdit()
+        let elapsedMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
+        return WorkspaceUserPerceivedTimingSmokeResult(
+            accepted: hadRedo,
+            elapsedMilliseconds: elapsedMilliseconds,
+            message: hadRedo ?
+                "redo replay completed \(transactionHistoryRestoreStageSummary())" :
+                "redo replay skipped without redo state",
             editAnimationGenerationChanged: generationBefore != deleteAnimationGeneration
         )
     }
@@ -2285,6 +3218,29 @@ final class WorkspaceView: NSView {
         refreshTranscriptActiveWordForCurrentVisualPlayhead()
     }
 
+    func hotPathContractSmokeLayoutSignature() -> String {
+        timelineSurface.hotPathContractSmokeLayoutSignature()
+    }
+
+    func hotPathContractSmokeFlushLayout() {
+        guard let contentView = window?.contentView else {
+            needsLayout = true
+            layoutSubtreeIfNeeded()
+            timelineSurface.layoutSubtreeIfNeeded()
+            return
+        }
+
+        // Constraint changes owned by WorkspaceView can invalidate ancestors
+        // before they affect the timeline's final frame. Lay out from the
+        // window root downward so a replay never measures deferred AppKit work
+        // from the preceding interaction.
+        contentView.needsLayout = true
+        needsLayout = true
+        contentView.layoutSubtreeIfNeeded()
+        layoutSubtreeIfNeeded()
+        timelineSurface.layoutSubtreeIfNeeded()
+    }
+
     func hotPathContractSmokeSnapshot() -> WorkspaceHotPathContractSmokeSnapshot {
         let startupSnapshot = startupCloseSmokeSnapshot()
         let diagnostics = SoundtimeDiagnostics.shared.snapshot(limit: 256)
@@ -2308,6 +3264,8 @@ final class WorkspaceView: NSView {
             warningEventCount: diagnostics.warningEventCount,
             severeEventCount: diagnostics.severeEventCount,
             diagnosticEventNames: diagnostics.events.map(\.name),
+            latestUndoRestoreStageMilliseconds: latestUndoRestoreStageMilliseconds,
+            lastPlaybackReloadErrorDescription: lastPlaybackReloadErrorDescription,
             statusText: currentPlaybackStatus
         )
     }
@@ -2367,7 +3325,8 @@ final class WorkspaceView: NSView {
         trackIndex: Int,
         startProgress: Double,
         endProgress: Double,
-        velocityPixelsPerSecond: CGFloat
+        velocityPixelsPerSecond: CGFloat,
+        motionDirection: CGFloat? = nil
     ) -> WorkspaceUserPerceivedTimingSmokeResult {
         let generationBefore = deleteAnimationGeneration
         let startedAt = CACurrentMediaTime()
@@ -2395,20 +3354,104 @@ final class WorkspaceView: NSView {
         publishSelectedTracksToTimeline()
         syncActiveTrackFields()
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
+        let resolvedMotionDirection = motionDirection ?? (endProgress >= startProgress ? 1 : -1)
         timelineSurface.userPerceivedTimingSmokeDisplayLiveSelection(
             selection,
-            leadingProgress: endProgress >= startProgress ? selection.endProgress : selection.startProgress,
+            leadingProgress: endProgress,
             velocityPixelsPerSecond: velocityPixelsPerSecond,
-            direction: endProgress >= startProgress ? 1 : -1
+            direction: resolvedMotionDirection
         )
         updateEffectCommandState()
         updateStatus(currentPlaybackStatus)
+        let renderedSelection = timelineSurface.userPerceivedTimingSmokeSelectionDragSnapshot()
 
         return WorkspaceUserPerceivedTimingSmokeResult(
             accepted: selection.durationProgress > 0,
             elapsedMilliseconds: (CACurrentMediaTime() - startedAt) * 1_000,
             message: "selection visual state published",
-            editAnimationGenerationChanged: generationBefore != deleteAnimationGeneration
+            editAnimationGenerationChanged: generationBefore != deleteAnimationGeneration,
+            expectedLeadingProgress: endProgress,
+            renderedLeadingProgress: renderedSelection.map { Double($0.leadingProgress) },
+            selectionEdgeErrorPixels: renderedSelection?.edgeErrorPixels(expectedLeadingProgress: endProgress),
+            motionDirection: Double(resolvedMotionDirection)
+        )
+    }
+
+    func interactionReplaySmokePublishLiveSelection(
+        trackIndex: Int,
+        startProgress: Double,
+        endProgress: Double,
+        velocityPixelsPerSecond: CGFloat,
+        motionDirection: CGFloat
+    ) -> WorkspaceUserPerceivedTimingSmokeResult {
+        let generationBefore = deleteAnimationGeneration
+        let startedAt = CACurrentMediaTime()
+        guard projectTracks.indices.contains(trackIndex) else {
+            return WorkspaceUserPerceivedTimingSmokeResult(
+                accepted: false,
+                elapsedMilliseconds: (CACurrentMediaTime() - startedAt) * 1_000,
+                message: "live selection target track was missing",
+                editAnimationGenerationChanged: false
+            )
+        }
+
+        let selection = TimelineSelection(
+            startProgress: startProgress,
+            endProgress: endProgress,
+            trackID: projectTracks[trackIndex].id
+        )
+        timelineSurface.userPerceivedTimingSmokeDisplayLiveSelection(
+            selection,
+            leadingProgress: endProgress,
+            velocityPixelsPerSecond: velocityPixelsPerSecond,
+            direction: motionDirection
+        )
+        let renderedSelection = timelineSurface.userPerceivedTimingSmokeSelectionDragSnapshot()
+        return WorkspaceUserPerceivedTimingSmokeResult(
+            accepted: selection.durationProgress > 0,
+            elapsedMilliseconds: (CACurrentMediaTime() - startedAt) * 1_000,
+            message: "live selection drag state published",
+            editAnimationGenerationChanged: generationBefore != deleteAnimationGeneration,
+            expectedLeadingProgress: endProgress,
+            renderedLeadingProgress: renderedSelection.map { Double($0.leadingProgress) },
+            selectionEdgeErrorPixels: renderedSelection?.edgeErrorPixels(expectedLeadingProgress: endProgress),
+            motionDirection: Double(motionDirection)
+        )
+    }
+
+    func userPerceivedTimingSmokeCollapseSelection(
+        trackIndex: Int,
+        at anchorProgress: Double
+    ) -> WorkspaceUserPerceivedTimingSmokeResult {
+        let generationBefore = deleteAnimationGeneration
+        let startedAt = CACurrentMediaTime()
+        guard projectTracks.indices.contains(trackIndex) else {
+            return WorkspaceUserPerceivedTimingSmokeResult(
+                accepted: false,
+                elapsedMilliseconds: (CACurrentMediaTime() - startedAt) * 1_000,
+                message: "selection collapse target track was missing",
+                editAnimationGenerationChanged: false,
+                isIntentionalSelectionCollapse: true
+            )
+        }
+
+        selectedTimelineRange = nil
+        selectedTranscriptSelection = nil
+        timelineSurface.displaySelection(nil)
+        updateEffectCommandState()
+        updateStatus(currentPlaybackStatus)
+        let didCollapse = selectedTimelineRange == nil &&
+            timelineSurface.userPerceivedTimingSmokeSelectionDragSnapshot() == nil
+        return WorkspaceUserPerceivedTimingSmokeResult(
+            accepted: didCollapse,
+            elapsedMilliseconds: (CACurrentMediaTime() - startedAt) * 1_000,
+            message: didCollapse ? "selection intentionally collapsed" : "selection collapse remained visible",
+            editAnimationGenerationChanged: generationBefore != deleteAnimationGeneration,
+            expectedLeadingProgress: anchorProgress,
+            renderedLeadingProgress: nil,
+            selectionEdgeErrorPixels: 0,
+            motionDirection: 0,
+            isIntentionalSelectionCollapse: true
         )
     }
 
@@ -2417,10 +3460,7 @@ final class WorkspaceView: NSView {
     ) -> WorkspaceUserPerceivedTimingSmokeResult {
         let generationBefore = deleteAnimationGeneration
         let startedAt = CACurrentMediaTime()
-        guard
-            let target = currentEditableSelectionTarget(),
-            projectTracks.indices.contains(target.trackIndex)
-        else {
+        guard currentEditableSelectionTarget() != nil else {
             return WorkspaceUserPerceivedTimingSmokeResult(
                 accepted: false,
                 elapsedMilliseconds: (CACurrentMediaTime() - startedAt) * 1_000,
@@ -2429,51 +3469,31 @@ final class WorkspaceView: NSView {
             )
         }
 
-        let track = projectTracks[target.trackIndex]
-        let overview = selectedWaveformOverview(
-            from: track.waveformOverview ?? track.sourceWaveformOverview,
-            selection: target.editSelection
-        ) ?? WaveformOverview(
-            duration: max(target.editSelection.duration(in: trackDuration(for: track)), 0.000_001),
-            bins: []
-        )
-
+        let previousClipboardID = audioClipboard?.id
+        copySelection()
         if
-            let fileTimeline = try? editableFileTimeline(forTrackAt: target.trackIndex),
-            let clip = fileTimeline.clip(for: target.editSelection)
+            includePortableBuffer,
+            let clipboard = audioClipboard,
+            clipboard.id != previousClipboardID,
+            clipboard.buffer == nil,
+            let duration = clipboardDuration(clipboard)
         {
-            let portableBuffer = includePortableBuffer ?
-                userPerceivedTimingSmokeClipboardBuffer(duration: clip.duration) :
-                nil
             audioClipboard = AudioClipboard(
-                buffer: portableBuffer,
-                waveformOverview: overview,
-                fileClipSourceURL: track.sourceURL,
-                fileClip: clip
-            )
-        } else if let audioTimeline = track.audioTimeline {
-            let buffer = audioTimeline.render(selection: target.editSelection)
-            audioClipboard = AudioClipboard(
-                buffer: buffer,
-                waveformOverview: overview
-            )
-        } else {
-            let fallbackBuffer = userPerceivedTimingSmokeClipboardBuffer(
-                duration: min(
-                    max(target.editSelection.duration(in: max(trackDuration(for: track), 0.000_001)), 0.05),
-                    0.25
-                )
-            )
-            audioClipboard = AudioClipboard(
-                buffer: fallbackBuffer,
-                waveformOverview: WaveformOverviewBuilder.build(from: fallbackBuffer, targetBinCount: 256)
+                id: clipboard.id,
+                buffer: userPerceivedTimingSmokeClipboardBuffer(duration: duration),
+                waveformOverview: clipboard.waveformOverview,
+                audioClip: clipboard.audioClip,
+                fileClipSourceID: clipboard.fileClipSourceID,
+                fileClipSourceURL: clipboard.fileClipSourceURL,
+                fileClip: clipboard.fileClip
             )
         }
 
+        let didPrepareClipboard = audioClipboard?.id != previousClipboardID
         return WorkspaceUserPerceivedTimingSmokeResult(
-            accepted: audioClipboard != nil,
+            accepted: didPrepareClipboard,
             elapsedMilliseconds: (CACurrentMediaTime() - startedAt) * 1_000,
-            message: "clipboard prepared",
+            message: didPrepareClipboard ? "clipboard prepared" : currentPlaybackStatus,
             editAnimationGenerationChanged: generationBefore != deleteAnimationGeneration
         )
     }
@@ -2499,30 +3519,68 @@ final class WorkspaceView: NSView {
     func userPerceivedTimingSmokeDeleteSelection(useGroupScope: Bool = false) -> WorkspaceUserPerceivedTimingSmokeResult {
         let generationBefore = deleteAnimationGeneration
         let startedAt = CACurrentMediaTime()
-        performOptimisticDelete(copyBeforeDeleting: false, scope: useGroupScope ? .group : .track)
+        let visualResponseMilliseconds = performTransactionalRangeEdit(
+            kind: .rippleDelete,
+            scope: useGroupScope ? .group : .track
+        )
         let elapsedMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
         let generationChanged = generationBefore != deleteAnimationGeneration
         return WorkspaceUserPerceivedTimingSmokeResult(
             accepted: generationChanged,
             elapsedMilliseconds: elapsedMilliseconds,
             message: generationChanged ?
-                "delete visual state submitted (\(useGroupScope ? "group" : "track") scope)" :
+                "delete visual state submitted (\(useGroupScope ? "group" : "track") scope) " +
+                    editTransactionStageSummary() :
                 "delete visual state did not start",
-            editAnimationGenerationChanged: generationChanged
+            editAnimationGenerationChanged: generationChanged,
+            visualResponseMilliseconds: visualResponseMilliseconds
         )
+    }
+
+    private func editTransactionStageSummary() -> String {
+        let transaction = latestEditTransactionStageTimings
+        let commit = latestEditCommitStageTimings
+        return "planMs=\(formatEditStageMilliseconds(transaction.planMilliseconds)) " +
+            "prepareMs=\(formatEditStageMilliseconds(transaction.prepareMilliseconds)) " +
+            "effectsMs=\(formatEditStageMilliseconds(transaction.effectsMilliseconds)) " +
+            "commitMs=\(formatEditStageMilliseconds(transaction.commitMilliseconds)) " +
+            "finalizeMs=\(formatEditStageMilliseconds(transaction.finalizeMilliseconds)) " +
+            "commit[captureMs=\(formatEditStageMilliseconds(commit.captureMilliseconds)) " +
+            "mutationMs=\(formatEditStageMilliseconds(commit.mutationMilliseconds)) " +
+            "renderProjectionMs=\(formatEditStageMilliseconds(commit.renderProjectionMilliseconds)) " +
+            "playbackProjectionMs=\(formatEditStageMilliseconds(commit.playbackProjectionMilliseconds)) " +
+            "playbackMs=\(formatEditStageMilliseconds(commit.playbackMilliseconds)) " +
+            "historyMs=\(formatEditStageMilliseconds(commit.historyMilliseconds))]"
+    }
+
+    private func transactionHistoryRestoreStageSummary() -> String {
+        let timings = latestTransactionHistoryRestoreStageTimings
+        return "indexMs=\(formatEditStageMilliseconds(timings.indexMilliseconds)) " +
+            "tracksMs=\(formatEditStageMilliseconds(timings.tracksMilliseconds)) " +
+            "modelMs=\(formatEditStageMilliseconds(timings.modelMilliseconds)) " +
+            "timelineMs=\(formatEditStageMilliseconds(timings.timelineMilliseconds)) " +
+            "playbackMs=\(formatEditStageMilliseconds(timings.playbackMilliseconds)) " +
+            "finalizeMs=\(formatEditStageMilliseconds(timings.finalizeMilliseconds))"
+    }
+
+    private func formatEditStageMilliseconds(_ milliseconds: Double) -> String {
+        String(format: "%.3f", milliseconds)
     }
 
     func userPerceivedTimingSmokePasteAtPlayhead() -> WorkspaceUserPerceivedTimingSmokeResult {
         let generationBefore = deleteAnimationGeneration
         let startedAt = CACurrentMediaTime()
-        pasteAudio()
+        let visualResponseMilliseconds = pasteAudio()
         let elapsedMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
         let generationChanged = generationBefore != deleteAnimationGeneration
         return WorkspaceUserPerceivedTimingSmokeResult(
             accepted: generationChanged,
             elapsedMilliseconds: elapsedMilliseconds,
-            message: generationChanged ? "paste visual state submitted" : "paste visual state did not start",
-            editAnimationGenerationChanged: generationChanged
+            message: generationChanged ?
+                "paste visual state submitted \(editTransactionStageSummary())" :
+                "paste visual state did not start (\(currentPlaybackStatus))",
+            editAnimationGenerationChanged: generationChanged,
+            visualResponseMilliseconds: visualResponseMilliseconds
         )
     }
 
@@ -2550,6 +3608,7 @@ final class WorkspaceView: NSView {
     }
 
     private func tearDownRuntimeState() {
+        cancelDeferredWorkspaceWorkForTeardown(reason: "view-detached")
         persistLatestTimelineViewport(flushImmediately: false, schedulesLaunchSnapshot: false)
         PerformanceDashboardWindowController.closeIfLoaded()
         if let keyDownMonitor {
@@ -2582,10 +3641,10 @@ final class WorkspaceView: NSView {
         pendingDenoiseReview = nil
         pendingStemSeparationReview = nil
         activeAudioProcessingOperation = nil
-        denoiseProgressOverlay.hide(animated: false)
-        transcriptionProgressOverlay.hide(animated: false)
-        denoiseReviewOverlay.hide(animated: false)
-        stemSeparationReviewOverlay.hide(animated: false)
+        denoiseProgressOverlayStorage?.hide(animated: false)
+        transcriptionProgressOverlayStorage?.hide(animated: false)
+        denoiseReviewOverlayStorage?.hide(animated: false)
+        stemSeparationReviewOverlayStorage?.hide(animated: false)
         setDenoiseModalInteractionLocked(false)
         timelineSurface.displayModalBackdropActive(false)
         timelineSurface.displayProcessingSelectionProgress(selection: nil, fractionCompleted: nil)
@@ -2594,8 +3653,8 @@ final class WorkspaceView: NSView {
         denoiseHighlightFadeTask = nil
         transcriptionHighlightFadeTask?.cancel()
         transcriptionHighlightFadeTask = nil
-        inputRecorder.stop()
-        inputRecorder.onChunk = nil
+        inputRecorderStorage?.stop()
+        inputRecorderStorage?.onChunk = nil
         recordingTakeWriter?.cancel()
         recordingTakeWriter = nil
         recordingTrackID = nil
@@ -2603,9 +3662,68 @@ final class WorkspaceView: NSView {
         recordingStartUndoStackCount = nil
         recordingSampleRate = 0
         recordingAccumulator = nil
-        playbackController.clear()
+        playbackControllerStorage?.clear()
         deleteAllOwnedSourceFiles(async: true)
         ImportWorkBudget.shared.setPlaybackActive(false)
+    }
+
+    private func cancelDeferredWorkspaceWorkForTeardown(reason: String) {
+        workspaceLifecycleGeneration += 1
+        projectLoadGeneration += 1
+        launchPreviewLoadGeneration += 1
+        isLaunchPreviewLoadInFlight = false
+        pendingHydrationAfterLaunchPreviewLoad = false
+        isDeferredProjectRestorePending = false
+
+        activeImportID = UUID()
+        activeImportOperationIDs.removeAll()
+        audioImportPrewarm?.admissionTask.cancel()
+        audioImportPrewarm?.previewTask.cancel()
+        audioImportPrewarm = nil
+        for operation in audioImportPreviewOperations.values {
+            operation.task.cancel()
+        }
+        audioImportPreviewOperations.removeAll()
+        let importSessionIDs = projectTracks.compactMap(\.importSessionID)
+        if !importSessionIDs.isEmpty {
+            Task {
+                for sessionID in importSessionIDs {
+                    await AudioImportCoordinator.shared.cancel(sessionID: sessionID)
+                    await AudioImportCoordinator.shared.forget(sessionID: sessionID)
+                }
+            }
+        }
+
+        viewportPersistenceWorkItem?.cancel()
+        viewportPersistenceWorkItem = nil
+        autosaveWorkItem?.cancel()
+        autosaveWorkItem = nil
+        autosaveGeneration += 1
+        latestAutosaveScheduleReason = reason
+
+        launchSnapshotSaveWorkItem?.cancel()
+        launchSnapshotSaveWorkItem = nil
+        launchSnapshotSaveGeneration += 1
+        pendingLaunchCacheWriteRequest = nil
+        launchWaveformCacheTasks.values.forEach { $0.cancel() }
+        launchWaveformCacheTasks.removeAll()
+        launchWaveformCacheRequestIDs.removeAll()
+
+        projectHydrationQueue?.cancel()
+        projectHydrationQueue = nil
+        projectHydrationLaunchCacheWriteScheduled = false
+        projectHydrationImprovedLaunchWaveforms = false
+        cancelAllEditMaterialization()
+
+        scheduledProjectTrackMixWorkItem?.cancel()
+        scheduledProjectTrackMixWorkItem = nil
+        pendingProjectTrackMixUpdate = false
+        deadAirAuditionStopTask?.cancel()
+        deadAirAuditionStopTask = nil
+        denoiseHighlightFadeTask?.cancel()
+        denoiseHighlightFadeTask = nil
+        transcriptionHighlightFadeTask?.cancel()
+        transcriptionHighlightFadeTask = nil
     }
 
     private func configureFisheyeTuningControls() {
@@ -2691,11 +3809,23 @@ final class WorkspaceView: NSView {
         selectionDragTuningPanel.isHidden = true
     }
 
+    private func ensureDebugTuningControlsConfigured() {
+        guard !debugTuningControlsConfigured else {
+            return
+        }
+        debugTuningControlsConfigured = true
+        configureFisheyeTuningControls()
+        configureSelectionDragTuningControls()
+    }
+
     private func toggleDebugTools() {
         setDebugToolsVisible(!debugToolsVisible)
     }
 
     private func setDebugToolsVisible(_ isVisible: Bool) {
+        if isVisible {
+            ensureDebugTuningControlsConfigured()
+        }
         debugToolsVisible = isVisible
         timelineSurface.isDebugToolsVisible = isVisible
         lastResponsiveLayoutWidth = -1
@@ -2856,7 +3986,23 @@ final class WorkspaceView: NSView {
         timelineSurface.updateSelectionDragWaveformTuning(tuning)
     }
 
+    private func applyDefaultWaveformInteractionTuning() {
+        timelineSurface.updateWaveformFisheyeTuning(
+            radius: Float(FisheyeDefaults.radius),
+            exponent: Float(FisheyeDefaults.power),
+            minimumVisibleDuration: FisheyeDefaults.start,
+            maximumVisibleDuration: FisheyeDefaults.full,
+            fadeCurve: Float(FisheyeDefaults.curve),
+            activationDuration: FisheyeDefaults.activationMilliseconds / 1_000
+        )
+        timelineSurface.updateSelectionDragWaveformTuning(SelectionDragTuningDefaults.value)
+    }
+
     private func resetWaveformFisheyeTuningToDefaults() {
+        guard debugTuningControlsConfigured else {
+            applyDefaultWaveformInteractionTuning()
+            return
+        }
         fisheyeRadiusControl.value = FisheyeDefaults.radius
         fisheyePowerControl.value = FisheyeDefaults.power
         fisheyeStartControl.value = FisheyeDefaults.start
@@ -2974,7 +4120,11 @@ final class WorkspaceView: NSView {
         }
 
         if event.keyCode == 6, event.modifierFlags.contains(.command) {
-            undoLastEdit()
+            if event.modifierFlags.contains(.shift) {
+                redoLastEdit()
+            } else {
+                undoLastEdit()
+            }
             return nil
         }
 
@@ -3214,6 +4364,10 @@ final class WorkspaceView: NSView {
             assertNoDefaultPlaceholderWasInstalledDuringRestore(reason: "initial-first-paint")
             recordLaunchFirstFrameLoaded(firstPaintFrame, firstPaint: false)
             LaunchStartupTrace.shared.mark(
+                .workspaceFirstPaintSourceRecorded,
+                recordsDiagnosticEvent: false
+            )
+            LaunchStartupTrace.shared.mark(
                 .workspaceFirstPaintInstalled,
                 fields: launchPlan.diagnosticFields
             )
@@ -3311,6 +4465,10 @@ final class WorkspaceView: NSView {
         let stateProjectURL = (stateProjectURL ?? firstFrame.projectURL).standardizedFileURL
         withoutAutosave {
             clearProjectForLoad(publishesTimeline: false)
+            LaunchStartupTrace.shared.mark(
+                .workspaceFirstPaintProjectCleared,
+                recordsDiagnosticEvent: false
+            )
             currentProjectURL = stateProjectURL
             applyLaunchFirstFrameIdentity(firstFrame)
             applyProjectMasterVolume(firstFrame.masterVolume)
@@ -3320,6 +4478,10 @@ final class WorkspaceView: NSView {
             )
             applyProjectTranscriptDisplayMode(firstFrame.transcriptDisplayMode)
             resetWaveformFisheyeTuningToDefaults()
+            LaunchStartupTrace.shared.mark(
+                .workspaceFirstPaintViewStateApplied,
+                recordsDiagnosticEvent: false
+            )
         }
         applyWindowLayout(
             SoundtimeProjectStore.rememberedWindowLayout(for: stateProjectURL) ??
@@ -3330,6 +4492,10 @@ final class WorkspaceView: NSView {
             launchPreviewTrack(from: track)
         }
         normalizeLoadedProjectEditGroups(reason: firstFrame.source.recordSourceName)
+        LaunchStartupTrace.shared.mark(
+            .workspaceFirstPaintTracksPrepared,
+            recordsDiagnosticEvent: false
+        )
         activeTrackID = projectTracks.first?.id
         selectedTrackID = nil
         selectedTrackIDs.removeAll()
@@ -3349,6 +4515,10 @@ final class WorkspaceView: NSView {
             )
             isLaunchVisualPreviewPendingImmediateRender = firstFrame.summary.hasAnyDrawableWaveform
         }
+        LaunchStartupTrace.shared.mark(
+            .workspaceFirstPaintStatePrepared,
+            recordsDiagnosticEvent: false
+        )
 
         window?.title = projectWindowTitle()
         timelineSurface.prepareLaunchPreviewFirstPaint(
@@ -3362,8 +4532,20 @@ final class WorkspaceView: NSView {
             updatesRendererImmediately: true
         )
         updateProjectDisplayTiming()
+        LaunchStartupTrace.shared.mark(
+            .workspaceFirstPaintDisplayTimingUpdated,
+            recordsDiagnosticEvent: false
+        )
         syncActiveTrackFields()
+        LaunchStartupTrace.shared.mark(
+            .workspaceFirstPaintActiveTrackSynchronized,
+            recordsDiagnosticEvent: false
+        )
         updateEffectCommandState()
+        LaunchStartupTrace.shared.mark(
+            .workspaceFirstPaintContentSynchronized,
+            recordsDiagnosticEvent: false
+        )
 
         if !firstFrame.isShellOnly {
             recordLaunchVisualSkeletonApplied(
@@ -3373,6 +4555,10 @@ final class WorkspaceView: NSView {
                 applyMilliseconds: (CACurrentMediaTime() - applyStartedAt) * 1_000
             )
         }
+        LaunchStartupTrace.shared.mark(
+            .workspaceFirstPaintVisualReadinessRecorded,
+            recordsDiagnosticEvent: false
+        )
     }
 
     private func recordLaunchFirstFrameLoaded(
@@ -3464,7 +4650,7 @@ final class WorkspaceView: NSView {
             fields: ["file": standardizedProjectURL.lastPathComponent]
         )
 
-        DispatchQueue.global(qos: .userInitiated).async {
+        projectCriticalLoadQueue.async {
             let result = ProjectLaunchCoordinator.loadDeferredFirstFrame(
                 projectURL: standardizedProjectURL,
                 usesAutosaveRecovery: usesAutosaveRecovery,
@@ -3578,6 +4764,8 @@ final class WorkspaceView: NSView {
         var isMuted: Bool
         var isSoloed: Bool
         var transcript: TranscriptDocument?
+        var importedAssetID: UUID?
+        var importFingerprint: AudioImportFingerprint?
 
         init(track: SoundtimeProject.Track, sourceURL: URL) {
             let previewSourceOverview = track.waveformPreview?.sourceOverview.waveformOverview
@@ -3599,6 +4787,8 @@ final class WorkspaceView: NSView {
             isMuted = track.isMuted
             isSoloed = track.isSoloed
             transcript = track.transcript
+            importedAssetID = track.importedAssetState?.assetID ?? track.editableSource?.importedAssetID
+            importFingerprint = track.importedAssetState?.fingerprint
         }
 
         init(track: ProjectLaunchFirstFrame.Track) {
@@ -3622,6 +4812,8 @@ final class WorkspaceView: NSView {
             isMuted = track.isMuted
             isSoloed = track.isSoloed
             transcript = track.transcript
+            importedAssetID = track.editableSource?.importedAssetID
+            importFingerprint = nil
         }
 
         func projectTrack(defaultEditGroupID: UUID) -> ProjectTrack {
@@ -3645,7 +4837,9 @@ final class WorkspaceView: NSView {
                 isSoloed: isSoloed,
                 importID: UUID(),
                 editRevision: fileTimeline?.hasEdits == true ? 1 : 0,
-                transcript: transcript
+                transcript: transcript,
+                importedAssetID: importedAssetID,
+                importFingerprint: importFingerprint
             )
         }
 
@@ -3835,16 +5029,30 @@ final class WorkspaceView: NSView {
             timelineSurface.setInteractionSuppressed(false)
         }
         reconcileProjectTranscriptsIfNeeded()
+        let renderTracks = timelineRenderTracks()
+        publishedTimelineRenderTracks = renderTracks
         timelineSurface.displayTracks(
-            timelineRenderTracks(),
+            renderTracks,
             animateWaveformTransition: animateWaveformTransition,
             allowImmediateWaveformPrewarm: allowImmediateWaveformPrewarm,
             allowImmediateInteractiveWaveformPrewarm: allowImmediateInteractiveWaveformPrewarm,
             updatesRendererImmediately: updatesRendererImmediately
         )
+        if updatesRendererImmediately {
+            LaunchStartupTrace.shared.mark(
+                .workspaceFirstPaintTimelinePublished,
+                recordsDiagnosticEvent: false
+            )
+        }
         publishSelectedTracksToTimeline()
         if rebuildControls {
             refreshTrackControls()
+        }
+        if updatesRendererImmediately {
+            LaunchStartupTrace.shared.mark(
+                .workspaceFirstPaintControlsPublished,
+                recordsDiagnosticEvent: false
+            )
         }
     }
 
@@ -3860,26 +5068,74 @@ final class WorkspaceView: NSView {
     }
 
     private func timelineRenderTracks() -> [TimelineRenderState.Track] {
-        projectTracks.map { track in
-            let renderPayload = waveformRenderPayload(for: track)
-            return TimelineRenderState.Track(
-                id: track.id,
-                waveformVersion: waveformVersion(for: track),
-                waveformOverview: renderPayload.overview,
-                durationHint: track.audioTimeline?.duration ??
-                    track.fileTimeline?.duration ??
-                    renderPayload.overview?.duration ??
-                    track.decodedAudioBuffer?.duration ??
-                    track.durationHint,
-                volume: track.volume,
-                isMuted: track.isMuted,
-                isSoloed: track.isSoloed,
-                clipRanges: timelineClipRanges(for: track),
-                waveformSegments: renderPayload.usesSourceSegments ? waveformSegmentsForRendering(track) : [],
-                waveformTileSource: waveformTileSource(for: track),
-                transcript: track.transcript
-            )
+        projectTracks.map { timelineRenderTrack(for: $0) }
+    }
+
+    private func timelineRenderTrack(
+        for track: ProjectTrack
+    ) -> TimelineRenderState.Track {
+        let renderPayload = waveformRenderPayload(for: track)
+        return TimelineRenderState.Track(
+            id: track.id,
+            waveformVersion: waveformVersion(for: track, renderPayload: renderPayload),
+            waveformOverview: renderPayload.overview,
+            durationHint: track.audioTimeline?.duration ??
+                track.fileTimeline?.duration ??
+                renderPayload.overview?.duration ??
+                track.decodedAudioBuffer?.duration ??
+                track.durationHint,
+            volume: track.volume,
+            isMuted: track.isMuted,
+            isSoloed: track.isSoloed,
+            clipRanges: timelineClipRanges(for: track),
+            waveformSegments: renderPayload.usesSourceSegments ? waveformSegmentsForRendering(track) : [],
+            waveformTileSource: waveformTileSource(for: track),
+            transcript: track.transcript
+        )
+    }
+
+    private func timelineRenderTrack(
+        for track: ProjectTrack,
+        reusing previousTrack: TimelineRenderState.Track
+    ) -> TimelineRenderState.Track {
+        guard previousTrack.id == track.id else {
+            return timelineRenderTrack(for: track)
         }
+
+        let renderPayload = waveformRenderPayload(for: track)
+        let canReuseWaveformSource =
+            renderPayload.usesSourceSegments &&
+            previousTrack.waveformOverview?.bins.count == renderPayload.overview?.bins.count &&
+            previousTrack.waveformOverview?.duration == renderPayload.overview?.duration
+
+        return TimelineRenderState.Track(
+            id: track.id,
+            waveformVersion: canReuseWaveformSource ?
+                previousTrack.waveformVersion :
+                waveformVersion(for: track, renderPayload: renderPayload),
+            waveformOverview: canReuseWaveformSource ?
+                previousTrack.waveformOverview :
+                renderPayload.overview,
+            durationHint: track.audioTimeline?.duration ??
+                track.fileTimeline?.duration ??
+                renderPayload.overview?.duration ??
+                track.decodedAudioBuffer?.duration ??
+                track.durationHint,
+            volume: track.volume,
+            isMuted: track.isMuted,
+            isSoloed: track.isSoloed,
+            hasWaveform: canReuseWaveformSource ?
+                previousTrack.hasWaveform :
+                nil,
+            clipRanges: timelineClipRanges(for: track),
+            waveformSegments: renderPayload.usesSourceSegments ?
+                waveformSegmentsForRendering(track) :
+                [],
+            waveformTileSource: canReuseWaveformSource ?
+                previousTrack.waveformTileSource :
+                waveformTileSource(for: track),
+            transcript: track.transcript
+        )
     }
 
     private func timelineMixRenderTracks() -> [TimelineRenderState.Track] {
@@ -3918,6 +5174,21 @@ final class WorkspaceView: NSView {
                 displayOverview: track.waveformOverview,
                 fileTimeline: fileTimeline
             )
+        }
+
+        if let audioTimeline = track.audioTimeline {
+            let sourceDuration = audioTimeline.sourceAudioBuffer.duration
+            let durationTolerance = max(0.01, sourceDuration * 0.000_01)
+            let sourceOverview = track.sourceWaveformOverview ?? track.waveformOverview
+            if
+                let sourceOverview,
+                abs(sourceOverview.duration - sourceDuration) <= durationTolerance
+            {
+                return WaveformRenderPayload(
+                    overview: sourceOverview,
+                    usesSourceSegments: true
+                )
+            }
         }
 
         return WaveformRenderPayload(overview: track.waveformOverview, usesSourceSegments: false)
@@ -3999,22 +5270,42 @@ final class WorkspaceView: NSView {
     }
 
     private func waveformSegmentsForRendering(_ track: ProjectTrack) -> [TimelineRenderState.Track.WaveformSegment] {
-        guard let fileTimeline = track.fileTimeline else {
-            return []
+        if let fileTimeline = track.fileTimeline {
+            return waveformSegmentsForRendering(
+                playbackSegments: fileTimeline.playbackSegments,
+                frameCount: fileTimeline.frameCount,
+                sourceFrameCount: fileTimeline.sourceFrameCount
+            )
         }
 
-        let frameCount = max(fileTimeline.frameCount, 1)
-        let sourceFrameCount = max(fileTimeline.sourceFrameCount, 1)
-        return fileTimeline.playbackSegments.compactMap { segment in
+        if let audioTimeline = track.audioTimeline {
+            return waveformSegmentsForRendering(
+                playbackSegments: audioTimeline.playbackSegments,
+                frameCount: audioTimeline.frameCount,
+                sourceFrameCount: audioTimeline.sourceAudioBuffer.frameCount
+            )
+        }
+
+        return []
+    }
+
+    private func waveformSegmentsForRendering(
+        playbackSegments: [AudioEditTimeline.PlaybackSegment],
+        frameCount: Int,
+        sourceFrameCount: Int
+    ) -> [TimelineRenderState.Track.WaveformSegment] {
+        let safeFrameCount = max(frameCount, 1)
+        let safeSourceFrameCount = max(sourceFrameCount, 1)
+        return playbackSegments.compactMap { segment in
             guard segment.frameCount > 0 else {
                 return nil
             }
 
             return TimelineRenderState.Track.WaveformSegment(
-                outputStartProgress: Float(segment.outputStartFrame) / Float(frameCount),
-                outputEndProgress: Float(segment.outputStartFrame + segment.frameCount) / Float(frameCount),
-                sourceStartProgress: Float(segment.sourceStartFrame) / Float(sourceFrameCount),
-                sourceEndProgress: Float(segment.sourceStartFrame + segment.frameCount) / Float(sourceFrameCount),
+                outputStartProgress: Float(segment.outputStartFrame) / Float(safeFrameCount),
+                outputEndProgress: Float(segment.outputStartFrame + segment.frameCount) / Float(safeFrameCount),
+                sourceStartProgress: Float(segment.sourceStartFrame) / Float(safeSourceFrameCount),
+                sourceEndProgress: Float(segment.sourceStartFrame + segment.frameCount) / Float(safeSourceFrameCount),
                 gainStart: segment.gainStart,
                 gainEnd: segment.gainEnd
             )
@@ -4023,13 +5314,25 @@ final class WorkspaceView: NSView {
 
     private func waveformTileSource(for track: ProjectTrack) -> WaveformTileBuildSource? {
         guard WaveformTiledRendererFeatureFlags.isEnabled,
-              track.audioTimeline == nil,
-              decodableWAVFileInfo(for: track.sourceURL) != nil
+              track.audioTimeline == nil
         else {
             return nil
         }
 
-        return try? WaveformTileBuildSource(wavURL: track.sourceURL, channelMode: .monoMix)
+        let normalizedURL = track.sourceURL.standardizedFileURL
+        if let cachedSource = waveformTileSourceCache[normalizedURL] {
+            return cachedSource
+        }
+        guard decodableWAVFileInfo(for: normalizedURL) != nil,
+              let source = try? WaveformTileBuildSource(
+                  wavURL: normalizedURL,
+                  channelMode: .monoMix
+              )
+        else {
+            return nil
+        }
+        waveformTileSourceCache[normalizedURL] = source
+        return source
     }
 
     private func timelineClipRanges(for track: ProjectTrack) -> [TimelineRenderState.ClipRange] {
@@ -4061,12 +5364,16 @@ final class WorkspaceView: NSView {
         ] : []
     }
 
-    private func waveformVersion(for track: ProjectTrack) -> Int {
+    private func waveformVersion(
+        for track: ProjectTrack,
+        renderPayload: WaveformRenderPayload? = nil
+    ) -> Int {
         var hasher = Hasher()
-        if track.fileTimeline == nil {
+        let renderPayload = renderPayload ?? waveformRenderPayload(for: track)
+        if !renderPayload.usesSourceSegments {
             hasher.combine(track.editRevision)
         }
-        guard let waveformOverview = waveformRenderPayload(for: track).overview else {
+        guard let waveformOverview = renderPayload.overview else {
             return hasher.finalize()
         }
 
@@ -4114,6 +5421,7 @@ final class WorkspaceView: NSView {
             controlView.onRecordRequested = nil
             controlView.onVolumeChanged = nil
             controlView.onVolumeEditingEnded = nil
+            controlView.onCancelImport = nil
             trackControlReusePool.append(controlView)
             trackControlViewsByID[trackID] = nil
         }
@@ -4139,7 +5447,8 @@ final class WorkspaceView: NSView {
                 isSoloed: track.isSoloed,
                 volume: track.volume,
                 isTrackSelected: selectedTrackIDs.contains(track.id),
-                isRecording: track.id == recordingTrackID
+                isRecording: track.id == recordingTrackID,
+                importProgress: activeImportProgress(for: track)
             )
             controlView.onTrackSelected = { [weak self, trackID = track.id] modifierFlags in
                 self?.selectTrack(trackID, modifierFlags: modifierFlags)
@@ -4159,9 +5468,58 @@ final class WorkspaceView: NSView {
             controlView.onVolumeEditingEnded = { [weak self] in
                 self?.publishProjectTrackMixImmediately()
             }
+            controlView.onCancelImport = { [weak self, trackID = track.id] in
+                self?.cancelAudioImport(for: trackID)
+            }
         }
 
         layoutTrackControlViews()
+    }
+
+    private func refreshExistingTrackControlStates() {
+        let tracksByID = Dictionary(uniqueKeysWithValues: projectTracks.map { ($0.id, $0) })
+        for (trackID, controlView) in trackControlViewsByID {
+            guard let track = tracksByID[trackID] else {
+                refreshTrackControls()
+                return
+            }
+            controlView.configure(
+                title: track.name,
+                isMuted: track.isMuted,
+                isSoloed: track.isSoloed,
+                volume: track.volume,
+                isTrackSelected: selectedTrackIDs.contains(track.id),
+                isRecording: track.id == recordingTrackID,
+                importProgress: activeImportProgress(for: track)
+            )
+        }
+    }
+
+    private func activeImportProgress(for track: ProjectTrack) -> Double? {
+        guard
+            let stage = track.importStage,
+            !stage.isTerminal,
+            stage != .editableReady
+        else {
+            return nil
+        }
+        return min(max(track.importProgress, 0), 1)
+    }
+
+    private func cancelAudioImport(for trackID: UUID) {
+        guard
+            let track = projectTracks.first(where: { $0.id == trackID }),
+            let sessionID = track.importSessionID
+        else {
+            return
+        }
+        cancelAudioImportPreview(for: trackID)
+        Task {
+            await AudioImportCoordinator.shared.cancel(sessionID: sessionID)
+            await AudioImportCoordinator.shared.forget(sessionID: sessionID)
+        }
+        removeProjectTrack(trackID)
+        updateStatus("Import canceled")
     }
 
     private func rebuildTrackIndexCache() {
@@ -4834,10 +6192,18 @@ final class WorkspaceView: NSView {
 
     private func ownedSourceURLs(in undoStack: [UndoAction]) -> Set<URL> {
         undoStack.reduce(into: Set<URL>()) { urls, action in
-            guard case let .projectTracks(snapshot) = action else {
-                return
+            switch action {
+            case let .timeline(_, timeline):
+                let url = timeline.sourceAudioBuffer.url
+                if isOwnedRecordingURL(url) {
+                    urls.insert(normalizedOwnedURL(url))
+                }
+            case let .projectTracks(snapshot):
+                urls.formUnion(ownedSourceURLs(in: snapshot.tracks))
+            case let .transaction(record):
+                urls.formUnion(ownedSourceURLs(in: Array(record.before.tracksByID.values)))
+                urls.formUnion(ownedSourceURLs(in: Array(record.after.tracksByID.values)))
             }
-            urls.formUnion(ownedSourceURLs(in: snapshot.tracks))
         }
     }
 
@@ -4853,11 +6219,7 @@ final class WorkspaceView: NSView {
                     continue
                 }
 
-                if AudioExportLeaseManager.shared.deferDeletionIfLeased(candidate) {
-                    continue
-                }
-
-                try? FileManager.default.removeItem(at: candidate)
+                try? AudioExportLeaseManager.shared.deleteOrDefer(candidate)
             }
         }
 
@@ -4874,14 +6236,35 @@ final class WorkspaceView: NSView {
             return
         }
 
-        var protectedURLs = ownedSourceURLs(in: projectTracks)
-        protectedURLs.formUnion(ownedSourceURLs(in: editUndoStack))
-        deleteOwnedSourceFiles(candidateURLs.subtracting(protectedURLs))
+        pendingOwnedSourceCleanupURLs.formUnion(candidateURLs)
+        ownedSourceCleanupWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else {
+                return
+            }
+            let candidates = self.pendingOwnedSourceCleanupURLs
+            self.pendingOwnedSourceCleanupURLs.removeAll()
+            self.ownedSourceCleanupWorkItem = nil
+            var protectedURLs = self.ownedSourceURLs(in: self.projectTracks)
+            protectedURLs.formUnion(self.ownedSourceURLs(in: self.editUndoStack))
+            protectedURLs.formUnion(self.ownedSourceURLs(in: self.editRedoStack))
+            self.deleteOwnedSourceFiles(
+                candidates.subtracting(protectedURLs),
+                async: true
+            )
+        }
+        ownedSourceCleanupWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75, execute: workItem)
     }
 
     private func deleteAllOwnedSourceFiles(async: Bool = false) {
+        ownedSourceCleanupWorkItem?.cancel()
+        ownedSourceCleanupWorkItem = nil
         var urls = ownedSourceURLs(in: projectTracks)
         urls.formUnion(ownedSourceURLs(in: editUndoStack))
+        urls.formUnion(ownedSourceURLs(in: editRedoStack))
+        urls.formUnion(pendingOwnedSourceCleanupURLs)
+        pendingOwnedSourceCleanupURLs.removeAll()
         deleteOwnedSourceFiles(urls, async: async)
     }
 
@@ -4890,13 +6273,36 @@ final class WorkspaceView: NSView {
             projectTracks[index].ownsSourceFile = false
         }
         for undoIndex in editUndoStack.indices {
-            guard case var .projectTracks(snapshot) = editUndoStack[undoIndex] else {
+            switch editUndoStack[undoIndex] {
+            case .timeline:
+                continue
+            case var .projectTracks(snapshot):
+                for trackIndex in snapshot.tracks.indices where snapshot.tracks[trackIndex].ownsSourceFile {
+                    snapshot.tracks[trackIndex].ownsSourceFile = false
+                }
+                editUndoStack[undoIndex] = .projectTracks(snapshot)
+            case var .transaction(record):
+                markTransactionSourcesAsSaved(&record)
+                editUndoStack[undoIndex] = .transaction(record)
+            }
+        }
+        for redoIndex in editRedoStack.indices {
+            guard case var .transaction(record) = editRedoStack[redoIndex] else {
                 continue
             }
-            for trackIndex in snapshot.tracks.indices where snapshot.tracks[trackIndex].ownsSourceFile {
-                snapshot.tracks[trackIndex].ownsSourceFile = false
-            }
-            editUndoStack[undoIndex] = .projectTracks(snapshot)
+            markTransactionSourcesAsSaved(&record)
+            editRedoStack[redoIndex] = .transaction(record)
+        }
+    }
+
+    private func markTransactionSourcesAsSaved(
+        _ record: inout ProjectEditTransactionRecord
+    ) {
+        for trackID in record.before.tracksByID.keys {
+            record.before.tracksByID[trackID]?.ownsSourceFile = false
+        }
+        for trackID in record.after.tracksByID.keys {
+            record.after.tracksByID[trackID]?.ownsSourceFile = false
         }
     }
 
@@ -5028,7 +6434,7 @@ final class WorkspaceView: NSView {
         if AudioAssetImporter.canImport(url) {
             addDroppedAudioAssetTrack(
                 at: url,
-                prewarmedImportTask: consumeAudioImportPrewarm(for: url)
+                prewarm: consumeAudioImportPrewarm(for: url)
             )
             return
         }
@@ -5055,7 +6461,7 @@ final class WorkspaceView: NSView {
         currentPlaybackStatus = "idle"
         playbackTimer?.invalidate()
         playbackTimer = nil
-        playbackController.clear()
+        playbackControllerStorage?.clear()
         timelineSurface.displayWaveform(nil)
         timelineSurface.displaySelection(nil)
         displayPlaybackVisuals(progress: 0, isPlaying: false, synchronizesRenderer: false)
@@ -5173,11 +6579,23 @@ final class WorkspaceView: NSView {
         }
 
         cancelAudioImportPrewarm()
-        let task = Task.detached(priority: .userInitiated) {
+        let admissionTask = Task(priority: .userInitiated) {
             try Task.checkCancellation()
-            return try await AudioImportPipeline.importEditableAsset(at: normalizedURL)
+            return try await AudioImportCoordinator.shared.admit(sourceURL: normalizedURL)
         }
-        audioImportPrewarm = AudioImportPrewarm(url: normalizedURL, task: task)
+        let previewTask = Task(priority: .userInitiated) {
+            try Task.checkCancellation()
+            return try await AudioImportPipeline.loadPreview(
+                at: normalizedURL,
+                targetBinCount: NativeAudioPreview.targetBinCount,
+                samplesPerBin: NativeAudioPreview.samplesPerBin
+            )
+        }
+        audioImportPrewarm = AudioImportPrewarm(
+            url: normalizedURL,
+            admissionTask: admissionTask,
+            previewTask: previewTask
+        )
         SoundtimeDiagnostics.shared.record(
             category: .audio,
             severity: .info,
@@ -5200,14 +6618,12 @@ final class WorkspaceView: NSView {
         }
 
         audioImportPrewarm = nil
-        prewarm.task.cancel()
-        Task.detached(priority: .utility) {
-            do {
-                let proxyResult = try await prewarm.task.value
-                if !proxyResult.usesOriginalFile {
-                    try? FileManager.default.removeItem(at: proxyResult.proxyURL)
-                }
-            } catch {}
+        prewarm.admissionTask.cancel()
+        prewarm.previewTask.cancel()
+        Task {
+            if let admission = try? await prewarm.admissionTask.value {
+                await AudioImportCoordinator.shared.forget(sessionID: admission.sessionID)
+            }
         }
         SoundtimeDiagnostics.shared.record(
             category: .audio,
@@ -5222,7 +6638,7 @@ final class WorkspaceView: NSView {
         PerformanceDashboardWindowController.refreshIfVisible()
     }
 
-    private func consumeAudioImportPrewarm(for url: URL) -> Task<AudioAssetProxyResult, Error>? {
+    private func consumeAudioImportPrewarm(for url: URL) -> AudioImportPrewarm? {
         let normalizedURL = url.standardizedFileURL
         guard let prewarm = audioImportPrewarm, prewarm.url == normalizedURL else {
             return nil
@@ -5240,7 +6656,7 @@ final class WorkspaceView: NSView {
             ]
         )
         PerformanceDashboardWindowController.refreshIfVisible()
-        return prewarm.task
+        return prewarm
     }
 
     private func showUnsupportedAudioFileAlert(for url: URL) {
@@ -5276,7 +6692,7 @@ final class WorkspaceView: NSView {
 
     private func addDroppedAudioAssetTrack(
         at url: URL,
-        prewarmedImportTask: Task<AudioAssetProxyResult, Error>? = nil
+        prewarm: AudioImportPrewarm? = nil
     ) {
         let importName = url.deletingPathExtension().lastPathComponent
         updateStatus("\(importName) opening")
@@ -5299,30 +6715,48 @@ final class WorkspaceView: NSView {
             guard let self else {
                 return
             }
+            var pendingTrackIdentity: (trackID: UUID, importID: UUID)?
             defer {
                 self.activeImportOperationIDs.remove(importOperationID)
             }
             do {
-                let assetInfo = try await AudioAssetImporter.inspect(url: normalizedURL)
+                let admission: AudioImportAdmission
+                if let prewarm {
+                    admission = try await prewarm.admissionTask.value
+                } else {
+                    admission = try await AudioImportCoordinator.shared.admit(
+                        sourceURL: normalizedURL
+                    )
+                }
 
                 let importIdentity = self.addPendingAudioAssetTrack(
-                    at: normalizedURL,
-                    assetInfo: assetInfo,
+                    admission: admission,
                     displayName: importName
                 )
-                self.startPendingAudioAssetPreview(
-                    trackID: importIdentity.trackID,
-                    importID: importIdentity.importID,
-                    url: normalizedURL,
-                    displayName: importName
-                )
-
-                let proxyResult: AudioAssetProxyResult
-                if let prewarmedImportTask {
-                    proxyResult = try await prewarmedImportTask.value
+                pendingTrackIdentity = importIdentity
+                if admission.cachedImport == nil {
+                    self.startPendingAudioAssetPreview(
+                        trackID: importIdentity.trackID,
+                        importID: importIdentity.importID,
+                        url: normalizedURL,
+                        displayName: importName,
+                        prewarmedTask: prewarm?.previewTask
+                    )
                 } else {
-                    proxyResult = try await AudioImportPipeline.importEditableAsset(at: normalizedURL)
+                    prewarm?.previewTask.cancel()
                 }
+                let preparationTask = await AudioImportCoordinator.shared.startPreparingEditableAsset(
+                    admission: admission
+                ) { [weak self] progress in
+                    Task { @MainActor [weak self] in
+                        self?.applyAudioImportProgress(
+                            trackID: importIdentity.trackID,
+                            importID: importIdentity.importID,
+                            progress: progress
+                        )
+                    }
+                }
+                let proxyResult = try await preparationTask.value
 
                 guard self.isTrackImportCurrent(
                     trackID: importIdentity.trackID,
@@ -5351,10 +6785,29 @@ final class WorkspaceView: NSView {
                         "sourceSampleRate": sourceRate,
                         "proxySampleRate": proxyRate,
                         "proxy": proxyResult.proxyURL.lastPathComponent,
+                        "cacheHit": "\(proxyResult.cacheHit)",
+                        "preparationMilliseconds": String(
+                            format: "%.3f",
+                            proxyResult.preparationMilliseconds
+                        ),
+                        "peakWorkingSetBytes": "\(proxyResult.peakWorkingSetBytes)",
                     ]
                 )
                 PerformanceDashboardWindowController.refreshIfVisible()
+            } catch is CancellationError {
+                return
             } catch {
+                if
+                    let pendingTrackIdentity,
+                    let trackIndex = self.projectTracks.firstIndex(where: {
+                        $0.id == pendingTrackIdentity.trackID &&
+                            $0.importID == pendingTrackIdentity.importID
+                    })
+                {
+                    self.projectTracks[trackIndex].importStage = .failed
+                    self.projectTracks[trackIndex].importSessionID = nil
+                    self.scheduleAutosaveIfNeeded()
+                }
                 self.updateStatus("\(importName) import failed: \(error.localizedDescription)")
                 SoundtimeDiagnostics.shared.record(
                     category: .audio,
@@ -5374,36 +6827,74 @@ final class WorkspaceView: NSView {
 
     @discardableResult
     private func addPendingAudioAssetTrack(
-        at url: URL,
-        assetInfo: AudioAssetInfo,
+        admission: AudioImportAdmission,
         displayName: String
     ) -> (trackID: UUID, importID: UUID) {
+        let url = admission.sourceURL
+        let assetInfo = admission.assetInfo
         let trackID = UUID()
-        let importID = UUID()
+        let importID = admission.assetID
         let trackName = displayName.isEmpty ? assetInfo.metadata.displayName : displayName
+        let sourceFrameCount = max(assetInfo.frameCount ?? 0, 0)
+        let sourceSampleRate = assetInfo.sampleRate ?? 0
+        let channelCount = max(assetInfo.channelCount ?? 0, 0)
+        let fileTimeline: AudioFileEditTimeline?
+        let editableSource: EditableAudioSource?
+        if sourceFrameCount > 0, sourceSampleRate.isFinite, sourceSampleRate > 0, channelCount > 0 {
+            fileTimeline = AudioFileEditTimeline(
+                sourceFrameCount: sourceFrameCount,
+                sourceSampleRate: sourceSampleRate
+            )
+            editableSource = EditableAudioSource(
+                importedAssetID: admission.assetID,
+                originalURL: url,
+                editableURL: url,
+                formatOrigin: assetInfo.format,
+                sourceFrameCount: sourceFrameCount,
+                sourceSampleRate: sourceSampleRate,
+                channelCount: channelCount,
+                ownsEditableFile: false
+            )
+        } else {
+            fileTimeline = nil
+            editableSource = nil
+        }
+        let cachedOverview = admission.cachedImport?.waveformOverview
         let track = ProjectTrack(
             id: trackID,
             editGroupID: editGroupIDForNewProjectTrack(),
             name: trackName,
             sourceURL: url,
             durationHint: assetInfo.duration,
-            sourceWaveformOverview: nil,
-            waveformOverview: nil,
+            sourceWaveformOverview: cachedOverview,
+            waveformOverview: cachedOverview,
             decodedAudioBuffer: nil,
             zeroCrossingIndex: nil,
             zeroCrossingProbe: nil,
             audioTimeline: nil,
-            fileTimeline: nil,
-            editableSource: nil,
+            fileTimeline: fileTimeline,
+            editableSource: editableSource,
             ownsSourceFile: false,
             volume: 1,
             isMuted: false,
             isSoloed: false,
             importID: importID,
-            editRevision: 0
+            editRevision: 0,
+            importedAssetID: admission.assetID,
+            importSessionID: admission.sessionID,
+            importStage: admission.initialStage,
+            importProgress: admission.cachedImport == nil ? 0 : 1,
+            importFingerprint: admission.fingerprint
         )
 
         projectTracks.append(track)
+        if let fileTimeline, let editableSource {
+            applyEditableTimelineMirror(
+                trackIndex: projectTracks.count - 1,
+                source: editableSource,
+                timeline: fileTimeline
+            )
+        }
         activeTrackID = trackID
         selectedTrackID = nil
         selectedTrackIDs.removeAll()
@@ -5415,17 +6906,28 @@ final class WorkspaceView: NSView {
         reloadPlaybackFromProjectTracks(preserveProgress: true)
         updateEffectCommandState()
         syncActiveTrackFields()
-        updateStatus("\(trackName) converting to editable audio")
+        scheduleAutosaveIfNeeded()
+        updateStatus(
+            admission.cachedImport == nil ?
+                "\(trackName) playable - preparing editable audio" :
+                "\(trackName) editable audio restored from cache"
+        )
 
         SoundtimeDiagnostics.shared.record(
             category: .audio,
             severity: .info,
             name: "audio-import-track-admitted",
-            message: "Added a dropped non-WAV file to the project before its editable proxy finished.",
+            message: "Admitted an audio asset with an immediate logical edit timeline and original-file playback.",
             fields: [
                 "file": url.lastPathComponent,
                 "format": assetInfo.format.displayName,
                 "duration": assetInfo.duration.map { String(format: "%.3f", $0) } ?? "unknown",
+                "cacheHit": "\(admission.cachedImport != nil)",
+                "assetID": admission.assetID.uuidString,
+                "admissionMilliseconds": String(
+                    format: "%.3f",
+                    admission.admissionMilliseconds
+                ),
             ]
         )
         PerformanceDashboardWindowController.refreshIfVisible()
@@ -5433,19 +6935,83 @@ final class WorkspaceView: NSView {
         return (trackID, importID)
     }
 
+    private func applyAudioImportProgress(
+        trackID: UUID,
+        importID: UUID,
+        progress: AudioImportProgress
+    ) {
+        guard let trackIndex = projectTracks.firstIndex(where: {
+            $0.id == trackID && $0.importID == importID
+        }) else {
+            return
+        }
+
+        projectTracks[trackIndex].importStage = progress.stage
+        projectTracks[trackIndex].importProgress = progress.fraction
+        if
+            let previewOverview = progress.previewOverview,
+            !previewOverview.bins.isEmpty,
+            (
+                projectTracks[trackIndex].sourceWaveformOverview == nil ||
+                projectTracks[trackIndex].importPreviewIsProgressive
+            )
+        {
+            projectTracks[trackIndex].importPreviewIsProgressive = true
+            projectTracks[trackIndex].sourceWaveformOverview = previewOverview
+            projectTracks[trackIndex].waveformOverview =
+                projectTracks[trackIndex].fileTimeline?.waveformOverview(
+                    from: previewOverview
+                ) ?? previewOverview
+            refreshProjectTimelineDisplay(
+                rebuildControls: false,
+                animateWaveformTransition: false,
+                allowImmediateWaveformPrewarm: true,
+                allowImmediateInteractiveWaveformPrewarm: false,
+                updatesRendererImmediately: true
+            )
+        }
+        if let controlView = trackControlViewsByID[trackID] {
+            controlView.configure(
+                title: projectTracks[trackIndex].name,
+                isMuted: projectTracks[trackIndex].isMuted,
+                isSoloed: projectTracks[trackIndex].isSoloed,
+                volume: projectTracks[trackIndex].volume,
+                isTrackSelected: selectedTrackIDs.contains(trackID),
+                isRecording: trackID == recordingTrackID,
+                importProgress: activeImportProgress(for: projectTracks[trackIndex])
+            )
+        }
+        updateStatus("\(projectTracks[trackIndex].name) \(progress.message.lowercased())")
+    }
+
     private func startPendingAudioAssetPreview(
         trackID: UUID,
         importID: UUID,
         url: URL,
-        displayName: String
+        displayName: String,
+        prewarmedTask: Task<AudioAssetPreviewResult, Error>? = nil
     ) {
-        Task { [weak self, trackID, importID, url, displayName] in
+        cancelAudioImportPreview(for: trackID)
+        let token = UUID()
+        let task = Task { @MainActor [weak self, trackID, importID, url, displayName, prewarmedTask] in
+            defer {
+                self?.finishAudioImportPreview(for: trackID, token: token)
+            }
             do {
-                let preview = try await AudioImportPipeline.loadPreview(
-                    at: url,
-                    targetBinCount: NativeAudioPreview.targetBinCount,
-                    samplesPerBin: NativeAudioPreview.samplesPerBin
-                )
+                let preview: AudioAssetPreviewResult
+                if let prewarmedTask {
+                    preview = try await withTaskCancellationHandler {
+                        try await prewarmedTask.value
+                    } onCancel: {
+                        prewarmedTask.cancel()
+                    }
+                } else {
+                    preview = try await AudioImportPipeline.loadPreview(
+                        at: url,
+                        targetBinCount: NativeAudioPreview.targetBinCount,
+                        samplesPerBin: NativeAudioPreview.samplesPerBin
+                    )
+                }
                 guard let self, self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
                     return
                 }
@@ -5475,6 +7041,21 @@ final class WorkspaceView: NSView {
                 PerformanceDashboardWindowController.refreshIfVisible()
             }
         }
+        audioImportPreviewOperations[trackID] = AudioImportPreviewOperation(
+            token: token,
+            task: task
+        )
+    }
+
+    private func cancelAudioImportPreview(for trackID: UUID) {
+        audioImportPreviewOperations.removeValue(forKey: trackID)?.task.cancel()
+    }
+
+    private func finishAudioImportPreview(for trackID: UUID, token: UUID) {
+        guard audioImportPreviewOperations[trackID]?.token == token else {
+            return
+        }
+        audioImportPreviewOperations.removeValue(forKey: trackID)
     }
 
     private func applyPendingAudioAssetPreview(
@@ -5491,6 +7072,7 @@ final class WorkspaceView: NSView {
 
         projectTracks[trackIndex].name = displayName
         projectTracks[trackIndex].durationHint = preview.waveformOverview.duration
+        projectTracks[trackIndex].importPreviewIsProgressive = false
         projectTracks[trackIndex].sourceWaveformOverview = preview.waveformOverview
         projectTracks[trackIndex].waveformOverview = preview.waveformOverview
         activeTrackID = trackID
@@ -5523,11 +7105,9 @@ final class WorkspaceView: NSView {
         guard let trackIndex = projectTracks.firstIndex(where: {
             $0.id == trackID && $0.importID == importID
         }) else {
-            if !proxyResult.usesOriginalFile {
-                try? FileManager.default.removeItem(at: proxyResult.proxyURL)
-            }
             return
         }
+        cancelAudioImportPreview(for: trackID)
 
         let proxyURL = proxyResult.proxyURL.standardizedFileURL
         wavFileInfoCache[proxyURL] = proxyResult.proxyFileInfo
@@ -5540,27 +7120,41 @@ final class WorkspaceView: NSView {
         projectTracks[trackIndex].name = displayName
         projectTracks[trackIndex].sourceURL = proxyURL
         projectTracks[trackIndex].durationHint = proxyResult.proxyFileInfo.duration
+        projectTracks[trackIndex].importPreviewIsProgressive = false
         projectTracks[trackIndex].sourceWaveformOverview = proxyResult.waveformOverview
         projectTracks[trackIndex].waveformOverview = proxyResult.waveformOverview
         projectTracks[trackIndex].decodedAudioBuffer = nil
-        projectTracks[trackIndex].zeroCrossingIndex = proxyResult.zeroCrossingIndex
+        // File-backed proxies use the bounded on-demand probe so very long imports
+        // never need to retain every crossing in memory.
+        projectTracks[trackIndex].zeroCrossingIndex = nil
         projectTracks[trackIndex].zeroCrossingProbe = zeroCrossingProbe
-        let fileTimeline = AudioFileEditTimeline(fileInfo: proxyResult.proxyFileInfo)
+        let fileTimeline = projectTracks[trackIndex].fileTimeline?.remapped(
+            toSourceFrameCount: proxyResult.proxyFileInfo.frameCount,
+            sampleRate: proxyResult.proxyFileInfo.sampleRate
+        ) ?? AudioFileEditTimeline(fileInfo: proxyResult.proxyFileInfo)
         let editableSource = editableAudioSource(
             originalURL: proxyResult.originalInfo.url,
             editableURL: proxyURL,
             formatOrigin: proxyResult.originalInfo.format,
             fileInfo: proxyResult.proxyFileInfo,
-            ownsEditableFile: !proxyResult.usesOriginalFile
+            ownsEditableFile: false,
+            importedAssetID: proxyResult.assetID
         )
         applyEditableTimelineMirror(
             trackIndex: trackIndex,
             source: editableSource,
             timeline: fileTimeline
         )
-        projectTracks[trackIndex].ownsSourceFile = !proxyResult.usesOriginalFile
-        projectTracks[trackIndex].editRevision = 0
+        projectTracks[trackIndex].ownsSourceFile = false
+        projectTracks[trackIndex].editRevision = fileTimeline.hasEdits ?
+            max(projectTracks[trackIndex].editRevision, 1) :
+            projectTracks[trackIndex].editRevision
         projectTracks[trackIndex].importID = UUID()
+        projectTracks[trackIndex].importedAssetID = proxyResult.assetID
+        projectTracks[trackIndex].importSessionID = nil
+        projectTracks[trackIndex].importStage = .complete
+        projectTracks[trackIndex].importProgress = 1
+        projectTracks[trackIndex].importFingerprint = proxyResult.fingerprint
 
         activeTrackID = trackID
         window?.title = projectWindowTitle()
@@ -5585,6 +7179,92 @@ final class WorkspaceView: NSView {
             trackName: displayName,
             reason: "audio-import-complete"
         )
+    }
+
+    private func resumeImportedAudioPreparationIfNeeded(trackID: UUID) {
+        guard
+            let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }),
+            projectTracks[trackIndex].importSessionID == nil,
+            let assetID = projectTracks[trackIndex].importedAssetID,
+            !WAVAudioDecoder.canDecode(projectTracks[trackIndex].sourceURL),
+            AudioAssetImporter.canImport(projectTracks[trackIndex].sourceURL)
+        else {
+            return
+        }
+
+        let sourceURL = projectTracks[trackIndex].sourceURL
+        let displayName = projectTracks[trackIndex].name
+        Task { [weak self, trackID, assetID, sourceURL, displayName] in
+            guard let self else {
+                return
+            }
+            do {
+                let admission = try await AudioImportCoordinator.shared.admit(
+                    sourceURL: sourceURL,
+                    assetID: assetID
+                )
+                guard let currentIndex = self.projectTracks.firstIndex(where: { $0.id == trackID }) else {
+                    await AudioImportCoordinator.shared.forget(sessionID: admission.sessionID)
+                    return
+                }
+                self.projectTracks[currentIndex].importID = assetID
+                self.projectTracks[currentIndex].importSessionID = admission.sessionID
+                self.projectTracks[currentIndex].importStage = admission.initialStage
+                self.projectTracks[currentIndex].importFingerprint = admission.fingerprint
+                if let cached = admission.cachedImport {
+                    self.projectTracks[currentIndex].sourceWaveformOverview = cached.waveformOverview
+                    self.projectTracks[currentIndex].waveformOverview =
+                        self.projectTracks[currentIndex].fileTimeline?.waveformOverview(
+                            from: cached.waveformOverview
+                        ) ?? cached.waveformOverview
+                    self.refreshProjectTimelineDisplay(
+                        rebuildControls: false,
+                        animateWaveformTransition: false
+                    )
+                }
+
+                let task = await AudioImportCoordinator.shared.startPreparingEditableAsset(
+                    admission: admission
+                ) { [weak self] progress in
+                    Task { @MainActor [weak self] in
+                        self?.applyAudioImportProgress(
+                            trackID: trackID,
+                            importID: assetID,
+                            progress: progress
+                        )
+                    }
+                }
+                let result = try await task.value
+                guard self.isTrackImportCurrent(trackID: trackID, importID: assetID) else {
+                    return
+                }
+                self.finishPendingAudioAssetImport(
+                    trackID: trackID,
+                    importID: assetID,
+                    proxyResult: result,
+                    displayName: displayName
+                )
+            } catch is CancellationError {
+                return
+            } catch {
+                guard let currentIndex = self.projectTracks.firstIndex(where: { $0.id == trackID }) else {
+                    return
+                }
+                self.projectTracks[currentIndex].importStage = .failed
+                self.projectTracks[currentIndex].importSessionID = nil
+                self.updateStatus("\(displayName) remains playable; editable proxy failed")
+                SoundtimeDiagnostics.shared.record(
+                    category: .audio,
+                    severity: .warning,
+                    name: "audio-import-resume-failed",
+                    message: "A saved native import stayed playable but its editable proxy could not resume.",
+                    fields: [
+                        "file": sourceURL.lastPathComponent,
+                        "error": error.localizedDescription,
+                    ]
+                )
+            }
+        }
     }
 
     private func addDroppedWAVTrack(
@@ -6568,6 +8248,15 @@ final class WorkspaceView: NSView {
             stopRecording()
         }
 
+        cancelAudioImportPreview(for: trackID)
+        if
+            let sessionID = projectTracks.first(where: { $0.id == trackID })?.importSessionID
+        {
+            Task {
+                await AudioImportCoordinator.shared.cancel(sessionID: sessionID)
+                await AudioImportCoordinator.shared.forget(sessionID: sessionID)
+            }
+        }
         let replacedTracks = projectTracks
         projectTracks.removeAll { $0.id == trackID }
         projectEditGraph.removeArrangement(for: trackID)
@@ -6867,7 +8556,9 @@ final class WorkspaceView: NSView {
     private func reloadPlaybackFromProjectTracks(
         preserveProgress: Bool,
         targetProgress: Float? = nil,
-        resumeIfPlaying: Bool? = nil
+        resumeIfPlaying: Bool? = nil,
+        playbackTracksOverride: [ProjectPlaybackTrack]? = nil,
+        publishesVisualState: Bool = true
     ) {
         scheduledPlaybackReloadWorkItem?.cancel()
         scheduledPlaybackReloadWorkItem = nil
@@ -6875,14 +8566,17 @@ final class WorkspaceView: NSView {
         let previousSnapshot = playbackController.snapshot()
         let previousProgress = targetProgress ?? previousSnapshot.progress
         let shouldResume = resumeIfPlaying ?? (preserveProgress && previousSnapshot.isPlaying)
-        let playbackTracks = projectPlaybackTracks()
+        let playbackTracks = playbackTracksOverride ?? projectPlaybackTracks()
+        publishedProjectPlaybackTracks = playbackTracks
 
         guard !playbackTracks.isEmpty else {
             playbackController.clear()
             currentPlayheadFrame = 0
-            displayPlaybackVisuals(progress: 0, isPlaying: false, synchronizesRenderer: false)
-            updateTimeReadout()
-            updateTransportControlState(isPlaying: false)
+            if publishesVisualState {
+                displayPlaybackVisuals(progress: 0, isPlaying: false, synchronizesRenderer: false)
+                updateTimeReadout()
+                updateTransportControlState(isPlaying: false)
+            }
             return
         }
 
@@ -6902,21 +8596,41 @@ final class WorkspaceView: NSView {
                 try playbackController.seek(toProgress: 0)
             }
 
-            let snapshot = playbackController.snapshot()
-            displayPlaybackVisuals(
-                progress: snapshot.progress,
-                isPlaying: snapshot.isPlaying,
-                syncPlayhead: true,
-                anchorTimestamp: snapshot.hostTimestamp,
-                synchronizesRenderer: snapshot.isPlaying
-            )
+            if publishesVisualState {
+                let snapshot = playbackController.snapshot()
+                displayPlaybackVisuals(
+                    progress: snapshot.progress,
+                    isPlaying: snapshot.isPlaying,
+                    syncPlayhead: true,
+                    anchorTimestamp: snapshot.hostTimestamp,
+                    synchronizesRenderer: snapshot.isPlaying
+                )
+            }
+            lastPlaybackReloadErrorDescription = nil
         } catch {
+            lastPlaybackReloadErrorDescription = error.localizedDescription
+            SoundtimeDiagnostics.shared.record(
+                category: .audio,
+                severity: .severe,
+                name: "project-playback-reload-failed",
+                message: "The project playback graph could not be published.",
+                fields: [
+                    "error": error.localizedDescription,
+                    "trackCount": "\(playbackTracks.count)",
+                    "usedSnapshotOverride": "\(playbackTracksOverride != nil)",
+                    "preserveProgress": "\(preserveProgress)",
+                ]
+            )
             stopPlaybackTimer()
-            displayPlaybackVisuals(progress: 0, isPlaying: false, synchronizesRenderer: false)
+            if publishesVisualState {
+                displayPlaybackVisuals(progress: 0, isPlaying: false, synchronizesRenderer: false)
+            }
             updateStatus("project playback failed: \(error.localizedDescription)")
         }
-        updateTimeReadout()
-        updateTransportControlState(isPlaying: playbackController.isPlaying)
+        if publishesVisualState {
+            updateTimeReadout()
+            updateTransportControlState(isPlaying: playbackController.isPlaying)
+        }
     }
 
     private func schedulePlaybackReloadFromProjectTracks(
@@ -6993,51 +8707,56 @@ final class WorkspaceView: NSView {
     }
 
     private func projectPlaybackTracks() -> [ProjectPlaybackTrack] {
-        return projectTracks.compactMap { track -> ProjectPlaybackTrack? in
-            let source: ProjectPlaybackTrack.Source
-            if
-                let fileTimeline = track.fileTimeline,
-                let fileInfo = decodableWAVFileInfo(for: track.sourceURL),
-                fileTimeline.isCompatible(with: fileInfo)
-            {
-                source = .fileTimeline(
-                    url: track.sourceURL,
-                    timeline: fileTimeline,
-                    zeroCrossingProbe: track.zeroCrossingProbe
-                )
-            } else if track.editRevision == 0, decodableWAVFileInfo(for: track.sourceURL) != nil {
-                source = .file(
-                    url: track.sourceURL,
-                    zeroCrossingProbe: track.zeroCrossingProbe
-                )
-            } else if track.editRevision == 0, AudioAssetImporter.canImport(track.sourceURL) {
-                source = .file(
-                    url: track.sourceURL,
-                    zeroCrossingProbe: nil
-                )
-            } else if let audioTimeline = track.audioTimeline {
-                source = .timeline(
-                    audioTimeline: audioTimeline,
-                    zeroCrossingIndex: track.zeroCrossingIndex
-                )
-            } else if let decodedAudioBuffer = track.decodedAudioBuffer {
-                source = .decoded(
-                    decodedAudioBuffer: decodedAudioBuffer,
-                    zeroCrossingIndex: track.zeroCrossingIndex
-                )
-            } else {
-                return nil
-            }
+        projectTracks.compactMap { projectPlaybackTrack(for: $0) }
+    }
 
-            return ProjectPlaybackTrack(
-                id: track.id,
-                source: source,
-                sourceRevision: track.editRevision,
-                volume: track.volume,
-                isMuted: track.isMuted,
-                isSoloed: track.isSoloed
+    private func projectPlaybackTrack(
+        for track: ProjectTrack
+    ) -> ProjectPlaybackTrack? {
+        let source: ProjectPlaybackTrack.Source
+        if
+            let fileTimeline = track.fileTimeline,
+            let editableSource = track.editableSource,
+            editableSource.editableURL == track.sourceURL.standardizedFileURL,
+            editableSource.isCompatible(with: fileTimeline)
+        {
+            source = .fileTimeline(
+                url: track.sourceURL,
+                timeline: fileTimeline,
+                zeroCrossingProbe: track.zeroCrossingProbe
             )
+        } else if track.editRevision == 0, decodableWAVFileInfo(for: track.sourceURL) != nil {
+            source = .file(
+                url: track.sourceURL,
+                zeroCrossingProbe: track.zeroCrossingProbe
+            )
+        } else if track.editRevision == 0, AudioAssetImporter.canImport(track.sourceURL) {
+            source = .file(
+                url: track.sourceURL,
+                zeroCrossingProbe: nil
+            )
+        } else if let audioTimeline = track.audioTimeline {
+            source = .timeline(
+                audioTimeline: audioTimeline,
+                zeroCrossingIndex: track.zeroCrossingIndex
+            )
+        } else if let decodedAudioBuffer = track.decodedAudioBuffer {
+            source = .decoded(
+                decodedAudioBuffer: decodedAudioBuffer,
+                zeroCrossingIndex: track.zeroCrossingIndex
+            )
+        } else {
+            return nil
         }
+
+        return ProjectPlaybackTrack(
+            id: track.id,
+            source: source,
+            sourceRevision: track.editRevision,
+            volume: track.volume,
+            isMuted: track.isMuted,
+            isSoloed: track.isSoloed
+        )
     }
 
     private func projectPlaybackTrackMixes() -> [ProjectPlaybackTrackMix] {
@@ -7520,7 +9239,8 @@ final class WorkspaceView: NSView {
             return nil
         }
 
-        let playheadTime = Double(playbackController.snapshot().progress) * projectDuration
+        let playheadProgress = playbackControllerStorage?.snapshot().progress ?? visualPlayheadProgress
+        let playheadTime = Double(playheadProgress) * projectDuration
         let localProgress = min(max(playheadTime / trackDuration, 0), 1)
         let clipRanges = timelineClipRanges(for: track)
         guard let clipRange = clipRanges.first(where: {
@@ -7654,12 +9374,755 @@ final class WorkspaceView: NSView {
         editMaterializationTasks[trackID] = task
     }
 
+    private func preparePortablePaste(
+        clipboard: AudioClipboard,
+        command: EditCommand,
+        destinationTrack: ProjectTrack
+    ) {
+        guard
+            command.kind == .paste,
+            command.clipboardID == clipboard.id,
+            let clipboardBuffer = clipboard.buffer
+        else {
+            updateStatus("paste failed: copied audio is not ready")
+            return
+        }
+
+        let plan: EditPlan
+        do {
+            plan = try EditTransactionPlanner.plan(
+                command: command,
+                currentRevision: projectEditRevision(),
+                tracks: editTrackDescriptors(for: command)
+            )
+        } catch {
+            updateStatus("paste failed: \(error.localizedDescription)")
+            return
+        }
+
+        guard
+            let trackEdit = plan.trackEdits.first,
+            case let .insert(insertionFrame) = trackEdit.mutation
+        else {
+            updateStatus("paste failed: invalid insertion plan")
+            return
+        }
+
+        let outputURL = recordingFileURL(trackName: "\(destinationTrack.name)-Paste")
+        let renderSnapshot: AudioExportSnapshot
+        do {
+            renderSnapshot = try portablePasteRenderSnapshot(
+                clipboardBuffer: clipboardBuffer,
+                destinationTrack: destinationTrack,
+                insertionFrame: insertionFrame,
+                outputURL: outputURL
+            )
+        } catch {
+            updateStatus("paste failed: \(error.localizedDescription)")
+            return
+        }
+
+        let trackID = destinationTrack.id
+        let requestID = UUID()
+        editMaterializationTasks[trackID]?.cancel()
+        portablePastePreparationJobs[trackID]?.cancel()
+        let previousSelection = selectedTimelineRange
+        let destinationFrameCount =
+            destinationTrack.fileTimeline?.frameCount ??
+            destinationTrack.audioTimeline?.frameCount ??
+            destinationTrack.decodedAudioBuffer?.frameCount ??
+            0
+        let insertionProgress = destinationFrameCount > 0
+            ? Double(insertionFrame) / Double(destinationFrameCount)
+            : 0
+        let optimisticOverview = optimisticWaveformOverview(
+            destinationTrack.waveformOverview ?? destinationTrack.sourceWaveformOverview,
+            replacing: TimelineSelection(
+                startProgress: insertionProgress,
+                endProgress: insertionProgress,
+                trackID: trackID
+            ),
+            with: clipboard.waveformOverview,
+            targetDuration: renderSnapshot.duration,
+            preservesResolution: true
+        )
+        let pasteVisual = beginPasteVisualEffect(
+            trackID: trackID,
+            startTime: command.insertionTime?.seconds ?? 0,
+            insertedDuration: clipboardBuffer.duration,
+            projectDurationBeforePaste: projectSelectionDuration,
+            waveformOverview: clipboard.waveformOverview
+        )
+        // Beginning the visual enters the shared edit critical section and
+        // cancels stale preparation. Register this request only after that reset.
+        editMaterializationRequestIDs[trackID] = requestID
+        updateStatus("preparing pasted audio")
+
+        let lease = AudioExportLeaseManager.shared.acquire(
+            urls: renderSnapshot.leasedURLs,
+            jobID: requestID
+        )
+        let job = PortablePastePreparationJob()
+        portablePastePreparationJobs[trackID] = job
+        portablePastePreparationQueue.async { [
+            clipboard,
+            clipboardBuffer,
+            command,
+            destinationTrack,
+            job,
+            lease,
+            optimisticOverview,
+            plan,
+            renderSnapshot,
+            requestID,
+            trackID,
+            previousSelection,
+            pasteVisual,
+        ] in
+            let preparationStartedAt = CACurrentMediaTime()
+            let result: PortablePastePreparationResult
+            do {
+                try job.checkCancellation()
+                let asset = try Self.renderPortablePasteAsset(
+                    snapshot: renderSnapshot,
+                    cancellationCheck: job.checkCancellation
+                )
+                try job.checkCancellation()
+                result = .success(asset)
+            } catch is CancellationError {
+                try? AudioExportLeaseManager.shared.deleteOrDefer(
+                    renderSnapshot.request.destinationURL
+                )
+                result = .canceled
+            } catch {
+                result = .failure(error.localizedDescription)
+            }
+            AudioExportLeaseManager.shared.release(lease)
+            SoundtimeDiagnostics.shared.record(
+                category: .edit,
+                severity: .info,
+                name: "portable-paste-preparation-complete",
+                message: "Cross-source paste media preparation finished.",
+                fields: [
+                    "elapsedMs": String(
+                        format: "%.3f",
+                        (CACurrentMediaTime() - preparationStartedAt) * 1_000
+                    ),
+                    "trackID": trackID.uuidString,
+                ]
+            )
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else {
+                    if case let .success(asset) = result {
+                        try? AudioExportLeaseManager.shared.deleteOrDefer(asset.url)
+                    }
+                    return
+                }
+                guard
+                    self.portablePastePreparationJobs[trackID] === job,
+                    self.editMaterializationRequestIDs[trackID] == requestID
+                else {
+                    if case let .success(asset) = result {
+                        try? AudioExportLeaseManager.shared.deleteOrDefer(asset.url)
+                    }
+                    return
+                }
+                self.clearPortablePastePreparationJob(
+                    trackID: trackID,
+                    requestID: requestID
+                )
+
+                guard
+                    self.projectEditRevision() == command.baseRevision,
+                    self.audioClipboard?.id == clipboard.id,
+                    self.projectTracks.contains(where: { $0.id == trackID })
+                else {
+                    if case let .success(asset) = result {
+                        try? AudioExportLeaseManager.shared.deleteOrDefer(asset.url)
+                    }
+                    self.rollbackPortablePasteVisual(
+                        generation: pasteVisual.generation,
+                        previousSelection: previousSelection
+                    )
+                    self.updateStatus("paste canceled because the project changed")
+                    return
+                }
+
+                switch result {
+                case let .success(asset):
+                let fileTimeline = AudioFileEditTimeline(fileInfo: asset.fileInfo)
+                let editableSource = self.editableAudioSource(
+                    originalURL: asset.url,
+                    editableURL: asset.url,
+                    formatOrigin: .wav,
+                    fileInfo: asset.fileInfo,
+                    ownsEditableFile: true
+                )
+                var nextTrack = destinationTrack
+                nextTrack.sourceURL = asset.url
+                nextTrack.sourceWaveformOverview = optimisticOverview
+                nextTrack.waveformOverview = optimisticOverview
+                nextTrack.decodedAudioBuffer = nil
+                nextTrack.zeroCrossingIndex = nil
+                nextTrack.zeroCrossingProbe = try? WAVAudioDecoder.makeZeroCrossingProbe(
+                    url: asset.url,
+                    fileInfo: asset.fileInfo
+                )
+                nextTrack.audioTimeline = nil
+                nextTrack.fileTimeline = fileTimeline
+                nextTrack.editableSource = editableSource
+                nextTrack.ownsSourceFile = true
+                nextTrack.durationHint = fileTimeline.duration
+                nextTrack.importID = UUID()
+                nextTrack.importedAssetID = nil
+                nextTrack.importSessionID = nil
+                nextTrack.importStage = nil
+                nextTrack.importProgress = 1
+                nextTrack.importFingerprint = nil
+                nextTrack.importPreviewIsProgressive = false
+                nextTrack.editRevision += 1
+                nextTrack.transcript = Self.transcript(
+                    destinationTrack.transcript,
+                    insertingDuration: clipboardBuffer.duration,
+                    at: command.insertionTime?.seconds ?? 0,
+                    sourceRevision: nextTrack.editRevision,
+                    sourceDuration: fileTimeline.duration
+                )
+
+                var nextGraph = self.currentEditGraph()
+                nextGraph.upsert(
+                    source: editableSource,
+                    trackID: trackID,
+                    timeline: fileTimeline
+                )
+                let insertedRange = ProjectEditRange(
+                    start: command.insertionTime ?? .zero,
+                    end: (command.insertionTime ?? .zero) +
+                        ProjectTime(seconds: clipboardBuffer.duration)
+                )
+                let nextProjectDuration = max(
+                    self.projectSelectionDuration,
+                    fileTimeline.duration
+                )
+                let finalSelection = insertedRange.map {
+                    self.displaySelection(
+                        for: $0,
+                        trackID: trackID,
+                        projectDuration: nextProjectDuration
+                    )
+                } ?? pasteVisual.visualSelection
+                let preparedCommit = PreparedProjectEditCommit(
+                    plan: plan,
+                    tracksByID: [trackID: nextTrack],
+                    editGraph: nextGraph,
+                    selectedTimelineRange: finalSelection,
+                    clipboard: clipboard
+                )
+                do {
+                    let transaction = try self.commitPreparedProjectEdit(
+                        preparedCommit,
+                        keepsTransitionVisual: true
+                    )
+                    self.scheduleTransactionVisualHandoff(
+                        generation: pasteVisual.generation,
+                        state: transaction.after
+                    )
+                    self.updateEffectCommandState()
+                    self.updateStatus("pasted \(self.formatDuration(clipboardBuffer.duration))")
+                    self.cleanupOwnedSourceFiles(replacedTracks: [destinationTrack])
+                } catch {
+                    try? AudioExportLeaseManager.shared.deleteOrDefer(asset.url)
+                    self.rollbackPortablePasteVisual(
+                        generation: pasteVisual.generation,
+                        previousSelection: previousSelection
+                    )
+                    self.updateStatus("paste failed: \(error.localizedDescription)")
+                }
+
+                case let .failure(message):
+                    self.rollbackPortablePasteVisual(
+                        generation: pasteVisual.generation,
+                        previousSelection: previousSelection
+                    )
+                    self.updateStatus("paste failed: \(message)")
+
+                case .canceled:
+                    self.rollbackPortablePasteVisual(
+                        generation: pasteVisual.generation,
+                        previousSelection: previousSelection
+                    )
+                }
+            }
+        }
+    }
+
+    private func portablePasteRenderSnapshot(
+        clipboardBuffer: DecodedAudioBuffer,
+        destinationTrack: ProjectTrack,
+        insertionFrame: Int,
+        outputURL: URL
+    ) throws -> AudioExportSnapshot {
+        let destinationSource: AudioExportTrackSource
+        let destinationSampleRate: Double
+        let destinationChannelCount: Int
+        let destinationFrameCount: Int
+        let destinationSourceURL: URL?
+
+        if let timeline = destinationTrack.audioTimeline {
+            destinationSampleRate = timeline.sourceAudioBuffer.sampleRate
+            destinationChannelCount = timeline.sourceAudioBuffer.channelCount
+            destinationFrameCount = timeline.frameCount
+            destinationSourceURL = timeline.sourceAudioBuffer.url
+            let insertedFrameCount = Int(
+                (clipboardBuffer.duration * destinationSampleRate).rounded()
+            )
+            destinationSource = .decodedSegments(
+                timeline.sourceAudioBuffer,
+                Self.playbackSegments(
+                    timeline.playbackSegments,
+                    insertingGapAt: insertionFrame,
+                    frameCount: insertedFrameCount
+                )
+            )
+        } else {
+            guard
+                let fileInfo = decodableWAVFileInfo(for: destinationTrack.sourceURL)
+            else {
+                throw PlaybackError.invalidFormat
+            }
+            let timeline = destinationTrack.fileTimeline ??
+                AudioFileEditTimeline(fileInfo: fileInfo)
+            destinationSampleRate = fileInfo.sampleRate
+            destinationChannelCount = fileInfo.channelCount
+            destinationFrameCount = timeline.frameCount
+            destinationSourceURL = destinationTrack.sourceURL
+            let insertedFrameCount = Int(
+                (clipboardBuffer.duration * destinationSampleRate).rounded()
+            )
+            destinationSource = .fileSegments(
+                destinationTrack.sourceURL,
+                fileInfo,
+                Self.playbackSegments(
+                    timeline.playbackSegments,
+                    insertingGapAt: insertionFrame,
+                    frameCount: insertedFrameCount
+                )
+            )
+        }
+
+        guard
+            destinationSampleRate.isFinite,
+            destinationSampleRate > 0,
+            clipboardBuffer.sampleRate.isFinite,
+            clipboardBuffer.sampleRate > 0,
+            clipboardBuffer.frameCount > 0
+        else {
+            throw PlaybackError.invalidFormat
+        }
+
+        let clampedInsertionFrame = min(max(insertionFrame, 0), destinationFrameCount)
+        let insertedDestinationFrameCount = max(
+            Int((clipboardBuffer.duration * destinationSampleRate).rounded()),
+            1
+        )
+        let clipboardOutputStartFrame = Int(
+            (
+                Double(clampedInsertionFrame) /
+                    destinationSampleRate *
+                    clipboardBuffer.sampleRate
+            ).rounded()
+        )
+        let clipboardSegment = AudioEditTimeline.PlaybackSegment(
+            outputStartFrame: clipboardOutputStartFrame,
+            sourceStartFrame: 0,
+            frameCount: clipboardBuffer.frameCount,
+            sourceFrameScale: 0,
+            gainStart: 1,
+            gainEnd: 1,
+            startsNewClip: true
+        )
+
+        let destinationSnapshot = AudioExportTrackSnapshot(
+            id: destinationTrack.id,
+            name: destinationTrack.name,
+            volume: 1,
+            source: destinationSource
+        )
+        let clipboardSnapshot = AudioExportTrackSnapshot(
+            id: UUID(),
+            name: "Clipboard",
+            volume: 1,
+            source: .decodedSegments(clipboardBuffer, [clipboardSegment])
+        )
+        let request = AudioExportRequest(
+            projectName: "Portable Paste",
+            scope: .fullMixdown,
+            format: .wav,
+            destinationURL: outputURL,
+            wavEncoding: .float32
+        )
+        let fullFrameCount = destinationFrameCount + insertedDestinationFrameCount
+        return AudioExportSnapshot(
+            id: request.id,
+            createdAt: request.createdAt,
+            request: request,
+            tracks: [destinationSnapshot, clipboardSnapshot],
+            sampleRate: destinationSampleRate,
+            channelCount: max(
+                destinationChannelCount,
+                clipboardBuffer.channelCount,
+                1
+            ),
+            fullDurationFrameCount: fullFrameCount,
+            exportFrameRange: 0..<fullFrameCount,
+            leasedURLs: destinationSourceURL.map { [$0] } ?? []
+        )
+    }
+
+    private nonisolated static func playbackSegments(
+        _ segments: [AudioEditTimeline.PlaybackSegment],
+        insertingGapAt requestedInsertionFrame: Int,
+        frameCount requestedInsertedFrameCount: Int
+    ) -> [AudioEditTimeline.PlaybackSegment] {
+        let insertionFrame = max(requestedInsertionFrame, 0)
+        let insertedFrameCount = max(requestedInsertedFrameCount, 0)
+        guard insertedFrameCount > 0 else {
+            return segments
+        }
+
+        var output: [AudioEditTimeline.PlaybackSegment] = []
+        output.reserveCapacity(segments.count + 1)
+        for segment in segments {
+            let segmentStart = segment.outputStartFrame
+            let segmentEnd = segment.outputStartFrame + segment.frameCount
+            if segmentEnd <= insertionFrame {
+                output.append(segment)
+                continue
+            }
+            if segmentStart >= insertionFrame {
+                output.append(AudioEditTimeline.PlaybackSegment(
+                    outputStartFrame: segmentStart + insertedFrameCount,
+                    sourceStartFrame: segment.sourceStartFrame,
+                    frameCount: segment.frameCount,
+                    sourceFrameScale: segment.sourceFrameScale,
+                    gainStart: segment.gainStart,
+                    gainEnd: segment.gainEnd,
+                    startsNewClip: segment.startsNewClip
+                ))
+                continue
+            }
+
+            let leadingFrameCount = insertionFrame - segmentStart
+            let trailingFrameCount = segmentEnd - insertionFrame
+            let sourceScale = segment.sourceFrameScale > 0
+                ? segment.sourceFrameScale
+                : 1
+            let leadingEndGain = Self.segmentGain(
+                segment,
+                at: max(leadingFrameCount - 1, 0)
+            )
+            let trailingStartGain = Self.segmentGain(
+                segment,
+                at: leadingFrameCount
+            )
+            if leadingFrameCount > 0 {
+                output.append(AudioEditTimeline.PlaybackSegment(
+                    outputStartFrame: segmentStart,
+                    sourceStartFrame: segment.sourceStartFrame,
+                    frameCount: leadingFrameCount,
+                    sourceFrameScale: segment.sourceFrameScale,
+                    gainStart: segment.gainStart,
+                    gainEnd: leadingEndGain,
+                    startsNewClip: segment.startsNewClip
+                ))
+            }
+            if trailingFrameCount > 0 {
+                output.append(AudioEditTimeline.PlaybackSegment(
+                    outputStartFrame: insertionFrame + insertedFrameCount,
+                    sourceStartFrame: segment.sourceStartFrame +
+                        Int((Double(leadingFrameCount) * sourceScale).rounded()),
+                    frameCount: trailingFrameCount,
+                    sourceFrameScale: segment.sourceFrameScale,
+                    gainStart: trailingStartGain,
+                    gainEnd: segment.gainEnd,
+                    startsNewClip: true
+                ))
+            }
+        }
+        return output
+    }
+
+    private nonisolated static func segmentGain(
+        _ segment: AudioEditTimeline.PlaybackSegment,
+        at requestedOffset: Int
+    ) -> Float {
+        guard segment.frameCount > 1 else {
+            return segment.gainEnd
+        }
+        let offset = min(max(requestedOffset, 0), segment.frameCount - 1)
+        let progress = Float(offset) / Float(segment.frameCount - 1)
+        let curve = progress * progress * (3 - 2 * progress)
+        return segment.gainStart + (segment.gainEnd - segment.gainStart) * curve
+    }
+
+    private nonisolated static func renderPortablePasteAsset(
+        snapshot: AudioExportSnapshot,
+        cancellationCheck: AudioExportRenderer.CancellationCheck? = nil
+    ) throws -> PortablePasteRenderedAsset {
+        let writer = try AudioExportStreamingWAVWriter(
+            url: snapshot.request.destinationURL,
+            sampleRate: snapshot.sampleRate,
+            channelCount: snapshot.channelCount,
+            encoding: .float32
+        )
+        do {
+            let usedFastPath = try renderPortablePasteFastPath(
+                snapshot: snapshot,
+                writer: writer,
+                cancellationCheck: cancellationCheck
+            )
+            if !usedFastPath {
+                _ = try AudioExportRenderer.renderMixdown(
+                    snapshot: snapshot,
+                    to: writer,
+                    cancellationCheck: cancellationCheck
+                )
+            }
+            let fileInfo = try WAVAudioDecoder.inspect(url: writer.url)
+            return PortablePasteRenderedAsset(
+                url: writer.url,
+                fileInfo: fileInfo
+            )
+        } catch {
+            writer.cancel()
+            throw error
+        }
+    }
+
+    private nonisolated static func renderPortablePasteFastPath(
+        snapshot: AudioExportSnapshot,
+        writer: AudioExportStreamingWAVWriter,
+        cancellationCheck: AudioExportRenderer.CancellationCheck?
+    ) throws -> Bool {
+        let hasSoloedTrack = snapshot.tracks.contains(where: \.isSoloed)
+        let audibleTracks = snapshot.tracks.filter { track in
+            hasSoloedTrack ? track.isSoloed : !track.isMuted
+        }
+        let sources: [PortablePasteSource] = audibleTracks.compactMap { track in
+            let gain = max(track.volume, 0) * max(track.volume, 0)
+            switch track.source {
+            case let .decodedSegments(buffer, segments):
+                return .decoded(buffer, segments, gain)
+            case let .fileSegments(url, fileInfo, segments):
+                return .file(url, fileInfo, segments, gain)
+            default:
+                return nil
+            }
+        }
+        guard
+            sources.count == audibleTracks.count,
+            sources.allSatisfy({
+                abs($0.sampleRate - snapshot.sampleRate) < 0.001 &&
+                    $0.segments.allSatisfy {
+                        $0.sourceFrameScale == 0 ||
+                            abs($0.sourceFrameScale - 1) < 0.000_000_001
+                    }
+            })
+        else {
+            return false
+        }
+
+        // Cross-source paste is a background operation, so use a larger bounded
+        // block than realtime export to reduce mapped-file and writer overhead.
+        let blockFrameCount = 262_144
+        var outputFrame = snapshot.exportFrameRange.lowerBound
+        while outputFrame < snapshot.exportFrameRange.upperBound {
+            try cancellationCheck?()
+            let outputEndFrame = min(
+                outputFrame + blockFrameCount,
+                snapshot.exportFrameRange.upperBound
+            )
+            let frameCount = outputEndFrame - outputFrame
+            var outputSamples = [[Float]](
+                repeating: [Float](repeating: 0, count: frameCount),
+                count: max(snapshot.channelCount, 1)
+            )
+
+            for source in sources {
+                for segment in source.segments {
+                    let segmentRange = segment.outputStartFrame..<(
+                        segment.outputStartFrame + segment.frameCount
+                    )
+                    let intersectionStart = max(outputFrame, segmentRange.lowerBound)
+                    let intersectionEnd = min(outputEndFrame, segmentRange.upperBound)
+                    guard intersectionStart < intersectionEnd else {
+                        continue
+                    }
+
+                    let segmentOffset = intersectionStart - segment.outputStartFrame
+                    let sourceStartFrame = segment.sourceStartFrame + segmentOffset
+                    let sourceFrameCount = intersectionEnd - intersectionStart
+                    let sourceBuffer: DecodedAudioBuffer
+                    switch source {
+                    case let .decoded(buffer, _, _):
+                        sourceBuffer = buffer
+                    case let .file(url, _, _, _):
+                        sourceBuffer = try WAVAudioDecoder.decode(
+                            url: url,
+                            frameRange: sourceStartFrame..<(sourceStartFrame + sourceFrameCount)
+                        )
+                    }
+
+                    let sourceBufferStartFrame: Int
+                    switch source {
+                    case .decoded:
+                        sourceBufferStartFrame = sourceStartFrame
+                    case .file:
+                        sourceBufferStartFrame = 0
+                    }
+                    let outputOffset = intersectionStart - outputFrame
+                    let sourceRange = sourceBufferStartFrame..<(
+                        sourceBufferStartFrame + sourceFrameCount
+                    )
+                    guard
+                        outputOffset >= 0,
+                        outputOffset + sourceFrameCount <= frameCount,
+                        sourceRange.lowerBound >= 0
+                    else {
+                        throw PlaybackError.invalidFormat
+                    }
+
+                    let constantSegmentGain = segment.gainStart == segment.gainEnd
+                        ? source.gain * segment.gainStart
+                        : nil
+                    for outputChannel in outputSamples.indices {
+                        let sourceChannel = sourceBuffer.channelCount == 1
+                            ? 0
+                            : outputChannel
+                        guard
+                            sourceBuffer.samplesByChannel.indices.contains(sourceChannel),
+                            sourceRange.upperBound <=
+                                sourceBuffer.samplesByChannel[sourceChannel].count
+                        else {
+                            continue
+                        }
+                        let sourceSamples = sourceBuffer.samplesByChannel[sourceChannel]
+                        outputSamples[outputChannel].withUnsafeMutableBufferPointer { output in
+                            sourceSamples.withUnsafeBufferPointer { input in
+                                if let constantSegmentGain {
+                                    for localFrame in 0..<sourceFrameCount {
+                                        output[outputOffset + localFrame] +=
+                                            input[sourceBufferStartFrame + localFrame] *
+                                                constantSegmentGain
+                                    }
+                                } else {
+                                    let denominator = Float(max(segment.frameCount - 1, 1))
+                                    for localFrame in 0..<sourceFrameCount {
+                                        let progress = Float(
+                                            min(
+                                                max(segmentOffset + localFrame, 0),
+                                                segment.frameCount - 1
+                                            )
+                                        ) / denominator
+                                        let curve = progress * progress * (3 - 2 * progress)
+                                        let segmentGain = segment.gainStart +
+                                            (segment.gainEnd - segment.gainStart) * curve
+                                        output[outputOffset + localFrame] +=
+                                            input[sourceBufferStartFrame + localFrame] *
+                                                source.gain *
+                                                segmentGain
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            try writer.append(
+                samplesByChannel: outputSamples,
+                frameCount: frameCount
+            )
+            outputFrame = outputEndFrame
+        }
+        _ = try writer.finish()
+        return true
+    }
+
+    private nonisolated static func transcript(
+        _ transcript: TranscriptDocument?,
+        insertingDuration: TimeInterval,
+        at insertionTime: TimeInterval,
+        sourceRevision: Int,
+        sourceDuration: TimeInterval
+    ) -> TranscriptDocument? {
+        guard var transcript else {
+            return nil
+        }
+        let duration = max(insertingDuration, 0)
+        let insertionTime = max(insertionTime, 0)
+        guard duration > 0 else {
+            return transcript
+        }
+
+        transcript.segments = transcript.segments.map { segment in
+            var segment = segment
+            segment.words = segment.words.map { word in
+                var word = word
+                if word.startTime >= insertionTime {
+                    word.startTime += duration
+                    word.endTime += duration
+                } else if word.endTime > insertionTime {
+                    word.endTime += duration
+                }
+                return word
+            }
+            if segment.startTime >= insertionTime {
+                segment.startTime += duration
+                segment.endTime += duration
+            } else if segment.endTime > insertionTime {
+                segment.endTime += duration
+            }
+            return segment
+        }
+        transcript.sourceRevision = sourceRevision
+        transcript.sourceDuration = max(sourceDuration, 0)
+        transcript.validity = .remapped
+        transcript.sourceFingerprint = nil
+        return transcript
+    }
+
+    private func rollbackPortablePasteVisual(
+        generation: Int,
+        previousSelection: TimelineSelection?
+    ) {
+        guard deleteAnimationGeneration == generation else {
+            return
+        }
+        timelineSurface.clearDeletionEffects()
+        selectedTimelineRange = previousSelection
+        timelineSurface.displaySelection(previousSelection)
+    }
+
+
     private func clearEditMaterializationTask(trackID: UUID, requestID: UUID) {
         guard editMaterializationRequestIDs[trackID] == requestID else {
             return
         }
 
         editMaterializationTasks[trackID] = nil
+        editMaterializationRequestIDs[trackID] = nil
+    }
+
+    private func clearPortablePastePreparationJob(
+        trackID: UUID,
+        requestID: UUID
+    ) {
+        guard editMaterializationRequestIDs[trackID] == requestID else {
+            return
+        }
+        portablePastePreparationJobs[trackID] = nil
         editMaterializationRequestIDs[trackID] = nil
     }
 
@@ -7982,6 +10445,31 @@ final class WorkspaceView: NSView {
             timeline: timeline,
             waveformOverview: WaveformOverviewBuilder.build(from: buffer),
             zeroCrossingIndex: AudioZeroCrossingIndex.build(from: buffer)
+        )
+    }
+
+    private nonisolated static func materializePaste(
+        timeline: AudioEditTimeline,
+        insertionFrame: Int,
+        clipboardBuffer: DecodedAudioBuffer
+    ) throws -> (
+        buffer: DecodedAudioBuffer,
+        timeline: AudioEditTimeline,
+        waveformOverview: WaveformOverview,
+        zeroCrossingIndex: AudioZeroCrossingIndex
+    ) {
+        let frame = min(max(insertionFrame, 0), timeline.frameCount)
+        let progress = timeline.frameCount > 0
+            ? Double(frame) / Double(timeline.frameCount)
+            : 0
+        return try materializePaste(
+            timeline: timeline,
+            selection: TimelineSelection(
+                startProgress: progress,
+                endProgress: progress,
+                trackID: nil
+            ),
+            clipboardBuffer: clipboardBuffer
         )
     }
 
@@ -8672,11 +11160,11 @@ final class WorkspaceView: NSView {
     }
 
     private func deleteSelection(trace: DeleteTimingTrace? = nil) {
-        performOptimisticDelete(copyBeforeDeleting: false, scope: editScope, trace: trace)
+        performTransactionalRangeEdit(kind: .rippleDelete, scope: editScope)
     }
 
     private func removeTimeRangeAcrossScope(trace: DeleteTimingTrace? = nil) {
-        performOptimisticDelete(copyBeforeDeleting: false, scope: editScope, trace: trace)
+        performTransactionalRangeEdit(kind: .rippleDelete, scope: editScope)
     }
 
     private func deleteTimingFields(for target: EditableSelectionTarget) -> [String: String] {
@@ -8695,209 +11183,8 @@ final class WorkspaceView: NSView {
         ]
     }
 
-    private func deleteTimingFields(for edit: RippleDeleteTrackEdit) -> [String: String] {
-        [
-            "trackIndex": "\(edit.trackIndex)",
-            "trackID": edit.trackID.uuidString,
-            "timelineKind": edit.timelineKind.rawValue,
-            "displayStartProgress": String(format: "%.9f", edit.displaySelection.startProgress),
-            "displayEndProgress": String(format: "%.9f", edit.displaySelection.endProgress),
-            "editStartProgress": String(format: "%.9f", edit.editSelection.startProgress),
-            "editEndProgress": String(format: "%.9f", edit.editSelection.endProgress),
-            "originalFrameCount": "\(edit.originalFrameCount)",
-            "originalDuration": String(format: "%.6f", edit.originalDuration),
-            "selectedStartFrame": "\(edit.selectedFrameRange.lowerBound)",
-            "selectedEndFrame": "\(edit.selectedFrameRange.upperBound)",
-            "expectedDeletedFrames": "\(edit.expectedDeletedFrameCount)",
-            "actualDeletedFrames": "\(edit.actualDeletedFrameCount)",
-            "deletedFrameMismatch": "\(edit.actualDeletedFrameCount - edit.expectedDeletedFrameCount)",
-            "deletedDuration": String(format: "%.6f", edit.deletedDuration),
-            "editedDuration": String(format: "%.6f", edit.editedDuration),
-            "usesFileTimeline": "\(edit.editedFileTimeline != nil)",
-            "usesAudioTimeline": "\(edit.editedAudioTimeline != nil)",
-        ]
-    }
-
-    private func recordDeleteSelectionAudit(
-        trackEdits: [RippleDeleteTrackEdit],
-        trace: DeleteTimingTrace
-    ) {
-        for edit in trackEdits {
-            let mismatch = edit.actualDeletedFrameCount - edit.expectedDeletedFrameCount
-            let expectedDuration = edit.originalFrameCount > 0 ?
-                Double(edit.expectedDeletedFrameCount) / Double(edit.originalFrameCount) * edit.originalDuration :
-                0
-            let severity: SoundtimeDiagnosticSeverity = mismatch == 0 ? .info : .warning
-            SoundtimeDiagnostics.shared.record(
-                category: .edit,
-                severity: severity,
-                name: "delete-selection-frame-audit",
-                message: mismatch == 0 ?
-                    "Delete selected the expected timeline frame range." :
-                    "Delete selected a different frame count than the computed selection range.",
-                fields: [
-                    "traceID": trace.id.uuidString,
-                    "operation": trace.operation,
-                    "trackIndex": "\(edit.trackIndex)",
-                    "trackID": edit.trackID.uuidString,
-                    "timelineKind": edit.timelineKind.rawValue,
-                    "displayStartProgress": String(format: "%.9f", edit.displaySelection.startProgress),
-                    "displayEndProgress": String(format: "%.9f", edit.displaySelection.endProgress),
-                    "editStartProgress": String(format: "%.9f", edit.editSelection.startProgress),
-                    "editEndProgress": String(format: "%.9f", edit.editSelection.endProgress),
-                    "originalFrameCount": "\(edit.originalFrameCount)",
-                    "originalDuration": String(format: "%.6f", edit.originalDuration),
-                    "selectedStartFrame": "\(edit.selectedFrameRange.lowerBound)",
-                    "selectedEndFrame": "\(edit.selectedFrameRange.upperBound)",
-                    "expectedDeletedFrames": "\(edit.expectedDeletedFrameCount)",
-                    "actualDeletedFrames": "\(edit.actualDeletedFrameCount)",
-                    "deletedFrameMismatch": "\(mismatch)",
-                    "expectedDuration": String(format: "%.6f", expectedDuration),
-                    "deletedDuration": String(format: "%.6f", edit.deletedDuration),
-                    "editedDuration": String(format: "%.6f", edit.editedDuration),
-                ]
-            )
-        }
-        DispatchQueue.main.async {
-            PerformanceDashboardWindowController.refreshIfVisible()
-        }
-    }
-
     private func clearSelection() {
-        guard
-            let target = currentEditableSelectionTarget()
-        else {
-            updateStatus("select audio to clear")
-            return
-        }
-
-        let displaySelectionToClear = target.displaySelection
-        let clearTargets = rippleDeleteTargets(for: target, scope: editScope)
-        let trackEdits: [ClearTrackEdit]
-        do {
-            trackEdits = try clearTargets.compactMap { try preparedClearTrackEdit(for: $0) }
-        } catch {
-            updateStatus("clear failed: \(error.localizedDescription)")
-            return
-        }
-        guard !trackEdits.isEmpty else {
-            updateStatus("no audio in selected time")
-            return
-        }
-
-        let undoSnapshot = ProjectTrackUndoSnapshot(
-            tracks: projectTracks,
-            activeTrackID: activeTrackID,
-            selectedTrackID: selectedTrackID,
-            selectedTrackIDs: selectedTrackIDs,
-            selectedTimelineRange: selectedTimelineRange,
-            restoreProgress: displaySelectionToClear.startProgressFloat
-        )
-
-        SoundtimeDiagnostics.shared.record(
-            category: .edit,
-            severity: .info,
-            name: "clear-selection",
-            message: "User requested a scoped non-ripple clear edit.",
-            fields: [
-                "scope": editScope.title,
-                "trackCount": "\(trackEdits.count)",
-                "startProgress": String(format: "%.9f", displaySelectionToClear.startProgress),
-                "endProgress": String(format: "%.9f", displaySelectionToClear.endProgress),
-            ]
-        )
-
-        editUndoStack.append(.projectTracks(undoSnapshot))
-        var materializationEdits: [(trackID: UUID, timeline: AudioEditTimeline, editRevision: Int)] = []
-        var statusDuration = TimeInterval(0)
-        for edit in trackEdits {
-            guard projectTracks.indices.contains(edit.trackIndex) else {
-                continue
-            }
-
-            projectTracks[edit.trackIndex].editRevision += 1
-            let editRevision = projectTracks[edit.trackIndex].editRevision
-            applyEditedTimelineState(
-                trackIndex: edit.trackIndex,
-                editedAudioTimeline: edit.editedAudioTimeline,
-                editedFileTimeline: edit.editedFileTimeline,
-                editedDuration: edit.editedDuration
-            )
-            let currentOverview = projectTracks[edit.trackIndex].waveformOverview
-            if let editedFileTimeline = edit.editedFileTimeline {
-                projectTracks[edit.trackIndex].waveformOverview =
-                    optimisticWaveformOverview(
-                        currentOverview,
-                        applyingGain: 0,
-                        to: edit.editSelection
-                    ) ??
-                    optimisticWaveformOverview(
-                        for: editedFileTimeline,
-                        sourceOverview: projectTracks[edit.trackIndex].sourceWaveformOverview,
-                        fallbackOverview: currentOverview
-                    )
-                scheduleFileTimelineWaveformRefinement(
-                    trackID: edit.trackID,
-                    fileTimeline: editedFileTimeline,
-                    sourceOverview: projectTracks[edit.trackIndex].sourceWaveformOverview ?? currentOverview,
-                    editRevision: editRevision
-                )
-            } else {
-                projectTracks[edit.trackIndex].waveformOverview = optimisticWaveformOverview(
-                    currentOverview,
-                    applyingGain: 0,
-                    to: edit.editSelection
-                )
-                cancelEditWaveformRefinement(for: edit.trackID)
-            }
-
-            statusDuration = max(statusDuration, edit.clearedDuration)
-            if let editedAudioTimeline = edit.editedAudioTimeline {
-                materializationEdits.append((
-                    trackID: edit.trackID,
-                    timeline: editedAudioTimeline,
-                    editRevision: editRevision
-                ))
-            }
-        }
-
-        selectedTimelineRange = nil
-        timelineSurface.displaySelection(nil)
-        timelineSurface.displayGainPreview(selection: nil, gain: 1)
-        syncActiveTrackFields()
-        refreshProjectTimelineDisplay(rebuildControls: false)
-        updateProjectDisplayTiming()
-        reloadPlaybackFromProjectTracks(preserveProgress: true)
-        updateEffectCommandState()
-        let scopeSuffix: String
-        if trackEdits.count > 1 {
-            switch editScope {
-            case .track:
-                scopeSuffix = ""
-            case .selected:
-                scopeSuffix = " across \(trackEdits.count) selected tracks"
-            case .group:
-                scopeSuffix = " across \(trackEdits.count) grouped tracks"
-            case .all:
-                scopeSuffix = " across \(trackEdits.count) tracks"
-            }
-        } else {
-            scopeSuffix = ""
-        }
-        let status = "cleared \(formatDuration(statusDuration))\(scopeSuffix)"
-        updateStatus(status)
-
-        for edit in materializationEdits {
-            materializeEditedTimeline(
-                trackID: edit.trackID,
-                timeline: edit.timeline,
-                editRevision: edit.editRevision,
-                status: status,
-                preservePlaybackProgress: true,
-                startDelay: editMaterializationDelay,
-                animateWaveformTransition: false
-            )
-        }
+        performTransactionalRangeEdit(kind: .clearGap, scope: editScope)
     }
 
     private func deleteSelectedTrackOrSelection(trace: DeleteTimingTrace? = nil) {
@@ -9948,10 +12235,10 @@ final class WorkspaceView: NSView {
             editSelection: candidate.editSelection
         )
         clearDeadAirReview(publish: true)
-        performOptimisticDelete(
-            target: target,
-            copyBeforeDeleting: false,
-            scope: .track
+        performTransactionalRangeEdit(
+            kind: .rippleDelete,
+            scope: .track,
+            target: target
         )
     }
 
@@ -10373,7 +12660,7 @@ final class WorkspaceView: NSView {
     }
 
     private func cutSelection() {
-        performOptimisticDelete(copyBeforeDeleting: true, scope: .track)
+        performTransactionalRangeEdit(kind: .cut, scope: .track)
     }
 
     private func copySelection() {
@@ -10385,89 +12672,162 @@ final class WorkspaceView: NSView {
         }
 
         timelineSurface.triggerSelectionCopyFlash()
-
-        let trackIndex = target.trackIndex
-        let selectedTimelineRange = target.editSelection
-        if let currentTimeline = projectTracks[trackIndex].audioTimeline {
-            updateStatus("copying selection")
-            Task { [weak self, currentTimeline, selectedTimelineRange] in
-                let clipboard = await Task.detached(priority: .userInitiated) {
-                    let buffer = currentTimeline.render(selection: selectedTimelineRange)
-                    return AudioClipboard(
-                        buffer: buffer,
-                        waveformOverview: WaveformOverviewBuilder.build(from: buffer)
-                    )
-                }.value
-
-                guard let self else {
-                    return
-                }
-
-                self.audioClipboard = clipboard
-                self.updateStatus("copied \(self.formatDuration(clipboard.buffer?.duration ?? 0))")
-            }
-            return
-        }
-
-        let fileTimeline: AudioFileEditTimeline
         do {
-            fileTimeline = try editableFileTimeline(forTrackAt: trackIndex)
+            let command = try makeRangeEditCommand(
+                kind: .cut,
+                target: target,
+                scope: .track
+            )
+            let plan = try EditTransactionPlanner.plan(
+                command: command,
+                currentRevision: projectEditRevision(),
+                tracks: editTrackDescriptors(for: command)
+            )
+            let clipboard = try captureClipboard(command: command, plan: plan)
+            audioClipboard = clipboard
+            updateStatus("copied \(formatDuration(clipboardDuration(clipboard) ?? 0))")
+            enrichClipboardInBackground(
+                clipboard,
+                command: command,
+                plan: plan
+            )
         } catch {
             updateStatus("copy failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func captureClipboard(
+        command: EditCommand,
+        plan: EditPlan
+    ) throws -> AudioClipboard {
+        guard
+            let range = command.range,
+            let trackEdit = plan.trackEdits.first(where: { $0.trackID == command.anchorTrackID }),
+            let track = projectTracks.first(where: { $0.id == command.anchorTrackID })
+        else {
+            throw EditTransactionError.missingRange
+        }
+        guard case let .delete(frameRange) = trackEdit.mutation else {
+            throw EditTransactionError.missingRange
+        }
+
+        let trackSelection = displaySelection(
+            for: range,
+            trackID: track.id,
+            projectDuration: max(trackDuration(for: track), range.end.seconds)
+        )
+
+        if
+            let arrangement = projectEditGraph.arrangement(for: track.id) ??
+                mirroredTrackArrangement(for: track)
+        {
+            let fileTimeline = arrangement.timeline
+            guard let fileClip = fileTimeline.clip(for: frameRange) else {
+                throw EditTransactionError.noAudioInRange
+            }
+            let waveformOverview = selectedWaveformOverview(
+                from: track.waveformOverview ?? track.sourceWaveformOverview,
+                selection: trackSelection
+            ) ?? WaveformOverview(duration: fileClip.duration, bins: [])
+            return AudioClipboard(
+                buffer: nil,
+                waveformOverview: waveformOverview,
+                fileClipSourceID: arrangement.sourceID,
+                fileClipSourceURL: track.sourceURL,
+                fileClip: fileClip
+            )
+        }
+
+        if let audioTimeline = track.audioTimeline {
+            guard let audioClip = audioTimeline.clip(for: frameRange) else {
+                throw EditTransactionError.noAudioInRange
+            }
+            let waveformOverview = selectedWaveformOverview(
+                from: track.waveformOverview ?? track.sourceWaveformOverview,
+                selection: trackSelection
+            ) ?? WaveformOverview(duration: audioClip.duration, bins: [])
+            return AudioClipboard(
+                buffer: nil,
+                waveformOverview: waveformOverview,
+                audioClip: audioClip
+            )
+        }
+
+        throw EditTransactionError.uneditableTrack(track.id)
+    }
+
+    private func enrichClipboardInBackground(
+        _ clipboard: AudioClipboard,
+        command: EditCommand,
+        plan: EditPlan
+    ) {
+        guard
+            let trackEdit = plan.trackEdits.first(where: { $0.trackID == command.anchorTrackID }),
+            case let .delete(frameRange) = trackEdit.mutation,
+            let track = projectTracks.first(where: { $0.id == command.anchorTrackID })
+        else {
             return
         }
 
-        let sourceURL = projectTracks[trackIndex].sourceURL
-        let fileClip = fileTimeline.clip(for: selectedTimelineRange)
-        let clipboardID = UUID()
-        if let fileClip {
-            let waveformOverview = selectedWaveformOverview(
-                from: projectTracks[trackIndex].waveformOverview,
-                selection: selectedTimelineRange
-            ) ?? WaveformOverview(duration: fileClip.duration, bins: [])
-            audioClipboard = AudioClipboard(
-                id: clipboardID,
-                buffer: nil,
-                waveformOverview: waveformOverview,
-                fileClipSourceURL: sourceURL,
-                fileClip: fileClip
-            )
-            updateStatus("copied \(formatDuration(fileClip.duration))")
-        } else {
-            updateStatus("copying selection")
-        }
-        Task { [weak self, fileTimeline, selectedTimelineRange, sourceURL, fileClip, clipboardID] in
-            let clipboard = await Task.detached(priority: .userInitiated) {
-                let sourceBuffer = try WAVAudioDecoder.decode(url: sourceURL)
-                let timeline = fileTimeline.audioTimeline(sourceBuffer: sourceBuffer)
-                let buffer = timeline.render(selection: selectedTimelineRange)
+        let selection = timelineSelection(
+            for: frameRange,
+            frameCount: max(
+                track.fileTimeline?.frameCount ??
+                    track.audioTimeline?.frameCount ??
+                    track.decodedAudioBuffer?.frameCount ??
+                    0,
+                1
+            ),
+            trackID: track.id
+        )
+        let fileTimeline = projectEditGraph.arrangement(for: track.id)?.timeline ?? track.fileTimeline
+        let audioTimeline = track.audioTimeline
+        let sourceURL = track.sourceURL
+        let clipboardID = clipboard.id
+
+        Task { [weak self] in
+            let result = await Task.detached(priority: .utility) {
+                let buffer: DecodedAudioBuffer
+                if let audioTimeline {
+                    buffer = audioTimeline.render(selection: selection)
+                } else if let fileTimeline {
+                    let sourceBuffer = try WAVAudioDecoder.decode(url: sourceURL)
+                    buffer = fileTimeline.audioTimeline(sourceBuffer: sourceBuffer)
+                        .render(selection: selection)
+                } else {
+                    throw EditTransactionError.uneditableTrack(command.anchorTrackID)
+                }
                 return AudioClipboard(
                     id: clipboardID,
                     buffer: buffer,
                     waveformOverview: WaveformOverviewBuilder.build(from: buffer),
-                    fileClipSourceURL: fileClip == nil ? nil : sourceURL,
-                    fileClip: fileClip
+                    audioClip: clipboard.audioClip,
+                    fileClipSourceID: clipboard.fileClipSourceID,
+                    fileClipSourceURL: clipboard.fileClipSourceURL,
+                    fileClip: clipboard.fileClip
                 )
             }.result
 
-            guard let self else {
+            guard let self, self.audioClipboard?.id == clipboardID else {
                 return
             }
-
-            switch clipboard {
-            case let .success(clipboard):
-                if
-                    let currentClipboard = self.audioClipboard,
-                    currentClipboard.id != clipboard.id
-                {
-                    return
-                }
-                self.audioClipboard = clipboard
-                self.updateStatus("copied \(self.formatDuration(clipboard.buffer?.duration ?? 0))")
-            case let .failure(error):
-                self.updateStatus("copy failed: \(error.localizedDescription)")
+            if case let .success(enrichedClipboard) = result {
+                self.audioClipboard = enrichedClipboard
             }
         }
+    }
+
+    private func timelineSelection(
+        for frameRange: Range<Int>,
+        frameCount: Int,
+        trackID: UUID
+    ) -> TimelineSelection {
+        let denominator = Double(max(frameCount, 1))
+        return TimelineSelection(
+            startProgress: Double(frameRange.lowerBound) / denominator,
+            endProgress: Double(frameRange.upperBound) / denominator,
+            trackID: trackID
+        )
     }
 
     private func editableFileTimeline(forTrackAt trackIndex: Int) throws -> AudioFileEditTimeline {
@@ -10836,260 +13196,77 @@ final class WorkspaceView: NSView {
         return WaveformOverview(duration: overview.duration, bins: bins)
     }
 
-    private func pasteAudio() {
+    @discardableResult
+    private func pasteAudio() -> Double? {
+        let transactionStartedAt = CACurrentMediaTime()
         guard
-            let audioClipboard,
+            let clipboard = audioClipboard,
             let trackIndex = activeProjectTrackIndex(),
             projectTracks.indices.contains(trackIndex)
         else {
-            return
+            updateStatus("paste failed: clipboard or destination is unavailable")
+            return nil
         }
 
-        let currentTimeline = projectTracks[trackIndex].audioTimeline
-        let currentFileTimeline: AudioFileEditTimeline?
-        if currentTimeline == nil {
-            do {
-                currentFileTimeline = try editableFileTimeline(forTrackAt: trackIndex)
-            } catch {
-                updateStatus("paste failed: \(error.localizedDescription)")
-                return
-            }
-        } else {
-            currentFileTimeline = nil
-        }
-
-        let playbackSnapshot = playbackController.snapshot()
-        let pasteSelection = editInsertionSelection(
-            forPlaybackProgress: playbackSnapshot.progress,
-            trackIndex: trackIndex
+        let track = projectTracks[trackIndex]
+        let insertionTime = currentProjectPlayheadTime()
+        let command = makePasteCommand(
+            trackID: track.id,
+            insertionTime: insertionTime,
+            clipboardID: clipboard.id
         )
-        let currentOverview = projectTracks[trackIndex].waveformOverview
-        let trackID = projectTracks[trackIndex].id
-        let sourceURL = projectTracks[trackIndex].sourceURL
-        let projectDurationBeforePaste = projectSelectionDuration
-        let trackDurationBeforePaste = trackDuration(for: projectTracks[trackIndex])
-        let selectedTimelineRangeBeforePaste = selectedTimelineRange
-        let pasteStartTime = min(
-            max(pasteSelection.startProgress * max(trackDurationBeforePaste, 0), 0),
-            max(trackDurationBeforePaste, projectDurationBeforePaste, 0)
-        )
-        let wasPlayingAtPaste = playbackSnapshot.isPlaying
+        let plannedAt = CACurrentMediaTime()
 
-        if
-            currentTimeline == nil,
-            let currentFileTimeline,
-            let fileClipSourceURL = audioClipboard.fileClipSourceURL,
-            let fileClip = audioClipboard.fileClip,
-            fileClipSourceURL.standardizedFileURL == sourceURL.standardizedFileURL,
-            currentFileTimeline.isCompatible(with: fileClip)
-        {
-            var editedFileTimeline = currentFileTimeline
-            guard let insertedFrameCount = editedFileTimeline.replace(pasteSelection, with: fileClip) else {
-                updateStatus("paste failed: incompatible clipboard")
-                return
-            }
-
-            let insertedDuration = Double(insertedFrameCount) / max(editedFileTimeline.sourceSampleRate, 1)
+        do {
+            let preparedCommit = try prepareRangeEditCommit(
+                command: command,
+                clipboard: clipboard
+            )
+            let preparedAt = CACurrentMediaTime()
+            let insertedDuration = clipboardDuration(clipboard) ?? 0
             let pasteVisual = beginPasteVisualEffect(
-                trackID: trackID,
-                startTime: pasteStartTime,
+                trackID: track.id,
+                startTime: insertionTime.seconds,
                 insertedDuration: insertedDuration,
-                projectDurationBeforePaste: projectDurationBeforePaste,
-                waveformOverview: audioClipboard.waveformOverview
+                projectDurationBeforePaste: projectSelectionDuration,
+                waveformOverview: clipboard.waveformOverview
             )
-            updateStatus("pasted \(formatDuration(insertedDuration))")
-            DispatchQueue.main.asyncAfter(deadline: .now() + pasteVisualCommitDeferral) { [weak self] in
-                guard let self else {
-                    return
-                }
-                guard self.deleteAnimationGeneration == pasteVisual.generation else {
-                    return
-                }
-                guard let nextTrackIndex = self.projectTracks.firstIndex(where: { $0.id == trackID }) else {
-                    return
-                }
-
-                let snapshot = ProjectTrackUndoSnapshot(
-                    tracks: self.projectTracks,
-                    activeTrackID: self.activeTrackID,
-                    selectedTrackID: self.selectedTrackID,
-                    selectedTrackIDs: self.selectedTrackIDs,
-                    selectedTimelineRange: selectedTimelineRangeBeforePaste,
-                    restoreProgress: pasteVisual.visualSelection.startProgressFloat
-                )
-                self.editUndoStack.append(.projectTracks(snapshot))
-                self.cancelEditMaterialization(for: trackID)
-                self.projectTracks[nextTrackIndex].editRevision += 1
-                let editRevision = self.projectTracks[nextTrackIndex].editRevision
-
-                self.applyEditedTimelineState(
-                    trackIndex: nextTrackIndex,
-                    editedAudioTimeline: nil,
-                    editedFileTimeline: editedFileTimeline,
-                    editedDuration: editedFileTimeline.duration
-                )
-                self.projectTracks[nextTrackIndex].waveformOverview =
-                    self.optimisticWaveformOverview(
-                        currentOverview,
-                        replacing: pasteSelection,
-                        with: audioClipboard.waveformOverview,
-                        targetDuration: editedFileTimeline.duration
-                    ) ??
-                    self.optimisticWaveformOverview(
-                        for: editedFileTimeline,
-                        sourceOverview: self.projectTracks[nextTrackIndex].sourceWaveformOverview,
-                        fallbackOverview: currentOverview
-                    )
-                self.scheduleFileTimelineWaveformRefinement(
-                    trackID: trackID,
-                    fileTimeline: editedFileTimeline,
-                    sourceOverview: self.projectTracks[nextTrackIndex].sourceWaveformOverview ?? currentOverview,
-                    editRevision: editRevision
-                )
-
-                self.timelineSurface.displayGainPreview(selection: nil, gain: 1)
-                self.syncActiveTrackFields()
-                self.updateProjectDisplayTiming()
-                let finalSelection = self.displaySelectionForInsertedAudio(
-                    trackID: trackID,
-                    startTime: pasteStartTime,
-                    insertedDuration: insertedDuration,
-                    projectDuration: self.projectSelectionDuration
-                )
-                self.selectedTimelineRange = finalSelection
-                self.finishPasteVisualHandoff(
-                    generation: pasteVisual.generation,
-                    finalSelection: finalSelection,
-                    pasteStartTime: pasteStartTime,
-                    reloadPlaybackSource: true,
-                    resumeIfPlaying: wasPlayingAtPaste
-                )
-            }
-            return
-        }
-
-        guard let clipboardBuffer = audioClipboard.buffer else {
-            updateStatus("paste waiting for copied audio")
-            return
-        }
-
-        let insertedDuration = clipboardBuffer.duration
-        let pasteVisual = beginPasteVisualEffect(
-            trackID: trackID,
-            startTime: pasteStartTime,
-            insertedDuration: insertedDuration,
-            projectDurationBeforePaste: projectDurationBeforePaste,
-            waveformOverview: audioClipboard.waveformOverview
-        )
-        updateStatus("pasting - playback updates shortly")
-        DispatchQueue.main.asyncAfter(deadline: .now() + pasteVisualCommitDeferral) { [weak self] in
-            guard let self else {
-                return
-            }
-            guard self.deleteAnimationGeneration == pasteVisual.generation else {
-                return
-            }
-            guard let nextTrackIndex = self.projectTracks.firstIndex(where: { $0.id == trackID }) else {
-                return
-            }
-
-            if let currentTimeline {
-                self.editUndoStack.append(.timeline(trackID: trackID, timeline: currentTimeline))
-            } else {
-                let snapshot = ProjectTrackUndoSnapshot(
-                    tracks: self.projectTracks,
-                    activeTrackID: self.activeTrackID,
-                    selectedTrackID: self.selectedTrackID,
-                    selectedTrackIDs: self.selectedTrackIDs,
-                    selectedTimelineRange: selectedTimelineRangeBeforePaste,
-                    restoreProgress: pasteVisual.visualSelection.startProgressFloat
-                )
-                self.editUndoStack.append(.projectTracks(snapshot))
-            }
-            self.projectTracks[nextTrackIndex].editRevision += 1
-            let editRevision = self.projectTracks[nextTrackIndex].editRevision
-
-            self.projectTracks[nextTrackIndex].waveformOverview = self.optimisticWaveformOverview(
-                currentOverview,
-                replacing: pasteSelection,
-                with: audioClipboard.waveformOverview
+            let effectsSubmittedAt = CACurrentMediaTime()
+            let visualResponseMilliseconds = (effectsSubmittedAt - transactionStartedAt) * 1_000
+            let transaction = try commitPreparedProjectEdit(
+                preparedCommit,
+                keepsTransitionVisual: true
             )
-            self.applyEditedTimelineState(
-                trackIndex: nextTrackIndex,
-                editedAudioTimeline: currentTimeline,
-                editedFileTimeline: currentFileTimeline,
-                editedDuration: currentTimeline?.duration ?? currentFileTimeline?.duration ?? 0
-            )
-            self.timelineSurface.displayGainPreview(selection: nil, gain: 1)
-            self.syncActiveTrackFields()
-            self.updateProjectDisplayTiming()
-            let finalSelection = self.displaySelectionForInsertedAudio(
-                trackID: trackID,
-                startTime: pasteStartTime,
-                insertedDuration: insertedDuration,
-                projectDuration: self.projectSelectionDuration
-            )
-            self.selectedTimelineRange = finalSelection
-            self.finishPasteVisualHandoff(
+            let committedAt = CACurrentMediaTime()
+            scheduleTransactionVisualHandoff(
                 generation: pasteVisual.generation,
-                finalSelection: finalSelection,
-                pasteStartTime: pasteStartTime,
-                reloadPlaybackSource: false,
-                resumeIfPlaying: wasPlayingAtPaste
+                state: transaction.after
             )
-            self.updateEffectCommandState()
-
-            Task {
-                [weak self,
-                 currentTimeline,
-                 currentFileTimeline,
-                 pasteSelection,
-                 clipboardBuffer,
-                 sourceURL,
-                 trackID,
-                 editRevision] in
-                do {
-                    try? await Task.sleep(nanoseconds: UInt64(0.14 * 1_000_000_000))
-                    let materialized = try await Task.detached(priority: .userInitiated) {
-                        let timeline: AudioEditTimeline
-                        if let currentTimeline {
-                            timeline = currentTimeline
-                        } else if let currentFileTimeline {
-                            let sourceBuffer = try WAVAudioDecoder.decode(url: sourceURL)
-                            timeline = currentFileTimeline.audioTimeline(sourceBuffer: sourceBuffer)
-                        } else {
-                            throw PlaybackError.invalidFormat
-                        }
-
-                        return try Self.materializePaste(
-                            timeline: timeline,
-                            selection: pasteSelection,
-                            clipboardBuffer: clipboardBuffer
-                        )
-                    }.value
-
-                    guard let self else {
-                        return
-                    }
-
-                    self.applyMaterializedTrackEdit(
-                        trackID: trackID,
-                        editRevision: editRevision,
-                        materialized: materialized,
-                        status: "pasted \(self.formatDuration(clipboardBuffer.duration))",
-                        preservePlaybackProgress: true,
-                        reloadPlaybackSource: true,
-                        preserveTimelineSource: false
-                    )
-                } catch {
-                    guard let self else {
-                        return
-                    }
-                    self.updateStatus("paste failed: \(error.localizedDescription)")
-                }
-            }
+            updateEffectCommandState()
+            updateStatus("pasted \(formatDuration(insertedDuration))")
+            let finishedAt = CACurrentMediaTime()
+            latestEditTransactionStageTimings = EditTransactionStageTimings(
+                planMilliseconds: (plannedAt - transactionStartedAt) * 1_000,
+                prepareMilliseconds: (preparedAt - plannedAt) * 1_000,
+                effectsMilliseconds: (effectsSubmittedAt - preparedAt) * 1_000,
+                commitMilliseconds: (committedAt - effectsSubmittedAt) * 1_000,
+                finalizeMilliseconds: (finishedAt - committedAt) * 1_000
+            )
+            return visualResponseMilliseconds
+        } catch EditTransactionError.incompatibleClipboardSource,
+                EditTransactionError.incompatibleClipboardClip {
+            preparePortablePaste(
+                clipboard: clipboard,
+                command: command,
+                destinationTrack: track
+            )
+            return nil
+        } catch {
+            updateStatus("paste failed: \(error.localizedDescription)")
+            return nil
         }
     }
+
 
     private func duplicateRegion() {
         guard
@@ -11116,6 +13293,9 @@ final class WorkspaceView: NSView {
         )
         let undoSnapshot = ProjectTrackUndoSnapshot(
             tracks: projectTracks,
+            editGraph: projectEditGraph,
+            renderTracks: publishedTimelineRenderTracks,
+            playbackTracks: publishedProjectPlaybackTracks,
             activeTrackID: activeTrackID,
             selectedTrackID: selectedTrackID,
             selectedTrackIDs: selectedTrackIDs,
@@ -11238,610 +13418,203 @@ final class WorkspaceView: NSView {
         updateStatus("duplicated \(formatDuration(duration))")
     }
 
-    private func performOptimisticDelete(
-        copyBeforeDeleting: Bool,
+    @discardableResult
+    private func performTransactionalRangeEdit(
+        kind: EditCommandKind,
         scope: EditScope,
-        trace incomingTrace: DeleteTimingTrace? = nil
-    ) {
-        var trace = incomingTrace ?? DeleteTimingTrace(operation: copyBeforeDeleting ? "cut-selection" : "delete-selection")
-        trace.mark(
-            "resolve-target-start",
-            message: "Resolving the current editable delete target.",
-            fields: [
-                "scope": scope.title,
-                "copyBeforeDeleting": "\(copyBeforeDeleting)",
-                "hasTimelineSelection": "\(selectedTimelineRange != nil)",
-                "projectTrackCount": "\(projectTracks.count)",
-            ]
-        )
-        guard
-            let target = currentEditableSelectionTarget()
-        else {
-            trace.mark(
-                "resolve-target-failed",
-                message: "Delete could not find an editable selection target.",
-                severity: .warning
-            )
-            updateStatus("select audio to delete")
-            return
+        target providedTarget: EditableSelectionTarget? = nil
+    ) -> Double? {
+        let transactionStartedAt = CACurrentMediaTime()
+        guard let target = providedTarget ?? currentEditableSelectionTarget() else {
+            updateStatus(kind == .clearGap ? "select audio to clear" : "select audio to delete")
+            return nil
         }
 
-        trace.mark(
-            "resolve-target-finished",
-            message: "Resolved the current editable delete target.",
-            fields: deleteTimingFields(for: target)
-        )
-        performOptimisticDelete(
-            target: target,
-            copyBeforeDeleting: copyBeforeDeleting,
-            scope: scope,
-            trace: trace
-        )
-    }
-
-    private func performOptimisticDelete(
-        target: EditableSelectionTarget,
-        copyBeforeDeleting: Bool,
-        scope: EditScope,
-        trace incomingTrace: DeleteTimingTrace? = nil
-    ) {
-        var trace = incomingTrace ?? DeleteTimingTrace(operation: copyBeforeDeleting ? "cut-selection" : "delete-selection")
-        trace.mark(
-            "edit-start",
-            message: "Starting optimistic ripple-delete edit.",
-            fields: [
-                "scope": scope.title,
-                "copyBeforeDeleting": "\(copyBeforeDeleting)",
-            ].merging(deleteTimingFields(for: target)) { _, new in new }
-        )
-
-        guard
-            projectTracks.indices.contains(target.trackIndex)
-        else {
-            trace.mark(
-                "invalid-track",
-                message: "Delete target track index was out of range.",
-                severity: .warning,
-                fields: [
-                    "trackIndex": "\(target.trackIndex)",
-                    "projectTrackCount": "\(projectTracks.count)",
-                ]
+        do {
+            let command = try makeRangeEditCommand(
+                kind: kind,
+                target: target,
+                scope: scope
             )
-            updateStatus("no track selected")
-            return
-        }
-
-        let displaySelectionToDelete = target.displaySelection
-        trace.mark(
-            "project-duration-start",
-            message: "Computing project duration for delete playback restoration.",
-            fields: [
-                "projectTrackCount": "\(projectTracks.count)",
-            ]
-        )
-        let projectDurationBeforeDelete = projectSelectionDuration
-        let targetPlaybackTime = min(
-            max(displaySelectionToDelete.startProgress * projectDurationBeforeDelete, 0),
-            projectDurationBeforeDelete
-        )
-        trace.mark(
-            "project-duration-finished",
-            message: "Computed project duration for delete playback restoration.",
-            fields: [
-                "projectDurationBeforeDelete": String(format: "%.6f", projectDurationBeforeDelete),
-                "targetPlaybackTime": String(format: "%.6f", targetPlaybackTime),
-            ]
-        )
-        trace.mark(
-            "target-expansion-start",
-            message: "Expanding delete target across the active edit scope.",
-            fields: [
-                "scope": scope.title,
-            ]
-        )
-        let deleteTargets = rippleDeleteTargets(for: target, scope: scope)
-        let editableDeleteTargets = deleteTargets.filter(isEditableRippleDeleteTarget)
-        trace.mark(
-            "target-expansion-finished",
-            message: "Expanded delete target across the active edit scope.",
-            fields: [
-                "deleteTargetCount": "\(deleteTargets.count)",
-                "editableDeleteTargetCount": "\(editableDeleteTargets.count)",
-                "targetTrackIDs": deleteTargets.map { projectTracks.indices.contains($0.trackIndex) ? projectTracks[$0.trackIndex].id.uuidString : "invalid" }.joined(separator: ","),
-            ]
-        )
-        guard !editableDeleteTargets.isEmpty else {
-            trace.mark(
-                "target-expansion-no-editable-targets",
-                message: "Delete found a selection but no editable audio timeline targets.",
-                severity: .warning,
-                fields: [
-                    "deleteTargetCount": "\(deleteTargets.count)",
-                ]
+            let plan = try EditTransactionPlanner.plan(
+                command: command,
+                currentRevision: projectEditRevision(),
+                tracks: editTrackDescriptors(for: command)
             )
-            updateStatus("audio is still preparing for editing")
-            return
-        }
-        let immediatePlaybackProgress = displaySelectionToDelete.startProgressFloat
-        let wasPlayingAtDelete = playbackController.isPlaying
-        let undoSelectedTimelineRange = selectedTimelineRange
-        currentPlayheadFrame = Int(
-            (Double(immediatePlaybackProgress) * Double(max(displayedFrameCount, 0))).rounded(.down)
-        )
-        previousLoopPlaybackProgress = nil
-        displayPlaybackVisuals(
-            progress: immediatePlaybackProgress,
-            isPlaying: wasPlayingAtDelete,
-            syncPlayhead: true,
-            anchorTimestamp: CACurrentMediaTime(),
-            synchronizesRenderer: true
-        )
-        trace.mark(
-            "playhead-snapped-to-delete-start",
-            message: "Snapped the visible playhead to the delete start before preparing the edit.",
-            fields: [
-                "startProgress": String(format: "%.9f", immediatePlaybackProgress),
-                "currentPlayheadFrame": "\(currentPlayheadFrame)",
-            ]
-        )
-
-        let deleteGeneration = beginDeleteAnimationCriticalSection()
-        var didArmFirstDeleteRenderTrace = false
-        for visualTarget in editableDeleteTargets {
-            trace.mark(
-                "deletion-effect-submit-start",
-                message: "Submitting immediate deletion effect to the timeline renderer.",
-                fields: deleteTimingFields(for: visualTarget)
-            )
-            if !didArmFirstDeleteRenderTrace {
-                let renderTrace = trace
-                let visualTrackID = projectTracks.indices.contains(visualTarget.trackIndex) ?
-                    projectTracks[visualTarget.trackIndex].id.uuidString :
-                    "invalid"
-                timelineSurface.notifyAfterNextSubmittedTimelineRender { submittedAt in
-                    renderTrace.markAfterRenderSubmitted(
-                        phase: "first-render-submitted",
-                        message: "Timeline submitted its first render after delete effect request.",
-                        submittedAt: submittedAt,
-                        fields: [
-                            "trackID": visualTrackID,
-                        ]
-                    )
-                }
-                didArmFirstDeleteRenderTrace = true
+            let plannedAt = CACurrentMediaTime()
+            let nextClipboard: AudioClipboard?
+            if kind == .cut {
+                nextClipboard = try captureClipboard(command: command, plan: plan)
+            } else {
+                nextClipboard = audioClipboard
             }
-            timelineSurface.triggerDeletionEffect(
-                selection: visualTarget.displaySelection,
-                sourceSelection: visualTarget.editSelection
+            let preparedCommit = try prepareRangeEditCommit(
+                command: command,
+                clipboard: nextClipboard,
+                precomputedPlan: plan
             )
-            trace.mark(
-                "deletion-effect-submit-finished",
-                message: "Immediate deletion effect request returned.",
-                fields: deleteTimingFields(for: visualTarget)
-            )
-        }
+            let preparedAt = CACurrentMediaTime()
 
-        if !copyBeforeDeleting {
-            selectedTimelineRange = nil
+            if kind == .clearGap {
+                _ = try commitPreparedProjectEdit(
+                    preparedCommit,
+                    keepsTransitionVisual: false
+                )
+                let committedAt = CACurrentMediaTime()
+                timelineSurface.displaySelection(nil)
+                timelineSurface.displayGainPreview(selection: nil, gain: 1)
+                updateEffectCommandState()
+                updateStatus(
+                    transactionStatus(
+                        verb: "cleared",
+                        command: command,
+                        trackCount: plan.trackEdits.count
+                    )
+                )
+                let finishedAt = CACurrentMediaTime()
+                latestEditTransactionStageTimings = EditTransactionStageTimings(
+                    planMilliseconds: (plannedAt - transactionStartedAt) * 1_000,
+                    prepareMilliseconds: (preparedAt - plannedAt) * 1_000,
+                    commitMilliseconds: (committedAt - preparedAt) * 1_000,
+                    finalizeMilliseconds: (finishedAt - committedAt) * 1_000
+                )
+                return (committedAt - transactionStartedAt) * 1_000
+            }
+
+            guard let range = command.range else {
+                throw EditTransactionError.missingRange
+            }
+            let generation = beginDeleteAnimationCriticalSection()
+            snapPlayheadVisuals(
+                toTimelineTime: range.start.seconds,
+                isPlaying: command.wasPlaying,
+                synchronizesRenderer: true
+            )
+            let deletionEffectRequests = try plan.trackEdits.map { trackEdit in
+                guard
+                    let trackIndex = preparedCommit.trackIndexesByID[trackEdit.trackID],
+                    projectTracks.indices.contains(trackIndex)
+                else {
+                    throw EditTransactionError.missingTrack(trackEdit.trackID)
+                }
+                let track = projectTracks[trackIndex]
+                let visualSelection = displaySelection(
+                    for: range,
+                    trackID: track.id
+                )
+                let sourceDuration = max(trackDuration(for: track), range.end.seconds, 0.000_001)
+                let sourceSelection = TimelineSelection(
+                    startProgress: min(max(range.start.seconds / sourceDuration, 0), 1),
+                    endProgress: min(max(range.end.seconds / sourceDuration, 0), 1),
+                    trackID: track.id
+                )
+                return TimelineDeletionEffectRequest(
+                    selection: visualSelection,
+                    sourceSelection: sourceSelection
+                )
+            }
+            timelineSurface.triggerDeletionEffects(deletionEffectRequests)
+            let effectsSubmittedAt = CACurrentMediaTime()
+            let visualResponseMilliseconds = (effectsSubmittedAt - transactionStartedAt) * 1_000
+
+            let transaction = try commitPreparedProjectEdit(
+                preparedCommit,
+                keepsTransitionVisual: true
+            )
+            let committedAt = CACurrentMediaTime()
+            if kind == .cut, let nextClipboard {
+                enrichClipboardInBackground(
+                    nextClipboard,
+                    command: command,
+                    plan: plan
+                )
+            }
             timelineSurface.displaySelection(nil)
             timelineSurface.displayGainPreview(selection: nil, gain: 1)
-        }
-
-        trace.mark(
-            "deferred-edit-scheduled",
-            message: "Scheduled the real delete mutation after the first visual opportunity.",
-            fields: [
-                "delaySeconds": String(format: "%.5f", deleteVisualCommitDeferral),
-            ]
-        )
-        DispatchQueue.main.asyncAfter(deadline: .now() + deleteVisualCommitDeferral) { [weak self] in
-            self?.finishOptimisticDelete(
-                target: target,
-                deleteTargets: editableDeleteTargets,
-                undoSelectedTimelineRange: undoSelectedTimelineRange,
-                targetPlaybackTime: targetPlaybackTime,
-                wasPlayingAtDelete: wasPlayingAtDelete,
-                copyBeforeDeleting: copyBeforeDeleting,
-                scope: scope,
-                deleteGeneration: deleteGeneration,
-                trace: trace
+            updateEffectCommandState()
+            scheduleTransactionVisualHandoff(
+                generation: generation,
+                state: transaction.after
             )
-        }
-    }
-
-    private func finishOptimisticDelete(
-        target: EditableSelectionTarget,
-        deleteTargets: [EditableSelectionTarget],
-        undoSelectedTimelineRange: TimelineSelection?,
-        targetPlaybackTime: TimeInterval,
-        wasPlayingAtDelete: Bool,
-        copyBeforeDeleting: Bool,
-        scope: EditScope,
-        deleteGeneration: Int,
-        trace incomingTrace: DeleteTimingTrace
-    ) {
-        var trace = incomingTrace
-        guard deleteAnimationGeneration == deleteGeneration else {
-            trace.mark(
-                "deferred-edit-cancelled",
-                message: "Deferred delete mutation was cancelled by a newer edit.",
-                severity: .warning
+            updateStatus(
+                transactionStatus(
+                    verb: kind == .cut ? "cut" : "deleted",
+                    command: command,
+                    trackCount: plan.trackEdits.count
+                )
             )
-            return
-        }
-
-        let displaySelectionToDelete = target.displaySelection
-        let trackEdits: [RippleDeleteTrackEdit]
-        do {
-            trace.mark(
-                "prepare-edits-start",
-                message: "Preparing per-track ripple-delete edit timelines.",
-                fields: [
-                    "deleteTargetCount": "\(deleteTargets.count)",
-                ]
+            let finishedAt = CACurrentMediaTime()
+            latestEditTransactionStageTimings = EditTransactionStageTimings(
+                planMilliseconds: (plannedAt - transactionStartedAt) * 1_000,
+                prepareMilliseconds: (preparedAt - plannedAt) * 1_000,
+                effectsMilliseconds: (effectsSubmittedAt - preparedAt) * 1_000,
+                commitMilliseconds: (committedAt - effectsSubmittedAt) * 1_000,
+                finalizeMilliseconds: (finishedAt - committedAt) * 1_000
             )
-            trackEdits = try deleteTargets.compactMap { try preparedRippleDeleteTrackEdit(for: $0) }
-            recordDeleteSelectionAudit(trackEdits: trackEdits, trace: trace)
-            trace.mark(
-                "prepare-edits-finished",
-                message: "Prepared per-track ripple-delete edit timelines.",
-                fields: [
-                    "trackEditCount": "\(trackEdits.count)",
-                    "editedTrackIDs": trackEdits.map(\.trackID.uuidString).joined(separator: ","),
-                    "deletedDurations": trackEdits.map { String(format: "%.6f", $0.deletedDuration) }.joined(separator: ","),
-                    "editedDurations": trackEdits.map { String(format: "%.6f", $0.editedDuration) }.joined(separator: ","),
-                ]
-            )
+            return visualResponseMilliseconds
         } catch {
-            trace.mark(
-                "prepare-edits-failed",
-                message: "Preparing ripple-delete edit timelines failed.",
+            timelineSurface.clearDeletionEffects()
+            timelineSurface.displaySelection(selectedTimelineRange)
+            updateStatus("\(kind.rawValue) failed: \(error.localizedDescription)")
+            SoundtimeDiagnostics.shared.record(
+                category: .edit,
                 severity: .warning,
+                name: "edit-transaction-rejected",
+                message: "An edit transaction failed before atomic publication.",
                 fields: [
+                    "kind": kind.rawValue,
                     "error": error.localizedDescription,
                 ]
             )
-            timelineSurface.clearDeletionEffects()
-            selectedTimelineRange = undoSelectedTimelineRange
-            timelineSurface.displaySelection(undoSelectedTimelineRange)
-            updateStatus("delete failed: \(error.localizedDescription)")
-            return
+            return nil
         }
-        guard !trackEdits.isEmpty else {
-            trace.mark(
-                "prepare-edits-empty",
-                message: "Delete produced no per-track edits.",
-                severity: .warning
-            )
-            timelineSurface.clearDeletionEffects()
-            selectedTimelineRange = undoSelectedTimelineRange
-            timelineSurface.displaySelection(undoSelectedTimelineRange)
-            updateStatus("no audio in selected time")
-            return
-        }
+    }
 
-        SoundtimeDiagnostics.shared.record(
-            category: .edit,
-            severity: .info,
-            name: copyBeforeDeleting ? "cut-selection" : "delete-time",
-            message: "User requested an optimistic audio edit.",
-            fields: [
-                "scope": scope.title,
-                "trackCount": "\(trackEdits.count)",
-                "startProgress": String(format: "%.9f", displaySelectionToDelete.startProgress),
-                "endProgress": String(format: "%.9f", displaySelectionToDelete.endProgress),
-            ]
-        )
-        let undoSnapshot = ProjectTrackUndoSnapshot(
-            tracks: projectTracks,
-            activeTrackID: activeTrackID,
-            selectedTrackID: selectedTrackID,
-            selectedTrackIDs: selectedTrackIDs,
-            selectedTimelineRange: undoSelectedTimelineRange,
-            restoreProgress: displaySelectionToDelete.startProgressFloat
-        )
+    private func transactionStatus(
+        verb: String,
+        command: EditCommand,
+        trackCount: Int
+    ) -> String {
+        let duration = command.range?.duration.seconds ?? 0
+        let scopeSuffix = trackCount > 1 ? " across \(trackCount) tracks" : ""
+        return "\(verb) \(formatDuration(duration))\(scopeSuffix)"
+    }
 
-        if copyBeforeDeleting {
-            trace.mark(
-                "copy-before-delete-start",
-                message: "Copying selection before cut/delete.",
-                fields: [
-                    "copyBeforeDeleting": "\(copyBeforeDeleting)",
-                ]
-            )
-            copySelection()
-            trace.mark(
-                "copy-before-delete-finished",
-                message: "Copy-before-delete returned to the delete path."
-            )
-        }
-
-        editUndoStack.append(.projectTracks(undoSnapshot))
-        trace.mark(
-            "undo-snapshot-appended",
-            message: "Stored undo snapshot before applying delete.",
-            fields: [
-                "undoStackCount": "\(editUndoStack.count)",
-            ]
-        )
-
-        let deletionAnimationRenderTracks = timelineRenderTracks()
-        trace.mark(
-            "deletion-effect-preflight-skipped",
-            message: "Delete animation will reuse the currently resident pre-delete waveform buffers."
-        )
-
-        var materializationEdits: [(trackID: UUID, timeline: AudioEditTimeline, editRevision: Int)] = []
-        var statusDuration = TimeInterval(0)
-        for edit in trackEdits {
-            guard projectTracks.indices.contains(edit.trackIndex) else {
-                continue
-            }
-
-            trace.mark(
-                "deletion-effect-already-submitted",
-                message: "Deletion effect was already submitted before edit preparation.",
-                fields: deleteTimingFields(for: edit)
-            )
-            projectTracks[edit.trackIndex].editRevision += 1
-            let editRevision = projectTracks[edit.trackIndex].editRevision
-            trace.mark(
-                "track-state-mutation-start",
-                message: "Applying edited timeline state to project track.",
-                fields: [
-                    "trackID": edit.trackID.uuidString,
-                    "editRevision": "\(editRevision)",
-                    "usesFileTimeline": "\(edit.editedFileTimeline != nil)",
-                    "usesAudioTimeline": "\(edit.editedAudioTimeline != nil)",
-                ]
-            )
-            applyEditedTimelineState(
-                trackIndex: edit.trackIndex,
-                editedAudioTimeline: edit.editedAudioTimeline,
-                editedFileTimeline: edit.editedFileTimeline,
-                editedDuration: edit.editedDuration
-            )
-            let currentOverview = projectTracks[edit.trackIndex].waveformOverview
-            let currentBinCount = currentOverview?.bins.count ?? 0
-            if let editedFileTimeline = edit.editedFileTimeline {
-                let bestSourceOverview = bestSourceWaveformOverview(
-                    sourceOverview: projectTracks[edit.trackIndex].sourceWaveformOverview,
-                    fallbackOverview: currentOverview,
-                    fileTimeline: editedFileTimeline
-                )
-                projectTracks[edit.trackIndex].sourceWaveformOverview = bestSourceOverview
-                projectTracks[edit.trackIndex].waveformOverview = bestSourceOverview
-                cancelEditWaveformRefinement(for: edit.trackID)
-                trace.mark(
-                    "waveform-remap-using-source",
-                    message: "File-backed delete will render by remapping the resident source waveform, not by rebuilding edited waveform bins.",
-                    fields: [
-                        "trackID": edit.trackID.uuidString,
-                        "editRevision": "\(editRevision)",
-                        "segmentCount": "\(editedFileTimeline.playbackSegments.count)",
-                        "sourceBinCount": "\(bestSourceOverview?.bins.count ?? currentBinCount)",
-                        "visibleBinCount": "\(projectTracks[edit.trackIndex].waveformOverview?.bins.count ?? 0)",
-                    ]
-                )
-            } else {
-                scheduleOptimisticDeleteWaveformOverviewUpdate(
-                    trackID: edit.trackID,
-                    editRevision: editRevision,
-                    currentOverview: currentOverview,
-                    editSelection: edit.editSelection,
-                    editedDuration: edit.editedDuration,
-                    editedFileTimeline: nil,
-                    sourceOverview: nil,
-                    minimumDisplayDelay: deletePostAnimationDisplayRefreshDelay
-                )
-                cancelEditWaveformRefinement(for: edit.trackID)
-            }
-            trace.mark(
-                "track-state-mutation-finished",
-                message: "Applied edited timeline state to project track.",
-                fields: [
-                    "trackID": edit.trackID.uuidString,
-                    "previousBinCount": "\(currentBinCount)",
-                    "nextBinCount": "\(projectTracks[edit.trackIndex].waveformOverview?.bins.count ?? 0)",
-                ]
-            )
-
-            statusDuration = max(statusDuration, edit.deletedDuration)
-            if let editedAudioTimeline = edit.editedAudioTimeline {
-                materializationEdits.append((
-                    trackID: edit.trackID,
-                    timeline: editedAudioTimeline,
-                    editRevision: editRevision
-                ))
-            }
-        }
-
-        trace.mark(
-            "visual-refresh-start",
-            message: "Publishing pre-delete waveform state for the active delete animation."
-        )
-        timelineSurface.displayTracks(
-            deletionAnimationRenderTracks,
-            animateWaveformTransition: false
-        )
-        publishSelectedTracksToTimeline()
-        trace.mark(
-            "visual-refresh-finished",
-            message: "Published pre-delete waveform state for the active delete animation.",
-            fields: [
-                "trackEditCount": "\(trackEdits.count)",
-            ]
-        )
-        timelineSurface.notifyAfterNextSubmittedTimelineRender { [weak self] submittedAt in
-            guard let self else {
+    private func scheduleTransactionVisualHandoff(
+        generation: Int,
+        state: ProjectEditTransactionState
+    ) {
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, self.deleteAnimationGeneration == generation else {
                 return
             }
-            guard self.deleteAnimationGeneration == deleteGeneration else {
-                return
-            }
-
-            let remainingDelay = max(
-                0,
-                submittedAt + self.deletePostAnimationDisplayRefreshDelay - CACurrentMediaTime()
+            self.postDeleteRefreshWorkItem = nil
+            self.timelineSurface.clearDeletionEffects()
+            self.updateProjectDisplayTiming()
+            self.publishedTimelineRenderTracks = state.renderTracks
+            self.timelineSurface.displayTracks(
+                state.renderTracks,
+                animateWaveformTransition: false,
+                allowImmediateWaveformPrewarm: false,
+                allowImmediateInteractiveWaveformPrewarm: false
             )
-            let workItem = DispatchWorkItem { [weak self] in
-                guard let self else {
-                    return
-                }
-                guard self.deleteAnimationGeneration == deleteGeneration else {
-                    return
-                }
-                self.postDeleteRefreshWorkItem = nil
-                self.timelineSurface.clearDeletionEffects()
-                self.refreshProjectTimelineDisplay(
-                    rebuildControls: false,
-                    animateWaveformTransition: false,
-                    allowImmediateWaveformPrewarm: false
-                )
-                if wasPlayingAtDelete {
-                    self.refreshPlaybackProgress(syncPlayheadWhenPlaying: true)
-                } else {
-                    self.snapPlayheadVisuals(
-                        toTimelineTime: targetPlaybackTime,
-                        isPlaying: false,
-                        synchronizesRenderer: true
-                    )
-                }
-            }
-            self.postDeleteRefreshWorkItem?.cancel()
-            self.postDeleteRefreshWorkItem = workItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + remainingDelay, execute: workItem)
-        }
-
-        trace.mark(
-            "selection-clear-start",
-            message: "Clearing UI selection after delete."
-        )
-        selectedTimelineRange = nil
-        timelineSurface.displaySelection(nil)
-        timelineSurface.displayGainPreview(selection: nil, gain: 1)
-        trace.mark(
-            "selection-clear-finished",
-            message: "Cleared UI selection after delete."
-        )
-        syncActiveTrackFields()
-        trace.mark(
-            "display-timing-start",
-            message: "Updating project display timing after delete."
-        )
-        updateProjectDisplayTiming()
-        trace.mark(
-            "display-timing-finished",
-            message: "Updated project display timing after delete.",
-            fields: [
-                "displayedDuration": String(format: "%.6f", displayedDuration),
-                "displayedFrameCount": "\(displayedFrameCount)",
-            ]
-        )
-        let clampedTargetPlaybackTime = min(
-            targetPlaybackTime,
-            max(displayedDuration, 0)
-        )
-        let targetPlaybackProgress = displayedDuration > 0 ?
-            min(max(Float(clampedTargetPlaybackTime / displayedDuration), 0), 1) :
-            0
-        trace.mark(
-            "playback-reload-start",
-            message: "Reloading playback graph after delete.",
-            fields: [
-                "targetPlaybackProgress": String(format: "%.9f", targetPlaybackProgress),
-                "resumeIfPlaying": "\(playbackController.isPlaying)",
-            ]
-        )
-        if wasPlayingAtDelete {
-            reloadPlaybackFromProjectTracks(
-                preserveProgress: false,
-                targetProgress: targetPlaybackProgress,
-                resumeIfPlaying: true
-            )
-        } else {
-            schedulePlaybackReloadFromProjectTracks(
-                preserveProgress: false,
-                targetProgress: targetPlaybackProgress,
-                resumeIfPlaying: false,
-                delay: deleteMaterializationDelay
+            self.publishSelectedTracksToTimeline()
+            self.selectedTimelineRange = state.selectedTimelineRange
+            self.timelineSurface.displaySelection(state.selectedTimelineRange)
+            self.snapPlayheadVisuals(
+                toTimelineTime: state.playheadTime.seconds,
+                isPlaying: self.playbackController.isPlaying,
+                synchronizesRenderer: true
             )
         }
-        trace.mark(
-            "playback-reload-finished",
-            message: wasPlayingAtDelete ?
-                "Playback graph reload returned after delete." :
-                "Playback graph reload was deferred until after the delete animation."
-        )
-        updateEffectCommandState()
-        let scopeSuffix: String
-        if trackEdits.count > 1 {
-            switch scope {
-            case .track:
-                scopeSuffix = ""
-            case .selected:
-                scopeSuffix = " across \(trackEdits.count) selected tracks"
-            case .group:
-                scopeSuffix = " across \(trackEdits.count) grouped tracks"
-            case .all:
-                scopeSuffix = " across \(trackEdits.count) tracks"
-            }
-        } else {
-            scopeSuffix = ""
-        }
-        let status = "\(copyBeforeDeleting ? "cut" : "deleted") \(formatDuration(statusDuration))\(scopeSuffix)"
-        updateStatus(status)
-        trace.mark(
-            "status-updated",
-            message: "Updated delete status text.",
-            fields: [
-                "status": status,
-            ]
-        )
-
-        for edit in materializationEdits {
-            trace.mark(
-                "materialization-scheduled",
-                message: "Scheduled delayed audio-timeline materialization after delete.",
-                fields: [
-                    "trackID": edit.trackID.uuidString,
-                    "editRevision": "\(edit.editRevision)",
-                    "delaySeconds": String(format: "%.3f", deleteMaterializationDelay),
-                ]
-            )
-            materializeEditedTimeline(
-                trackID: edit.trackID,
-                timeline: edit.timeline,
-                editRevision: edit.editRevision,
-                status: status,
-                preservePlaybackProgress: true,
-                startDelay: deleteMaterializationDelay,
-                animateWaveformTransition: false
-            )
-        }
-        trace.mark(
-            "finished",
-            message: "Optimistic delete path finished on the main thread.",
-            fields: [
-                "materializationCount": "\(materializationEdits.count)",
-            ]
+        postDeleteRefreshWorkItem?.cancel()
+        postDeleteRefreshWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + deletePostAnimationDisplayRefreshDelay,
+            execute: workItem
         )
     }
 
-    private func rippleDeleteTargets(
-        for target: EditableSelectionTarget,
-        scope: EditScope
-    ) -> [EditableSelectionTarget] {
-        scopedTrackIndices(anchorTrackIndex: target.trackIndex, scope: scope).compactMap { trackIndex in
-            if trackIndex == target.trackIndex {
-                return target
-            }
-            return rippleDeleteTarget(
-                matching: target.displaySelection,
-                trackIndex: trackIndex
-            )
-        }
-    }
 
     private func scopedTrackIndices(
         anchorTrackIndex: Int,
@@ -11869,147 +13642,6 @@ final class WorkspaceView: NSView {
         }
     }
 
-    private func rippleDeleteTarget(
-        matching displaySelection: TimelineSelection,
-        trackIndex: Int
-    ) -> EditableSelectionTarget? {
-        guard projectTracks.indices.contains(trackIndex) else {
-            return nil
-        }
-
-        let trackID = projectTracks[trackIndex].id
-        let trackDisplaySelection = TimelineSelection(
-            startProgress: displaySelection.startProgress,
-            endProgress: displaySelection.endProgress,
-            trackID: trackID
-        )
-        guard let editSelection = editSelection(from: trackDisplaySelection, trackIndex: trackIndex) else {
-            return nil
-        }
-        return EditableSelectionTarget(
-            trackIndex: trackIndex,
-            displaySelection: trackDisplaySelection,
-            editSelection: editSelection
-        )
-    }
-
-    private func preparedRippleDeleteTrackEdit(
-        for target: EditableSelectionTarget
-    ) throws -> RippleDeleteTrackEdit? {
-        guard projectTracks.indices.contains(target.trackIndex) else {
-            return nil
-        }
-
-        let trackIndex = target.trackIndex
-        let trackID = projectTracks[trackIndex].id
-        let selectionToDelete = target.editSelection
-
-        if let currentFileTimeline = try preferredFileTimelineForEditing(trackIndex: trackIndex) {
-            var timeline = currentFileTimeline
-            let selectedFrameRange = currentFileTimeline.frameRange(for: selectionToDelete)
-            let expectedDeletedFrameCount = selectedFrameRange.count
-            let deletedDuration = selectionToDelete.duration(in: currentFileTimeline.duration)
-            let deletedFrameCount = timeline.delete(selectionToDelete)
-            guard deletedFrameCount > 0 else {
-                return nil
-            }
-            return RippleDeleteTrackEdit(
-                trackIndex: trackIndex,
-                trackID: trackID,
-                displaySelection: target.displaySelection,
-                editSelection: selectionToDelete,
-                timelineKind: .file,
-                originalFrameCount: currentFileTimeline.frameCount,
-                originalDuration: currentFileTimeline.duration,
-                selectedFrameRange: selectedFrameRange,
-                expectedDeletedFrameCount: expectedDeletedFrameCount,
-                actualDeletedFrameCount: deletedFrameCount,
-                deletedDuration: deletedDuration,
-                editedDuration: timeline.duration,
-                editedAudioTimeline: nil,
-                editedFileTimeline: timeline
-            )
-        }
-
-        if let currentTimeline = projectTracks[trackIndex].audioTimeline {
-            var timeline = currentTimeline
-            let selectedFrameRange = currentTimeline.frameRange(for: selectionToDelete)
-            let expectedDeletedFrameCount = selectedFrameRange.count
-            let deletedDuration = selectionToDelete.duration(in: currentTimeline.duration)
-            let deletedFrameCount = timeline.delete(selectionToDelete)
-            guard deletedFrameCount > 0 else {
-                return nil
-            }
-            return RippleDeleteTrackEdit(
-                trackIndex: trackIndex,
-                trackID: trackID,
-                displaySelection: target.displaySelection,
-                editSelection: selectionToDelete,
-                timelineKind: .memory,
-                originalFrameCount: currentTimeline.frameCount,
-                originalDuration: currentTimeline.duration,
-                selectedFrameRange: selectedFrameRange,
-                expectedDeletedFrameCount: expectedDeletedFrameCount,
-                actualDeletedFrameCount: deletedFrameCount,
-                deletedDuration: deletedDuration,
-                editedDuration: timeline.duration,
-                editedAudioTimeline: timeline,
-                editedFileTimeline: nil
-            )
-        }
-
-        return nil
-    }
-
-    private func preparedClearTrackEdit(
-        for target: EditableSelectionTarget
-    ) throws -> ClearTrackEdit? {
-        guard projectTracks.indices.contains(target.trackIndex) else {
-            return nil
-        }
-
-        let trackIndex = target.trackIndex
-        let trackID = projectTracks[trackIndex].id
-        let selectionToClear = target.editSelection
-
-        if let currentFileTimeline = try preferredFileTimelineForEditing(trackIndex: trackIndex) {
-            var timeline = currentFileTimeline
-            let clearedDuration = selectionToClear.duration(in: currentFileTimeline.duration)
-            let affectedFrameCount = timeline.clear(selectionToClear)
-            guard affectedFrameCount > 0 else {
-                return nil
-            }
-            return ClearTrackEdit(
-                trackIndex: trackIndex,
-                trackID: trackID,
-                editSelection: selectionToClear,
-                clearedDuration: clearedDuration,
-                editedDuration: timeline.duration,
-                editedAudioTimeline: nil,
-                editedFileTimeline: timeline
-            )
-        }
-
-        if let currentTimeline = projectTracks[trackIndex].audioTimeline {
-            var timeline = currentTimeline
-            let clearedDuration = selectionToClear.duration(in: currentTimeline.duration)
-            let affectedFrameCount = timeline.clear(selectionToClear)
-            guard affectedFrameCount > 0 else {
-                return nil
-            }
-            return ClearTrackEdit(
-                trackIndex: trackIndex,
-                trackID: trackID,
-                editSelection: selectionToClear,
-                clearedDuration: clearedDuration,
-                editedDuration: timeline.duration,
-                editedAudioTimeline: timeline,
-                editedFileTimeline: nil
-            )
-        }
-
-        return nil
-    }
 
     private func preparedSplitTrackEdit(
         trackIndex: Int,
@@ -12890,7 +14522,7 @@ final class WorkspaceView: NSView {
                 return
             }
             handleTranscriptSelection(selection)
-            performOptimisticDelete(copyBeforeDeleting: false, scope: .track)
+            performTransactionalRangeEdit(kind: .rippleDelete, scope: .track)
         case .clearWordsLeaveGap:
             guard let selection = command.selection else {
                 return
@@ -12933,7 +14565,7 @@ final class WorkspaceView: NSView {
         selectedTimelineRange = timelineSelection
         timelineSurface.displaySelection(timelineSelection)
         selectedTranscriptSelection = selection
-        performOptimisticDelete(copyBeforeDeleting: false, scope: .track)
+        performTransactionalRangeEdit(kind: .rippleDelete, scope: .track)
     }
 
     private func executeTranscriptSplit(_ command: TranscriptEditCommand) {
@@ -14696,6 +16328,14 @@ final class WorkspaceView: NSView {
     }
 
     private func undoLastEdit() {
+        guard !editUndoStack.isEmpty else {
+            return
+        }
+
+        isNavigatingEditHistory = true
+        defer {
+            isNavigatingEditHistory = false
+        }
         guard let undoAction = editUndoStack.popLast() else {
             return
         }
@@ -14709,11 +16349,202 @@ final class WorkspaceView: NSView {
             updateStatus("undo")
         case let .projectTracks(snapshot):
             restoreProjectTracks(from: snapshot)
+        case let .transaction(record):
+            do {
+                try restoreProjectEditTransactionState(
+                    record.before,
+                    transactionID: record.command.transactionID,
+                    commandKind: record.command.kind,
+                    operation: "undo"
+                )
+                editRedoStack.append(.transaction(record))
+            } catch {
+                editUndoStack.append(.transaction(record))
+                updateStatus("undo failed: \(error.localizedDescription)")
+            }
         }
     }
 
+    private func redoLastEdit() {
+        guard !editRedoStack.isEmpty else {
+            return
+        }
+
+        isNavigatingEditHistory = true
+        defer {
+            isNavigatingEditHistory = false
+        }
+        guard let redoAction = editRedoStack.popLast() else {
+            return
+        }
+        guard case let .transaction(record) = redoAction else {
+            return
+        }
+
+        do {
+            try restoreProjectEditTransactionState(
+                record.after,
+                transactionID: record.command.transactionID,
+                commandKind: record.command.kind,
+                operation: "redo"
+            )
+            editUndoStack.append(.transaction(record))
+        } catch {
+            editRedoStack.append(.transaction(record))
+            updateStatus("redo failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func restoreProjectEditTransactionState(
+        _ state: ProjectEditTransactionState,
+        transactionID: EditTransactionID,
+        commandKind: EditCommandKind,
+        operation: String
+    ) throws {
+        let startedAt = CACurrentMediaTime()
+        let restoredTrackIDs = Set(state.tracksByID.keys)
+        guard projectTracks.map(\.id) == state.projectTrackIDs else {
+            throw EditTransactionError.changedProjectTopology
+        }
+        let trackIndexesByID = state.trackIndexesByID
+        let hasValidTrackIndexes = restoredTrackIDs.allSatisfy { trackID in
+            guard
+                let index = trackIndexesByID[trackID],
+                projectTracks.indices.contains(index)
+            else {
+                return false
+            }
+            return projectTracks[index].id == trackID
+        }
+        guard
+            trackIndexesByID.count == restoredTrackIDs.count,
+            hasValidTrackIndexes
+        else {
+            throw EditTransactionError.missingTrack(
+                restoredTrackIDs.first ?? state.projectTrackIDs.first ?? UUID()
+            )
+        }
+        let indexedAt = CACurrentMediaTime()
+
+        var nextTracks = projectTracks
+        for (trackID, restoredTrack) in state.tracksByID {
+            guard let index = trackIndexesByID[trackID] else {
+                throw EditTransactionError.missingTrack(trackID)
+            }
+            nextTracks[index] = restoredTrack
+        }
+        let tracksPreparedAt = CACurrentMediaTime()
+
+        for trackID in restoredTrackIDs {
+            cancelEditMaterialization(for: trackID)
+        }
+        cancelDeleteVisualHandoff()
+        let nextRevision = projectEditRevision().advanced()
+        projectTracks = nextTracks
+        projectEditGraph = state.editGraph
+        currentEditGraphRevision = nextRevision.rawValue
+
+        activeTrackID = state.activeTrackID ?? projectTracks.last?.id
+        selectedTrackID = state.selectedTrackID
+        selectedTrackIDs = state.selectedTrackIDs
+        if let selectedTrackID {
+            selectedTrackIDs.insert(selectedTrackID)
+        }
+        trackSelectionAnchorID = selectedTrackID
+        selectedTimelineRange = state.selectedTimelineRange
+        audioClipboard = state.clipboard
+        syncActiveTrackFields()
+        displayedSampleRate = state.displayedSampleRate
+        displayedFrameCount = state.displayedFrameCount
+        let modelRestoredAt = CACurrentMediaTime()
+
+        timelineSurface.clearDeletionEffects()
+        timelineSurface.displaySelection(selectedTimelineRange)
+        timelineSurface.displayGainPreview(selection: nil, gain: 1)
+        publishedTimelineRenderTracks = state.renderTracks
+        timelineSurface.displayTracks(
+            state.renderTracks,
+            animateWaveformTransition: false,
+            allowImmediateWaveformPrewarm: false,
+            allowImmediateInteractiveWaveformPrewarm: false
+        )
+        publishSelectedTracksToTimeline()
+        publishedTimelineEditRevision = nextRevision.rawValue
+        let timelinePublishedAt = CACurrentMediaTime()
+
+        let duration = max(state.projectDuration, state.playheadTime.seconds, 0.000_001)
+        reloadPlaybackFromProjectTracks(
+            preserveProgress: false,
+            targetProgress: Float(min(max(state.playheadTime.seconds / duration, 0), 1)),
+            playbackTracksOverride: state.playbackTracks,
+            publishesVisualState: false
+        )
+        publishedPlaybackEditRevision = nextRevision.rawValue
+        snapPlayheadVisuals(
+            toTimelineTime: state.playheadTime.seconds,
+            isPlaying: playbackController.isPlaying,
+            synchronizesRenderer: true
+        )
+        updateTransportControlState(isPlaying: playbackController.isPlaying)
+        let playbackPublishedAt = CACurrentMediaTime()
+        assertPublishedEditRevisionsMatch(context: operation)
+        let finishedAt = CACurrentMediaTime()
+        latestTransactionHistoryRestoreStageTimings = EditHistoryRestoreStageTimings(
+            indexMilliseconds: (indexedAt - startedAt) * 1_000,
+            tracksMilliseconds: (tracksPreparedAt - indexedAt) * 1_000,
+            modelMilliseconds: (modelRestoredAt - tracksPreparedAt) * 1_000,
+            timelineMilliseconds: (timelinePublishedAt - modelRestoredAt) * 1_000,
+            playbackMilliseconds: (playbackPublishedAt - timelinePublishedAt) * 1_000,
+            finalizeMilliseconds: (finishedAt - playbackPublishedAt) * 1_000
+        )
+        DispatchQueue.main.async { [weak self] in
+            guard
+                let self,
+                self.currentEditGraphRevision == nextRevision.rawValue
+            else {
+                return
+            }
+            self.refreshExistingTrackControlStates()
+            self.updateLoadedProjectSummary()
+            self.updateEffectCommandState()
+            self.updateStatus(operation)
+        }
+
+        SoundtimeDiagnostics.shared.record(
+            category: .edit,
+            severity: .info,
+            name: "edit-transaction-\(operation)",
+            message: "Published an edit transaction history state.",
+            fields: [
+                "transactionID": transactionID.description,
+                "kind": commandKind.rawValue,
+                "sourceRevision": state.revision.description,
+                "publishedRevision": nextRevision.description,
+                "trackCount": "\(restoredTrackIDs.count)",
+                "elapsedMs": String(format: "%.3f", (finishedAt - startedAt) * 1_000),
+            ]
+        )
+    }
+
+    private func cancelDeleteVisualHandoff() {
+        postDeleteRefreshWorkItem?.cancel()
+        postDeleteRefreshWorkItem = nil
+        deleteAnimationGeneration += 1
+    }
+
     private func restoreProjectTracks(from snapshot: ProjectTrackUndoSnapshot) {
+        let restoreStartedAt = CACurrentMediaTime()
         let replacedTracks = projectTracks
+        let previousSelectedTrackID = selectedTrackID
+        let previousSelectedTrackIDs = selectedTrackIDs
+        let preservesTrackTopology = replacedTracks.map(\.id) == snapshot.tracks.map(\.id)
+        let preservesTrackControlState = preservesTrackTopology &&
+            zip(replacedTracks, snapshot.tracks).allSatisfy { currentTrack, restoredTrack in
+                currentTrack.name == restoredTrack.name &&
+                    currentTrack.volume == restoredTrack.volume &&
+                    currentTrack.isMuted == restoredTrack.isMuted &&
+                    currentTrack.isSoloed == restoredTrack.isSoloed
+            }
         SoundtimeDiagnostics.shared.record(
             category: .edit,
             severity: .info,
@@ -14726,12 +16557,14 @@ final class WorkspaceView: NSView {
         )
         cancelAllEditMaterialization()
         projectTracks = snapshot.tracks
+        let tracksRestoredAt = CACurrentMediaTime()
         if let editGraph = snapshot.editGraph {
             projectEditGraph = editGraph
             pruneProjectEditGraphToCurrentTracks()
         } else {
             rebuildProjectEditGraphFromTrackMirrors()
         }
+        let editGraphRestoredAt = CACurrentMediaTime()
         activeTrackID = snapshot.activeTrackID.flatMap { activeID in
             projectTracks.contains(where: { $0.id == activeID }) ? activeID : nil
         } ?? projectTracks.last?.id
@@ -14750,20 +16583,75 @@ final class WorkspaceView: NSView {
         timelineSurface.clearDeletionEffects()
         timelineSurface.displaySelection(selectedTimelineRange)
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
+        let restoredRenderTracks = snapshot.renderTracks ?? timelineRenderTracks()
+        publishedTimelineRenderTracks = restoredRenderTracks
+        timelineSurface.displayTracks(
+            restoredRenderTracks,
+            animateWaveformTransition: false,
+            allowImmediateWaveformPrewarm: false,
+            allowImmediateInteractiveWaveformPrewarm: false
+        )
         publishSelectedTracksToTimeline()
-        refreshProjectTimelineDisplay(animateWaveformTransition: false)
+        if preservesTrackTopology {
+            if
+                !preservesTrackControlState ||
+                previousSelectedTrackID != selectedTrackID ||
+                previousSelectedTrackIDs != selectedTrackIDs
+            {
+                refreshExistingTrackControlStates()
+            }
+        } else {
+            refreshTrackControls()
+        }
+        let timelinePublishedAt = CACurrentMediaTime()
         reloadPlaybackFromProjectTracks(
             preserveProgress: snapshot.restoreProgress == nil,
-            targetProgress: snapshot.restoreProgress
+            targetProgress: snapshot.restoreProgress,
+            playbackTracksOverride: snapshot.playbackTracks
         )
-        updateEffectCommandState()
-        cleanupOwnedSourceFiles(replacedTracks: replacedTracks)
+        let playbackPublishedAt = CACurrentMediaTime()
         updateStatus("undo")
+        let finishedAt = CACurrentMediaTime()
+        let totalMilliseconds = (finishedAt - restoreStartedAt) * 1_000
+        latestUndoRestoreStageMilliseconds = [
+            "tracksMs": (tracksRestoredAt - restoreStartedAt) * 1_000,
+            "editGraphMs": (editGraphRestoredAt - tracksRestoredAt) * 1_000,
+            "timelineMs": (timelinePublishedAt - editGraphRestoredAt) * 1_000,
+            "playbackMs": (playbackPublishedAt - timelinePublishedAt) * 1_000,
+            "finalizeMs": (finishedAt - playbackPublishedAt) * 1_000,
+            "totalMs": totalMilliseconds,
+        ]
+        if totalMilliseconds > 16 {
+            SoundtimeDiagnostics.shared.record(
+                category: .edit,
+                severity: .warning,
+                name: "undo-project-tracks-complete",
+                message: "Project track undo restoration exceeded its interaction budget.",
+                fields: [
+                    "trackCount": "\(snapshot.tracks.count)",
+                    "tracksMs": String(format: "%.3f", (tracksRestoredAt - restoreStartedAt) * 1_000),
+                    "editGraphMs": String(format: "%.3f", (editGraphRestoredAt - tracksRestoredAt) * 1_000),
+                    "timelineMs": String(format: "%.3f", (timelinePublishedAt - editGraphRestoredAt) * 1_000),
+                    "playbackMs": String(format: "%.3f", (playbackPublishedAt - timelinePublishedAt) * 1_000),
+                    "finalizeMs": String(format: "%.3f", (finishedAt - playbackPublishedAt) * 1_000),
+                    "totalMs": String(format: "%.3f", totalMilliseconds),
+                ]
+            )
+        }
+
+        DispatchQueue.main.async { [weak self] in
+            self?.updateEffectCommandState()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak self] in
+            self?.cleanupOwnedSourceFiles(replacedTracks: replacedTracks)
+        }
     }
 
     private func cancelEditMaterialization(for trackID: UUID) {
         editMaterializationTasks[trackID]?.cancel()
         editMaterializationTasks[trackID] = nil
+        portablePastePreparationJobs[trackID]?.cancel()
+        portablePastePreparationJobs[trackID] = nil
         editMaterializationRequestIDs[trackID] = nil
         cancelOptimisticDeleteWaveformUpdate(for: trackID)
         cancelEditWaveformRefinement(for: trackID)
@@ -14789,6 +16677,10 @@ final class WorkspaceView: NSView {
             task.cancel()
         }
         editMaterializationTasks.removeAll()
+        for job in portablePastePreparationJobs.values {
+            job.cancel()
+        }
+        portablePastePreparationJobs.removeAll()
         editMaterializationRequestIDs.removeAll()
         for task in optimisticDeleteWaveformTasks.values {
             task.cancel()
@@ -14810,6 +16702,10 @@ final class WorkspaceView: NSView {
             task.cancel()
         }
         editMaterializationTasks.removeAll()
+        for job in portablePastePreparationJobs.values {
+            job.cancel()
+        }
+        portablePastePreparationJobs.removeAll()
         editMaterializationRequestIDs.removeAll()
         for task in editWaveformRefinementTasks.values {
             task.cancel()
@@ -14991,6 +16887,9 @@ final class WorkspaceView: NSView {
     }
 
     private func exportCurrentAudio() {
+        guard canPresentNewAudioExport() else {
+            return
+        }
         guard canCreateAudioExportSnapshot(for: .fullMixdown) else {
             return
         }
@@ -15000,12 +16899,12 @@ final class WorkspaceView: NSView {
         savePanel.nameFieldStringValue = suggestedExportFilename()
         savePanel.canCreateDirectories = true
         savePanel.isExtensionHidden = false
-        savePanel.allowedContentTypes = [
-            .wav,
-            UTType(filenameExtension: "m4a") ?? .audio,
-            UTType(filenameExtension: "aac") ?? .audio,
-            UTType(filenameExtension: "mp3") ?? .audio,
-        ]
+        savePanel.allowedContentTypes = supportedAudioExportContentTypes()
+        let exportOptions = AudioExportOptionsAccessoryView(
+            includesCompressedOptions: true,
+            includesStemOptions: false
+        )
+        savePanel.accessoryView = exportOptions
 
         let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
             guard
@@ -15018,7 +16917,9 @@ final class WorkspaceView: NSView {
             self?.beginAudioExport(
                 scope: .fullMixdown,
                 destinationURL: destinationURL,
-                format: AudioExportFormat(destinationURL: destinationURL)
+                format: AudioExportFormat(destinationURL: destinationURL),
+                wavEncoding: exportOptions.wavEncoding,
+                compressedQuality: exportOptions.compressedQuality
             )
         }
 
@@ -15028,12 +16929,17 @@ final class WorkspaceView: NSView {
             beginAudioExport(
                 scope: .fullMixdown,
                 destinationURL: destinationURL,
-                format: AudioExportFormat(destinationURL: destinationURL)
+                format: AudioExportFormat(destinationURL: destinationURL),
+                wavEncoding: exportOptions.wavEncoding,
+                compressedQuality: exportOptions.compressedQuality
             )
         }
     }
 
     private func exportWAVMixdown() {
+        guard canPresentNewAudioExport() else {
+            return
+        }
         guard canCreateAudioExportSnapshot(for: .fullMixdown) else {
             updateStatus("load audio before exporting")
             return
@@ -15045,6 +16951,11 @@ final class WorkspaceView: NSView {
         savePanel.canCreateDirectories = true
         savePanel.isExtensionHidden = false
         savePanel.allowedContentTypes = [.wav]
+        let exportOptions = AudioExportOptionsAccessoryView(
+            includesCompressedOptions: false,
+            includesStemOptions: false
+        )
+        savePanel.accessoryView = exportOptions
 
         let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
             guard response == .OK, let destinationURL = savePanel.url else {
@@ -15054,7 +16965,8 @@ final class WorkspaceView: NSView {
             self?.beginAudioExport(
                 scope: .fullMixdown,
                 destinationURL: destinationURL,
-                format: .wav
+                format: .wav,
+                wavEncoding: exportOptions.wavEncoding
             )
         }
 
@@ -15097,6 +17009,9 @@ final class WorkspaceView: NSView {
     }
 
     private func presentSelectedRegionExportPanel(scope: AudioExportScope) {
+        guard canPresentNewAudioExport() else {
+            return
+        }
         guard canCreateAudioExportSnapshot(for: scope) else {
             updateStatus("load audio before exporting")
             return
@@ -15107,12 +17022,12 @@ final class WorkspaceView: NSView {
         savePanel.nameFieldStringValue = suggestedSelectedRegionExportFilename()
         savePanel.canCreateDirectories = true
         savePanel.isExtensionHidden = false
-        savePanel.allowedContentTypes = [
-            .wav,
-            UTType(filenameExtension: "m4a") ?? .audio,
-            UTType(filenameExtension: "aac") ?? .audio,
-            UTType(filenameExtension: "mp3") ?? .audio,
-        ]
+        savePanel.allowedContentTypes = supportedAudioExportContentTypes()
+        let exportOptions = AudioExportOptionsAccessoryView(
+            includesCompressedOptions: true,
+            includesStemOptions: false
+        )
+        savePanel.accessoryView = exportOptions
 
         let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
             guard response == .OK, let destinationURL = savePanel.url else {
@@ -15122,7 +17037,9 @@ final class WorkspaceView: NSView {
             self?.beginAudioExport(
                 scope: scope,
                 destinationURL: destinationURL,
-                format: AudioExportFormat(destinationURL: destinationURL)
+                format: AudioExportFormat(destinationURL: destinationURL),
+                wavEncoding: exportOptions.wavEncoding,
+                compressedQuality: exportOptions.compressedQuality
             )
         }
 
@@ -15142,6 +17059,9 @@ final class WorkspaceView: NSView {
     }
 
     private func exportStemSet(includeMixdown: Bool) {
+        guard canPresentNewAudioExport() else {
+            return
+        }
         let scope = AudioExportScope.stems(includeMixdown: includeMixdown, selection: nil)
         guard canCreateAudioExportSnapshot(for: scope) else {
             updateStatus("load tracks before exporting stems")
@@ -15155,6 +17075,11 @@ final class WorkspaceView: NSView {
         openPanel.canChooseDirectories = true
         openPanel.canCreateDirectories = true
         openPanel.allowsMultipleSelection = false
+        let exportOptions = AudioExportOptionsAccessoryView(
+            includesCompressedOptions: false,
+            includesStemOptions: true
+        )
+        openPanel.accessoryView = exportOptions
 
         let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
             guard response == .OK, let folderURL = openPanel.url else {
@@ -15164,7 +17089,9 @@ final class WorkspaceView: NSView {
             self?.beginAudioExport(
                 scope: scope,
                 destinationURL: folderURL,
-                format: .wav
+                format: .wav,
+                wavEncoding: exportOptions.wavEncoding,
+                stemOptions: exportOptions.stemOptions
             )
         }
 
@@ -15178,24 +17105,38 @@ final class WorkspaceView: NSView {
     private func beginAudioExport(
         scope: AudioExportScope,
         destinationURL: URL,
-        format: AudioExportFormat
+        format: AudioExportFormat,
+        wavEncoding: AudioExportWAVEncoding = .pcm24,
+        compressedQuality: AudioExportCompressedQuality = .standard,
+        stemOptions: AudioExportStemOptions = .v1Default
     ) {
+        guard !audioExportService.hasActiveExport else {
+            presentActiveExportConflict()
+            return
+        }
         let request = AudioExportRequest(
             projectName: suggestedProjectFilename(),
             scope: scope,
             format: format,
-            destinationURL: destinationURL
+            destinationURL: destinationURL,
+            wavEncoding: wavEncoding,
+            compressedQuality: compressedQuality,
+            stemOptions: stemOptions
         )
 
         do {
+            let snapshotStartedAt = CACurrentMediaTime()
             let snapshot = try makeAudioExportSnapshot(request: request)
+            let snapshotElapsedMilliseconds =
+                (CACurrentMediaTime() - snapshotStartedAt) * 1_000
             let initialProgress = AudioExportProgress.initial(request: request)
             activeAudioExportJobID = request.id
+            lastDiagnosedAudioExportStage = nil
             latestAudioExportProgress = initialProgress
             showAudioExportWindow()
             handleAudioExportProgress(initialProgress)
             updateStatus("exporting \(scope.displayName.lowercased()) in background")
-            audioExportService.start(snapshot: snapshot)
+            try audioExportService.start(snapshot: snapshot)
             SoundtimeDiagnostics.shared.record(
                 category: .system,
                 severity: .info,
@@ -15207,10 +17148,40 @@ final class WorkspaceView: NSView {
                     "format": format.displayName,
                     "trackCount": "\(snapshot.tracks.count)",
                     "frameCount": "\(snapshot.frameCount)",
+                    "snapshotMs": String(
+                        format: "%.2f",
+                        snapshotElapsedMilliseconds
+                    ),
                 ]
             )
+            if snapshotElapsedMilliseconds > 16 {
+                SoundtimeDiagnostics.shared.record(
+                    category: .threading,
+                    severity: .warning,
+                    name: "audio-export-snapshot-budget-exceeded",
+                    message: "Capturing the immutable export snapshot exceeded one 60 Hz frame.",
+                    fields: [
+                        "jobID": request.id.uuidString,
+                        "elapsedMs": String(
+                            format: "%.2f",
+                            snapshotElapsedMilliseconds
+                        ),
+                        "trackCount": "\(snapshot.tracks.count)",
+                    ]
+                )
+            }
         } catch {
             activeAudioExportJobID = nil
+            if latestAudioExportProgress?.jobID == request.id {
+                handleAudioExportProgress(AudioExportProgress(
+                    jobID: request.id,
+                    request: request,
+                    stage: .failed,
+                    fractionCompleted: 0,
+                    message: error.localizedDescription,
+                    outputURLs: []
+                ))
+            }
             updateStatus("export failed: \(error.localizedDescription)")
             SoundtimeDiagnostics.shared.record(
                 category: .system,
@@ -15226,12 +17197,56 @@ final class WorkspaceView: NSView {
         }
     }
 
+    private func supportedAudioExportContentTypes() -> [UTType] {
+        AudioExportFormat.allCases.compactMap { format in
+            guard format.isSystemEncoderAvailable else {
+                return nil
+            }
+            return format == .wav ?
+                .wav :
+                UTType(filenameExtension: format.fileExtension)
+        }
+    }
+
+    private func presentActiveExportConflict() {
+        let alert = NSAlert()
+        alert.messageText = "An Export Is Already Running"
+        alert.informativeText = "Keep the current export running, or cancel it before starting another export."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Keep Current Export")
+        alert.addButton(withTitle: "Cancel Current Export")
+
+        let handleResponse: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .alertSecondButtonReturn else {
+                return
+            }
+            self?.audioExportWindowController?.markCancellationRequested()
+            self?.audioExportService.cancel()
+        }
+        if let window {
+            alert.beginSheetModal(for: window, completionHandler: handleResponse)
+        } else {
+            handleResponse(alert.runModal())
+        }
+    }
+
+    private func canPresentNewAudioExport() -> Bool {
+        guard !audioExportService.hasActiveExport else {
+            presentActiveExportConflict()
+            return false
+        }
+        return true
+    }
+
     private func canCreateAudioExportSnapshot(for scope: AudioExportScope) -> Bool {
         !audioExportTrackSnapshots(for: scope).isEmpty || fallbackAudioExportTrackSnapshot() != nil
     }
 
     private func makeAudioExportSnapshot(request: AudioExportRequest) throws -> AudioExportSnapshot {
-        var tracks = audioExportTrackSnapshots(for: request.scope)
+        var tracks = audioExportTrackSnapshots(
+            for: request.scope,
+            stemOptions: request.stemOptions
+        )
         if tracks.isEmpty, let fallbackTrack = fallbackAudioExportTrackSnapshot() {
             tracks = [fallbackTrack]
         }
@@ -15246,10 +17261,17 @@ final class WorkspaceView: NSView {
 
         let sampleRate = firstTiming.sampleRate > 0 ? firstTiming.sampleRate : max(displayedSampleRate, 44_100)
         let channelCount = max(timings.map(\.channelCount).max() ?? 2, 2)
-        let fullDurationFrameCount = timings.reduce(0) { result, timing in
+        let exportedTracksDurationFrameCount = timings.reduce(0) { result, timing in
             let convertedFrameCount = Int((Double(timing.frameCount) / max(timing.sampleRate, 1) * sampleRate).rounded(.up))
             return max(result, convertedFrameCount)
         }
+        let projectDurationFrameCount = Int(
+            (max(projectSelectionDuration, 0) * sampleRate).rounded(.up)
+        )
+        let fullDurationFrameCount = max(
+            exportedTracksDurationFrameCount,
+            projectDurationFrameCount
+        )
         guard fullDurationFrameCount > 0 else {
             throw WorkspaceAudioExportError.noAudioToExport
         }
@@ -15285,34 +17307,47 @@ final class WorkspaceView: NSView {
         )
     }
 
-    private func audioExportTrackSnapshots(for scope: AudioExportScope) -> [AudioExportTrackSnapshot] {
+    private func audioExportTrackSnapshots(
+        for scope: AudioExportScope,
+        stemOptions: AudioExportStemOptions = .v1Default
+    ) -> [AudioExportTrackSnapshot] {
         let sourceTracks: [ProjectTrack]
         switch scope {
         case .fullMixdown, .timeRange:
-            sourceTracks = audibleProjectTracks
+            sourceTracks = projectTracks
         case let .trackRange(trackID, _):
             sourceTracks = projectTracks.filter { $0.id == trackID }
         case .stems:
-            sourceTracks = projectTracks
+            switch stemOptions.trackInclusion {
+            case .allTracks:
+                sourceTracks = projectTracks
+            case .audibleTracks:
+                sourceTracks = audibleProjectTracks
+            }
         }
 
         return sourceTracks.compactMap(audioExportTrackSnapshot(for:))
     }
 
     private func audioExportTrackSnapshot(for track: ProjectTrack) -> AudioExportTrackSnapshot? {
+        let normalizedSourceURL = track.sourceURL.standardizedFileURL
+        let knownFileInfo = wavFileInfoCache[normalizedSourceURL]
+
         let source: AudioExportTrackSource
         if
             let fileTimeline = track.fileTimeline,
-            let fileInfo = decodableWAVFileInfo(for: track.sourceURL),
+            let fileInfo = knownFileInfo ?? decodableWAVFileInfo(for: track.sourceURL),
             fileTimeline.isCompatible(with: fileInfo)
         {
             source = .fileTimeline(track.sourceURL, fileInfo, fileTimeline)
         } else if let audioTimeline = track.audioTimeline {
             source = .timeline(audioTimeline)
-        } else if let fileInfo = decodableWAVFileInfo(for: track.sourceURL) {
-            source = .file(track.sourceURL, fileInfo)
+        } else if let knownFileInfo {
+            source = .file(track.sourceURL, knownFileInfo)
         } else if let decodedAudioBuffer = track.decodedAudioBuffer {
             source = .decoded(decodedAudioBuffer)
+        } else if let fileInfo = decodableWAVFileInfo(for: track.sourceURL) {
+            source = .file(track.sourceURL, fileInfo)
         } else {
             return nil
         }
@@ -15321,6 +17356,8 @@ final class WorkspaceView: NSView {
             id: track.id,
             name: track.name,
             volume: track.volume,
+            isMuted: track.isMuted,
+            isSoloed: track.isSoloed,
             source: source
         )
     }
@@ -15344,10 +17381,22 @@ final class WorkspaceView: NSView {
         switch source {
         case let .decoded(buffer):
             return (buffer.sampleRate, buffer.channelCount, buffer.frameCount)
+        case let .decodedSegments(buffer, segments):
+            return (
+                buffer.sampleRate,
+                buffer.channelCount,
+                segments.map { $0.outputStartFrame + $0.frameCount }.max() ?? 0
+            )
         case let .timeline(timeline):
             return (timeline.sourceAudioBuffer.sampleRate, timeline.sourceAudioBuffer.channelCount, timeline.frameCount)
         case let .file(_, fileInfo):
             return (fileInfo.sampleRate, fileInfo.channelCount, fileInfo.frameCount)
+        case let .fileSegments(_, fileInfo, segments):
+            return (
+                fileInfo.sampleRate,
+                fileInfo.channelCount,
+                segments.map { $0.outputStartFrame + $0.frameCount }.max() ?? 0
+            )
         case let .fileTimeline(_, fileInfo, fileTimeline):
             return (fileInfo.sampleRate, fileInfo.channelCount, fileTimeline.frameCount)
         }
@@ -15364,6 +17413,7 @@ final class WorkspaceView: NSView {
                     return
                 }
                 if self.audioExportService.hasActiveExport {
+                    self.audioExportWindowController?.markCancellationRequested()
                     self.audioExportService.cancel()
                 } else {
                     self.audioExportWindowController?.close()
@@ -15390,6 +17440,24 @@ final class WorkspaceView: NSView {
 
         latestAudioExportProgress = progress
         audioExportWindowController?.update(progress: progress)
+        if lastDiagnosedAudioExportStage != progress.stage {
+            lastDiagnosedAudioExportStage = progress.stage
+            SoundtimeDiagnostics.shared.record(
+                category: .system,
+                severity: progress.stage == .failed ? .warning : .info,
+                name: "audio-export-stage",
+                message: "Audio export changed stage.",
+                fields: [
+                    "jobID": progress.jobID.uuidString,
+                    "stage": progress.stage.rawValue,
+                    "fraction": String(
+                        format: "%.3f",
+                        progress.fractionCompleted
+                    ),
+                    "message": progress.message,
+                ]
+            )
+        }
         if progress.stage == .completed || progress.stage == .canceled || progress.stage == .failed {
             activeAudioExportJobID = nil
         }
@@ -15467,7 +17535,7 @@ final class WorkspaceView: NSView {
             audioExportStatusButton.title = "Export failed"
         case .canceled:
             audioExportStatusButton.title = "Export canceled"
-        case .preparing, .rendering, .encoding, .finishing:
+        case .preparing, .rendering, .encoding, .validating, .committing, .finishing:
             audioExportStatusButton.title = "Export \(percent)%"
         }
         audioExportStatusButton.isHidden = audioExportWindowController?.window?.isVisible == true
@@ -15605,28 +17673,28 @@ final class WorkspaceView: NSView {
         let startedAt = CACurrentMediaTime()
         viewportPersistenceWorkItem?.cancel()
         viewportPersistenceWorkItem = nil
-        persistLatestTimelineViewport(schedulesLaunchSnapshot: false)
 
         guard let currentProjectURL else {
             return
         }
 
+        let viewport = latestTimelineViewportForPersistence ?? currentTimelineViewport()
+        latestTimelineViewportForPersistence = viewport
         let layout = currentWindowLayout()
-        if let layout {
+        if layout != nil || viewport != nil {
             advanceLaunchStateRevision()
-            SoundtimeProjectStore.rememberWindowLayout(layout, for: currentProjectURL)
         }
-        var overlayPersistedSynchronously = false
-        var overlayPersistedAsynchronously = false
-        if let overlay = currentLaunchStateOverlay(windowLayout: layout) {
-            if projectTracks.count <= 32 {
+        let overlay = currentLaunchStateOverlay(windowLayout: layout)
+        let trackCount = projectTracks.count
+        statePersistenceQueue.async { [layout, viewport, overlay, currentProjectURL] in
+            if let layout {
+                SoundtimeProjectStore.rememberWindowLayout(layout, for: currentProjectURL)
+            }
+            if let viewport {
+                SoundtimeProjectStore.rememberTimelineViewport(viewport, for: currentProjectURL)
+            }
+            if let overlay {
                 SoundtimeProjectStore.rememberLaunchStateOverlay(overlay, for: currentProjectURL)
-                overlayPersistedSynchronously = true
-            } else {
-                overlayPersistedAsynchronously = true
-                closeStatePersistenceQueue.async { [overlay, currentProjectURL] in
-                    SoundtimeProjectStore.rememberLaunchStateOverlay(overlay, for: currentProjectURL)
-                }
             }
         }
 
@@ -15635,11 +17703,11 @@ final class WorkspaceView: NSView {
             .windowCloseStatePersisted,
             fields: [
                 "elapsedMs": String(format: "%.2f", elapsedMilliseconds),
-                "tracks": "\(projectTracks.count)",
+                "tracks": "\(trackCount)",
                 "launchSnapshotWrite": "false",
                 "firstFramePacketWrite": "false",
-                "launchOverlaySync": "\(overlayPersistedSynchronously)",
-                "launchOverlayAsync": "\(overlayPersistedAsynchronously)",
+                "launchOverlaySync": "false",
+                "launchOverlayAsync": "\(overlay != nil)",
             ]
         )
         SoundtimeDiagnostics.shared.record(
@@ -15652,8 +17720,8 @@ final class WorkspaceView: NSView {
                 "tracks": "\(projectTracks.count)",
                 "launchSnapshotWrite": "false",
                 "firstFramePacketWrite": "false",
-                "launchOverlaySync": "\(overlayPersistedSynchronously)",
-                "launchOverlayAsync": "\(overlayPersistedAsynchronously)",
+                "launchOverlaySync": "false",
+                "launchOverlayAsync": "\(overlay != nil)",
             ]
         )
     }
@@ -15677,13 +17745,16 @@ final class WorkspaceView: NSView {
         lastTimelineHotInteractionTime = CACurrentMediaTime()
     }
 
-    private func scheduleTimelineViewportPersistence() {
+    private func scheduleTimelineViewportPersistence(delay: TimeInterval? = nil) {
         viewportPersistenceWorkItem?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
             self?.persistLatestTimelineViewport()
         }
         viewportPersistenceWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + viewportPersistenceDelay, execute: workItem)
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + (delay ?? viewportPersistenceDelay),
+            execute: workItem
+        )
     }
 
     private func persistLatestTimelineViewport(
@@ -15692,6 +17763,23 @@ final class WorkspaceView: NSView {
     ) {
         viewportPersistenceWorkItem?.cancel()
         viewportPersistenceWorkItem = nil
+
+        if schedulesLaunchSnapshot,
+           let deferralReason = launchCacheHotPathDeferralReason()
+        {
+            scheduleTimelineViewportPersistence(delay: launchCacheHotPathQuietInterval)
+            SoundtimeDiagnostics.shared.record(
+                category: .system,
+                severity: .info,
+                name: "launch-state-overlay-persist-deferred-hot-path",
+                message: "Timeline launch-state persistence was deferred until interaction became quiet.",
+                fields: [
+                    "deferral": deferralReason,
+                    "delayMs": String(format: "%.0f", launchCacheHotPathQuietInterval * 1_000),
+                ]
+            )
+            return
+        }
 
         guard let currentProjectURL else {
             return
@@ -15704,34 +17792,32 @@ final class WorkspaceView: NSView {
 
         latestTimelineViewportForPersistence = viewport
         advanceLaunchStateRevision()
-        SoundtimeProjectStore.rememberTimelineViewport(viewport, for: currentProjectURL)
-        if schedulesLaunchSnapshot {
-            persistLaunchStateOverlayOnly(reason: "timeline-viewport")
+        let overlay = schedulesLaunchSnapshot ?
+            currentLaunchStateOverlay(windowLayout: currentWindowLayout()) :
+            nil
+        let trackCount = projectTracks.count
+        statePersistenceQueue.async { [viewport, overlay, currentProjectURL] in
+            SoundtimeProjectStore.rememberTimelineViewport(viewport, for: currentProjectURL)
+            if let overlay {
+                SoundtimeProjectStore.rememberLaunchStateOverlay(overlay, for: currentProjectURL)
+            }
+            SoundtimeDiagnostics.shared.record(
+                category: .system,
+                severity: .info,
+                name: "launch-state-overlay-persisted",
+                message: "Persisted lightweight launch state off the main thread.",
+                fields: [
+                    "reason": "timeline-viewport",
+                    "tracks": "\(trackCount)",
+                    "mainThread": "\(Thread.isMainThread)",
+                ]
+            )
         }
         if flushImmediately {
-            UserDefaults.standard.synchronize()
+            statePersistenceQueue.async {
+                SoundtimeProjectStore.synchronizePersistence()
+            }
         }
-    }
-
-    private func persistLaunchStateOverlayOnly(reason: String) {
-        guard
-            let currentProjectURL,
-            let overlay = currentLaunchStateOverlay(windowLayout: currentWindowLayout())
-        else {
-            return
-        }
-
-        SoundtimeProjectStore.rememberLaunchStateOverlay(overlay, for: currentProjectURL)
-        SoundtimeDiagnostics.shared.record(
-            category: .system,
-            severity: .info,
-            name: "launch-state-overlay-persisted",
-            message: "Persisted lightweight launch state without writing waveform packets.",
-            fields: [
-                "reason": reason,
-                "tracks": "\(projectTracks.count)",
-            ]
-        )
     }
 
     private func currentLaunchStateOverlay(
@@ -15975,6 +18061,7 @@ final class WorkspaceView: NSView {
         }
 
         launchCacheWriteInFlight = true
+        let lifecycleGeneration = workspaceLifecycleGeneration
         SoundtimeDiagnostics.shared.record(
             category: .render,
             severity: .info,
@@ -16005,7 +18092,8 @@ final class WorkspaceView: NSView {
             )
         }
 
-        launchCacheWriteQueue.async { [draft, request, trackCount, draftDurationMilliseconds] in
+        launchCacheWriteQueue.async {
+            [draft, request, trackCount, draftDurationMilliseconds, lifecycleGeneration] in
             let startedAt = CACurrentMediaTime()
             let result = Result { () -> (packetDrawable: Bool, launchBundleSaved: Bool) in
                 let snapshot = ProjectLaunchSnapshot(
@@ -16071,7 +18159,10 @@ final class WorkspaceView: NSView {
             let durationMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
 
             DispatchQueue.main.async { [weak self] in
-                guard let self else {
+                guard
+                    let self,
+                    self.workspaceLifecycleGeneration == lifecycleGeneration
+                else {
                     return
                 }
                 self.launchCacheWriteInFlight = false
@@ -16258,6 +18349,7 @@ final class WorkspaceView: NSView {
         projectHydrationCompletedTrackIDs.removeAll()
         projectHydrationFailedTrackIDs.removeAll()
         projectHydrationLaunchCacheWriteScheduled = false
+        projectHydrationImprovedLaunchWaveforms = false
         isLoadingProject = true
         updateStatus("opening project")
         SoundtimeDiagnostics.shared.record(
@@ -16268,7 +18360,7 @@ final class WorkspaceView: NSView {
             fields: ["file": projectURL.lastPathComponent]
         )
 
-        DispatchQueue.global(qos: .userInitiated).async {
+        projectCriticalLoadQueue.async {
             let startedAt = CACurrentMediaTime()
             let result = Result {
                 try SoundtimeProjectStore.loadRecoveringAutosave(from: projectURL)
@@ -16318,13 +18410,14 @@ final class WorkspaceView: NSView {
         projectHydrationCompletedTrackIDs.removeAll()
         projectHydrationFailedTrackIDs.removeAll()
         projectHydrationLaunchCacheWriteScheduled = false
+        projectHydrationImprovedLaunchWaveforms = false
         isLoadingProject = true
         updateStatus("opening recovered autosave")
 
         DispatchQueue.global(qos: .userInitiated).async {
             let startedAt = CACurrentMediaTime()
             let result = Result {
-                try SoundtimeProjectStore.load(from: autosaveURL)
+                try SoundtimeProjectStore.loadRecoveredAutosave(from: autosaveURL)
             }
             let loadDurationMilliseconds = (CACurrentMediaTime() - startedAt) * 1_000
 
@@ -16334,14 +18427,15 @@ final class WorkspaceView: NSView {
                 }
 
                 switch result {
-                case let .success(project):
+                case let .success(recoveredAutosave):
+                    let canonicalProjectURL = recoveredAutosave.canonicalProjectURL
                     self.applyLoadedProjectSkeleton(
-                        project,
-                        projectURL: autosaveURL,
+                        recoveredAutosave.project,
+                        projectURL: canonicalProjectURL ?? autosaveURL,
                         loadGeneration: generation,
                         loadDurationMilliseconds: loadDurationMilliseconds,
                         statusPrefix: "recovered autosave",
-                        remembersProjectURL: false
+                        remembersProjectURL: canonicalProjectURL != nil
                     )
                 case let .failure(error):
                     self.isLoadingProject = false
@@ -16356,7 +18450,8 @@ final class WorkspaceView: NSView {
     private struct LoadedProjectTrackHydration: Sendable {
         var trackID: UUID
         var sourceURL: URL
-        var fileInfo: WAVFileInfo
+        var fileInfo: WAVFileInfo?
+        var sampleRate: Double
         var sourceOverview: WaveformOverview?
         var displayOverview: WaveformOverview?
         var fileTimeline: AudioFileEditTimeline
@@ -16520,6 +18615,7 @@ final class WorkspaceView: NSView {
         projectHydrationCompletedTrackIDs.removeAll()
         projectHydrationFailedTrackIDs.removeAll()
         projectHydrationLaunchCacheWriteScheduled = false
+        projectHydrationImprovedLaunchWaveforms = false
         let cachedPreviewTrackCount = project.tracks.filter { $0.waveformPreview != nil }.count
 
         isLoadingProject = true
@@ -16560,7 +18656,7 @@ final class WorkspaceView: NSView {
         )
         updateProjectDisplayTiming()
         syncActiveTrackFields()
-        playbackController.clear()
+        playbackControllerStorage?.clear()
         updateTransportControlState(isPlaying: false)
         window?.title = projectWindowTitle()
         updateLoadedProjectSummary()
@@ -16730,7 +18826,7 @@ final class WorkspaceView: NSView {
             ]
         )
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        projectCriticalLoadQueue.async { [weak self] in
             let result = ProjectLaunchPlaybackPrimer.prime(
                 project: project,
                 projectURL: projectURL,
@@ -16763,7 +18859,10 @@ final class WorkspaceView: NSView {
 
         if result.hasPlayableTracks {
             do {
-                try playbackController.loadProjectTracks(result.tracks.map(\.playbackTrack))
+                let playbackTracks = result.tracks.map(\.playbackTrack)
+                try playbackController.loadProjectTracks(playbackTracks)
+                publishedProjectPlaybackTracks = playbackTracks
+                lastPlaybackReloadErrorDescription = nil
                 projectPlaybackPrimedTrackIDs = Set(result.tracks.map(\.trackID))
                 applyLoadedProjectPlaybackPrimeTracks(result.tracks)
                 let outputWarmStartedAt = CACurrentMediaTime()
@@ -16838,6 +18937,8 @@ final class WorkspaceView: NSView {
                     ]
                 )
             } catch {
+                publishedProjectPlaybackTracks.removeAll()
+                lastPlaybackReloadErrorDescription = error.localizedDescription
                 projectPlaybackPrimedTrackIDs.removeAll()
                 LaunchStartupTrace.shared.mark(
                     .playbackPrimeReadyWithFailures,
@@ -16861,6 +18962,7 @@ final class WorkspaceView: NSView {
                 )
             }
         } else {
+            publishedProjectPlaybackTracks.removeAll()
             projectPlaybackPrimedTrackIDs.removeAll()
             LaunchStartupTrace.shared.mark(
                 .playbackPrimeReadyWithFailures,
@@ -16895,17 +18997,19 @@ final class WorkspaceView: NSView {
                 continue
             }
 
-            wavFileInfoCache[primeTrack.sourceURL] = primeTrack.fileInfo
+            if let fileInfo = primeTrack.fileInfo {
+                wavFileInfoCache[primeTrack.sourceURL] = fileInfo
+            }
             projectTracks[trackIndex].sourceURL = primeTrack.sourceURL
             projectTracks[trackIndex].durationHint = projectTracks[trackIndex].durationHint ??
-                primeTrack.fileInfo.duration
+                primeTrack.fileTimeline?.duration
             projectTracks[trackIndex].fileTimeline = primeTrack.fileTimeline
             projectTracks[trackIndex].editableSource = primeTrack.editableSource
             projectTracks[trackIndex].ownsSourceFile = primeTrack.ownsSourceFile
             projectTracks[trackIndex].editRevision = primeTrack.editRevision
         }
 
-        updateProjectDisplayTiming(sampleRateHint: tracks.first?.fileInfo.sampleRate)
+        updateProjectDisplayTiming(sampleRateHint: tracks.first?.sampleRate)
         updateEffectCommandState()
     }
 
@@ -16923,6 +19027,7 @@ final class WorkspaceView: NSView {
         let cache = waveformOverviewDiskCache
         let expectedTrackCount = project.tracks.count
         projectHydrationLaunchCacheWriteScheduled = false
+        projectHydrationImprovedLaunchWaveforms = false
         let hydrationQueue = ProjectHydrationQueue(
             tracks: project.tracks,
             projectURL: projectURL,
@@ -16977,6 +19082,14 @@ final class WorkspaceView: NSView {
 
         projectHydrationQueue = nil
         isLoadingProject = false
+        updateProjectDisplayTiming()
+        updateTimeReadout()
+        if projectPlaybackPrimedTrackIDs.count < completedTrackCount {
+            reloadPlaybackFromProjectTracks(preserveProgress: true)
+        } else {
+            updateTransportControlState(isPlaying: playbackController.isPlaying)
+        }
+        updateEffectCommandState()
         if completedTrackCount >= expectedTrackCount {
             setProjectReadinessState(
                 .playbackReady(trackCount: completedTrackCount),
@@ -17006,7 +19119,9 @@ final class WorkspaceView: NSView {
 
         if !projectHydrationLaunchCacheWriteScheduled {
             projectHydrationLaunchCacheWriteScheduled = true
-            scheduleLaunchSnapshotSaveIfNeeded(reason: "project-hydration-complete", delay: 0.75)
+            if projectHydrationImprovedLaunchWaveforms {
+                scheduleLaunchSnapshotSaveIfNeeded(reason: "project-hydration-complete", delay: 0.75)
+            }
             SoundtimeDiagnostics.shared.record(
                 category: .system,
                 severity: failedTrackCount == 0 ? .info : .warning,
@@ -17018,6 +19133,7 @@ final class WorkspaceView: NSView {
                     "hydrated": "\(completedTrackCount)",
                     "failed": "\(failedTrackCount)",
                     "tracks": "\(expectedTrackCount)",
+                    "launchCacheRefresh": "\(projectHydrationImprovedLaunchWaveforms)",
                 ]
             )
         }
@@ -17028,9 +19144,71 @@ final class WorkspaceView: NSView {
         projectURL: URL,
         waveformOverviewDiskCache: WaveformOverviewDiskCacheStore
     ) -> LoadedProjectTrackHydrationResult {
-        let sourceURL = URL(fileURLWithPath: track.filePath).standardizedFileURL
-        do {
-            let fileInfo = try WAVAudioDecoder.inspect(url: sourceURL)
+        var lastError: Error?
+        for sourceURL in track.audioSourceCandidateURLs {
+            do {
+            guard let fileInfo = try? WAVAudioDecoder.inspect(url: sourceURL) else {
+                let assetInfo = try AudioAssetImporter.inspectSynchronously(url: sourceURL)
+                guard
+                    let sourceFrameCount = assetInfo.frameCount,
+                    let sourceSampleRate = assetInfo.sampleRate,
+                    let channelCount = assetInfo.channelCount,
+                    sourceFrameCount > 0,
+                    sourceSampleRate > 0,
+                    channelCount > 0
+                else {
+                    throw AudioAssetImporter.ImportError.unreadableNativeAudio(assetInfo.format)
+                }
+                let persistedTimeline = track.editTimeline
+                    .flatMap(AudioFileEditTimeline.init)
+                    .flatMap { timeline in
+                        timeline.sourceFrameCount == sourceFrameCount &&
+                            abs(timeline.sourceSampleRate - sourceSampleRate) < 0.001 ?
+                            timeline :
+                            nil
+                    }
+                let canonicalTimeline = persistedTimeline ?? AudioFileEditTimeline(
+                    sourceFrameCount: sourceFrameCount,
+                    sourceSampleRate: sourceSampleRate
+                )
+                let assetID = track.importedAssetState?.assetID ??
+                    track.editableSource?.importedAssetID ??
+                    UUID()
+                let restoredEditableSource = track.editableSource?.editableAudioSource()
+                let editableSource =
+                    restoredEditableSource.flatMap { source in
+                        source.editableURL.standardizedFileURL == sourceURL ? source : nil
+                    } ??
+                    EditableAudioSource(
+                        importedAssetID: assetID,
+                        originalURL: track.importedAssetState.map {
+                            URL(fileURLWithPath: $0.originalFilePath)
+                        } ?? sourceURL,
+                        editableURL: sourceURL,
+                        formatOrigin: track.importedAssetState?.format ?? assetInfo.format,
+                        sourceFrameCount: sourceFrameCount,
+                        sourceSampleRate: sourceSampleRate,
+                        channelCount: channelCount,
+                        ownsEditableFile: false
+                    )
+                let sourceOverview = track.waveformPreview?.sourceOverview.waveformOverview
+                let displayOverview = track.waveformPreview?.displayOverview.waveformOverview ??
+                    sourceOverview
+
+                return .success(LoadedProjectTrackHydration(
+                    trackID: track.id,
+                    sourceURL: sourceURL,
+                    fileInfo: nil,
+                    sampleRate: sourceSampleRate,
+                    sourceOverview: sourceOverview,
+                    displayOverview: displayOverview,
+                    fileTimeline: canonicalTimeline,
+                    editableSource: editableSource,
+                    zeroCrossingProbe: nil,
+                    ownsSourceFile: false,
+                    editRevision: canonicalTimeline.hasEdits ? 1 : 0
+                ))
+            }
             let persistedFileTimeline: AudioFileEditTimeline?
             if
                 let editTimeline = track.editTimeline,
@@ -17094,6 +19272,7 @@ final class WorkspaceView: NSView {
                 trackID: track.id,
                 sourceURL: sourceURL,
                 fileInfo: fileInfo,
+                sampleRate: fileInfo.sampleRate,
                 sourceOverview: sourceOverview,
                 displayOverview: displayOverview,
                 fileTimeline: canonicalFileTimeline,
@@ -17102,14 +19281,17 @@ final class WorkspaceView: NSView {
                 ownsSourceFile: track.ownsSourceFile ?? false,
                 editRevision: canonicalFileTimeline.hasEdits ? 1 : 0
             ))
-        } catch {
-            return .failure(
-                trackID: track.id,
-                trackName: track.name,
-                fileName: projectURL.lastPathComponent,
-                message: error.localizedDescription
-            )
+            } catch {
+                lastError = error
+            }
         }
+
+        return .failure(
+            trackID: track.id,
+            trackName: track.name,
+            fileName: projectURL.lastPathComponent,
+            message: lastError?.localizedDescription ?? "No saved audio source is available."
+        )
     }
 
     private func applyLoadedProjectTrackHydration(
@@ -17133,8 +19315,13 @@ final class WorkspaceView: NSView {
                 return
             }
 
-            wavFileInfoCache[hydration.sourceURL] = hydration.fileInfo
+            if let fileInfo = hydration.fileInfo {
+                wavFileInfoCache[hydration.sourceURL] = fileInfo
+            }
             projectTracks[trackIndex].sourceURL = hydration.sourceURL
+            let previousDuration = trackDuration(for: projectTracks[trackIndex])
+            let previousSourceBinCount = projectTracks[trackIndex].sourceWaveformOverview?.bins.count ?? 0
+            let previousDisplayBinCount = projectTracks[trackIndex].waveformOverview?.bins.count ?? 0
             projectTracks[trackIndex].sourceWaveformOverview = bestAvailableLaunchOverview(
                 hydration.sourceOverview,
                 projectTracks[trackIndex].sourceWaveformOverview
@@ -17143,6 +19330,13 @@ final class WorkspaceView: NSView {
                 hydration.displayOverview,
                 projectTracks[trackIndex].waveformOverview
             ) ?? projectTracks[trackIndex].sourceWaveformOverview
+            let hydratedSourceBinCount = projectTracks[trackIndex].sourceWaveformOverview?.bins.count ?? 0
+            let hydratedDisplayBinCount = projectTracks[trackIndex].waveformOverview?.bins.count ?? 0
+            let waveformImproved = hydratedSourceBinCount > previousSourceBinCount ||
+                hydratedDisplayBinCount > previousDisplayBinCount
+            if waveformImproved {
+                projectHydrationImprovedLaunchWaveforms = true
+            }
             projectTracks[trackIndex].zeroCrossingProbe = hydration.zeroCrossingProbe
             projectTracks[trackIndex].ownsSourceFile = hydration.ownsSourceFile
             projectTracks[trackIndex].editRevision = hydration.editRevision
@@ -17151,24 +19345,38 @@ final class WorkspaceView: NSView {
                 source: hydration.editableSource,
                 timeline: hydration.fileTimeline
             )
-            refreshProjectTimelineDisplay(
-                rebuildControls: false,
-                animateWaveformTransition: false,
-                allowImmediateWaveformPrewarm: true,
-                allowImmediateInteractiveWaveformPrewarm: false,
-                updatesRendererImmediately: true
-            )
-            updateProjectDisplayTiming(sampleRateHint: hydration.fileInfo.sampleRate)
-            updateTimeReadout()
-            if projectPlaybackPrimedTrackIDs.contains(hydration.trackID), playbackController.hasSource {
-                updateTransportControlState(isPlaying: playbackController.isPlaying)
-            } else {
-                reloadPlaybackFromProjectTracks(preserveProgress: true)
+            if hydration.fileInfo == nil {
+                projectTracks[trackIndex].importedAssetID =
+                    projectTracks[trackIndex].importedAssetID ??
+                    hydration.editableSource.importedAssetID
+                resumeImportedAudioPreparationIfNeeded(trackID: hydration.trackID)
             }
-            updateEffectCommandState()
 
             let hydratedTrackCount = projectTracks.filter { $0.editableSource != nil }.count
             let completedTrackCount = projectHydrationCompletedTrackIDs.count
+            let shouldPublishHydrationProgress = shouldRecordTrackHydratedDiagnostic(
+                completedTrackCount: completedTrackCount,
+                expectedTrackCount: expectedTrackCount
+            )
+            let waveformBecameDrawable =
+                previousSourceBinCount == 0 &&
+                previousDisplayBinCount == 0 &&
+                (hydratedSourceBinCount > 0 || hydratedDisplayBinCount > 0)
+            if waveformImproved && (waveformBecameDrawable || shouldPublishHydrationProgress) {
+                refreshProjectTimelineDisplay(
+                    rebuildControls: false,
+                    animateWaveformTransition: false,
+                    allowImmediateWaveformPrewarm: true,
+                    allowImmediateInteractiveWaveformPrewarm: false,
+                    updatesRendererImmediately: true
+                )
+            }
+            let durationChanged =
+                abs(trackDuration(for: projectTracks[trackIndex]) - previousDuration) > 0.000_001
+            if durationChanged && shouldPublishHydrationProgress {
+                updateProjectDisplayTiming(sampleRateHint: hydration.sampleRate)
+                updateTimeReadout()
+            }
             let statusOverride: String
             if playbackController.hasSource, completedTrackCount < expectedTrackCount {
                 statusOverride = "\(statusPrefix) playback ready - hydrating details \(completedTrackCount)/\(expectedTrackCount)"
@@ -17177,19 +19385,15 @@ final class WorkspaceView: NSView {
             } else {
                 statusOverride = "\(statusPrefix) loading playback \(hydratedTrackCount)/\(expectedTrackCount)"
             }
-            setProjectReadinessState(
-                .playbackHydrating(
-                    completed: completedTrackCount,
-                    failed: projectHydrationFailedTrackIDs.count,
-                    total: expectedTrackCount
-                ),
-                statusOverride: statusOverride
-            )
-            let shouldRecordHydrationProgress = shouldRecordTrackHydratedDiagnostic(
-                completedTrackCount: completedTrackCount,
-                expectedTrackCount: expectedTrackCount
-            )
-            if shouldRecordHydrationProgress {
+            if shouldPublishHydrationProgress {
+                setProjectReadinessState(
+                    .playbackHydrating(
+                        completed: completedTrackCount,
+                        failed: projectHydrationFailedTrackIDs.count,
+                        total: expectedTrackCount
+                    ),
+                    statusOverride: statusOverride
+                )
                 SoundtimeDiagnostics.shared.record(
                     category: .system,
                     severity: .info,
@@ -17213,7 +19417,7 @@ final class WorkspaceView: NSView {
                     "failed": "\(projectHydrationFailedTrackIDs.count)",
                     "tracks": "\(expectedTrackCount)",
                 ],
-                recordsDiagnosticEvent: shouldRecordHydrationProgress
+                recordsDiagnosticEvent: shouldPublishHydrationProgress
             )
             finishLoadedProjectHydrationIfReady(
                 expectedTrackCount: expectedTrackCount,
@@ -17316,6 +19520,7 @@ final class WorkspaceView: NSView {
         projectHydrationCompletedTrackIDs.removeAll()
         projectHydrationFailedTrackIDs.removeAll()
         projectHydrationLaunchCacheWriteScheduled = false
+        projectHydrationImprovedLaunchWaveforms = false
         projectReadinessState = .empty
         viewportPersistenceWorkItem?.cancel()
         viewportPersistenceWorkItem = nil
@@ -17324,7 +19529,8 @@ final class WorkspaceView: NSView {
         launchWaveformCacheRequestIDs.removeAll()
         latestTimelineViewportForPersistence = nil
         deleteAllOwnedSourceFiles()
-        playbackController.clear()
+        playbackControllerStorage?.clear()
+        publishedProjectPlaybackTracks.removeAll()
         projectTracks.removeAll()
         projectEditGraph = EditGraph()
         activeTrackID = nil
@@ -17469,8 +19675,53 @@ final class WorkspaceView: NSView {
             visualRevision: currentVisualRevision,
             launchStateRevision: currentLaunchStateRevision,
             tracks: projectTracks.compactMap { track in
-                guard let fileInfo = decodableWAVFileInfo(for: track.sourceURL) else {
+                let fileInfo = decodableWAVFileInfo(for: track.sourceURL)
+                guard
+                    fileInfo != nil ||
+                    (
+                        AudioAssetImporter.canImport(track.sourceURL) &&
+                        track.importedAssetID != nil &&
+                        track.editableSource != nil
+                    )
+                else {
                     return nil
+                }
+
+                let waveformPreview: SoundtimeProject.WaveformPreview?
+                if let fileInfo {
+                    waveformPreview = includeWaveformPreviews ?
+                        SoundtimeProject.WaveformPreview(
+                            sourceOverview: track.sourceWaveformOverview,
+                            displayOverview: track.waveformOverview,
+                            fileInfo: fileInfo
+                        ) :
+                        nil
+                } else if let importFingerprint = track.importFingerprint {
+                    waveformPreview = includeWaveformPreviews ?
+                        SoundtimeProject.WaveformPreview(
+                            sourceOverview: track.sourceWaveformOverview,
+                            displayOverview: track.waveformOverview,
+                            importedFingerprint: importFingerprint
+                        ) :
+                        nil
+                } else {
+                    waveformPreview = nil
+                }
+                let importedAssetState: SoundtimeProject.Track.ImportedAssetState?
+                if
+                    let assetID = track.importedAssetID,
+                    let fingerprint = track.importFingerprint,
+                    let editableSource = track.editableSource
+                {
+                    importedAssetState = SoundtimeProject.Track.ImportedAssetState(
+                        assetID: assetID,
+                        originalURL: editableSource.originalURL,
+                        format: editableSource.formatOrigin,
+                        fingerprint: fingerprint,
+                        stage: track.importStage ?? .complete
+                    )
+                } else {
+                    importedAssetState = nil
                 }
 
                 return SoundtimeProject.Track(
@@ -17483,15 +19734,10 @@ final class WorkspaceView: NSView {
                     isSoloed: track.isSoloed,
                     editTimeline: persistedEditTimeline(for: track),
                     editableSource: track.editableSource.map(SoundtimeProject.Track.EditableSource.init),
-                    waveformPreview: includeWaveformPreviews ?
-                        SoundtimeProject.WaveformPreview(
-                            sourceOverview: track.sourceWaveformOverview,
-                            displayOverview: track.waveformOverview,
-                            fileInfo: fileInfo
-                        ) :
-                        nil,
+                    waveformPreview: waveformPreview,
                     ownsSourceFile: track.ownsSourceFile,
-                    transcript: track.transcript
+                    transcript: track.transcript,
+                    importedAssetState: importedAssetState
                 )
             },
             windowLayout: currentWindowLayout(),
@@ -17510,7 +19756,7 @@ final class WorkspaceView: NSView {
 
         let clampedVolume = min(max(volume, 0), 1)
         volumeControl.perceptualVolume = clampedVolume
-        playbackController.setPerceptualVolume(clampedVolume)
+        playbackControllerStorage?.setPerceptualVolume(clampedVolume)
     }
 
     private func currentTimelineViewport() -> SoundtimeProject.TimelineViewport? {
@@ -18680,7 +20926,7 @@ final class WorkspaceView: NSView {
             return false
         }
 
-        let projectProgress = playbackController.snapshot().progress
+        let projectProgress = playbackControllerStorage?.snapshot().progress ?? visualPlayheadProgress
         return scopedTrackIndices(anchorTrackIndex: trackIndex, scope: editScope).contains { scopedTrackIndex in
             canSplitTrack(at: scopedTrackIndex, projectProgress: projectProgress)
         }
@@ -18731,7 +20977,7 @@ final class WorkspaceView: NSView {
         guard let target = currentEditableSelectionTarget() else {
             return false
         }
-        return rippleDeleteTargets(for: target, scope: editScope).contains(where: isEditableRippleDeleteTarget)
+        return plannedEditableTargetCount(for: target, scope: editScope) > 0
     }
 
     private var canClearSelection: Bool {
@@ -18778,6 +21024,26 @@ final class WorkspaceView: NSView {
         return hasEditableTimelineState(track)
     }
 
+    private func plannedEditableTargetCount(
+        for target: EditableSelectionTarget,
+        scope: EditScope
+    ) -> Int {
+        do {
+            let command = try makeRangeEditCommand(
+                kind: .rippleDelete,
+                target: target,
+                scope: scope
+            )
+            return try EditTransactionPlanner.plan(
+                command: command,
+                currentRevision: projectEditRevision(),
+                tracks: editTrackDescriptors(for: command)
+            ).trackEdits.count
+        } catch {
+            return 0
+        }
+    }
+
     private func updateEditScopeHint() {
         editScopeControl.selectedSegment = editScope.rawValue
         updateEditScopeVisibility(animated: true)
@@ -18803,9 +21069,10 @@ final class WorkspaceView: NSView {
             return
         }
 
-        let affectedTrackCount = rippleDeleteTargets(for: target, scope: editScope)
-            .filter(isEditableRippleDeleteTarget)
-            .count
+        let affectedTrackCount = plannedEditableTargetCount(
+            for: target,
+            scope: editScope
+        )
         guard affectedTrackCount > 0 else {
             editScopeHintLabel.stringValue = "No overlapping audio"
             return

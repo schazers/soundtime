@@ -15,7 +15,7 @@ final class AudioExportLeaseManager: @unchecked Sendable {
     private init() {}
 
     func acquire(urls: [URL], jobID: UUID) -> AudioExportAssetLease {
-        let uniqueURLs = Array(Set(urls.map { $0.standardizedFileURL }))
+        let uniqueURLs = Array(Set(urls.map(canonicalURL)))
         lock.lock()
         for url in uniqueURLs {
             var leases = leasesByURL[url] ?? []
@@ -96,7 +96,7 @@ final class AudioExportLeaseManager: @unchecked Sendable {
     }
 
     func isLeased(_ url: URL) -> Bool {
-        let normalizedURL = url.standardizedFileURL
+        let normalizedURL = canonicalURL(url)
         lock.lock()
         defer {
             lock.unlock()
@@ -105,7 +105,7 @@ final class AudioExportLeaseManager: @unchecked Sendable {
     }
 
     func deferDeletionIfLeased(_ url: URL) -> Bool {
-        let normalizedURL = url.standardizedFileURL
+        let normalizedURL = canonicalURL(url)
         lock.lock()
         let isCurrentlyLeased = leasesByURL[normalizedURL]?.isEmpty == false
         if isCurrentlyLeased {
@@ -126,5 +126,17 @@ final class AudioExportLeaseManager: @unchecked Sendable {
         }
 
         return isCurrentlyLeased
+    }
+
+    func deleteOrDefer(_ url: URL) throws {
+        let normalizedURL = canonicalURL(url)
+        if deferDeletionIfLeased(normalizedURL) {
+            return
+        }
+        try FileManager.default.removeItem(at: normalizedURL)
+    }
+
+    private func canonicalURL(_ url: URL) -> URL {
+        url.standardizedFileURL.resolvingSymlinksInPath()
     }
 }

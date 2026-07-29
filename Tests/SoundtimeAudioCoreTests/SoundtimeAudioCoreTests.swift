@@ -1759,6 +1759,111 @@ final class SoundtimeAudioCoreTests: XCTestCase {
         XCTAssertEqual(actual, expected, accuracy: 1e-12, file: file, line: line)
     }
 
+    func testOfflineRenderMatchesRealtimeRenderForResampledSegmentGraph() throws {
+        let engine = try XCTUnwrap(soundtime_audio_core_create())
+        defer {
+            soundtime_audio_core_destroy(engine)
+        }
+
+        let sourceSamples: [Float] = [0, 0.2, 0.5, -0.25, -0.6, 0.1]
+        let source = try sourceSamples.withUnsafeBufferPointer { sampleBuffer in
+            let channels = [sampleBuffer.baseAddress]
+            return try channels.withUnsafeBufferPointer { channelBuffer in
+                try XCTUnwrap(soundtime_audio_core_source_create_planar(
+                    channelBuffer.baseAddress,
+                    UInt64(sourceSamples.count),
+                    1,
+                    24_000
+                ))
+            }
+        }
+        defer {
+            soundtime_audio_core_source_destroy(source)
+        }
+
+        var segment = SoundtimeAudioCoreSegmentConfig(
+            outputStartFrame: 0,
+            sourceStartFrame: 0,
+            frameCount: 10,
+            sourceFrameScale: 0.5,
+            gainStart: 0.35,
+            gainEnd: 0.9
+        )
+        let didPrepare = withUnsafePointer(to: &segment) { segmentPointer in
+            var track = SoundtimeAudioCoreSegmentedTrackConfig(
+                source: source,
+                segments: segmentPointer,
+                segmentCount: 1,
+                gain: 0.8
+            )
+            return withUnsafePointer(to: &track) { trackPointer in
+                soundtime_audio_core_set_prepared_segmented_tracks_at_sample_rate(
+                    engine,
+                    trackPointer,
+                    1,
+                    48_000
+                )
+            }
+        }
+        XCTAssertTrue(didPrepare)
+
+        let offline = renderOffline(
+            engine: engine,
+            channelCount: 2,
+            frameCount: 10,
+            startFrameIndex: 0
+        )
+        soundtime_audio_core_set_transport_ramp_duration(engine, 0)
+        soundtime_audio_core_set_track_gain_ramp_duration(engine, 0)
+        soundtime_audio_core_play(engine)
+        let realtime = render(
+            engine: engine,
+            channelCount: 2,
+            frameCount: 10,
+            hostTimestamp: 1
+        )
+
+        XCTAssertEqual(offline.count, realtime.count)
+        for channelIndex in 0..<offline.count {
+            XCTAssertEqual(offline[channelIndex].count, realtime[channelIndex].count)
+            for frameIndex in 0..<offline[channelIndex].count {
+                XCTAssertEqual(
+                    offline[channelIndex][frameIndex],
+                    realtime[channelIndex][frameIndex],
+                    accuracy: 0.000_001
+                )
+            }
+        }
+    }
+
+    private func renderOffline(
+        engine: OpaquePointer,
+        channelCount: Int,
+        frameCount: Int,
+        startFrameIndex: Int
+    ) -> [[Float]] {
+        let buffers = (0..<channelCount).map { _ in
+            UnsafeMutablePointer<Float>.allocate(capacity: frameCount)
+        }
+        defer {
+            buffers.forEach { $0.deallocate() }
+        }
+        let pointers: [UnsafeMutablePointer<Float>?] = buffers
+        let didRender = pointers.withUnsafeBufferPointer { pointerBuffer in
+            soundtime_audio_core_render_offline(
+                engine,
+                UInt64(startFrameIndex),
+                pointerBuffer.baseAddress,
+                UInt32(channelCount),
+                UInt32(frameCount)
+            )
+        }
+        XCTAssertTrue(didRender)
+        return buffers.map {
+            Array(UnsafeBufferPointer(start: $0, count: frameCount))
+        }
+    }
+
     private func renderSilence(
         engine: OpaquePointer,
         channelCount: Int,

@@ -2,7 +2,9 @@ import CoreGraphics
 import Foundation
 
 enum TranscriptViewportGeometry {
-    private static let layoutCacheViewportOverscanMultiplier: TimeInterval = 1.0
+    private static let layoutCacheViewportOverscanMultiplier: TimeInterval = 2.0
+    private static let minimumLayoutCachePadding: TimeInterval = 30
+    private static let maximumLayoutCachePadding: TimeInterval = 90
 
     static func visibleProjectRange(
         viewport: TimelineViewport,
@@ -32,7 +34,13 @@ enum TranscriptViewportGeometry {
             return visibleRange
         }
 
-        let padding = visibleRange.duration * layoutCacheViewportOverscanMultiplier
+        let padding = min(
+            max(
+                visibleRange.duration * layoutCacheViewportOverscanMultiplier,
+                minimumLayoutCachePadding
+            ),
+            maximumLayoutCachePadding
+        )
         return TranscriptionTimeRange(
             startTime: max(visibleRange.startTime - padding, 0),
             endTime: min(visibleRange.endTime + padding, timelineDuration)

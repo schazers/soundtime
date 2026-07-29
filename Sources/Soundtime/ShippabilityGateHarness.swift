@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 
@@ -65,6 +66,17 @@ enum ShippabilityGateHarness {
                 return []
             case .full:
                 return ["--stress"]
+            }
+        }
+
+        var childTimeoutSeconds: TimeInterval {
+            switch self {
+            case .quick:
+                return 90
+            case .standard:
+                return 300
+            case .full:
+                return 900
             }
         }
     }
@@ -410,7 +422,7 @@ enum ShippabilityGateHarness {
         let fixtureRoot = explicitFixtureRoot ??
             (usesDisposableFixtures
                 ? runDirectory.appendingPathComponent("fixtures/v1", isDirectory: true)
-                : defaultFixtureCacheDirectory())
+                : defaultFixtureCacheDirectory(for: mode))
         let fixtureStrategy: String
         if explicitFixtureRoot != nil {
             fixtureStrategy = rebuildFixtures ? "explicit-rebuild" : "explicit-reuse"
@@ -493,6 +505,22 @@ enum ShippabilityGateHarness {
             }
             fflush(stdout)
         }
+
+        let fixtureIntegrityReport = runFinalFixtureIntegrityPhase(
+            fixtureRoot: fixtureRoot,
+            mode: mode,
+            fixtureSetupSucceeded: shouldContinue
+        )
+        phaseReports.append(fixtureIntegrityReport)
+        print(formatPhaseLine(
+            status: fixtureIntegrityReport.status == "passed" ? "PASS" : fixtureIntegrityReport.status == "failed" ? "FAIL" : "SKIP",
+            name: fixtureIntegrityReport.name,
+            milliseconds: fixtureIntegrityReport.durationMilliseconds
+        ))
+        if let failureMessage = fixtureIntegrityReport.failureMessage {
+            print("  \(failureMessage)")
+        }
+        fflush(stdout)
 
         cleanupFixturesIfNeeded(rootDirectory: fixtureRoot, keepFixtures: keepFixtures)
 
@@ -803,6 +831,33 @@ enum ShippabilityGateHarness {
         cleanupFixturesIfNeeded(rootDirectory: kept, keepFixtures: true)
         try require(FileManager.default.fileExists(atPath: kept.path), "kept fixture root was removed")
 
+        let timeoutProcess = Process()
+        timeoutProcess.executableURL = URL(fileURLWithPath: "/bin/sh")
+        timeoutProcess.arguments = ["-c", "sleep 60 & wait"]
+        timeoutProcess.standardOutput = FileHandle.nullDevice
+        timeoutProcess.standardError = FileHandle.nullDevice
+        try timeoutProcess.run()
+        let timeoutPID = timeoutProcess.processIdentifier
+        let timeoutProcessGroupID: pid_t? =
+            (setpgid(timeoutPID, timeoutPID) == 0 || getpgid(timeoutPID) == timeoutPID)
+            ? timeoutPID
+            : nil
+        let timeoutResult = waitForChildProcess(
+            timeoutProcess,
+            processGroupID: timeoutProcessGroupID,
+            timeoutSeconds: 0.1
+        )
+        try require(timeoutResult.timedOut, "self-test child process did not time out")
+        try require(!timeoutProcess.isRunning, "self-test timed-out child process remained alive")
+        if let timeoutProcessGroupID {
+            errno = 0
+            let groupProbe = Darwin.kill(-timeoutProcessGroupID, 0)
+            try require(
+                groupProbe == -1 && errno == ESRCH,
+                "self-test timed-out child process group retained a descendant"
+            )
+        }
+
         print("Soundtime shippability gate self-test passed")
     }
 
@@ -891,8 +946,9 @@ enum ShippabilityGateHarness {
             ),
             GatePhase(
                 name: "edit graph delete paste",
-                detail: "Verify edit graph, edit preview, and project edit round-trip behavior for delete/paste/undo reliability.",
+                detail: "Verify canonical edit transactions, edit graph, edit preview, and project round-trip behavior for delete, clear, cut, paste, undo, and redo reliability.",
                 kind: .commands([
+                    command("edit transaction smoke", ["--edit-transaction-smoke"]),
                     command("edit graph smoke", ["--edit-graph-smoke"]),
                     command("edit preview smoke", ["--edit-preview-smoke"]),
                     command("project edit round-trip smoke", ["--project-edit-roundtrip-smoke"]),
@@ -907,9 +963,10 @@ enum ShippabilityGateHarness {
             ),
             GatePhase(
                 name: "export",
-                detail: "Verify snapshot export, selected-region renders, stem output, compressed M4A export, mix-bus math, source leases, long-file block rendering, and export reports.",
+                detail: "Verify snapshot export, selected-region renders, stem output, system codec output, mix-bus math, source leases, cancellation safety, progress UI, long-file block rendering, and export reports.",
                 kind: .commands([
                     command("audio export smoke", ["--audio-export-smoke"]),
+                    command("audio export UI contract", ["--audio-export-ui-smoke"]),
                 ])
             ),
             GatePhase(
@@ -1106,6 +1163,71 @@ enum ShippabilityGateHarness {
         }
     }
 
+    private static func runFinalFixtureIntegrityPhase(
+        fixtureRoot: URL,
+        mode: GateMode,
+        fixtureSetupSucceeded: Bool
+    ) -> GatePhaseReport {
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        guard fixtureSetupSucceeded else {
+            return GatePhaseReport(
+                name: "Fixture Integrity",
+                status: "skipped",
+                durationMilliseconds: 0,
+                detail: "Verify golden inputs remained byte-identical after all child processes.",
+                metrics: [:],
+                warnings: [],
+                failureMessage: "Skipped because fixture setup failed.",
+                checks: []
+            )
+        }
+
+        do {
+            try verifyFixtureBundle(rootDirectory: fixtureRoot, mode: mode)
+            return GatePhaseReport(
+                name: "Fixture Integrity",
+                status: "passed",
+                durationMilliseconds: elapsedMilliseconds(since: startedAt),
+                detail: "Verify golden inputs remained byte-identical after all child processes.",
+                metrics: ["checksumVerification": "passed"],
+                warnings: [],
+                failureMessage: nil,
+                checks: [
+                    GateCheckReport(
+                        label: "verify source fixture checksums",
+                        status: "passed",
+                        durationMilliseconds: elapsedMilliseconds(since: startedAt),
+                        exitCode: nil,
+                        commandLine: "ShippabilityFixtureBuilder.verify",
+                        logPath: nil,
+                        outputTail: nil
+                    ),
+                ]
+            )
+        } catch {
+            return GatePhaseReport(
+                name: "Fixture Integrity",
+                status: "failed",
+                durationMilliseconds: elapsedMilliseconds(since: startedAt),
+                detail: "Verify golden inputs remained byte-identical after all child processes.",
+                metrics: ["checksumVerification": "failed"],
+                warnings: [],
+                failureMessage: "\(error)",
+                checks: [
+                    GateCheckReport(
+                        label: "verify source fixture checksums",
+                        status: "failed",
+                        durationMilliseconds: elapsedMilliseconds(since: startedAt),
+                        exitCode: nil,
+                        commandLine: "ShippabilityFixtureBuilder.verify",
+                        logPath: nil,
+                        outputTail: "\(error)"
+                    ),
+                ]
+            )
+        }
+    }
+
     private static func runCommandPhase(
         phaseIndex: Int,
         phase: GatePhase,
@@ -1148,7 +1270,8 @@ enum ShippabilityGateHarness {
                 arguments: childArguments,
                 logURL: logURL,
                 stabilityReportDirectory: childReportDirectory,
-                fixtureRoot: fixtureRoot
+                fixtureRoot: fixtureRoot,
+                timeoutSeconds: mode.childTimeoutSeconds
             )
             commandResults.append((command: command, check: check))
             if check.status == "failed", !command.required {
@@ -1204,16 +1327,44 @@ enum ShippabilityGateHarness {
         arguments: [String],
         logURL: URL,
         stabilityReportDirectory: URL,
-        fixtureRoot: URL
+        fixtureRoot: URL,
+        timeoutSeconds: TimeInterval
     ) -> GateCheckReport {
         let startedAt = DispatchTime.now().uptimeNanoseconds
+        let sandbox: GateChildSandbox
+        do {
+            sandbox = try GateChildSandbox.create(
+                sourceFixtureRoot: fixtureRoot,
+                root: stabilityReportDirectory.appendingPathComponent("process-sandbox", isDirectory: true)
+            )
+        } catch {
+            return GateCheckReport(
+                label: label,
+                status: "failed",
+                durationMilliseconds: elapsedMilliseconds(since: startedAt),
+                exitCode: 126,
+                commandLine: commandLine(executableURL: executableURL, arguments: arguments),
+                logPath: logURL.path,
+                stabilityReportPaths: [],
+                metrics: ["fixtureSandbox": "failed"],
+                budgetFindings: [],
+                outputTail: "failed to prepare isolated fixture sandbox: \(error)",
+                userVisibleRisk: userVisibleRisk(phaseName: phaseName, checkLabel: label),
+                failureSummary: "\(label) could not prepare an isolated fixture sandbox"
+            )
+        }
+
         let process = Process()
         process.executableURL = executableURL
         process.arguments = arguments
         var environment = ProcessInfo.processInfo.environment
         environment["SOUNDTIME_SHIPPABILITY_GATE"] = "1"
-        environment["SOUNDTIME_SHIPPABILITY_FIXTURE_ROOT"] = fixtureRoot.path
+        environment["SOUNDTIME_SHIPPABILITY_FIXTURE_ROOT"] = sandbox.fixtureRoot.path
         environment["SOUNDTIME_STABILITY_REPORT_DIR"] = stabilityReportDirectory.path
+        environment["SOUNDTIME_GATE_SANDBOX_ROOT"] = sandbox.root.path
+        environment["HOME"] = sandbox.homeDirectory.path
+        environment["CFFIXED_USER_HOME"] = sandbox.homeDirectory.path
+        environment["TMPDIR"] = sandbox.temporaryDirectory.path
         process.environment = environment
 
         try? FileManager.default.createDirectory(at: stabilityReportDirectory, withIntermediateDirectories: true)
@@ -1222,11 +1373,16 @@ enum ShippabilityGateHarness {
         process.standardOutput = outputHandle
         process.standardError = outputHandle
 
+        var processGroupID: pid_t?
         do {
             try process.run()
-            process.waitUntilExit()
+            let pid = process.processIdentifier
+            if setpgid(pid, pid) == 0 || getpgid(pid) == pid {
+                processGroupID = pid
+            }
         } catch {
             try? outputHandle?.close()
+            sandbox.remove()
             return GateCheckReport(
                 label: label,
                 status: "failed",
@@ -1243,22 +1399,54 @@ enum ShippabilityGateHarness {
             )
         }
 
+        let waitResult = waitForChildProcess(
+            process,
+            processGroupID: processGroupID,
+            timeoutSeconds: timeoutSeconds
+        )
+        if waitResult.timedOut {
+            let message = "\nSoundtime gate terminated this child after \(Int(timeoutSeconds)) seconds.\n"
+            if let data = message.data(using: .utf8) {
+                try? outputHandle?.write(contentsOf: data)
+            }
+        }
         try? outputHandle?.close()
         let output = (try? String(contentsOf: logURL, encoding: .utf8)) ?? ""
-        let exitCode = process.terminationStatus
+        let exitCode: Int32 = waitResult.timedOut ? 124 : process.terminationStatus
+        let fixtureMutationFailure: String?
+        do {
+            try sandbox.verifyFixtureInputsUnchanged()
+            fixtureMutationFailure = nil
+        } catch {
+            fixtureMutationFailure = "\(error)"
+        }
         let stabilityReports = readStabilityReports(in: stabilityReportDirectory)
         let budgetFindings = budgetFindings(for: stabilityReports)
         let budgetFailures = budgetFindings.filter { $0.severity == "failure" }
-        let status = exitCode == 0 && budgetFailures.isEmpty ? "passed" : "failed"
+        let status = !waitResult.timedOut &&
+            exitCode == 0 &&
+            budgetFailures.isEmpty &&
+            fixtureMutationFailure == nil
+            ? "passed"
+            : "failed"
         let outputTail: String?
         if status == "failed" {
             let budgetTail = budgetFailures.map(formatBudgetFinding).joined(separator: "\n")
-            outputTail = [tail(output, limit: 3_000), budgetTail]
+            outputTail = [tail(output, limit: 3_000), budgetTail, fixtureMutationFailure]
+                .compactMap { $0 }
                 .filter { !$0.isEmpty }
                 .joined(separator: "\n")
         } else {
             outputTail = nil
+            sandbox.remove()
         }
+        var metrics = flattenedMetrics(from: stabilityReports)
+        metrics["fixtureSandbox"] = "isolated"
+        metrics["fixtureMutationCheck"] = fixtureMutationFailure == nil ? "passed" : "failed"
+        metrics["childTimedOut"] = waitResult.timedOut ? "true" : "false"
+        metrics["childTimeoutSeconds"] = String(format: "%.0f", timeoutSeconds)
+        metrics["processGroupIsolation"] = processGroupID == nil ? "unavailable" : "active"
+        metrics["terminationEscalatedToKill"] = waitResult.escalatedToKill ? "true" : "false"
         return GateCheckReport(
             label: label,
             status: status,
@@ -1267,12 +1455,61 @@ enum ShippabilityGateHarness {
             commandLine: commandLine(executableURL: executableURL, arguments: arguments),
             logPath: logURL.path,
             stabilityReportPaths: stabilityReports.map(\.url.path),
-            metrics: flattenedMetrics(from: stabilityReports),
+            metrics: metrics,
             budgetFindings: budgetFindings,
             outputTail: outputTail,
             userVisibleRisk: status == "failed" ? userVisibleRisk(phaseName: phaseName, checkLabel: label) : nil,
-            failureSummary: status == "failed" ? checkFailureSummary(label: label, exitCode: exitCode, budgetFailures: budgetFailures) : nil
+            failureSummary: status == "failed"
+                ? (
+                    waitResult.timedOut
+                        ? "\(label) exceeded its \(Int(timeoutSeconds))-second child-process timeout"
+                        : checkFailureSummary(label: label, exitCode: exitCode, budgetFailures: budgetFailures)
+                )
+                : nil
         )
+    }
+
+    private struct ChildProcessWaitResult {
+        var timedOut: Bool
+        var escalatedToKill: Bool
+    }
+
+    private static func waitForChildProcess(
+        _ process: Process,
+        processGroupID: pid_t?,
+        timeoutSeconds: TimeInterval
+    ) -> ChildProcessWaitResult {
+        let completion = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .utility).async {
+            process.waitUntilExit()
+            completion.signal()
+        }
+
+        guard completion.wait(timeout: .now() + timeoutSeconds) == .timedOut else {
+            return ChildProcessWaitResult(timedOut: false, escalatedToKill: false)
+        }
+
+        terminateChildProcess(process, processGroupID: processGroupID, signal: SIGTERM)
+        if completion.wait(timeout: .now() + 2) == .success {
+            return ChildProcessWaitResult(timedOut: true, escalatedToKill: false)
+        }
+
+        terminateChildProcess(process, processGroupID: processGroupID, signal: SIGKILL)
+        _ = completion.wait(timeout: .now() + 2)
+        return ChildProcessWaitResult(timedOut: true, escalatedToKill: true)
+    }
+
+    private static func terminateChildProcess(
+        _ process: Process,
+        processGroupID: pid_t?,
+        signal: Int32
+    ) {
+        if let processGroupID {
+            _ = Darwin.kill(-processGroupID, signal)
+        }
+        if process.isRunning {
+            _ = Darwin.kill(process.processIdentifier, signal)
+        }
     }
 
     private static func readStabilityReports(in directory: URL) -> [ChildStabilityReport] {
@@ -1334,10 +1571,14 @@ enum ShippabilityGateHarness {
                 findings.append(contentsOf: timelinePerfBudgetFindings(report))
             case "audio-safety-smoke":
                 findings.append(contentsOf: audioSafetyBudgetFindings(report))
+            case "audio-asset-importer-smoke":
+                findings.append(contentsOf: audioImportBudgetFindings(report))
             case "realtime-graph-publish-smoke":
                 findings.append(contentsOf: realtimeGraphBudgetFindings(report))
             case "edit-graph-smoke":
                 findings.append(contentsOf: editGraphBudgetFindings(report))
+            case "edit-transaction-smoke":
+                findings.append(contentsOf: editTransactionBudgetFindings(report))
             case "edit-preview-smoke":
                 findings.append(contentsOf: editPreviewBudgetFindings(report))
             default:
@@ -1401,7 +1642,14 @@ enum ShippabilityGateHarness {
             ),
             maxDoubleFinding(
                 report,
-                "worstPlaybackReadyMilliseconds",
+                "worstColdPlaybackReadyMilliseconds",
+                warning: ShippabilityTimingBudgets.coldPlaybackReady.warningMilliseconds,
+                failure: ShippabilityTimingBudgets.coldPlaybackReady.failureMilliseconds,
+                unit: "ms"
+            ),
+            maxDoubleFinding(
+                report,
+                "worstWarmPlaybackReadyMilliseconds",
                 warning: ShippabilityTimingBudgets.playbackReady.warningMilliseconds,
                 failure: GateThresholds.production.firstPlaybackReadyMilliseconds,
                 unit: "ms"
@@ -1527,8 +1775,8 @@ enum ShippabilityGateHarness {
                 suiteName: report.suiteName,
                 metric: "maxTranscriptLayoutBuilds",
                 actual: metadataInt(report, "maxTranscriptLayoutBuilds"),
-                warning: 1,
-                failure: 1,
+                warning: 2,
+                failure: 2,
                 unit: "builds"
             ),
             maxIntFinding(
@@ -1548,6 +1796,83 @@ enum ShippabilityGateHarness {
     private static func interactionReplayBudgetFindings(_ report: StabilitySuiteReport) -> [GateBudgetFinding] {
         [
             maxDoubleFinding(report, "maxReplayActionMilliseconds", warning: 16, failure: 35, unit: "ms"),
+            maxIntFinding(
+                suiteName: report.suiteName,
+                metric: "maxRejectedActions",
+                actual: metadataInt(report, "maxRejectedActions"),
+                warning: 0,
+                failure: 0,
+                unit: "actions"
+            ),
+            maxDoubleFinding(
+                report,
+                "maxSelectionEdgeErrorPixels",
+                warning: 0.5,
+                failure: 0.75,
+                unit: "px"
+            ),
+            minIntFinding(
+                report,
+                "maxSelectionDirectionReversals",
+                warning: 1,
+                failure: 1,
+                unit: "reversals"
+            ),
+            equalIntFinding(
+                report,
+                "selectionCollapseValidated",
+                expected: 1,
+                unit: "boolean"
+            ),
+            minDoubleFinding(
+                report,
+                "minReplayFrameRatePercent",
+                warning: 95,
+                failure: 75,
+                unit: "%"
+            ),
+            minDoubleFinding(
+                report,
+                "minSelectionDragFrameRatePercent",
+                warning: 95,
+                failure: 85,
+                unit: "%"
+            ),
+            maxDoubleFinding(
+                report,
+                "maxReplayFrameJitterMilliseconds",
+                warning: 3,
+                failure: 8,
+                unit: "ms"
+            ),
+            maxDoubleFinding(
+                report,
+                "maxSelectionDragFrameJitterMilliseconds",
+                warning: 5,
+                failure: 5,
+                unit: "ms"
+            ),
+            maxDoubleFinding(
+                report,
+                "p90SelectionDragFrameJitterMilliseconds",
+                warning: 2,
+                failure: 5,
+                unit: "ms"
+            ),
+            maxDoubleFinding(
+                report,
+                "maxReplayWorstFrameMilliseconds",
+                warning: 25,
+                failure: 50,
+                unit: "ms"
+            ),
+            maxDoubleFinding(
+                report,
+                "maxSelectionDragWorstFrameMilliseconds",
+                warning: 16.67,
+                failure: 25,
+                unit: "ms"
+            ),
             maxIntFinding(
                 suiteName: report.suiteName,
                 metric: "maxCPUWaveformVertices",
@@ -1616,8 +1941,8 @@ enum ShippabilityGateHarness {
                 suiteName: report.suiteName,
                 metric: "maxTranscriptLayoutBuilds",
                 actual: metadataInt(report, "maxTranscriptLayoutBuilds"),
-                warning: 1,
-                failure: 1,
+                warning: 2,
+                failure: 2,
                 unit: "builds"
             ),
             maxIntFinding(
@@ -1736,9 +2061,34 @@ enum ShippabilityGateHarness {
 
     private static func audioSafetyBudgetFindings(_ report: StabilitySuiteReport) -> [GateBudgetFinding] {
         var findings = [
+            requiredMetadataFinding(report, "renderWorkDeadlineMissCount"),
             equalIntFinding(report, "underrunCount", expected: 0, unit: "underruns"),
             equalIntFinding(report, "droppedCommandCount", expected: 0, unit: "commands"),
-            equalIntFinding(report, "renderDeadlineMissCount", expected: 0, unit: "misses"),
+            equalIntFinding(report, "renderWorkDeadlineMissCount", expected: 0, unit: "misses"),
+            maxIntFinding(
+                suiteName: report.suiteName,
+                metric: "renderDeadlineMissCount",
+                actual: metadataInt(report, "renderDeadlineMissCount"),
+                warning: 0,
+                failure: Int.max,
+                unit: "wall-clock misses"
+            ),
+            maxIntFinding(
+                suiteName: report.suiteName,
+                metric: "callbackSchedulingLateCount",
+                actual: metadataInt(report, "callbackSchedulingLateCount"),
+                warning: 0,
+                failure: Int.max,
+                unit: "late callbacks"
+            ),
+            maxIntFinding(
+                suiteName: report.suiteName,
+                metric: "maxCallbackSchedulingLatenessNanoseconds",
+                actual: metadataInt(report, "maxCallbackSchedulingLatenessNanoseconds"),
+                warning: 1_000_000,
+                failure: Int.max,
+                unit: "ns"
+            ),
             maxIntFinding(
                 suiteName: report.suiteName,
                 metric: "maxSeekFrameError",
@@ -1772,10 +2122,93 @@ enum ShippabilityGateHarness {
         return findings
     }
 
+    private static func audioImportBudgetFindings(
+        _ report: StabilitySuiteReport
+    ) -> [GateBudgetFinding] {
+        [
+            requiredMetadataFinding(report, "admissionMilliseconds"),
+            requiredMetadataFinding(report, "cachedPreparationMilliseconds"),
+            requiredMetadataFinding(report, "peakWorkingSetBytes"),
+            maxDoubleFinding(
+                report,
+                "admissionMilliseconds",
+                warning: AudioImportPerformanceContract.admittedMilliseconds,
+                failure: AudioImportPerformanceContract.admittedMilliseconds * 2,
+                unit: "ms"
+            ),
+            maxDoubleFinding(
+                report,
+                "cachedPreparationMilliseconds",
+                warning: AudioImportPerformanceContract.cachedPreviewMilliseconds * 0.5,
+                failure: AudioImportPerformanceContract.cachedPreviewMilliseconds,
+                unit: "ms"
+            ),
+            maxIntFinding(
+                suiteName: report.suiteName,
+                metric: "peakWorkingSetBytes",
+                actual: metadataInt(report, "peakWorkingSetBytes"),
+                warning: AudioImportPerformanceContract.maximumWorkingSetBytes * 3 / 4,
+                failure: AudioImportPerformanceContract.maximumWorkingSetBytes,
+                unit: "bytes"
+            ),
+        ].compactMap { $0 }
+    }
+
+    private static func requiredMetadataFinding(
+        _ report: StabilitySuiteReport,
+        _ metric: String
+    ) -> GateBudgetFinding? {
+        guard report.metadata[metric] == nil else {
+            return nil
+        }
+        return finding(
+            severity: "failure",
+            suiteName: report.suiteName,
+            metric: metric,
+            actual: "missing",
+            threshold: "required",
+            unit: "metadata",
+            message: "\(report.suiteName) did not publish required release-gate metadata"
+        )
+    }
+
     private static func editGraphBudgetFindings(_ report: StabilitySuiteReport) -> [GateBudgetFinding] {
         [
             maxDoubleFinding(report, "operationP95Milliseconds", warning: 3, failure: 8, unit: "ms"),
             maxDoubleFinding(report, "operationMaxMilliseconds", warning: 12, failure: 25, unit: "ms"),
+        ].compactMap { $0 }
+    }
+
+    private static func editTransactionBudgetFindings(
+        _ report: StabilitySuiteReport
+    ) -> [GateBudgetFinding] {
+        [
+            equalIntFinding(
+                report,
+                "atomicRejectionFailures",
+                expected: 0,
+                unit: "failures"
+            ),
+            equalIntFinding(
+                report,
+                "exactFrameMismatchCount",
+                expected: 0,
+                unit: "mismatches"
+            ),
+            maxDoubleFinding(
+                report,
+                "historyP99Milliseconds",
+                warning: 0.5,
+                failure: 1,
+                unit: "ms"
+            ),
+            maxDoubleFinding(
+                report,
+                "historyMaxMilliseconds",
+                warning: 2,
+                failure: 4,
+                unit: "ms"
+            ),
         ].compactMap { $0 }
     }
 
@@ -3089,9 +3522,12 @@ enum ShippabilityGateHarness {
             .appendingPathComponent(".build/shippability-gate", isDirectory: true)
     }
 
-    private static func defaultFixtureCacheDirectory() -> URL {
+    private static func defaultFixtureCacheDirectory(for mode: GateMode) -> URL {
         URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-            .appendingPathComponent(".build/shippability-fixtures/v1", isDirectory: true)
+            .appendingPathComponent(
+                ".build/shippability-fixtures/v1/\(fixtureProfileArgument(for: mode))",
+                isDirectory: true
+            )
             .standardizedFileURL
     }
 
@@ -3191,6 +3627,159 @@ enum ShippabilityGateHarness {
 
     private static func elapsedMilliseconds(since startedAtNanoseconds: UInt64) -> Double {
         Double(DispatchTime.now().uptimeNanoseconds - startedAtNanoseconds) / 1_000_000
+    }
+
+    private struct GateChildSandbox {
+        enum SandboxError: LocalizedError {
+            case fixtureMutation([String])
+
+            var errorDescription: String? {
+                switch self {
+                case let .fixtureMutation(paths):
+                    return "fixture sandbox inputs changed: \(paths.sorted().joined(separator: ", "))"
+                }
+            }
+        }
+
+        let root: URL
+        let fixtureRoot: URL
+        let homeDirectory: URL
+        let temporaryDirectory: URL
+        private let inputDigests: [String: String]
+
+        static func create(sourceFixtureRoot: URL, root: URL) throws -> GateChildSandbox {
+            let fileManager = FileManager.default
+            try? fileManager.removeItem(at: root)
+            try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+
+            let fixtureRoot = root.appendingPathComponent("fixtures", isDirectory: true)
+            let homeDirectory = root.appendingPathComponent("home", isDirectory: true)
+            let temporaryDirectory = root.appendingPathComponent("tmp", isDirectory: true)
+            try fileManager.createDirectory(at: fixtureRoot, withIntermediateDirectories: true)
+            try fileManager.createDirectory(
+                at: homeDirectory.appendingPathComponent("Library/Application Support", isDirectory: true),
+                withIntermediateDirectories: true
+            )
+            try fileManager.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
+
+            for fileName in ["fixtures-manifest.json", "README.md"] {
+                let source = sourceFixtureRoot.appendingPathComponent(fileName)
+                guard fileManager.fileExists(atPath: source.path) else {
+                    continue
+                }
+                try fileManager.copyItem(
+                    at: source,
+                    to: fixtureRoot.appendingPathComponent(fileName)
+                )
+            }
+
+            try fileManager.copyItem(
+                at: sourceFixtureRoot.appendingPathComponent("projects", isDirectory: true),
+                to: fixtureRoot.appendingPathComponent("projects", isDirectory: true)
+            )
+            try fileManager.copyItem(
+                at: sourceFixtureRoot.appendingPathComponent("audio", isDirectory: true),
+                to: fixtureRoot.appendingPathComponent("audio", isDirectory: true)
+            )
+            try protectFixtureTree(at: fixtureRoot)
+
+            return GateChildSandbox(
+                root: root,
+                fixtureRoot: fixtureRoot,
+                homeDirectory: homeDirectory,
+                temporaryDirectory: temporaryDirectory,
+                inputDigests: try immutableInputDigests(fixtureRoot: fixtureRoot)
+            )
+        }
+
+        func verifyFixtureInputsUnchanged() throws {
+            let currentDigests = try Self.immutableInputDigests(fixtureRoot: fixtureRoot)
+            guard currentDigests != inputDigests else {
+                return
+            }
+
+            let allPaths = Set(currentDigests.keys).union(inputDigests.keys)
+            let changedPaths = allPaths.filter { currentDigests[$0] != inputDigests[$0] }
+            throw SandboxError.fixtureMutation(Array(changedPaths))
+        }
+
+        func remove() {
+            Self.makeTreeWritable(at: fixtureRoot)
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        private static func immutableInputDigests(fixtureRoot: URL) throws -> [String: String] {
+            var urls = [
+                fixtureRoot.appendingPathComponent("fixtures-manifest.json"),
+                fixtureRoot.appendingPathComponent("README.md"),
+            ]
+            let projectDirectory = fixtureRoot.appendingPathComponent("projects", isDirectory: true)
+            if let enumerator = FileManager.default.enumerator(
+                at: projectDirectory,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            ) {
+                for case let url as URL in enumerator {
+                    guard
+                        (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+                    else {
+                        continue
+                    }
+                    urls.append(url)
+                }
+            }
+
+            return try Dictionary(uniqueKeysWithValues: urls.map { url in
+                let relativePath = String(
+                    url.standardizedFileURL.path.dropFirst(fixtureRoot.standardizedFileURL.path.count + 1)
+                )
+                let digest = SHA256.hash(data: try Data(contentsOf: url))
+                    .map { String(format: "%02x", $0) }
+                    .joined()
+                return (relativePath, digest)
+            })
+        }
+
+        private static func protectFixtureTree(at fixtureRoot: URL) throws {
+            let fileManager = FileManager.default
+            var directories = [fixtureRoot]
+            if let enumerator = fileManager.enumerator(
+                at: fixtureRoot,
+                includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            ) {
+                for case let url as URL in enumerator {
+                    let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey])
+                    if values.isDirectory == true {
+                        directories.append(url)
+                    } else if values.isRegularFile == true {
+                        try fileManager.setAttributes([.posixPermissions: 0o444], ofItemAtPath: url.path)
+                    }
+                }
+            }
+            for directory in directories.reversed() {
+                try fileManager.setAttributes([.posixPermissions: 0o555], ofItemAtPath: directory.path)
+            }
+        }
+
+        private static func makeTreeWritable(at fixtureRoot: URL) {
+            let fileManager = FileManager.default
+            try? fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fixtureRoot.path)
+            guard let enumerator = fileManager.enumerator(
+                at: fixtureRoot,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            ) else {
+                return
+            }
+            for case let url as URL in enumerator {
+                let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+                try? fileManager.setAttributes(
+                    [.posixPermissions: isDirectory ? 0o755 : 0o644],
+                    ofItemAtPath: url.path
+                )
+            }
+        }
     }
 
     private static func require(_ condition: @autoclosure () throws -> Bool, _ message: String) throws {

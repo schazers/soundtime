@@ -25,6 +25,11 @@ typedef struct SoundtimeAudioCoreSnapshot {
     uint64_t lastRenderNanoseconds;
     uint64_t maxRenderNanoseconds;
     uint64_t renderDeadlineMissCount;
+    uint64_t lastRenderWorkNanoseconds;
+    uint64_t maxRenderWorkNanoseconds;
+    uint64_t renderWorkDeadlineMissCount;
+    uint64_t callbackSchedulingLateCount;
+    uint64_t maxCallbackSchedulingLatenessNanoseconds;
 } SoundtimeAudioCoreSnapshot;
 
 typedef struct SoundtimeAudioCoreClockSample {
@@ -90,6 +95,10 @@ SoundtimeAudioCoreSource* soundtime_audio_core_source_create_wav_bytes(
 );
 void soundtime_audio_core_source_destroy(SoundtimeAudioCoreSource* source);
 void soundtime_audio_core_reset(SoundtimeAudioCoreEngine* engine);
+void soundtime_audio_core_set_detailed_timing_enabled(
+    SoundtimeAudioCoreEngine* engine,
+    bool isEnabled
+);
 void soundtime_audio_core_set_source_info(
     SoundtimeAudioCoreEngine* engine,
     uint64_t frameCount,
@@ -128,6 +137,12 @@ bool soundtime_audio_core_set_prepared_segmented_tracks(
     SoundtimeAudioCoreEngine* engine,
     const SoundtimeAudioCoreSegmentedTrackConfig* tracks,
     uint32_t trackCount
+);
+bool soundtime_audio_core_set_prepared_segmented_tracks_at_sample_rate(
+    SoundtimeAudioCoreEngine* engine,
+    const SoundtimeAudioCoreSegmentedTrackConfig* tracks,
+    uint32_t trackCount,
+    double sampleRate
 );
 bool soundtime_audio_core_update_prepared_segmented_tracks(
     SoundtimeAudioCoreEngine* engine,
@@ -181,6 +196,13 @@ void soundtime_audio_core_render_at_host_time(
     uint32_t channelCount,
     uint32_t frameCount,
     double hostTimestamp
+);
+bool soundtime_audio_core_render_offline(
+    SoundtimeAudioCoreEngine* engine,
+    uint64_t startFrameIndex,
+    float* const* outputs,
+    uint32_t channelCount,
+    uint32_t frameCount
 );
 
 SoundtimeAudioCoreRecordingRing* soundtime_audio_core_recording_ring_create(

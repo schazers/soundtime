@@ -30,11 +30,17 @@ final class AudioExportStreamingCompressedWriter: AudioExportSampleWriter, @unch
     private let format: AudioExportFormat
     private let channelCount: Int
     private let inputFormat: AVAudioFormat
-    private let audioFile: AVAudioFile
+    private var audioFile: AVAudioFile?
     private var frameCount = 0
     private var isFinished = false
 
-    init(url: URL, format: AudioExportFormat, sampleRate: Double, channelCount: Int) throws {
+    init(
+        url: URL,
+        format: AudioExportFormat,
+        sampleRate: Double,
+        channelCount: Int,
+        bitRate: Int
+    ) throws {
         guard
             format.isCompressed,
             sampleRate.isFinite,
@@ -56,14 +62,19 @@ final class AudioExportStreamingCompressedWriter: AudioExportSampleWriter, @unch
         self.channelCount = channelCount
         self.inputFormat = inputFormat
 
-        try FileManager.default.removeCompressedExportIfPresent(at: self.url)
+        guard !FileManager.default.fileExists(atPath: self.url.path) else {
+            throw WriterError.writeFailed(
+                CocoaError(.fileWriteFileExists)
+            )
+        }
         do {
             audioFile = try AVAudioFile(
                 forWriting: self.url,
                 settings: Self.settings(
                     format: format,
                     sampleRate: sampleRate,
-                    channelCount: channelCount
+                    channelCount: channelCount,
+                    bitRate: bitRate
                 ),
                 commonFormat: .pcmFormatFloat32,
                 interleaved: false
@@ -105,6 +116,9 @@ final class AudioExportStreamingCompressedWriter: AudioExportSampleWriter, @unch
         }
 
         do {
+            guard let audioFile else {
+                throw WriterError.invalidFormat
+            }
             try audioFile.write(from: buffer)
             frameCount += chunkFrameCount
         } catch {
@@ -121,6 +135,7 @@ final class AudioExportStreamingCompressedWriter: AudioExportSampleWriter, @unch
             throw WriterError.noSamplesWritten
         }
 
+        audioFile = nil
         isFinished = true
         return url
     }
@@ -129,6 +144,7 @@ final class AudioExportStreamingCompressedWriter: AudioExportSampleWriter, @unch
         guard !isFinished else {
             return
         }
+        audioFile = nil
         try? FileManager.default.removeItem(at: url)
         isFinished = true
     }
@@ -136,7 +152,8 @@ final class AudioExportStreamingCompressedWriter: AudioExportSampleWriter, @unch
     private static func settings(
         format: AudioExportFormat,
         sampleRate: Double,
-        channelCount: Int
+        channelCount: Int,
+        bitRate: Int
     ) throws -> [String: Any] {
         let formatID: AudioFormatID
         switch format {
@@ -152,20 +169,11 @@ final class AudioExportStreamingCompressedWriter: AudioExportSampleWriter, @unch
             AVFormatIDKey: formatID,
             AVSampleRateKey: sampleRate,
             AVNumberOfChannelsKey: channelCount,
-            AVEncoderBitRateKey: 192_000,
+            AVEncoderBitRateKey: bitRate,
         ]
     }
 
     private static func clampAudioSample(_ sample: Float) -> Float {
         min(max(sample, -1), 1)
-    }
-}
-
-private extension FileManager {
-    func removeCompressedExportIfPresent(at url: URL) throws {
-        guard fileExists(atPath: url.path) else {
-            return
-        }
-        try removeItem(at: url)
     }
 }

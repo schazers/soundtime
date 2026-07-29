@@ -174,6 +174,7 @@ final class PerformanceDashboardWindowController: NSWindowController, NSWindowDe
         for index in 0..<12 {
             controller.display(frameStats: TimelineFrameStats(
                 framesPerSecond: index.isMultiple(of: 4) ? 72 : 144,
+                displayRefreshFramesPerSecond: 144,
                 averageFrameTimeMilliseconds: index.isMultiple(of: 4) ? 13.8 : 6.9,
                 frameTimeJitterMilliseconds: 0.4,
                 worstFrameTimeMilliseconds: index.isMultiple(of: 4) ? 18.0 : 8.2,
@@ -623,8 +624,11 @@ private final class PerformanceDashboardView: NSView {
                 "Underruns     \(audio.underrunCount)",
                 "Dropped cmds  \(audio.droppedCommandCount)",
                 "Callbacks     \(audio.callbackCount)",
-                String(format: "Render ms     %.3f last  %.3f max", Double(audio.lastRenderNanoseconds) / 1_000_000, Double(audio.maxRenderNanoseconds) / 1_000_000),
-                "Deadline miss \(audio.renderDeadlineMissCount)",
+                String(format: "Wall ms       %.3f last  %.3f max", Double(audio.lastRenderNanoseconds) / 1_000_000, Double(audio.maxRenderNanoseconds) / 1_000_000),
+                String(format: "Work ms       %.3f last  %.3f max", Double(audio.lastRenderWorkNanoseconds) / 1_000_000, Double(audio.maxRenderWorkNanoseconds) / 1_000_000),
+                "Work misses   \(audio.renderWorkDeadlineMissCount)",
+                "Wall misses   \(audio.renderDeadlineMissCount)",
+                "Late delivery \(audio.callbackSchedulingLateCount)",
                 "Sample rate   \(Int(audio.sampleRate.rounded())) Hz",
             ])
         } else {

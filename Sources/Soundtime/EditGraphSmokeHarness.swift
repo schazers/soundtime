@@ -330,7 +330,9 @@ enum EditGraphSmokeHarness {
     }
 
     private static func runSharedEditableSourceCatalogSmoke(fileInfo: WAVFileInfo) throws {
+        let importedAssetID = UUID()
         let source = EditableAudioSource(
+            importedAssetID: importedAssetID,
             originalURL: fileInfo.url,
             editableURL: fileInfo.url,
             formatOrigin: .wav,
@@ -338,6 +340,14 @@ enum EditGraphSmokeHarness {
             ownsEditableFile: false
         )
         let repeatedSource = EditableAudioSource(
+            importedAssetID: importedAssetID,
+            originalURL: fileInfo.url,
+            editableURL: fileInfo.url,
+            formatOrigin: .wav,
+            fileInfo: fileInfo,
+            ownsEditableFile: true
+        )
+        let separateImport = EditableAudioSource(
             importedAssetID: UUID(),
             originalURL: fileInfo.url,
             editableURL: fileInfo.url,
@@ -362,6 +372,10 @@ enum EditGraphSmokeHarness {
             repeatedSource.id == source.id,
             "shared editable source smoke did not create matching stable IDs"
         )
+        try require(
+            separateImport.id != source.id,
+            "separate logical imports unexpectedly shared an editable source ID"
+        )
 
         let graph = EditGraph(
             sources: [source, repeatedSource],
@@ -377,8 +391,8 @@ enum EditGraphSmokeHarness {
             "shared editable source smoke lost the second shared-source arrangement"
         )
         try require(
-            graph.source(for: secondTrackID)?.importedAssetID == repeatedSource.importedAssetID,
-            "shared editable source smoke did not keep the richer canonical source metadata"
+            graph.source(for: secondTrackID)?.ownsEditableFile == true,
+            "shared editable source smoke did not keep the richer canonical source ownership"
         )
     }
 

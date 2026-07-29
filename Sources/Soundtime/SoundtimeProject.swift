@@ -1,7 +1,7 @@
 import Foundation
 
 struct SoundtimeProject: Codable, Sendable {
-    static let currentSchemaVersion = 8
+    static let currentSchemaVersion = 9
     static let launchWaveformPreviewBinCount = 4_096
 
     struct WindowLayout: Codable, Sendable {
@@ -49,6 +49,24 @@ struct SoundtimeProject: Codable, Sendable {
             var dataByteCount: Int
             var fileSize: Int64?
             var modificationTime: TimeInterval?
+
+            init(
+                frameCount: Int,
+                sampleRate: Double,
+                channelCount: Int,
+                bitsPerSample: Int,
+                dataByteCount: Int,
+                fileSize: Int64?,
+                modificationTime: TimeInterval?
+            ) {
+                self.frameCount = frameCount
+                self.sampleRate = sampleRate
+                self.channelCount = channelCount
+                self.bitsPerSample = bitsPerSample
+                self.dataByteCount = dataByteCount
+                self.fileSize = fileSize
+                self.modificationTime = modificationTime
+            }
 
             init(fileInfo: WAVFileInfo) {
                 frameCount = fileInfo.frameCount
@@ -173,6 +191,36 @@ struct SoundtimeProject: Codable, Sendable {
             ))
         }
 
+        init?(
+            sourceOverview: WaveformOverview?,
+            displayOverview: WaveformOverview?,
+            importedFingerprint: AudioImportFingerprint,
+            maximumBinCount: Int = SoundtimeProject.launchWaveformPreviewBinCount
+        ) {
+            guard let displayOverview, !displayOverview.isEmpty else {
+                return nil
+            }
+
+            let sourceOverview = sourceOverview?.isEmpty == false ? sourceOverview! : displayOverview
+            fileFingerprint = FileFingerprint(
+                frameCount: Int(importedFingerprint.frameCount),
+                sampleRate: importedFingerprint.sampleRate,
+                channelCount: importedFingerprint.channelCount,
+                bitsPerSample: 0,
+                dataByteCount: Int(clamping: importedFingerprint.fileSize),
+                fileSize: importedFingerprint.fileSize,
+                modificationTime: importedFingerprint.modificationTime
+            )
+            self.sourceOverview = Overview(Self.reducedOverview(
+                sourceOverview,
+                maximumBinCount: maximumBinCount
+            ))
+            self.displayOverview = Overview(Self.reducedOverview(
+                displayOverview,
+                maximumBinCount: maximumBinCount
+            ))
+        }
+
         func isValid(for fileInfo: WAVFileInfo) -> Bool {
             fileFingerprint.matches(fileInfo: fileInfo) &&
                 sourceOverview.duration.isFinite &&
@@ -211,6 +259,28 @@ struct SoundtimeProject: Codable, Sendable {
     }
 
     struct Track: Codable, Sendable {
+        struct ImportedAssetState: Codable, Sendable {
+            var assetID: UUID
+            var originalFilePath: String
+            var format: AudioAssetFormat
+            var fingerprint: AudioImportFingerprint
+            var stage: AudioImportStage
+
+            init(
+                assetID: UUID,
+                originalURL: URL,
+                format: AudioAssetFormat,
+                fingerprint: AudioImportFingerprint,
+                stage: AudioImportStage
+            ) {
+                self.assetID = assetID
+                originalFilePath = originalURL.standardizedFileURL.path
+                self.format = format
+                self.fingerprint = fingerprint
+                self.stage = stage
+            }
+        }
+
         struct EditableSource: Codable, Sendable {
             var importedAssetID: UUID?
             var originalFilePath: String
@@ -255,6 +325,29 @@ struct SoundtimeProject: Codable, Sendable {
                     ownsEditableFile: ownsEditableFile
                 )
             }
+
+            func editableAudioSource() -> EditableAudioSource? {
+                guard
+                    let importedAssetID,
+                    sourceFrameCount >= 0,
+                    sourceSampleRate.isFinite,
+                    sourceSampleRate > 0,
+                    channelCount > 0
+                else {
+                    return nil
+                }
+
+                return EditableAudioSource(
+                    importedAssetID: importedAssetID,
+                    originalURL: URL(fileURLWithPath: originalFilePath),
+                    editableURL: URL(fileURLWithPath: editableFilePath),
+                    formatOrigin: formatOrigin,
+                    sourceFrameCount: sourceFrameCount,
+                    sourceSampleRate: sourceSampleRate,
+                    channelCount: channelCount,
+                    ownsEditableFile: ownsEditableFile
+                )
+            }
         }
 
         var id: UUID
@@ -269,6 +362,27 @@ struct SoundtimeProject: Codable, Sendable {
         var waveformPreview: WaveformPreview? = nil
         var ownsSourceFile: Bool? = nil
         var transcript: TranscriptDocument? = nil
+        var importedAssetState: ImportedAssetState? = nil
+
+        var audioSourceCandidateURLs: [URL] {
+            let paths = [
+                filePath,
+                importedAssetState?.originalFilePath,
+                editableSource?.editableFilePath,
+                editableSource?.originalFilePath,
+            ]
+            var seenPaths = Set<String>()
+            return paths.compactMap { path in
+                guard let path, !path.isEmpty else {
+                    return nil
+                }
+                let url = URL(fileURLWithPath: path).standardizedFileURL
+                guard seenPaths.insert(url.path).inserted else {
+                    return nil
+                }
+                return url
+            }
+        }
     }
 
     var projectID: UUID
@@ -415,17 +529,74 @@ struct SoundtimeProjectLaunchStateOverlay: Codable, Sendable {
     var tracks: [TrackState]
 }
 
+struct SoundtimeRecoveredAutosave: Sendable {
+    var project: SoundtimeProject
+    var canonicalProjectURL: URL?
+}
+
 enum SoundtimeProjectStore {
     static let fileExtension = "soundtime"
     static let autosaveFileExtension = "soundtime-autosave"
     static let maximumRecentProjectCount = 8
+    private static let persistenceSuiteEnvironmentKey = "SOUNDTIME_PERSISTENCE_SUITE"
+    private static let persistenceRootEnvironmentKey = "SOUNDTIME_PERSISTENCE_ROOT"
     private static let lastProjectURLKey = "Soundtime.lastProjectURL"
     private static let recentProjectURLPathsKey = "Soundtime.recentProjectURLPaths"
     private static let projectWindowLayoutKeyPrefix = "Soundtime.projectWindowLayout."
     private static let projectTimelineViewportKeyPrefix = "Soundtime.projectTimelineViewport."
     private static let projectLaunchStateOverlayKeyPrefix = "Soundtime.projectLaunchStateOverlay."
+    nonisolated(unsafe) private static let defaults: UserDefaults = {
+        guard
+            let suiteName = ProcessInfo.processInfo.environment[persistenceSuiteEnvironmentKey],
+            !suiteName.isEmpty,
+            let defaults = UserDefaults(suiteName: suiteName)
+        else {
+            return .standard
+        }
+        return defaults
+    }()
+
+    private struct AutosaveEnvelope: Codable {
+        static let currentFormatVersion = 1
+
+        var formatVersion: Int
+        var sourceProjectPath: String?
+        var autosaveID: UUID
+        var savedAt: TimeInterval
+        var project: SoundtimeProject
+    }
+
+    static func configurePersistenceForCommandLine(arguments: [String]) {
+        guard arguments.dropFirst().contains(where: isAutomationCommandLineArgument) else {
+            return
+        }
+
+        let processID = ProcessInfo.processInfo.processIdentifier
+        let suiteName = "com.soundtime.automation.\(processID)"
+        let persistenceRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("Soundtime-Automation", isDirectory: true)
+            .appendingPathComponent(String(processID), isDirectory: true)
+            .standardizedFileURL
+        setenv(persistenceSuiteEnvironmentKey, suiteName, 1)
+        setenv(persistenceRootEnvironmentKey, persistenceRoot.path, 1)
+        UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName)
+    }
+
+    private static func isAutomationCommandLineArgument(_ argument: String) -> Bool {
+        guard argument.hasPrefix("--") else {
+            return false
+        }
+        return argument.contains("smoke") ||
+            argument.contains("gate") ||
+            argument.contains("fixture") ||
+            argument.contains("baseline") ||
+            argument.contains("production-readiness")
+    }
 
     static func load(from url: URL) throws -> SoundtimeProject {
+        if url.pathExtension == autosaveFileExtension {
+            return try loadRecoveredAutosave(from: url).project
+        }
         let migratedProject = try loadRaw(from: url)
         return TranscriptSidecarStore.projectResolvingSidecars(migratedProject, projectURL: url)
     }
@@ -442,7 +613,7 @@ enum SoundtimeProjectStore {
             return try savedProjectResult.get()
         }
 
-        let autosaveProject = try loadRaw(from: autosaveURL)
+        let autosaveProject = try loadAutosaveRaw(from: autosaveURL).project
         guard case let .success(savedProject) = savedProjectResult else {
             return autosaveProject
         }
@@ -451,7 +622,10 @@ enum SoundtimeProjectStore {
     }
 
     static func loadLaunchPreview(from url: URL) throws -> SoundtimeProject {
-        try loadRaw(from: url)
+        if url.pathExtension == autosaveFileExtension {
+            return try loadAutosaveRaw(from: url).project
+        }
+        return try loadRaw(from: url)
     }
 
     private static func loadRaw(from url: URL) throws -> SoundtimeProject {
@@ -471,7 +645,7 @@ enum SoundtimeProjectStore {
             return try savedProjectResult.get()
         }
 
-        let autosaveProject = try load(from: autosaveURL)
+        let autosaveProject = try loadRecoveredAutosave(from: autosaveURL).project
         guard case let .success(savedProject) = savedProjectResult else {
             return autosaveProject
         }
@@ -505,8 +679,47 @@ enum SoundtimeProjectStore {
             migratedProject,
             projectURL: url
         )
-        try write(projectWithSidecars, to: url)
+        let envelope = AutosaveEnvelope(
+            formatVersion: AutosaveEnvelope.currentFormatVersion,
+            sourceProjectPath: projectURL?.standardizedFileURL.path,
+            autosaveID: autosaveID,
+            savedAt: Date().timeIntervalSince1970,
+            project: projectWithSidecars
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(envelope).write(to: url, options: [.atomic])
         return url
+    }
+
+    static func loadRecoveredAutosave(from url: URL) throws -> SoundtimeRecoveredAutosave {
+        let decoded = try loadAutosaveRaw(from: url)
+        let project = TranscriptSidecarStore.projectResolvingSidecars(
+            decoded.project,
+            projectURL: url
+        )
+        let canonicalProjectURL = decoded.sourceProjectPath
+            .map { URL(fileURLWithPath: $0).standardizedFileURL }
+            .flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil }
+        return SoundtimeRecoveredAutosave(
+            project: project,
+            canonicalProjectURL: canonicalProjectURL
+        )
+    }
+
+    static func canonicalProjectURL(forAutosaveAt url: URL) -> URL? {
+        guard
+            let decoded = try? loadAutosaveRaw(from: url),
+            let sourceProjectPath = decoded.sourceProjectPath
+        else {
+            return nil
+        }
+        let projectURL = URL(fileURLWithPath: sourceProjectPath).standardizedFileURL
+        return FileManager.default.fileExists(atPath: projectURL.path) ? projectURL : nil
+    }
+
+    static var usesIsolatedAutomationPersistence: Bool {
+        ProcessInfo.processInfo.environment[persistenceSuiteEnvironmentKey] != nil
     }
 
     static func removeAutosave(projectURL: URL?, autosaveID: UUID) {
@@ -528,6 +741,7 @@ enum SoundtimeProjectStore {
         )) ?? []
         return urls
             .filter { $0.pathExtension == autosaveFileExtension }
+            .filter { !isLegacyAutomationAutosave($0) }
             .sorted { $0.modificationDateOrDistantPast > $1.modificationDateOrDistantPast }
     }
 
@@ -565,12 +779,12 @@ enum SoundtimeProjectStore {
     }
 
     static func rememberLastProjectURL(_ url: URL) {
-        UserDefaults.standard.set(url.path, forKey: lastProjectURLKey)
+        defaults.set(url.path, forKey: lastProjectURLKey)
         rememberRecentProjectURL(url)
     }
 
     static func lastProjectURL() -> URL? {
-        guard let path = UserDefaults.standard.string(forKey: lastProjectURLKey), !path.isEmpty else {
+        guard let path = defaults.string(forKey: lastProjectURLKey), !path.isEmpty else {
             return nil
         }
 
@@ -578,7 +792,7 @@ enum SoundtimeProjectStore {
     }
 
     static func forgetLastProjectURL() {
-        UserDefaults.standard.removeObject(forKey: lastProjectURLKey)
+        defaults.removeObject(forKey: lastProjectURLKey)
     }
 
     static func rememberRecentProjectURL(_ url: URL) {
@@ -589,7 +803,7 @@ enum SoundtimeProjectStore {
             paths = Array(paths.prefix(maximumRecentProjectCount))
         }
 
-        UserDefaults.standard.set(paths, forKey: recentProjectURLPathsKey)
+        defaults.set(paths, forKey: recentProjectURLPathsKey)
     }
 
     static func recentProjectURLs() -> [URL] {
@@ -597,8 +811,31 @@ enum SoundtimeProjectStore {
     }
 
     static func clearRecentProjectURLs() {
-        UserDefaults.standard.removeObject(forKey: recentProjectURLPathsKey)
-        UserDefaults.standard.removeObject(forKey: lastProjectURLKey)
+        defaults.removeObject(forKey: recentProjectURLPathsKey)
+        defaults.removeObject(forKey: lastProjectURLKey)
+    }
+
+    static func synchronizePersistence() {
+        defaults.synchronize()
+    }
+
+    static func removeAutomationArtifactsFromUserHistory() {
+        guard ProcessInfo.processInfo.environment[persistenceSuiteEnvironmentKey] == nil else {
+            return
+        }
+
+        let paths = defaults.stringArray(forKey: recentProjectURLPathsKey) ?? []
+        let filteredPaths = paths.filter { !isKnownAutomationArtifactPath($0) }
+        if filteredPaths != paths {
+            defaults.set(filteredPaths, forKey: recentProjectURLPathsKey)
+        }
+
+        if
+            let lastProjectPath = defaults.string(forKey: lastProjectURLKey),
+            isKnownAutomationArtifactPath(lastProjectPath)
+        {
+            defaults.removeObject(forKey: lastProjectURLKey)
+        }
     }
 
     static func rememberWindowLayout(_ layout: SoundtimeProject.WindowLayout, for projectURL: URL) {
@@ -606,11 +843,11 @@ enum SoundtimeProjectStore {
             return
         }
 
-        UserDefaults.standard.set(data, forKey: projectWindowLayoutKey(for: projectURL))
+        defaults.set(data, forKey: projectWindowLayoutKey(for: projectURL))
     }
 
     static func rememberedWindowLayout(for projectURL: URL) -> SoundtimeProject.WindowLayout? {
-        guard let data = UserDefaults.standard.data(forKey: projectWindowLayoutKey(for: projectURL)) else {
+        guard let data = defaults.data(forKey: projectWindowLayoutKey(for: projectURL)) else {
             return nil
         }
 
@@ -625,11 +862,11 @@ enum SoundtimeProjectStore {
             return
         }
 
-        UserDefaults.standard.set(data, forKey: projectTimelineViewportKey(for: projectURL))
+        defaults.set(data, forKey: projectTimelineViewportKey(for: projectURL))
     }
 
     static func rememberedTimelineViewport(for projectURL: URL) -> SoundtimeProject.TimelineViewport? {
-        guard let data = UserDefaults.standard.data(forKey: projectTimelineViewportKey(for: projectURL)) else {
+        guard let data = defaults.data(forKey: projectTimelineViewportKey(for: projectURL)) else {
             return nil
         }
 
@@ -644,11 +881,11 @@ enum SoundtimeProjectStore {
             return
         }
 
-        UserDefaults.standard.set(data, forKey: projectLaunchStateOverlayKey(for: projectURL))
+        defaults.set(data, forKey: projectLaunchStateOverlayKey(for: projectURL))
     }
 
     static func rememberedLaunchStateOverlay(for projectURL: URL) -> SoundtimeProjectLaunchStateOverlay? {
-        guard let data = UserDefaults.standard.data(forKey: projectLaunchStateOverlayKey(for: projectURL)) else {
+        guard let data = defaults.data(forKey: projectLaunchStateOverlayKey(for: projectURL)) else {
             return nil
         }
 
@@ -656,8 +893,55 @@ enum SoundtimeProjectStore {
     }
 
     private static func recentProjectURLPaths() -> [String] {
-        (UserDefaults.standard.stringArray(forKey: recentProjectURLPathsKey) ?? [])
+        (defaults.stringArray(forKey: recentProjectURLPathsKey) ?? [])
             .filter { !$0.isEmpty }
+    }
+
+    private static func loadAutosaveRaw(
+        from url: URL
+    ) throws -> (project: SoundtimeProject, sourceProjectPath: String?) {
+        let data = try Data(contentsOf: url)
+        let decoder = JSONDecoder()
+        if let envelope = try? decoder.decode(AutosaveEnvelope.self, from: data) {
+            return (migrate(envelope.project), envelope.sourceProjectPath)
+        }
+        return (migrate(try decoder.decode(SoundtimeProject.self, from: data)), nil)
+    }
+
+    private static func isKnownAutomationArtifactPath(_ path: String) -> Bool {
+        let lowercasedPath = path.lowercased()
+        return lowercasedPath.contains("soundtime-transcript-sidecar-smoke-") ||
+            lowercasedPath.contains("soundtimetimelineuxsmoke-") ||
+            lowercasedPath.contains("soundtimestartupcloselifecycle-") ||
+            lowercasedPath.contains("soundtimeaudioexportsmoke-") ||
+            lowercasedPath.contains("soundtimeaudioprocessingsmoke-") ||
+            lowercasedPath.contains("soundtime-transcription-chunk-recovery-smoke-") ||
+            lowercasedPath.contains("soundtime-shippability") ||
+            lowercasedPath.contains("/fixtures/shippability/") ||
+            lowercasedPath.contains("/.build/shippability-fixtures/") ||
+            lowercasedPath.contains("/process-sandbox/") ||
+            lowercasedPath.contains("/soundtime-automation/")
+    }
+
+    private static func isLegacyAutomationAutosave(_ url: URL) -> Bool {
+        guard !usesIsolatedAutomationPersistence else {
+            return false
+        }
+        guard let decoded = try? loadAutosaveRaw(from: url) else {
+            return false
+        }
+        if
+            let sourceProjectPath = decoded.sourceProjectPath,
+            isKnownAutomationArtifactPath(sourceProjectPath)
+        {
+            return true
+        }
+
+        let sourcePaths = decoded.project.tracks
+            .flatMap(\.audioSourceCandidateURLs)
+            .map(\.path)
+        return !sourcePaths.isEmpty &&
+            sourcePaths.allSatisfy(isKnownAutomationArtifactPath)
     }
 
     private static func projectWindowLayoutKey(for projectURL: URL) -> String {
@@ -693,6 +977,14 @@ enum SoundtimeProjectStore {
     }
 
     private static func autosavesDirectoryURL() -> URL {
+        if
+            let persistenceRootPath = ProcessInfo.processInfo.environment[persistenceRootEnvironmentKey],
+            !persistenceRootPath.isEmpty
+        {
+            return URL(fileURLWithPath: persistenceRootPath, isDirectory: true)
+                .appendingPathComponent("Autosaves", isDirectory: true)
+                .standardizedFileURL
+        }
         let baseDirectory = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask

@@ -39,6 +39,7 @@ struct AudioEditTimeline: Sendable {
 
     struct Clip: Sendable {
         fileprivate var segments: [Segment]
+        fileprivate let sourceID: UUID
 
         var frameCount: Int {
             Self.totalFrameCount(segments)
@@ -289,25 +290,50 @@ struct AudioEditTimeline: Sendable {
 
         return Clip(
             segments: selectedSegments,
+            sourceID: sourceID,
             sourceSampleRate: sourceBuffer.sampleRate
         )
     }
 
-    mutating func replace(_ selection: TimelineSelection, with clip: Clip) -> Int? {
-        guard
-            abs(sourceBuffer.sampleRate - clip.sourceSampleRate) < 0.001,
-            !clip.segments.isEmpty
-        else {
+    func clip(for frameRange: Range<Int>) -> Clip? {
+        let selectedSegments = segments(in: clampedFrameRange(frameRange))
+        guard !selectedSegments.isEmpty else {
             return nil
         }
 
-        let replacementRange = clampedFrameRange(for: selection)
+        return Clip(
+            segments: selectedSegments,
+            sourceID: sourceID,
+            sourceSampleRate: sourceBuffer.sampleRate
+        )
+    }
+
+    func isCompatible(with clip: Clip) -> Bool {
+        sourceID == clip.sourceID &&
+            abs(sourceBuffer.sampleRate - clip.sourceSampleRate) < 0.001
+    }
+
+    mutating func replace(_ selection: TimelineSelection, with clip: Clip) -> Int? {
+        replace(frameRange: clampedFrameRange(for: selection), with: clip)
+    }
+
+    mutating func replace(frameRange: Range<Int>, with clip: Clip) -> Int? {
+        guard isCompatible(with: clip), !clip.segments.isEmpty else {
+            return nil
+        }
+
+        let replacementRange = clampedFrameRange(frameRange)
         let beforeSegments = segments(in: 0..<replacementRange.lowerBound)
         let afterSegments = segments(in: replacementRange.upperBound..<frameCount)
         segments = Self.coalescedSegments(beforeSegments + clip.segments + afterSegments)
         let replacementFrameCount = Self.totalFrameCount(clip.segments)
         timelineFrameCount = timelineFrameCount - replacementRange.count + replacementFrameCount
         return replacementFrameCount
+    }
+
+    mutating func insert(_ clip: Clip, atFrame frame: Int) -> Int? {
+        let insertionFrame = min(max(frame, 0), frameCount)
+        return replace(frameRange: insertionFrame..<insertionFrame, with: clip)
     }
 
     mutating func insertSilence(frameCount requestedFrameCount: Int, atProgress progress: Double) -> Int {
@@ -771,7 +797,13 @@ struct AudioEditTimeline: Sendable {
 
     private func clampedFrameRange(for selection: TimelineSelection) -> Range<Int> {
         let frameRange = frameRange(for: selection)
-        return max(frameRange.lowerBound, 0)..<min(max(frameRange.upperBound, frameRange.lowerBound), frameCount)
+        return clampedFrameRange(frameRange)
+    }
+
+    private func clampedFrameRange(_ frameRange: Range<Int>) -> Range<Int> {
+        let lowerBound = min(max(frameRange.lowerBound, 0), frameCount)
+        let upperBound = min(max(frameRange.upperBound, lowerBound), frameCount)
+        return lowerBound..<upperBound
     }
 
     private func segments(in frameRange: Range<Int>) -> [Segment] {

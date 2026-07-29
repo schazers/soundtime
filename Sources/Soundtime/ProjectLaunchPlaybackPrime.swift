@@ -4,7 +4,8 @@ import QuartzCore
 struct ProjectLaunchPlaybackPrimeTrack: Sendable {
     var trackID: UUID
     var sourceURL: URL
-    var fileInfo: WAVFileInfo
+    var fileInfo: WAVFileInfo?
+    var sampleRate: Double
     var fileTimeline: AudioFileEditTimeline?
     var editableSource: EditableAudioSource
     var ownsSourceFile: Bool
@@ -99,33 +100,86 @@ enum ProjectLaunchPlaybackPrimer {
     }
 
     static func prime(track: SoundtimeProject.Track) throws -> ProjectLaunchPlaybackPrimeTrack {
-        let sourceURL = URL(fileURLWithPath: track.filePath).standardizedFileURL
-        let fileInfo = try WAVAudioDecoder.inspect(url: sourceURL)
+        var lastError: Error?
+        for sourceURL in track.audioSourceCandidateURLs {
+            do {
+                return try prime(track: track, sourceURL: sourceURL)
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError ?? AudioAssetImporter.ImportError.unreadableNativeAudio(
+            AudioAssetFormat.inferred(
+                from: URL(fileURLWithPath: track.filePath).standardizedFileURL
+            )
+        )
+    }
+
+    private static func prime(
+        track: SoundtimeProject.Track,
+        sourceURL: URL
+    ) throws -> ProjectLaunchPlaybackPrimeTrack {
+        let fileInfo = try? WAVAudioDecoder.inspect(url: sourceURL)
+        let nativeInfo = fileInfo == nil ?
+            try AudioAssetImporter.inspectSynchronously(url: sourceURL) :
+            nil
+        let sourceFrameCount = fileInfo?.frameCount ?? nativeInfo?.frameCount ?? 0
+        let sourceSampleRate = fileInfo?.sampleRate ?? nativeInfo?.sampleRate ?? 0
+        let channelCount = fileInfo?.channelCount ?? nativeInfo?.channelCount ?? 0
+        guard sourceFrameCount > 0, sourceSampleRate > 0, channelCount > 0 else {
+            throw AudioAssetImporter.ImportError.unreadableNativeAudio(
+                AudioAssetFormat.inferred(from: sourceURL)
+            )
+        }
         let restoredTimeline: AudioFileEditTimeline?
         if
             let editTimeline = track.editTimeline,
             let timeline = AudioFileEditTimeline(persistentState: editTimeline),
-            timeline.isCompatible(with: fileInfo)
+            timeline.sourceFrameCount == sourceFrameCount,
+            abs(timeline.sourceSampleRate - sourceSampleRate) < 0.001
         {
             restoredTimeline = timeline
         } else {
             restoredTimeline = nil
         }
 
-        let editableSource = track.editableSource?.editableAudioSource(fileInfo: fileInfo) ??
-            EditableAudioSource(
-                importedAssetID: track.editableSource?.importedAssetID,
-                originalURL: track.editableSource.map { URL(fileURLWithPath: $0.originalFilePath) } ?? sourceURL,
+        let editableSource: EditableAudioSource
+        if let fileInfo {
+            editableSource = track.editableSource?.editableAudioSource(fileInfo: fileInfo) ??
+                EditableAudioSource(
+                    importedAssetID: track.editableSource?.importedAssetID,
+                    originalURL: track.editableSource.map { URL(fileURLWithPath: $0.originalFilePath) } ?? sourceURL,
+                    editableURL: sourceURL,
+                    formatOrigin: track.editableSource?.formatOrigin ?? AudioAssetFormat.inferred(from: sourceURL),
+                    fileInfo: fileInfo,
+                    ownsEditableFile: track.ownsSourceFile ?? false
+                )
+        } else if
+            let restoredSource = track.editableSource?.editableAudioSource(),
+            restoredSource.editableURL.standardizedFileURL == sourceURL
+        {
+            editableSource = restoredSource
+        } else {
+            let assetID = track.importedAssetState?.assetID ?? UUID()
+            editableSource = EditableAudioSource(
+                importedAssetID: assetID,
+                originalURL: track.importedAssetState.map {
+                    URL(fileURLWithPath: $0.originalFilePath)
+                } ?? sourceURL,
                 editableURL: sourceURL,
-                formatOrigin: track.editableSource?.formatOrigin ?? AudioAssetFormat.inferred(from: sourceURL),
-                fileInfo: fileInfo,
-                ownsEditableFile: track.ownsSourceFile ?? false
+                formatOrigin: track.importedAssetState?.format ?? AudioAssetFormat.inferred(from: sourceURL),
+                sourceFrameCount: sourceFrameCount,
+                sourceSampleRate: sourceSampleRate,
+                channelCount: channelCount,
+                ownsEditableFile: false
             )
+        }
 
         return ProjectLaunchPlaybackPrimeTrack(
             trackID: track.id,
             sourceURL: sourceURL,
             fileInfo: fileInfo,
+            sampleRate: sourceSampleRate,
             fileTimeline: restoredTimeline,
             editableSource: editableSource,
             ownsSourceFile: track.ownsSourceFile ?? false,
@@ -135,4 +189,5 @@ enum ProjectLaunchPlaybackPrimer {
             isSoloed: track.isSoloed
         )
     }
+
 }

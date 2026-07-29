@@ -52,6 +52,11 @@ struct RealtimeAudioCoreSnapshot {
     let lastRenderNanoseconds: Int
     let maxRenderNanoseconds: Int
     let renderDeadlineMissCount: Int
+    let lastRenderWorkNanoseconds: Int
+    let maxRenderWorkNanoseconds: Int
+    let renderWorkDeadlineMissCount: Int
+    let callbackSchedulingLateCount: Int
+    let maxCallbackSchedulingLatenessNanoseconds: Int
 
     var playbackSnapshot: PlaybackSnapshot {
         PlaybackSnapshot(
@@ -186,6 +191,9 @@ final class RealtimeAudioCore {
         }
 
         self.engine = engine
+        if ProcessInfo.processInfo.environment["SOUNDTIME_AUDIO_DETAILED_TIMING"] == "1" {
+            soundtime_audio_core_set_detailed_timing_enabled(engine, true)
+        }
     }
 
     deinit {
@@ -260,6 +268,24 @@ final class RealtimeAudioCore {
                 engine,
                 trackConfigs.baseAddress,
                 UInt32(trackConfigs.count)
+            )
+        }
+    }
+
+    func setPreparedTracks(
+        _ tracks: [PreparedRealtimeAudioTrack],
+        sampleRate: Double
+    ) -> Bool {
+        guard let engine, !tracks.isEmpty, sampleRate.isFinite, sampleRate > 0 else {
+            return false
+        }
+
+        return withSegmentedTrackConfigs(tracks) { trackConfigs in
+            soundtime_audio_core_set_prepared_segmented_tracks_at_sample_rate(
+                engine,
+                trackConfigs.baseAddress,
+                UInt32(trackConfigs.count),
+                sampleRate
             )
         }
     }
@@ -392,6 +418,43 @@ final class RealtimeAudioCore {
         soundtime_audio_core_set_track_gain_ramp_duration(engine, max(duration, 0))
     }
 
+    func renderOffline(
+        startFrameIndex: Int,
+        channelCount: Int,
+        frameCount: Int
+    ) -> [[Float]]? {
+        guard
+            let engine,
+            channelCount > 0,
+            frameCount > 0
+        else {
+            return nil
+        }
+
+        let channelBuffers = (0..<channelCount).map { _ in
+            UnsafeMutablePointer<Float>.allocate(capacity: frameCount)
+        }
+        defer {
+            channelBuffers.forEach { $0.deallocate() }
+        }
+        var channelPointers = channelBuffers.map(Optional.some)
+        let didRender = channelPointers.withUnsafeMutableBufferPointer { pointerBuffer in
+            soundtime_audio_core_render_offline(
+                engine,
+                UInt64(max(startFrameIndex, 0)),
+                pointerBuffer.baseAddress,
+                UInt32(channelCount),
+                UInt32(frameCount)
+            )
+        }
+        guard didRender else {
+            return nil
+        }
+        return channelBuffers.map { buffer in
+            Array(UnsafeBufferPointer(start: buffer, count: frameCount))
+        }
+    }
+
     func reset() {
         guard let engine else {
             return
@@ -418,7 +481,12 @@ final class RealtimeAudioCore {
                 callbackCount: 0,
                 lastRenderNanoseconds: 0,
                 maxRenderNanoseconds: 0,
-                renderDeadlineMissCount: 0
+                renderDeadlineMissCount: 0,
+                lastRenderWorkNanoseconds: 0,
+                maxRenderWorkNanoseconds: 0,
+                renderWorkDeadlineMissCount: 0,
+                callbackSchedulingLateCount: 0,
+                maxCallbackSchedulingLatenessNanoseconds: 0
             )
         }
 
@@ -435,7 +503,14 @@ final class RealtimeAudioCore {
             callbackCount: Int(min(snapshot.callbackCount, UInt64(Int.max))),
             lastRenderNanoseconds: Int(min(snapshot.lastRenderNanoseconds, UInt64(Int.max))),
             maxRenderNanoseconds: Int(min(snapshot.maxRenderNanoseconds, UInt64(Int.max))),
-            renderDeadlineMissCount: Int(min(snapshot.renderDeadlineMissCount, UInt64(Int.max)))
+            renderDeadlineMissCount: Int(min(snapshot.renderDeadlineMissCount, UInt64(Int.max))),
+            lastRenderWorkNanoseconds: Int(min(snapshot.lastRenderWorkNanoseconds, UInt64(Int.max))),
+            maxRenderWorkNanoseconds: Int(min(snapshot.maxRenderWorkNanoseconds, UInt64(Int.max))),
+            renderWorkDeadlineMissCount: Int(min(snapshot.renderWorkDeadlineMissCount, UInt64(Int.max))),
+            callbackSchedulingLateCount: Int(min(snapshot.callbackSchedulingLateCount, UInt64(Int.max))),
+            maxCallbackSchedulingLatenessNanoseconds: Int(
+                min(snapshot.maxCallbackSchedulingLatenessNanoseconds, UInt64(Int.max))
+            )
         )
     }
 

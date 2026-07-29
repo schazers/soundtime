@@ -2,6 +2,14 @@ import AppKit
 
 @MainActor
 final class AudioExportWindowController: NSWindowController, NSWindowDelegate {
+    struct SmokeSnapshot {
+        let stageTitle: String
+        let cancelTitle: String
+        let cancelEnabled: Bool
+        let revealVisible: Bool
+        let percent: Int
+    }
+
     var onCancel: (() -> Void)?
     var onClosed: (() -> Void)?
 
@@ -12,6 +20,8 @@ final class AudioExportWindowController: NSWindowController, NSWindowDelegate {
     private let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
     private let revealButton = NSButton(title: "Reveal", target: nil, action: nil)
     private var outputURLs: [URL] = []
+    private var displayedJobID: UUID?
+    private var isCancellationRequested = false
 
     init() {
         let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 460, height: 210))
@@ -34,6 +44,10 @@ final class AudioExportWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func update(progress: AudioExportProgress) {
+        if displayedJobID != progress.jobID {
+            displayedJobID = progress.jobID
+            isCancellationRequested = false
+        }
         titleField.stringValue = "\(progress.request.scope.displayName) Export"
         subtitleField.stringValue = progress.message
         progressIndicator.doubleValue = min(max(progress.fractionCompleted, 0), 1)
@@ -42,15 +56,37 @@ final class AudioExportWindowController: NSWindowController, NSWindowDelegate {
 
         switch progress.stage {
         case .completed:
+            isCancellationRequested = false
             cancelButton.title = "Close"
+            cancelButton.isEnabled = true
             revealButton.isHidden = outputURLs.isEmpty
         case .canceled, .failed:
+            isCancellationRequested = false
             cancelButton.title = "Close"
+            cancelButton.isEnabled = true
             revealButton.isHidden = true
-        case .preparing, .rendering, .encoding, .finishing:
-            cancelButton.title = "Cancel"
+        case .preparing, .rendering, .encoding, .validating, .committing, .finishing:
+            cancelButton.title = isCancellationRequested ? "Canceling..." : "Cancel"
+            cancelButton.isEnabled = !isCancellationRequested
             revealButton.isHidden = true
         }
+    }
+
+    func markCancellationRequested() {
+        isCancellationRequested = true
+        subtitleField.stringValue = "Canceling and removing partial output..."
+        cancelButton.title = "Canceling..."
+        cancelButton.isEnabled = false
+    }
+
+    func smokeSnapshot() -> SmokeSnapshot {
+        SmokeSnapshot(
+            stageTitle: titleField.stringValue,
+            cancelTitle: cancelButton.title,
+            cancelEnabled: cancelButton.isEnabled,
+            revealVisible: !revealButton.isHidden,
+            percent: Int((progressIndicator.doubleValue * 100).rounded())
+        )
     }
 
     func show(relativeTo parentWindow: NSWindow?) {

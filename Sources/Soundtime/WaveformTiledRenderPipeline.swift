@@ -122,14 +122,22 @@ final class WaveformTiledRenderPipeline: @unchecked Sendable {
 
     @discardableResult
     func registerSources(_ sources: [WaveformTileBuildSource]) -> Set<WaveformSourceID> {
-        let nextSourceIDs = Set(sources.map(\.sourceID))
+        var uniqueSources: [WaveformSourceID: WaveformTileBuildSource] = [:]
+        uniqueSources.reserveCapacity(sources.count)
+        for source in sources {
+            uniqueSources[source.sourceID] = source
+        }
+        let nextSourceIDs = Set(uniqueSources.keys)
         lock.lock()
         let staleSourceIDs = registeredSourceIDs.subtracting(nextSourceIDs)
+        let newSourceIDs = nextSourceIDs.subtracting(registeredSourceIDs)
         registeredSourceIDs = nextSourceIDs
         lock.unlock()
 
-        for source in sources {
-            buildWorker.registerSource(source)
+        for sourceID in newSourceIDs {
+            if let source = uniqueSources[sourceID] {
+                buildWorker.registerSource(source)
+            }
         }
         for sourceID in staleSourceIDs {
             buildWorker.unregisterSource(sourceID)

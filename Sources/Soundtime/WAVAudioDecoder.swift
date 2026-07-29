@@ -299,31 +299,29 @@ enum WAVAudioDecoder {
             fileInfo.frameCount
         )
         let frameCount = max(decodeEndFrame - decodeStartFrame, 0)
-        var samplesByChannel = (0..<fileInfo.channelCount).map { _ in
-            [Float]()
-        }
-
-        for channelIndex in samplesByChannel.indices {
-            samplesByChannel[channelIndex].reserveCapacity(frameCount)
-        }
-
-        for outputFrameIndex in 0..<frameCount {
-            if outputFrameIndex.isMultiple(of: 4_096) {
-                try ImportWorkBudget.shared.waitIfPlaybackActive()
-            }
-
-            let frameIndex = decodeStartFrame + outputFrameIndex
-            let frameOffset = fileInfo.dataRange.lowerBound + frameIndex * fileInfo.blockAlign
-
+        var samplesByChannel = [[Float]]()
+        samplesByChannel.reserveCapacity(fileInfo.channelCount)
+        try data.withUnsafeBytes { bytes in
             for channelIndex in 0..<fileInfo.channelCount {
-                let sampleOffset = frameOffset + channelIndex * bytesPerSample
-                let sample = try decodeSample(
-                    in: data,
-                    at: sampleOffset,
-                    formatTag: fileInfo.formatTag,
-                    bitsPerSample: fileInfo.bitsPerSample
-                )
-                samplesByChannel[channelIndex].append(sample)
+                var channelSamples = [Float](repeating: 0, count: frameCount)
+                for outputFrameIndex in 0..<frameCount {
+                    if outputFrameIndex.isMultiple(of: 4_096) {
+                        try ImportWorkBudget.shared.waitIfPlaybackActive()
+                    }
+
+                    let frameIndex = decodeStartFrame + outputFrameIndex
+                    let sampleOffset =
+                        fileInfo.dataRange.lowerBound +
+                        frameIndex * fileInfo.blockAlign +
+                        channelIndex * bytesPerSample
+                    channelSamples[outputFrameIndex] = try decodeSample(
+                        in: bytes,
+                        at: sampleOffset,
+                        formatTag: fileInfo.formatTag,
+                        bitsPerSample: fileInfo.bitsPerSample
+                    )
+                }
+                samplesByChannel.append(channelSamples)
             }
         }
 
@@ -374,6 +372,53 @@ enum WAVAudioDecoder {
             return Float(bitPattern: try readUInt32LE(in: data, at: offset)).clampedToAudioRange()
         case (3, 64):
             return Float(Double(bitPattern: try readUInt64LE(in: data, at: offset))).clampedToAudioRange()
+        default:
+            throw DecodeError.unsupportedBitDepth(bitsPerSample)
+        }
+    }
+
+    private static func decodeSample(
+        in bytes: UnsafeRawBufferPointer,
+        at offset: Int,
+        formatTag: UInt16,
+        bitsPerSample: Int
+    ) throws -> Float {
+        guard offset >= 0, offset + max(bitsPerSample / 8, 1) <= bytes.count else {
+            throw DecodeError.invalidChunk
+        }
+        switch (formatTag, bitsPerSample) {
+        case (1, 8):
+            return (Float(Int(bytes[offset]) - 128) / 128).clampedToAudioRange()
+        case (1, 16):
+            let value = UInt16(bytes[offset]) |
+                UInt16(bytes[offset + 1]) << 8
+            return (Float(Int16(bitPattern: value)) / 32_768).clampedToAudioRange()
+        case (1, 24):
+            var value = Int32(bytes[offset]) |
+                Int32(bytes[offset + 1]) << 8 |
+                Int32(bytes[offset + 2]) << 16
+            if value & 0x0080_0000 != 0 {
+                value |= ~0x00FF_FFFF
+            }
+            return (Float(value) / 8_388_608).clampedToAudioRange()
+        case (1, 32):
+            let value = UInt32(bytes[offset]) |
+                UInt32(bytes[offset + 1]) << 8 |
+                UInt32(bytes[offset + 2]) << 16 |
+                UInt32(bytes[offset + 3]) << 24
+            return (Float(Int32(bitPattern: value)) / 2_147_483_648).clampedToAudioRange()
+        case (3, 32):
+            let value = UInt32(bytes[offset]) |
+                UInt32(bytes[offset + 1]) << 8 |
+                UInt32(bytes[offset + 2]) << 16 |
+                UInt32(bytes[offset + 3]) << 24
+            return Float(bitPattern: value).clampedToAudioRange()
+        case (3, 64):
+            var value = UInt64(0)
+            for byteIndex in 0..<8 {
+                value |= UInt64(bytes[offset + byteIndex]) << UInt64(byteIndex * 8)
+            }
+            return Float(Double(bitPattern: value)).clampedToAudioRange()
         default:
             throw DecodeError.unsupportedBitDepth(bitsPerSample)
         }

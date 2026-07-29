@@ -167,13 +167,17 @@ struct AudioAssetPreviewResult: Sendable {
 }
 
 struct AudioAssetProxyResult: Sendable {
+    let assetID: UUID
     let originalInfo: AudioAssetInfo
+    let fingerprint: AudioImportFingerprint
     let proxyURL: URL
     let proxyFileInfo: WAVFileInfo
-    let decodedAudioBuffer: DecodedAudioBuffer
     let waveformOverview: WaveformOverview
     let zeroCrossingIndex: AudioZeroCrossingIndex
     let usesOriginalFile: Bool
+    let cacheHit: Bool
+    let peakWorkingSetBytes: Int
+    let preparationMilliseconds: Double
 }
 
 enum AudioAssetImporter {
@@ -245,13 +249,15 @@ enum AudioAssetImporter {
     }
 
     static func inspect(url: URL) async throws -> AudioAssetInfo {
-        try await Task.detached(priority: .userInitiated) {
-            try inspectSynchronously(url: url)
-        }.value
+        try Task.checkCancellation()
+        return try inspectSynchronously(url: url)
     }
 
     static func inspectSynchronously(url: URL) throws -> AudioAssetInfo {
         let format = AudioAssetFormat.inferred(from: url)
+        guard canImport(url) else {
+            throw ImportError.unsupportedDecodeFormat(format)
+        }
         if format.isWAVFastPath, WAVAudioDecoder.canDecode(url) {
             let fileInfo = try WAVAudioDecoder.inspect(url: url)
             let metadata = try AudioFileMetadataLoader.loadQuickMetadata(
@@ -266,20 +272,20 @@ enum AudioAssetImporter {
             )
         }
 
-        let nativeInfo = try? inspectNativeAudioSynchronously(url: url, format: format)
+        let nativeInfo = try inspectNativeAudioSynchronously(url: url, format: format)
         let metadata = try AudioFileMetadataLoader.loadQuickMetadata(
             for: url,
-            duration: nativeInfo?.duration
+            duration: nativeInfo.duration
         )
         return AudioAssetInfo(
             url: url,
             format: format,
             metadata: metadata,
             wavFileInfo: nil,
-            nativeSampleRate: nativeInfo?.sampleRate,
-            nativeChannelCount: nativeInfo?.channelCount,
-            nativeFrameCount: nativeInfo?.frameCount,
-            codecDescription: nativeInfo?.codecDescription
+            nativeSampleRate: nativeInfo.sampleRate,
+            nativeChannelCount: nativeInfo.channelCount,
+            nativeFrameCount: nativeInfo.frameCount,
+            codecDescription: nativeInfo.codecDescription
         )
     }
 
@@ -288,35 +294,34 @@ enum AudioAssetImporter {
         targetBinCount: Int = 512,
         samplesPerBin: Int = 8
     ) async throws -> AudioAssetPreviewResult {
-        try await Task.detached(priority: .userInitiated) {
-            let assetInfo = try inspectSynchronously(url: url)
-            let waveformOverview: WaveformOverview
-            let zeroCrossingProbe: WAVZeroCrossingProbe?
-            if assetInfo.format.isWAVFastPath, let fileInfo = assetInfo.wavFileInfo {
-                (_, waveformOverview) = try WAVAudioDecoder.buildSparsePreview(
-                    url: url,
-                    targetBinCount: targetBinCount,
-                    samplesPerBin: samplesPerBin
-                )
-                zeroCrossingProbe = try? WAVAudioDecoder.makeZeroCrossingProbe(
-                    url: url,
-                    fileInfo: fileInfo
-                )
-            } else {
-                waveformOverview = try buildNativeSparsePreview(
-                    url: url,
-                    assetInfo: assetInfo,
-                    targetBinCount: targetBinCount,
-                    samplesPerBin: samplesPerBin
-                )
-                zeroCrossingProbe = nil
-            }
-            return AudioAssetPreviewResult(
-                assetInfo: assetInfo,
-                waveformOverview: waveformOverview,
-                zeroCrossingProbe: zeroCrossingProbe
+        try Task.checkCancellation()
+        let assetInfo = try inspectSynchronously(url: url)
+        let waveformOverview: WaveformOverview
+        let zeroCrossingProbe: WAVZeroCrossingProbe?
+        if assetInfo.format.isWAVFastPath, let fileInfo = assetInfo.wavFileInfo {
+            (_, waveformOverview) = try WAVAudioDecoder.buildSparsePreview(
+                url: url,
+                targetBinCount: targetBinCount,
+                samplesPerBin: samplesPerBin
             )
-        }.value
+            zeroCrossingProbe = try? WAVAudioDecoder.makeZeroCrossingProbe(
+                url: url,
+                fileInfo: fileInfo
+            )
+        } else {
+            waveformOverview = try buildNativeSparsePreview(
+                url: url,
+                assetInfo: assetInfo,
+                targetBinCount: targetBinCount,
+                samplesPerBin: samplesPerBin
+            )
+            zeroCrossingProbe = nil
+        }
+        return AudioAssetPreviewResult(
+            assetInfo: assetInfo,
+            waveformOverview: waveformOverview,
+            zeroCrossingProbe: zeroCrossingProbe
+        )
     }
 
     static func loadPreviewOverview(
@@ -324,20 +329,18 @@ enum AudioAssetImporter {
         targetBinCount: Int,
         samplesPerBin: Int
     ) async throws -> (AudioAssetInfo, WaveformOverview) {
-        try await Task.detached(priority: .utility) {
-            try ImportWorkBudget.shared.performScheduledHeavyWork(.previewRefinement) {
-                let assetInfo = try inspectSynchronously(url: url)
-                guard assetInfo.format.isWAVFastPath else {
-                    throw ImportError.unsupportedPreviewFormat(assetInfo.format)
-                }
-                let (_, waveformOverview) = try WAVAudioDecoder.buildSparsePreview(
-                    url: url,
-                    targetBinCount: targetBinCount,
-                    samplesPerBin: samplesPerBin
-                )
-                return (assetInfo, waveformOverview)
+        try ImportWorkBudget.shared.performScheduledHeavyWork(.previewRefinement) {
+            let assetInfo = try inspectSynchronously(url: url)
+            guard assetInfo.format.isWAVFastPath else {
+                throw ImportError.unsupportedPreviewFormat(assetInfo.format)
             }
-        }.value
+            let (_, waveformOverview) = try WAVAudioDecoder.buildSparsePreview(
+                url: url,
+                targetBinCount: targetBinCount,
+                samplesPerBin: samplesPerBin
+            )
+            return (assetInfo, waveformOverview)
+        }
     }
 
     static func loadDecodedAsset(at url: URL) async throws -> (
@@ -346,92 +349,194 @@ enum AudioAssetImporter {
         WaveformOverview,
         AudioZeroCrossingIndex
     ) {
-        try await Task.detached(priority: .background) {
-            try ImportWorkBudget.shared.performScheduledHeavyWork(.backgroundDecode) {
-                let assetInfo = try inspectSynchronously(url: url)
-                let decodedAudioBuffer: DecodedAudioBuffer
-                if assetInfo.format.isWAVFastPath {
-                    decodedAudioBuffer = try WAVAudioDecoder.decode(url: url)
-                } else {
-                    decodedAudioBuffer = try decodeNativeAudioSynchronously(url: url, format: assetInfo.format)
-                }
-
-                let waveformOverview = WaveformOverviewBuilder.build(from: decodedAudioBuffer)
-                let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: decodedAudioBuffer)
-                return (assetInfo, decodedAudioBuffer, waveformOverview, zeroCrossingIndex)
+        try ImportWorkBudget.shared.performScheduledHeavyWork(.backgroundDecode) {
+            let assetInfo = try inspectSynchronously(url: url)
+            let decodedAudioBuffer: DecodedAudioBuffer
+            if assetInfo.format.isWAVFastPath {
+                decodedAudioBuffer = try WAVAudioDecoder.decode(url: url)
+            } else {
+                decodedAudioBuffer = try decodeNativeAudioSynchronously(url: url, format: assetInfo.format)
             }
-        }.value
+
+            let waveformOverview = WaveformOverviewBuilder.build(from: decodedAudioBuffer)
+            let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: decodedAudioBuffer)
+            return (assetInfo, decodedAudioBuffer, waveformOverview, zeroCrossingIndex)
+        }
     }
 
     static func importEditableAsset(
         at url: URL,
-        targetSampleRate: Double = editableProxySampleRate
+        targetSampleRate: Double = editableProxySampleRate,
+        assetID: UUID = UUID(),
+        progress: (@Sendable (AudioImportProgress) -> Void)? = nil
     ) async throws -> AudioAssetProxyResult {
-        try await Task.detached(priority: .userInitiated) {
-            try ImportWorkBudget.shared.performScheduledHeavyWork(.backgroundDecode) {
-                try Task.checkCancellation()
-                let originalInfo = try inspectSynchronously(url: url)
-                try Task.checkCancellation()
-                if originalInfo.format.isWAVFastPath {
-                    guard let proxyFileInfo = originalInfo.wavFileInfo else {
-                        throw ImportError.missingWAVFileInfo
-                    }
-                    let decodedAudioBuffer = try WAVAudioDecoder.decode(url: url)
-                    try Task.checkCancellation()
-                    let waveformOverview = WaveformOverviewBuilder.build(from: decodedAudioBuffer)
-                    let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: decodedAudioBuffer)
-                    return AudioAssetProxyResult(
-                        originalInfo: originalInfo,
-                        proxyURL: url,
-                        proxyFileInfo: proxyFileInfo,
-                        decodedAudioBuffer: decodedAudioBuffer,
-                        waveformOverview: waveformOverview,
-                        zeroCrossingIndex: zeroCrossingIndex,
-                        usesOriginalFile: true
-                    )
-                }
+        try ImportWorkBudget.shared.performScheduledHeavyWork(.backgroundDecode) {
+            try Task.checkCancellation()
+            let originalInfo = try inspectSynchronously(url: url)
+            let fingerprint = try AudioImportFingerprint(
+                url: url,
+                assetInfo: originalInfo
+            )
+            return try prepareEditableAsset(
+                originalInfo: originalInfo,
+                fingerprint: fingerprint,
+                targetSampleRate: targetSampleRate,
+                assetID: assetID,
+                progress: progress
+            )
+        }
+    }
 
-                var decodedAudioBuffer = try decodeNativeAudioSynchronously(
-                    url: url,
-                    format: originalInfo.format
-                )
-                try Task.checkCancellation()
-                decodedAudioBuffer = try resampleIfNeeded(
-                    decodedAudioBuffer,
-                    targetSampleRate: targetSampleRate
-                )
-                try Task.checkCancellation()
+    static func importEditableAsset(
+        admission: AudioImportAdmission,
+        targetSampleRate: Double = editableProxySampleRate,
+        progress: (@Sendable (AudioImportProgress) -> Void)? = nil
+    ) async throws -> AudioAssetProxyResult {
+        try ImportWorkBudget.shared.performScheduledHeavyWork(.backgroundDecode) {
+            try prepareEditableAsset(
+                originalInfo: admission.assetInfo,
+                fingerprint: admission.fingerprint,
+                targetSampleRate: targetSampleRate,
+                assetID: admission.assetID,
+                progress: progress
+            )
+        }
+    }
 
-                let proxyURL = try makeEditableProxyURL(for: url, format: originalInfo.format)
-                let proxyBuffer = DecodedAudioBuffer(
-                    url: proxyURL,
-                    sampleRate: decodedAudioBuffer.sampleRate,
-                    channelCount: decodedAudioBuffer.channelCount,
-                    frameCount: decodedAudioBuffer.frameCount,
-                    samplesByChannel: decodedAudioBuffer.samplesByChannel
-                )
-                try Task.checkCancellation()
-                try WAVFileWriter.write(proxyBuffer, to: proxyURL)
-                do {
-                    try Task.checkCancellation()
-                } catch {
-                    try? FileManager.default.removeItem(at: proxyURL)
-                    throw error
-                }
-                let proxyFileInfo = try WAVAudioDecoder.inspect(url: proxyURL)
-                let waveformOverview = WaveformOverviewBuilder.build(from: proxyBuffer)
-                let zeroCrossingIndex = AudioZeroCrossingIndex.build(from: proxyBuffer)
-                return AudioAssetProxyResult(
-                    originalInfo: originalInfo,
-                    proxyURL: proxyURL,
-                    proxyFileInfo: proxyFileInfo,
-                    decodedAudioBuffer: proxyBuffer,
-                    waveformOverview: waveformOverview,
-                    zeroCrossingIndex: zeroCrossingIndex,
-                    usesOriginalFile: false
-                )
+    private static func prepareEditableAsset(
+        originalInfo: AudioAssetInfo,
+        fingerprint: AudioImportFingerprint,
+        targetSampleRate: Double,
+        assetID: UUID,
+        progress: (@Sendable (AudioImportProgress) -> Void)?
+    ) throws -> AudioAssetProxyResult {
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        func elapsedMilliseconds() -> Double {
+            Double(DispatchTime.now().uptimeNanoseconds &- startedAt) / 1_000_000
+        }
+        try Task.checkCancellation()
+        let url = originalInfo.url
+        guard fingerprint.isCurrent(for: url) else {
+            throw CocoaError(.fileReadUnknown)
+        }
+
+        if originalInfo.format.isWAVFastPath {
+            guard let proxyFileInfo = originalInfo.wavFileInfo else {
+                throw ImportError.missingWAVFileInfo
             }
-        }.value
+            let (_, waveformOverview) = try WAVAudioDecoder.buildSparsePreview(
+                url: url,
+                targetBinCount: 16_384,
+                samplesPerBin: 32
+            )
+            progress?(AudioImportProgress(
+                stage: .complete,
+                completedFrames: Int64(proxyFileInfo.frameCount),
+                totalFrames: Int64(proxyFileInfo.frameCount),
+                message: "Audio ready"
+            ))
+            return AudioAssetProxyResult(
+                assetID: assetID,
+                originalInfo: originalInfo,
+                fingerprint: fingerprint,
+                proxyURL: url,
+                proxyFileInfo: proxyFileInfo,
+                waveformOverview: waveformOverview,
+                zeroCrossingIndex: AudioZeroCrossingIndex(
+                    frameCount: proxyFileInfo.frameCount,
+                    crossings: []
+                ),
+                usesOriginalFile: true,
+                cacheHit: true,
+                peakWorkingSetBytes: 0,
+                preparationMilliseconds: elapsedMilliseconds()
+            )
+        }
+
+        if let cached = AudioImportCacheStore.shared.cachedImport(
+            for: fingerprint,
+            sourceURL: url
+        ) {
+            progress?(AudioImportProgress(
+                stage: .complete,
+                completedFrames: Int64(cached.proxyFileInfo.frameCount),
+                totalFrames: Int64(cached.proxyFileInfo.frameCount),
+                message: "Loaded cached editable audio"
+            ))
+            return AudioAssetProxyResult(
+                assetID: assetID,
+                originalInfo: originalInfo,
+                fingerprint: fingerprint,
+                proxyURL: cached.proxyURL,
+                proxyFileInfo: cached.proxyFileInfo,
+                waveformOverview: cached.waveformOverview,
+                zeroCrossingIndex: cached.zeroCrossingIndex,
+                usesOriginalFile: false,
+                cacheHit: true,
+                peakWorkingSetBytes: 0,
+                preparationMilliseconds: elapsedMilliseconds()
+            )
+        }
+
+        let transaction = try AudioImportCacheStore.shared.beginTransaction(
+            for: fingerprint
+        )
+        do {
+            progress?(AudioImportProgress(
+                stage: .proxying,
+                completedFrames: 0,
+                totalFrames: Int64(originalInfo.frameCount ?? 0),
+                message: "Converting to editable audio"
+            ))
+            let built = try StreamingAudioProxyBuilder.build(
+                sourceURL: url,
+                destinationURL: transaction.stagedProxyURL,
+                targetSampleRate: targetSampleRate,
+                progress: progress
+            )
+            try Task.checkCancellation()
+            let manifest = AudioImportManifest(
+                assetID: assetID,
+                fingerprint: fingerprint,
+                originalURL: url,
+                format: originalInfo.format,
+                displayName: originalInfo.metadata.displayName,
+                proxyFileName: transaction.stagedProxyURL.lastPathComponent,
+                sourceSampleRate: originalInfo.sampleRate ?? 0,
+                sourceFrameCount: Int64(originalInfo.frameCount ?? 0),
+                proxySampleRate: built.fileInfo.sampleRate,
+                proxyFrameCount: Int64(built.fileInfo.frameCount),
+                channelCount: built.fileInfo.channelCount
+            )
+            let cached = try AudioImportCacheStore.shared.commit(
+                transaction,
+                manifest: manifest,
+                waveformOverview: built.waveformOverview,
+                zeroCrossingIndex: built.zeroCrossingIndex
+            )
+            progress?(AudioImportProgress(
+                stage: .complete,
+                completedFrames: Int64(cached.proxyFileInfo.frameCount),
+                totalFrames: Int64(cached.proxyFileInfo.frameCount),
+                message: "Import complete"
+            ))
+            return AudioAssetProxyResult(
+                assetID: assetID,
+                originalInfo: originalInfo,
+                fingerprint: fingerprint,
+                proxyURL: cached.proxyURL,
+                proxyFileInfo: cached.proxyFileInfo,
+                waveformOverview: cached.waveformOverview,
+                zeroCrossingIndex: cached.zeroCrossingIndex,
+                usesOriginalFile: false,
+                cacheHit: false,
+                peakWorkingSetBytes: built.peakWorkingSetBytes,
+                preparationMilliseconds: elapsedMilliseconds()
+            )
+        } catch {
+            AudioImportCacheStore.shared.cancel(transaction)
+            throw error
+        }
     }
 
     private struct NativeAudioInspection {
@@ -627,104 +732,6 @@ enum AudioAssetImporter {
         }
     }
 
-    private static func resampleIfNeeded(
-        _ buffer: DecodedAudioBuffer,
-        targetSampleRate: Double
-    ) throws -> DecodedAudioBuffer {
-        guard targetSampleRate.isFinite, targetSampleRate > 0 else {
-            throw ImportError.invalidSampleRate
-        }
-        guard buffer.sampleRate.isFinite, buffer.sampleRate > 0 else {
-            throw ImportError.invalidSampleRate
-        }
-        guard abs(buffer.sampleRate - targetSampleRate) >= 0.5 else {
-            return buffer
-        }
-
-        let ratio = targetSampleRate / buffer.sampleRate
-        let targetFrameCount = max(0, Int((Double(buffer.frameCount) * ratio).rounded()))
-        guard targetFrameCount > 0 else {
-            return DecodedAudioBuffer(
-                url: buffer.url,
-                sampleRate: targetSampleRate,
-                channelCount: buffer.channelCount,
-                frameCount: 0,
-                samplesByChannel: Array(repeating: [], count: buffer.channelCount)
-            )
-        }
-
-        var resampledChannels: [[Float]] = []
-        resampledChannels.reserveCapacity(buffer.channelCount)
-        for channelIndex in 0..<buffer.channelCount {
-            let source = channelIndex < buffer.samplesByChannel.count ?
-                buffer.samplesByChannel[channelIndex] :
-                []
-            guard !source.isEmpty else {
-                resampledChannels.append([Float](repeating: 0, count: targetFrameCount))
-                continue
-            }
-
-            var output = [Float](repeating: 0, count: targetFrameCount)
-            let sourceLastIndex = max(source.count - 1, 0)
-            for targetIndex in 0..<targetFrameCount {
-                if targetIndex % 16_384 == 0 {
-                    try Task.checkCancellation()
-                }
-                let sourcePosition = Double(targetIndex) / ratio
-                let lowerIndex = min(max(Int(sourcePosition.rounded(.down)), 0), sourceLastIndex)
-                let upperIndex = min(lowerIndex + 1, sourceLastIndex)
-                let fraction = Float(sourcePosition - Double(lowerIndex))
-                output[targetIndex] = source[lowerIndex] + (source[upperIndex] - source[lowerIndex]) * fraction
-            }
-            resampledChannels.append(output)
-        }
-
-        return DecodedAudioBuffer(
-            url: buffer.url,
-            sampleRate: targetSampleRate,
-            channelCount: buffer.channelCount,
-            frameCount: targetFrameCount,
-            samplesByChannel: resampledChannels
-        )
-    }
-
-    private static func makeEditableProxyURL(
-        for url: URL,
-        format: AudioAssetFormat
-    ) throws -> URL {
-        let directory = try editableProxyDirectory()
-        let baseName = sanitizedFilenameStem(url.deletingPathExtension().lastPathComponent)
-        let formatName = format.rawValue
-        return directory.appendingPathComponent(
-            "\(baseName)-\(formatName)-\(UUID().uuidString).wav",
-            isDirectory: false
-        )
-    }
-
-    private static func editableProxyDirectory() throws -> URL {
-        guard let applicationSupportURL = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first else {
-            throw ImportError.proxyDirectoryUnavailable
-        }
-        let directory = applicationSupportURL
-            .appendingPathComponent("Soundtime", isDirectory: true)
-            .appendingPathComponent("AudioProxies", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        return directory
-    }
-
-    private static func sanitizedFilenameStem(_ value: String) -> String {
-        let allowedScalars = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
-        let scalars = value.unicodeScalars.map { scalar -> Character in
-            allowedScalars.contains(scalar) ? Character(scalar) : "-"
-        }
-        let collapsed = String(scalars)
-            .split(separator: "-", omittingEmptySubsequences: true)
-            .joined(separator: "-")
-        return collapsed.isEmpty ? "ImportedAudio" : String(collapsed.prefix(64))
-    }
 }
 
 private extension AudioStreamBasicDescription {

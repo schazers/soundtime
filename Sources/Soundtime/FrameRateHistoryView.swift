@@ -26,6 +26,12 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
         var danger: SIMD4<Float>
     }
 
+    private struct RendererResources {
+        let device: MTLDevice
+        let commandQueue: MTLCommandQueue
+        let pipelineState: MTLRenderPipelineState
+    }
+
     private let historyDuration: CFTimeInterval = 15
     private let historyExitDuration: CFTimeInterval = 1.25
     private let staleSampleHoldDuration: Float = 0.75
@@ -37,6 +43,8 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
     private var displayTimer: Timer?
     private var commandQueue: MTLCommandQueue?
     private var pipelineState: MTLRenderPipelineState?
+    private var rendererInitializationID = UUID()
+    private var isRendererInitializationScheduled = false
     private let metric: Metric
     private var isLiveResizePaused = false
     private var vertices: [HistoryVertex] = [
@@ -52,22 +60,28 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
         false
     }
 
-    override init(frame frameRect: NSRect = .zero, device: MTLDevice? = MTLCreateSystemDefaultDevice()) {
+    override init(frame frameRect: NSRect = .zero, device: MTLDevice? = nil) {
         metric = .framesPerSecond
         super.init(frame: frameRect, device: device)
-        configureHistoryRenderer()
+        configureHistoryAppearance()
+        if let device {
+            installHistoryRenderer(try? Self.makeRendererResources(device: device))
+        }
     }
 
-    init(metric: Metric, frame frameRect: NSRect = .zero, device: MTLDevice? = MTLCreateSystemDefaultDevice()) {
+    init(metric: Metric, frame frameRect: NSRect = .zero, device: MTLDevice? = nil) {
         self.metric = metric
         super.init(frame: frameRect, device: device)
-        configureHistoryRenderer()
+        configureHistoryAppearance()
+        if let device {
+            installHistoryRenderer(try? Self.makeRendererResources(device: device))
+        }
     }
 
     required init?(coder: NSCoder) {
         metric = .framesPerSecond
         super.init(coder: coder)
-        configureHistoryRenderer()
+        configureHistoryAppearance()
     }
 
     override func viewDidMoveToWindow() {
@@ -76,6 +90,7 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
         if window == nil {
             stopDisplayTimer()
         } else {
+            scheduleHistoryRendererInitializationIfNeeded()
             startDisplayTimerIfNeeded()
             render()
         }
@@ -170,44 +185,99 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
         displayTimer = nil
     }
 
-    private func configureHistoryRenderer() {
+    private func configureHistoryAppearance() {
         colorPixelFormat = .bgra8Unorm
         clearColor = MTLClearColor(red: 0.055, green: 0.055, blue: 0.055, alpha: 1)
         framebufferOnly = true
+    }
 
+    nonisolated private static func makeRendererResources(device: MTLDevice) throws -> RendererResources {
         guard
-            let device = metalDevice,
             let commandQueue = device.makeCommandQueue()
         else {
+            throw NSError(
+                domain: "Soundtime.FrameRateHistoryView",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Metal command queue unavailable"]
+            )
+        }
+
+        let library = try BundledMetalLibrary.load(
+            named: "FrameRateHistoryShaders",
+            device: device,
+            developmentSource: Self.shaderSource
+        )
+        guard
+            let vertexFunction = library.makeFunction(name: "frame_rate_history_vertex"),
+            let fragmentFunction = library.makeFunction(name: "frame_rate_history_fragment")
+        else {
+            throw NSError(
+                domain: "Soundtime.FrameRateHistoryView",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Metal shader functions unavailable"]
+            )
+        }
+
+        let descriptor = MTLRenderPipelineDescriptor()
+        descriptor.vertexFunction = vertexFunction
+        descriptor.fragmentFunction = fragmentFunction
+        descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+        descriptor.colorAttachments[0].isBlendingEnabled = true
+        descriptor.colorAttachments[0].rgbBlendOperation = .add
+        descriptor.colorAttachments[0].alphaBlendOperation = .add
+        descriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        descriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+        descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        descriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+
+        return RendererResources(
+            device: device,
+            commandQueue: commandQueue,
+            pipelineState: try device.makeRenderPipelineState(descriptor: descriptor)
+        )
+    }
+
+    private func scheduleHistoryRendererInitializationIfNeeded() {
+        guard pipelineState == nil, !isRendererInitializationScheduled else {
             return
         }
-
-        do {
-            let library = try device.makeLibrary(source: Self.shaderSource, options: nil)
-            guard
-                let vertexFunction = library.makeFunction(name: "frame_rate_history_vertex"),
-                let fragmentFunction = library.makeFunction(name: "frame_rate_history_fragment")
-            else {
-                return
+        isRendererInitializationScheduled = true
+        let initializationID = UUID()
+        rendererInitializationID = initializationID
+        MetalRendererInitialization.auxiliaryQueue.async {
+            let result = Result {
+                guard let device = MTLCreateSystemDefaultDevice() else {
+                    throw NSError(
+                        domain: "Soundtime.FrameRateHistoryView",
+                        code: 3,
+                        userInfo: [NSLocalizedDescriptionKey: "Metal device unavailable"]
+                    )
+                }
+                return try Self.makeRendererResources(device: device)
             }
-
-            let descriptor = MTLRenderPipelineDescriptor()
-            descriptor.vertexFunction = vertexFunction
-            descriptor.fragmentFunction = fragmentFunction
-            descriptor.colorAttachments[0].pixelFormat = colorPixelFormat
-            descriptor.colorAttachments[0].isBlendingEnabled = true
-            descriptor.colorAttachments[0].rgbBlendOperation = .add
-            descriptor.colorAttachments[0].alphaBlendOperation = .add
-            descriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
-            descriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
-            descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
-            descriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
-
-            self.commandQueue = commandQueue
-            pipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
-        } catch {
-            Swift.print("Soundtime could not create frame-rate history renderer: \(error)")
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.rendererInitializationID == initializationID else {
+                    return
+                }
+                self.isRendererInitializationScheduled = false
+                switch result {
+                case let .success(resources):
+                    self.installHistoryRenderer(resources)
+                    self.render()
+                case let .failure(error):
+                    Swift.print("Soundtime could not create frame-rate history renderer: \(error)")
+                }
+            }
         }
+    }
+
+    private func installHistoryRenderer(_ resources: RendererResources?) {
+        guard let resources else {
+            return
+        }
+        installMetalDevice(resources.device)
+        commandQueue = resources.commandQueue
+        pipelineState = resources.pipelineState
     }
 
     private func render() {
@@ -363,7 +433,11 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
         guard let commandQueue = device.makeCommandQueue() else {
             throw MetalPixelSmokeError.commandQueueUnavailable
         }
-        let library = try device.makeLibrary(source: shaderSource, options: nil)
+        let library = try BundledMetalLibrary.load(
+            named: "FrameRateHistoryShaders",
+            device: device,
+            developmentSource: shaderSource
+        )
         guard
             let vertexFunction = library.makeFunction(name: "frame_rate_history_vertex"),
             let fragmentFunction = library.makeFunction(name: "frame_rate_history_fragment")
@@ -453,7 +527,7 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
         return MetalPixelSmokeSummary.analyzeBGRA8(bytes, width: width, height: height)
     }
 
-    private static let shaderSource = """
+    nonisolated private static let shaderSource = """
     #include <metal_stdlib>
     using namespace metal;
 
