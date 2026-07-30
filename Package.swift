@@ -21,10 +21,14 @@ let package = Package(
             name: "SoundtimeAudioCore",
             publicHeadersPath: "include"
         ),
+        .target(
+            name: "SoundtimeEditing"
+        ),
         .executableTarget(
             name: "Soundtime",
             dependencies: [
                 "SoundtimeAudioCore",
+                "SoundtimeEditing",
                 .product(name: "Sparkle", package: "Sparkle"),
             ],
             resources: [
@@ -46,6 +50,12 @@ let package = Package(
             name: "SoundtimeAudioCoreTests",
             dependencies: [
                 "SoundtimeAudioCore",
+            ]
+        ),
+        .testTarget(
+            name: "SoundtimeEditingTests",
+            dependencies: [
+                "SoundtimeEditing",
             ]
         ),
     ],

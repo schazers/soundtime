@@ -1,16 +1,5 @@
 import Foundation
 
-struct AudioImportResult: Sendable {
-    enum DecodeStatus: Sendable {
-        case unsupported
-        case decoded(DecodedAudioBuffer, WaveformOverview, AudioZeroCrossingIndex)
-        case failed(String)
-    }
-
-    let metadata: AudioFileMetadata
-    let decodeStatus: DecodeStatus
-}
-
 enum AudioImportPipeline {
     static func loadWAVPreview(
         at url: URL,
@@ -56,18 +45,6 @@ enum AudioImportPipeline {
         return (fileInfo, waveformOverview)
     }
 
-    static func loadPreviewOverview(
-        at url: URL,
-        targetBinCount: Int,
-        samplesPerBin: Int
-    ) async throws -> (AudioAssetInfo, WaveformOverview) {
-        try await AudioAssetImporter.loadPreviewOverview(
-            at: url,
-            targetBinCount: targetBinCount,
-            samplesPerBin: samplesPerBin
-        )
-    }
-
     static func loadDecodedWAV(at url: URL) async throws -> (
         DecodedAudioBuffer,
         WaveformOverview,
@@ -78,40 +55,4 @@ enum AudioImportPipeline {
         return (decodedAudioBuffer, waveformOverview, zeroCrossingIndex)
     }
 
-    static func loadDecodedAsset(at url: URL) async throws -> (
-        AudioAssetInfo,
-        DecodedAudioBuffer,
-        WaveformOverview,
-        AudioZeroCrossingIndex
-    ) {
-        try await AudioAssetImporter.loadDecodedAsset(at: url)
-    }
-
-    static func importEditableAsset(at url: URL) async throws -> AudioAssetProxyResult {
-        try await AudioAssetImporter.importEditableAsset(at: url)
-    }
-
-    static func loadDroppedFile(at url: URL) async throws -> AudioImportResult {
-        try await Task.detached(priority: .userInitiated) {
-            let metadata = try await AudioFileMetadataLoader.loadMetadata(for: url)
-
-            guard AudioAssetImporter.canImport(url) else {
-                return AudioImportResult(metadata: metadata, decodeStatus: .unsupported)
-            }
-
-            do {
-                let (_, decodedAudioBuffer, waveformOverview, zeroCrossingIndex) =
-                    try await AudioAssetImporter.loadDecodedAsset(at: url)
-                return AudioImportResult(
-                    metadata: metadata,
-                    decodeStatus: .decoded(decodedAudioBuffer, waveformOverview, zeroCrossingIndex)
-                )
-            } catch {
-                return AudioImportResult(
-                    metadata: metadata,
-                    decodeStatus: .failed(error.localizedDescription)
-                )
-            }
-        }.value
-    }
 }

@@ -1,0 +1,13 @@
+import SoundtimeEditing
+
+typealias TimelineSelection = SoundtimeEditing.TimelineSelection
+typealias TimelineSelectionDragSnapshot = SoundtimeEditing.TimelineSelectionDragSnapshot
+typealias TimelineTrimRange = SoundtimeEditing.TimelineTrimRange
+typealias AudioTimelineFadeDirection = SoundtimeEditing.AudioTimelineFadeDirection
+typealias AudioTimelinePlaybackSegment = SoundtimeEditing.AudioTimelinePlaybackSegment
+typealias AudioTimelineClipRange = SoundtimeEditing.AudioTimelineClipRange
+typealias AudioTimelineClipEdge = SoundtimeEditing.AudioTimelineClipEdge
+typealias AudioTimelineSegment = SoundtimeEditing.AudioTimelineSegment
+typealias AudioSegmentArrangement = SoundtimeEditing.AudioSegmentArrangement
+typealias DeferredEditStatePublicationPolicy =
+    SoundtimeEditing.DeferredEditStatePublicationPolicy

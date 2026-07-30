@@ -1,7 +1,8 @@
 import Foundation
 
 struct AudioFileEditTimeline: Sendable {
-    private static let gainEpsilon: Float = 0.000_001
+    typealias ClipRange = AudioTimelineClipRange
+    typealias ClipEdge = AudioTimelineClipEdge
 
     struct PersistentSegment: Codable, Sendable {
         var sourceStartFrame: Int
@@ -37,9 +38,7 @@ struct AudioFileEditTimeline: Sendable {
         var segments: [PersistentSegment]
 
         var frameCount: Int {
-            segments.reduce(0) { total, segment in
-                total + segment.frameCount
-            }
+            segments.reduce(0) { $0 + $1.frameCount }
         }
 
         var duration: TimeInterval {
@@ -50,101 +49,9 @@ struct AudioFileEditTimeline: Sendable {
         }
     }
 
-    struct ClipRange: Equatable, Sendable {
-        let startProgress: Double
-        let endProgress: Double
-    }
-
-    enum ClipEdge: Sendable {
-        case leading
-        case trailing
-    }
-
-    private struct Segment: Sendable {
-        let sourceStartFrame: Int
-        let frameCount: Int
-        let gainStart: Float
-        let gainEnd: Float
-        let startsNewClip: Bool
-
-        init(
-            sourceStartFrame: Int,
-            frameCount: Int,
-            gainStart: Float,
-            gainEnd: Float,
-            startsNewClip: Bool = false
-        ) {
-            self.sourceStartFrame = sourceStartFrame
-            self.frameCount = frameCount
-            self.gainStart = gainStart
-            self.gainEnd = gainEnd
-            self.startsNewClip = startsNewClip
-        }
-
-        var sourceEndFrame: Int {
-            sourceStartFrame + frameCount
-        }
-
-        var hasConstantGain: Bool {
-            abs(gainStart - gainEnd) <= AudioFileEditTimeline.gainEpsilon
-        }
-
-        func gain(at offset: Int) -> Float {
-            guard frameCount > 1 else {
-                return gainEnd
-            }
-
-            let clampedOffset = min(max(offset, 0), frameCount - 1)
-            let progress = Float(clampedOffset) / Float(frameCount - 1)
-            let curve = AudioFileEditTimeline.smoothstep(progress)
-            return gainStart + (gainEnd - gainStart) * curve
-        }
-
-        func scaled(by gain: Float) -> Segment {
-            Segment(
-                sourceStartFrame: sourceStartFrame,
-                frameCount: frameCount,
-                gainStart: gainStart * gain,
-                gainEnd: gainEnd * gain,
-                startsNewClip: startsNewClip
-            )
-        }
-
-        func scaled(startMultiplier: Float, endMultiplier: Float) -> Segment {
-            Segment(
-                sourceStartFrame: sourceStartFrame,
-                frameCount: frameCount,
-                gainStart: gainStart * startMultiplier,
-                gainEnd: gainEnd * endMultiplier,
-                startsNewClip: startsNewClip
-            )
-        }
-
-        func withClipBoundary(_ startsNewClip: Bool) -> Segment {
-            Segment(
-                sourceStartFrame: sourceStartFrame,
-                frameCount: frameCount,
-                gainStart: gainStart,
-                gainEnd: gainEnd,
-                startsNewClip: startsNewClip
-            )
-        }
-
-        func shifted(by frameDelta: Int) -> Segment {
-            Segment(
-                sourceStartFrame: sourceStartFrame + frameDelta,
-                frameCount: frameCount,
-                gainStart: gainStart,
-                gainEnd: gainEnd,
-                startsNewClip: startsNewClip
-            )
-        }
-    }
-
     let sourceFrameCount: Int
     let sourceSampleRate: Double
-    private var segments: [Segment]
-    private var timelineFrameCount: Int
+    private var arrangement: AudioSegmentArrangement
 
     init(fileInfo: WAVFileInfo) {
         self.init(
@@ -157,18 +64,12 @@ struct AudioFileEditTimeline: Sendable {
         self.sourceFrameCount = max(sourceFrameCount, 0)
         self.sourceSampleRate = sourceSampleRate
         if sourceFrameCount > 0, sourceSampleRate.isFinite, sourceSampleRate > 0 {
-            segments = [
-                Segment(
-                    sourceStartFrame: 0,
-                    frameCount: sourceFrameCount,
-                    gainStart: 1,
-                    gainEnd: 1
-                ),
-            ]
-            timelineFrameCount = sourceFrameCount
+            arrangement = AudioSegmentArrangement(sourceFrameCount: sourceFrameCount)
         } else {
-            segments = []
-            timelineFrameCount = 0
+            arrangement = AudioSegmentArrangement(
+                sourceFrameCount: max(sourceFrameCount, 0),
+                segments: []
+            )
         }
     }
 
@@ -183,21 +84,11 @@ struct AudioFileEditTimeline: Sendable {
 
         sourceFrameCount = persistentState.sourceFrameCount
         sourceSampleRate = persistentState.sourceSampleRate
-        segments = Self.validatedSegments(
-            persistentState.segments.map { persistentSegment in
-                Segment(
-                    sourceStartFrame: persistentSegment.sourceStartFrame,
-                    frameCount: persistentSegment.frameCount,
-                    gainStart: persistentSegment.gainStart,
-                    gainEnd: persistentSegment.gainEnd,
-                    startsNewClip: persistentSegment.startsNewClip == true
-                )
-            },
-            sourceFrameCount: persistentState.sourceFrameCount
+        arrangement = AudioSegmentArrangement(
+            sourceFrameCount: sourceFrameCount,
+            segments: persistentState.segments.map(Self.segment)
         )
-        timelineFrameCount = Self.totalFrameCount(segments)
-
-        guard persistentState.sourceFrameCount == 0 || !segments.isEmpty else {
+        guard sourceFrameCount == 0 || !arrangement.segments.isEmpty else {
             return nil
         }
     }
@@ -217,27 +108,25 @@ struct AudioFileEditTimeline: Sendable {
 
         self.sourceFrameCount = sourceFrameCount
         self.sourceSampleRate = sourceSampleRate
-        segments = Self.validatedSegments(
-            playbackSegments.map { playbackSegment in
-                Segment(
-                    sourceStartFrame: playbackSegment.sourceStartFrame,
-                    frameCount: playbackSegment.frameCount,
-                    gainStart: playbackSegment.gainStart,
-                    gainEnd: playbackSegment.gainEnd,
-                    startsNewClip: playbackSegment.startsNewClip
+        arrangement = AudioSegmentArrangement(
+            sourceFrameCount: sourceFrameCount,
+            segments: playbackSegments.map { segment in
+                AudioTimelineSegment(
+                    sourceStartFrame: segment.sourceStartFrame,
+                    frameCount: segment.frameCount,
+                    gainStart: segment.gainStart,
+                    gainEnd: segment.gainEnd,
+                    startsNewClip: segment.startsNewClip
                 )
-            },
-            sourceFrameCount: sourceFrameCount
+            }
         )
-        timelineFrameCount = Self.totalFrameCount(segments)
-
-        guard sourceFrameCount == 0 || !segments.isEmpty else {
+        guard sourceFrameCount == 0 || !arrangement.segments.isEmpty else {
             return nil
         }
     }
 
     var frameCount: Int {
-        timelineFrameCount
+        arrangement.frameCount
     }
 
     var duration: TimeInterval {
@@ -248,53 +137,22 @@ struct AudioFileEditTimeline: Sendable {
     }
 
     var hasEdits: Bool {
-        guard segments.count == 1, let segment = segments.first else {
-            return true
-        }
-
-        return segment.sourceStartFrame != 0 ||
-            segment.frameCount != sourceFrameCount ||
-            abs(segment.gainStart - 1) > Float.ulpOfOne ||
-            abs(segment.gainEnd - 1) > Float.ulpOfOne
+        arrangement.hasEdits
     }
 
     var persistentState: PersistentState? {
         guard sourceFrameCount >= 0, sourceSampleRate > 0, sourceSampleRate.isFinite else {
             return nil
         }
-
         return PersistentState(
             sourceFrameCount: sourceFrameCount,
             sourceSampleRate: sourceSampleRate,
-            segments: segments.map { segment in
-                PersistentSegment(
-                    sourceStartFrame: segment.sourceStartFrame,
-                    frameCount: segment.frameCount,
-                    gainStart: segment.gainStart,
-                    gainEnd: segment.gainEnd,
-                    startsNewClip: segment.startsNewClip ? true : nil
-                )
-            }
+            segments: arrangement.segments.map(Self.persistentSegment)
         )
     }
 
     var playbackSegments: [AudioEditTimeline.PlaybackSegment] {
-        var outputStartFrame = 0
-        return segments.map { segment in
-            defer {
-                outputStartFrame += segment.frameCount
-            }
-
-            return AudioEditTimeline.PlaybackSegment(
-                outputStartFrame: outputStartFrame,
-                sourceStartFrame: segment.sourceStartFrame,
-                frameCount: segment.frameCount,
-                sourceFrameScale: 0,
-                gainStart: segment.gainStart,
-                gainEnd: segment.gainEnd,
-                startsNewClip: segment.startsNewClip
-            )
-        }
+        arrangement.playbackSegments
     }
 
     func remapped(
@@ -324,7 +182,7 @@ struct AudioFileEditTimeline: Sendable {
                 ),
                 destinationSourceFrameCount
             )
-            return AudioEditTimeline.PlaybackSegment(
+            return AudioTimelinePlaybackSegment(
                 outputStartFrame: 0,
                 sourceStartFrame: sourceStartFrame,
                 frameCount: max(sourceEndFrame - sourceStartFrame, 0),
@@ -344,30 +202,7 @@ struct AudioFileEditTimeline: Sendable {
     }
 
     var clipRanges: [ClipRange] {
-        guard timelineFrameCount > 0 else {
-            return []
-        }
-
-        var ranges: [ClipRange] = []
-        var clipStartFrame = 0
-        var timelineFrame = 0
-        for segment in segments {
-            if segment.startsNewClip, timelineFrame > clipStartFrame {
-                ranges.append(ClipRange(
-                    startProgress: Double(clipStartFrame) / Double(timelineFrameCount),
-                    endProgress: Double(timelineFrame) / Double(timelineFrameCount)
-                ))
-                clipStartFrame = timelineFrame
-            }
-            timelineFrame += segment.frameCount
-        }
-        if timelineFrame > clipStartFrame {
-            ranges.append(ClipRange(
-                startProgress: Double(clipStartFrame) / Double(timelineFrameCount),
-                endProgress: Double(timelineFrame) / Double(timelineFrameCount)
-            ))
-        }
-        return ranges
+        arrangement.clipRanges
     }
 
     func audioTimeline(sourceBuffer: DecodedAudioBuffer) -> AudioEditTimeline {
@@ -388,100 +223,58 @@ struct AudioFileEditTimeline: Sendable {
     }
 
     func clip(for selection: TimelineSelection) -> Clip? {
-        let selectedSegments = segments(in: frameRange(for: selection))
-        guard !selectedSegments.isEmpty else {
-            return nil
-        }
-
-        return Clip(
-            sourceFrameCount: sourceFrameCount,
-            sourceSampleRate: sourceSampleRate,
-            segments: selectedSegments.map { segment in
-                PersistentSegment(
-                    sourceStartFrame: segment.sourceStartFrame,
-                    frameCount: segment.frameCount,
-                    gainStart: segment.gainStart,
-                    gainEnd: segment.gainEnd,
-                    startsNewClip: segment.startsNewClip ? true : nil
-                )
-            }
-        )
+        clip(for: frameRange(for: selection))
     }
 
     func clip(for frameRange: Range<Int>) -> Clip? {
-        let selectedSegments = segments(in: clampedFrameRange(frameRange))
+        let selectedSegments = arrangement.segments(in: frameRange)
         guard !selectedSegments.isEmpty else {
             return nil
         }
-
         return Clip(
             sourceFrameCount: sourceFrameCount,
             sourceSampleRate: sourceSampleRate,
-            segments: selectedSegments.map { segment in
-                PersistentSegment(
-                    sourceStartFrame: segment.sourceStartFrame,
-                    frameCount: segment.frameCount,
-                    gainStart: segment.gainStart,
-                    gainEnd: segment.gainEnd,
-                    startsNewClip: segment.startsNewClip ? true : nil
-                )
-            }
+            segments: selectedSegments.map(Self.persistentSegment)
         )
     }
 
     mutating func replace(_ selection: TimelineSelection, with clip: Clip) -> Int? {
-        replace(frameRange: clampedFrameRange(for: selection), with: clip)
+        replace(frameRange: frameRange(for: selection), with: clip)
     }
 
     mutating func replace(frameRange: Range<Int>, with clip: Clip) -> Int? {
         guard isCompatible(with: clip) else {
             return nil
         }
-
-        let replacementSegments = Self.validatedSegments(
-            clip.segments.map { persistentSegment in
-                Segment(
-                    sourceStartFrame: persistentSegment.sourceStartFrame,
-                    frameCount: persistentSegment.frameCount,
-                    gainStart: persistentSegment.gainStart,
-                    gainEnd: persistentSegment.gainEnd,
-                    startsNewClip: persistentSegment.startsNewClip == true
-                )
-            },
-            sourceFrameCount: sourceFrameCount
+        return arrangement.replace(
+            frameRange: frameRange,
+            with: clip.segments.map(Self.segment)
         )
-        guard !replacementSegments.isEmpty else {
-            return nil
-        }
-
-        let replacementRange = clampedFrameRange(frameRange)
-        let beforeSegments = segments(in: 0..<replacementRange.lowerBound)
-        let afterSegments = segments(in: replacementRange.upperBound..<frameCount)
-        segments = Self.coalescedSegments(beforeSegments + replacementSegments + afterSegments)
-        let replacementFrameCount = Self.totalFrameCount(replacementSegments)
-        timelineFrameCount = timelineFrameCount - replacementRange.count + replacementFrameCount
-        return replacementFrameCount
     }
 
     mutating func insert(_ clip: Clip, atFrame frame: Int) -> Int? {
-        let insertionFrame = min(max(frame, 0), frameCount)
-        return replace(frameRange: insertionFrame..<insertionFrame, with: clip)
+        guard isCompatible(with: clip) else {
+            return nil
+        }
+        return arrangement.insert(
+            clip.segments.map(Self.segment),
+            atFrame: frame
+        )
     }
 
     func waveformOverview(from sourceOverview: WaveformOverview) -> WaveformOverview {
-        guard sourceFrameCount > 0, timelineFrameCount > 0, !sourceOverview.bins.isEmpty else {
+        guard sourceFrameCount > 0, frameCount > 0, !sourceOverview.bins.isEmpty else {
             return WaveformOverview(duration: duration, bins: [])
         }
-
-        if timelineFrameCount == sourceFrameCount, hasSourceFrameAlignment {
+        if frameCount == sourceFrameCount, arrangement.hasSourceFrameAlignment {
             return equalDurationWaveformOverview(from: sourceOverview)
         }
 
         let sourceBinCount = sourceOverview.bins.count
+        let sourceFramesPerBin = Double(sourceFrameCount) / Double(sourceBinCount)
         var editedBins: [WaveformOverview.Bin] = []
         editedBins.reserveCapacity(sourceBinCount)
-        let sourceFramesPerBin = Double(sourceFrameCount) / Double(sourceBinCount)
-        for segment in segments {
+        for segment in arrangement.segments {
             let startBin = min(
                 max(Int((Double(segment.sourceStartFrame) / sourceFramesPerBin).rounded(.down)), 0),
                 sourceBinCount
@@ -493,44 +286,42 @@ struct AudioFileEditTimeline: Sendable {
             guard startBin < endBin else {
                 continue
             }
-
             if segment.hasConstantGain {
-                let gain = segment.gainStart
-                if abs(gain - 1) <= Self.gainEpsilon {
+                if abs(segment.gainStart - 1) <= AudioSegmentArrangement.gainEpsilon {
                     editedBins.append(contentsOf: sourceOverview.bins[startBin..<endBin])
                 } else {
-                    for sourceBinIndex in startBin..<endBin {
-                        editedBins.append(sourceOverview.bins[sourceBinIndex].scaled(by: gain))
+                    for binIndex in startBin..<endBin {
+                        editedBins.append(
+                            sourceOverview.bins[binIndex].scaled(by: segment.gainStart)
+                        )
                     }
                 }
                 continue
             }
-
-            for sourceBinIndex in startBin..<endBin {
-                let binCenterFrame = min(
-                    max(Int((Double(sourceBinIndex) + 0.5) * sourceFramesPerBin), segment.sourceStartFrame),
+            for binIndex in startBin..<endBin {
+                let centerFrame = min(
+                    max(Int((Double(binIndex) + 0.5) * sourceFramesPerBin), segment.sourceStartFrame),
                     max(segment.sourceEndFrame - 1, segment.sourceStartFrame)
                 )
-                editedBins.append(sourceOverview.bins[sourceBinIndex].scaled(
-                    by: segment.gain(at: binCenterFrame - segment.sourceStartFrame)
+                editedBins.append(sourceOverview.bins[binIndex].scaled(
+                    by: segment.gain(at: centerFrame - segment.sourceStartFrame)
                 ))
             }
         }
-
         return WaveformOverview(duration: duration, bins: editedBins)
     }
 
-    private func equalDurationWaveformOverview(from sourceOverview: WaveformOverview) -> WaveformOverview {
+    private func equalDurationWaveformOverview(
+        from sourceOverview: WaveformOverview
+    ) -> WaveformOverview {
         let sourceBinCount = sourceOverview.bins.count
         let sourceFramesPerBin = Double(sourceFrameCount) / Double(sourceBinCount)
         var editedBins = sourceOverview.bins
         var timelineFrame = 0
-
-        for segment in segments {
+        for segment in arrangement.segments {
             let segmentStartFrame = timelineFrame
             let segmentEndFrame = timelineFrame + segment.frameCount
             timelineFrame = segmentEndFrame
-
             let startBin = min(
                 max(Int((Double(segmentStartFrame) / sourceFramesPerBin).rounded(.down)), 0),
                 sourceBinCount
@@ -542,248 +333,78 @@ struct AudioFileEditTimeline: Sendable {
             guard startBin < endBin else {
                 continue
             }
-
             if segment.hasConstantGain {
-                let gain = segment.gainStart
-                guard abs(gain - 1) > Self.gainEpsilon else {
+                guard abs(segment.gainStart - 1) > AudioSegmentArrangement.gainEpsilon else {
                     continue
                 }
-                for outputBinIndex in startBin..<endBin {
-                    editedBins[outputBinIndex] = sourceOverview.bins[outputBinIndex].scaled(by: gain)
+                for binIndex in startBin..<endBin {
+                    editedBins[binIndex] = sourceOverview.bins[binIndex].scaled(
+                        by: segment.gainStart
+                    )
                 }
                 continue
             }
-
-            for outputBinIndex in startBin..<endBin {
-                let binCenterFrame = min(
-                    max(Int((Double(outputBinIndex) + 0.5) * sourceFramesPerBin), segmentStartFrame),
+            for binIndex in startBin..<endBin {
+                let centerFrame = min(
+                    max(Int((Double(binIndex) + 0.5) * sourceFramesPerBin), segmentStartFrame),
                     max(segmentEndFrame - 1, segmentStartFrame)
                 )
-                editedBins[outputBinIndex] = sourceOverview.bins[outputBinIndex].scaled(
-                    by: segment.gain(at: binCenterFrame - segmentStartFrame)
+                editedBins[binIndex] = sourceOverview.bins[binIndex].scaled(
+                    by: segment.gain(at: centerFrame - segmentStartFrame)
                 )
             }
         }
-
         return WaveformOverview(duration: duration, bins: editedBins)
     }
 
-    private var hasSourceFrameAlignment: Bool {
-        var timelineFrame = 0
-        for segment in segments {
-            guard segment.sourceStartFrame == timelineFrame else {
-                return false
-            }
-            timelineFrame += segment.frameCount
-        }
-        return timelineFrame == sourceFrameCount
-    }
-
     mutating func delete(_ selection: TimelineSelection) -> Int {
-        deleteFrames(in: frameRange(for: selection))
+        arrangement.delete(frameRange: frameRange(for: selection))
     }
 
     mutating func delete(frameRange: Range<Int>) -> Int {
-        deleteFrames(in: frameRange)
+        arrangement.delete(frameRange: frameRange)
     }
 
     mutating func clear(_ selection: TimelineSelection) -> Int {
-        clearFrames(in: frameRange(for: selection))
+        arrangement.clear(frameRange: frameRange(for: selection))
     }
 
     mutating func clear(frameRange: Range<Int>) -> Int {
-        clearFrames(in: frameRange)
+        arrangement.clear(frameRange: frameRange)
     }
 
-    mutating func insertSilence(frameCount requestedFrameCount: Int, atProgress progress: Double) -> Int {
-        guard
-            requestedFrameCount > 0,
-            progress.isFinite,
-            sourceFrameCount > 0
-        else {
-            return 0
-        }
-
-        let insertionFrame = min(
-            max(Int((progress * Double(timelineFrameCount)).rounded()), 0),
-            timelineFrameCount
-        )
-        if insertionFrame > 0, insertionFrame < timelineFrameCount {
-            _ = split(atFrame: insertionFrame)
-        }
-
-        var insertedFrameCount = 0
-        let silenceSegments = makeSilenceSegments(
-            frameCount: requestedFrameCount,
-            insertedFrameCount: &insertedFrameCount
-        )
-        guard !silenceSegments.isEmpty, insertedFrameCount > 0 else {
-            return 0
-        }
-
-        var nextSegments: [Segment] = []
-        nextSegments.reserveCapacity(segments.count + silenceSegments.count + 1)
-        var timelineFrame = 0
-        var didInsert = false
-        var marksNextSegmentAsClipStart = false
-
-        for segment in segments {
-            if !didInsert, insertionFrame <= timelineFrame {
-                nextSegments.append(contentsOf: silenceSegments)
-                didInsert = true
-                marksNextSegmentAsClipStart = true
-            }
-
-            nextSegments.append(marksNextSegmentAsClipStart ? segment.withClipBoundary(true) : segment)
-            marksNextSegmentAsClipStart = false
-            timelineFrame += segment.frameCount
-        }
-
-        if !didInsert {
-            nextSegments.append(contentsOf: silenceSegments)
-        }
-
-        segments = Self.coalescedSegments(nextSegments)
-        timelineFrameCount += insertedFrameCount
-        return insertedFrameCount
+    mutating func insertSilence(frameCount: Int, atProgress progress: Double) -> Int {
+        arrangement.insertSilence(frameCount: frameCount, atProgress: progress)
     }
 
     mutating func applyGain(_ gain: Float, to selection: TimelineSelection) -> Int {
-        applyGain(gain, toFramesIn: frameRange(for: selection))
+        arrangement.applyGain(gain, frameRange: frameRange(for: selection))
     }
 
-    mutating func applyFade(_ direction: AudioEditTimeline.FadeDirection, to selection: TimelineSelection) -> Int {
-        applyFade(direction, toFramesIn: frameRange(for: selection))
+    mutating func applyFade(
+        _ direction: AudioEditTimeline.FadeDirection,
+        to selection: TimelineSelection
+    ) -> Int {
+        arrangement.applyFade(direction, frameRange: frameRange(for: selection))
     }
 
     mutating func split(atProgress progress: Double) -> Bool {
-        guard progress.isFinite, timelineFrameCount > 1 else {
-            return false
-        }
-
-        let splitFrame = Int((progress * Double(timelineFrameCount)).rounded())
-        return split(atFrame: splitFrame)
+        arrangement.split(atProgress: progress)
     }
 
     mutating func healNearestClipBoundary(atProgress progress: Double) -> Bool {
-        guard progress.isFinite, timelineFrameCount > 1 else {
-            return false
-        }
-
-        let targetFrame = min(
-            max(Int((progress * Double(timelineFrameCount)).rounded()), 0),
-            timelineFrameCount
-        )
-        var timelineFrame = 0
-        var nearestIndex: Int?
-        var nearestDistance = Int.max
-        for index in segments.indices {
-            let segment = segments[index]
-            if segment.startsNewClip, timelineFrame > 0 {
-                let distance = abs(timelineFrame - targetFrame)
-                if distance < nearestDistance {
-                    nearestDistance = distance
-                    nearestIndex = index
-                }
-            }
-            timelineFrame += segment.frameCount
-        }
-
-        guard let nearestIndex else {
-            return false
-        }
-
-        segments[nearestIndex] = segments[nearestIndex].withClipBoundary(false)
-        segments = Self.coalescedSegments(segments)
-        timelineFrameCount = Self.totalFrameCount(segments)
-        return true
+        arrangement.healNearestClipBoundary(atProgress: progress)
     }
 
     mutating func slipClip(
         _ clipRange: ClipRange,
-        byFrameCount requestedFrameDelta: Int
+        byFrameCount frameDelta: Int
     ) -> Int {
-        guard
-            requestedFrameDelta != 0,
-            sourceFrameCount > 0,
-            clipRange.startProgress < clipRange.endProgress
-        else {
-            return 0
-        }
-
-        let clipFrameRange = frameRange(for: TimelineSelection(
-            startProgress: clipRange.startProgress,
-            endProgress: clipRange.endProgress
-        ))
-        let clipSegments = segments(in: clipFrameRange)
-        guard !clipSegments.isEmpty else {
-            return 0
-        }
-
-        let minimumDelta = clipSegments.map { -$0.sourceStartFrame }.max() ?? 0
-        let maximumDelta = clipSegments.map { sourceFrameCount - $0.sourceEndFrame }.min() ?? 0
-        let frameDelta = min(max(requestedFrameDelta, minimumDelta), maximumDelta)
-        guard frameDelta != 0 else {
-            return 0
-        }
-
-        var nextSegments: [Segment] = []
-        nextSegments.reserveCapacity(segments.count + 2)
-        var timelineFrame = 0
-        for segment in segments {
-            let segmentStartFrame = timelineFrame
-            let segmentEndFrame = timelineFrame + segment.frameCount
-            timelineFrame = segmentEndFrame
-
-            let overlapStartFrame = max(segmentStartFrame, clipFrameRange.lowerBound)
-            let overlapEndFrame = min(segmentEndFrame, clipFrameRange.upperBound)
-            guard overlapStartFrame < overlapEndFrame else {
-                nextSegments.append(segment)
-                continue
-            }
-
-            let beforeCount = overlapStartFrame - segmentStartFrame
-            if beforeCount > 0 {
-                nextSegments.append(slice(segment, offset: 0, count: beforeCount))
-            }
-
-            let selectedSegment = slice(
-                segment,
-                offset: overlapStartFrame - segmentStartFrame,
-                count: overlapEndFrame - overlapStartFrame
-            ).shifted(by: frameDelta)
-            nextSegments.append(selectedSegment)
-
-            let afterCount = segmentEndFrame - overlapEndFrame
-            if afterCount > 0 {
-                nextSegments.append(slice(
-                    segment,
-                    offset: overlapEndFrame - segmentStartFrame,
-                    count: afterCount
-                ))
-            }
-        }
-
-        segments = Self.coalescedSegments(nextSegments)
-        timelineFrameCount = Self.totalFrameCount(segments)
-        return frameDelta
+        arrangement.slipClip(clipRange, byFrameCount: frameDelta)
     }
 
     mutating func trim(to trimRange: TimelineTrimRange) -> Int {
-        let originalFrameCount = frameCount
-        let keepStartFrame = Int((trimRange.startProgress * Float(originalFrameCount)).rounded(.down))
-        let keepEndFrame = Int((trimRange.endProgress * Float(originalFrameCount)).rounded(.up))
-
-        guard
-            keepStartFrame < keepEndFrame,
-            keepStartFrame > 0 || keepEndFrame < originalFrameCount
-        else {
-            return 0
-        }
-
-        let trailingDeletedFrameCount = deleteFrames(in: keepEndFrame..<originalFrameCount)
-        let leadingDeletedFrameCount = deleteFrames(in: 0..<keepStartFrame)
-        return trailingDeletedFrameCount + leadingDeletedFrameCount
+        arrangement.trim(to: trimRange)
     }
 
     mutating func trimClip(
@@ -791,478 +412,38 @@ struct AudioFileEditTimeline: Sendable {
         edge: ClipEdge,
         toProgress targetProgress: Double
     ) -> Int {
-        let originalFrameCount = frameCount
-        guard
-            originalFrameCount > 1,
-            targetProgress.isFinite,
-            clipRange.startProgress < clipRange.endProgress
-        else {
-            return 0
-        }
-
-        let clipStartFrame = min(
-            max(Int((clipRange.startProgress * Double(originalFrameCount)).rounded()), 0),
-            originalFrameCount
+        arrangement.trimClip(
+            clipRange,
+            edge: edge,
+            toProgress: targetProgress
         )
-        let clipEndFrame = min(
-            max(Int((clipRange.endProgress * Double(originalFrameCount)).rounded()), clipStartFrame),
-            originalFrameCount
-        )
-        guard clipEndFrame - clipStartFrame > 1 else {
-            return 0
-        }
-
-        switch edge {
-        case .leading:
-            let targetFrame = min(
-                max(Int((targetProgress * Double(originalFrameCount)).rounded()), clipStartFrame + 1),
-                clipEndFrame - 1
-            )
-            let deletedFrameCount = deleteFrames(in: clipStartFrame..<targetFrame)
-            if deletedFrameCount > 0, clipStartFrame > 0 {
-                _ = split(atFrame: clipStartFrame)
-            }
-            return deletedFrameCount
-        case .trailing:
-            let targetFrame = min(
-                max(Int((targetProgress * Double(originalFrameCount)).rounded()), clipStartFrame + 1),
-                clipEndFrame - 1
-            )
-            return deleteFrames(in: targetFrame..<clipEndFrame)
-        }
     }
 
     func frameRange(for selection: TimelineSelection) -> Range<Int> {
-        let startFrame = Int((selection.startProgress * Double(frameCount)).rounded(.down))
-        let endFrame = Int((selection.endProgress * Double(frameCount)).rounded(.up))
-        return max(startFrame, 0)..<min(max(endFrame, startFrame), frameCount)
+        arrangement.frameRange(for: selection)
     }
 
-    private func clampedFrameRange(for selection: TimelineSelection) -> Range<Int> {
-        let startFrame = Int((selection.startProgress * Double(frameCount)).rounded(.down))
-        let endFrame = Int((selection.endProgress * Double(frameCount)).rounded(.up))
-        return clampedFrameRange(startFrame..<max(endFrame, startFrame))
-    }
-
-    private func clampedFrameRange(_ frameRange: Range<Int>) -> Range<Int> {
-        let lowerBound = min(max(frameRange.lowerBound, 0), frameCount)
-        let upperBound = min(max(frameRange.upperBound, lowerBound), frameCount)
-        return lowerBound..<upperBound
-    }
-
-    private func segments(in frameRange: Range<Int>) -> [Segment] {
-        guard
-            frameRange.lowerBound < frameRange.upperBound,
-            frameRange.lowerBound < frameCount,
-            frameRange.upperBound > 0
-        else {
-            return []
-        }
-
-        let clampedRange = max(frameRange.lowerBound, 0)..<min(frameRange.upperBound, frameCount)
-        var outputSegments: [Segment] = []
-        outputSegments.reserveCapacity(segments.count)
-        var timelineFrame = 0
-
-        for segment in segments {
-            let segmentStartFrame = timelineFrame
-            let segmentEndFrame = timelineFrame + segment.frameCount
-            timelineFrame = segmentEndFrame
-
-            let overlapStartFrame = max(segmentStartFrame, clampedRange.lowerBound)
-            let overlapEndFrame = min(segmentEndFrame, clampedRange.upperBound)
-
-            guard overlapStartFrame < overlapEndFrame else {
-                continue
-            }
-
-            outputSegments.append(slice(
-                segment,
-                offset: overlapStartFrame - segmentStartFrame,
-                count: overlapEndFrame - overlapStartFrame
-            ))
-        }
-
-        return Self.coalescedSegments(outputSegments)
-    }
-
-    private mutating func deleteFrames(in frameRange: Range<Int>) -> Int {
-        guard
-            frameRange.lowerBound < frameRange.upperBound,
-            frameRange.lowerBound < timelineFrameCount,
-            frameRange.upperBound > 0
-        else {
-            return 0
-        }
-
-        let originalFrameCount = timelineFrameCount
-        let clampedRange = max(frameRange.lowerBound, 0)..<min(frameRange.upperBound, originalFrameCount)
-        var nextSegments: [Segment] = []
-        nextSegments.reserveCapacity(segments.count + 2)
-        var timelineFrame = 0
-        var deletedFrameCount = 0
-
-        for segment in segments {
-            let segmentStartFrame = timelineFrame
-            let segmentEndFrame = timelineFrame + segment.frameCount
-            timelineFrame = segmentEndFrame
-
-            let overlapStartFrame = max(segmentStartFrame, clampedRange.lowerBound)
-            let overlapEndFrame = min(segmentEndFrame, clampedRange.upperBound)
-
-            guard overlapStartFrame < overlapEndFrame else {
-                nextSegments.append(segment)
-                continue
-            }
-
-            deletedFrameCount += overlapEndFrame - overlapStartFrame
-            let beforeCount = overlapStartFrame - segmentStartFrame
-            if beforeCount > 0 {
-                nextSegments.append(Segment(
-                    sourceStartFrame: segment.sourceStartFrame,
-                    frameCount: beforeCount,
-                    gainStart: segment.gainStart,
-                    gainEnd: segment.gainEnd,
-                    startsNewClip: segment.startsNewClip
-                ))
-            }
-
-            let afterCount = segmentEndFrame - overlapEndFrame
-            if afterCount > 0 {
-                nextSegments.append(Segment(
-                    sourceStartFrame: segment.sourceStartFrame + overlapEndFrame - segmentStartFrame,
-                    frameCount: afterCount,
-                    gainStart: segment.gainStart,
-                    gainEnd: segment.gainEnd,
-                    startsNewClip: overlapEndFrame == segmentStartFrame ? segment.startsNewClip : false
-                ))
-            }
-        }
-
-        segments = Self.coalescedSegments(nextSegments)
-        timelineFrameCount = originalFrameCount - deletedFrameCount
-        return deletedFrameCount
-    }
-
-    private mutating func clearFrames(in frameRange: Range<Int>) -> Int {
-        applyGain(0, toFramesIn: frameRange)
-    }
-
-    private func makeSilenceSegments(
-        frameCount requestedFrameCount: Int,
-        insertedFrameCount: inout Int
-    ) -> [Segment] {
-        guard requestedFrameCount > 0, sourceFrameCount > 0 else {
-            return []
-        }
-
-        var remainingFrameCount = requestedFrameCount
-        var result: [Segment] = []
-        result.reserveCapacity(max(Int(ceil(Double(requestedFrameCount) / Double(sourceFrameCount))), 1))
-        var isFirstSegment = true
-        while remainingFrameCount > 0 {
-            let chunkFrameCount = min(remainingFrameCount, sourceFrameCount)
-            result.append(Segment(
-                sourceStartFrame: 0,
-                frameCount: chunkFrameCount,
-                gainStart: 0,
-                gainEnd: 0,
-                startsNewClip: isFirstSegment
-            ))
-            insertedFrameCount += chunkFrameCount
-            remainingFrameCount -= chunkFrameCount
-            isFirstSegment = false
-        }
-        return result
-    }
-
-    private mutating func applyGain(_ gain: Float, toFramesIn frameRange: Range<Int>) -> Int {
-        guard
-            frameRange.lowerBound < frameRange.upperBound,
-            frameRange.lowerBound < timelineFrameCount,
-            frameRange.upperBound > 0,
-            gain >= 0,
-            gain.isFinite
-        else {
-            return 0
-        }
-
-        let clampedRange = max(frameRange.lowerBound, 0)..<min(frameRange.upperBound, timelineFrameCount)
-        var nextSegments: [Segment] = []
-        nextSegments.reserveCapacity(segments.count + 2)
-        var timelineFrame = 0
-        var affectedFrameCount = 0
-
-        for segment in segments {
-            let segmentStartFrame = timelineFrame
-            let segmentEndFrame = timelineFrame + segment.frameCount
-            timelineFrame = segmentEndFrame
-
-            let overlapStartFrame = max(segmentStartFrame, clampedRange.lowerBound)
-            let overlapEndFrame = min(segmentEndFrame, clampedRange.upperBound)
-
-            guard overlapStartFrame < overlapEndFrame else {
-                nextSegments.append(segment)
-                continue
-            }
-
-            let beforeCount = overlapStartFrame - segmentStartFrame
-            if beforeCount > 0 {
-                nextSegments.append(slice(segment, offset: 0, count: beforeCount))
-            }
-
-            let selectedCount = overlapEndFrame - overlapStartFrame
-            nextSegments.append(slice(
-                segment,
-                offset: overlapStartFrame - segmentStartFrame,
-                count: selectedCount
-            ).scaled(by: gain))
-            affectedFrameCount += selectedCount
-
-            let afterCount = segmentEndFrame - overlapEndFrame
-            if afterCount > 0 {
-                nextSegments.append(slice(
-                    segment,
-                    offset: overlapEndFrame - segmentStartFrame,
-                    count: afterCount
-                ))
-            }
-        }
-
-        segments = Self.coalescedSegments(nextSegments)
-        return affectedFrameCount
-    }
-
-    private mutating func applyFade(
-        _ direction: AudioEditTimeline.FadeDirection,
-        toFramesIn frameRange: Range<Int>
-    ) -> Int {
-        guard
-            frameRange.lowerBound < frameRange.upperBound,
-            frameRange.lowerBound < timelineFrameCount,
-            frameRange.upperBound > 0
-        else {
-            return 0
-        }
-
-        let clampedRange = max(frameRange.lowerBound, 0)..<min(frameRange.upperBound, timelineFrameCount)
-        let selectedFrameCount = clampedRange.count
-        var nextSegments: [Segment] = []
-        nextSegments.reserveCapacity(segments.count + 2)
-        var timelineFrame = 0
-        var affectedFrameCount = 0
-
-        for segment in segments {
-            let segmentStartFrame = timelineFrame
-            let segmentEndFrame = timelineFrame + segment.frameCount
-            timelineFrame = segmentEndFrame
-
-            let overlapStartFrame = max(segmentStartFrame, clampedRange.lowerBound)
-            let overlapEndFrame = min(segmentEndFrame, clampedRange.upperBound)
-
-            guard overlapStartFrame < overlapEndFrame else {
-                nextSegments.append(segment)
-                continue
-            }
-
-            let beforeCount = overlapStartFrame - segmentStartFrame
-            if beforeCount > 0 {
-                nextSegments.append(slice(segment, offset: 0, count: beforeCount))
-            }
-
-            let selectedCount = overlapEndFrame - overlapStartFrame
-            let selectedStartOffset = overlapStartFrame - clampedRange.lowerBound
-            let selectedEndOffset = selectedStartOffset + selectedCount - 1
-            let startMultiplier = Self.fadeMultiplier(
-                for: direction,
-                selectedOffset: selectedStartOffset,
-                selectedFrameCount: selectedFrameCount
-            )
-            let endMultiplier = Self.fadeMultiplier(
-                for: direction,
-                selectedOffset: selectedEndOffset,
-                selectedFrameCount: selectedFrameCount
-            )
-            nextSegments.append(slice(
-                segment,
-                offset: overlapStartFrame - segmentStartFrame,
-                count: selectedCount
-            ).scaled(startMultiplier: startMultiplier, endMultiplier: endMultiplier))
-            affectedFrameCount += selectedCount
-
-            let afterCount = segmentEndFrame - overlapEndFrame
-            if afterCount > 0 {
-                nextSegments.append(slice(
-                    segment,
-                    offset: overlapEndFrame - segmentStartFrame,
-                    count: afterCount
-                ))
-            }
-        }
-
-        segments = Self.coalescedSegments(nextSegments)
-        return affectedFrameCount
-    }
-
-    private func slice(_ segment: Segment, offset: Int, count: Int) -> Segment {
-        guard count > 0 else {
-            return Segment(
-                sourceStartFrame: segment.sourceStartFrame + offset,
-                frameCount: 0,
-                gainStart: segment.gain(at: offset),
-                gainEnd: segment.gain(at: offset),
-                startsNewClip: offset == 0 && segment.startsNewClip
-            )
-        }
-
-        return Segment(
-            sourceStartFrame: segment.sourceStartFrame + offset,
-            frameCount: count,
-            gainStart: segment.gain(at: offset),
-            gainEnd: segment.gain(at: offset + count - 1),
-            startsNewClip: offset == 0 && segment.startsNewClip
+    private static func segment(
+        _ persistent: PersistentSegment
+    ) -> AudioTimelineSegment {
+        AudioTimelineSegment(
+            sourceStartFrame: persistent.sourceStartFrame,
+            frameCount: persistent.frameCount,
+            gainStart: persistent.gainStart,
+            gainEnd: persistent.gainEnd,
+            startsNewClip: persistent.startsNewClip == true
         )
     }
 
-    private mutating func split(atFrame requestedFrame: Int) -> Bool {
-        guard requestedFrame > 0, requestedFrame < timelineFrameCount else {
-            return false
-        }
-
-        var nextSegments: [Segment] = []
-        nextSegments.reserveCapacity(segments.count + 1)
-        var timelineFrame = 0
-        var didSplit = false
-
-        for segment in segments {
-            let segmentStartFrame = timelineFrame
-            let segmentEndFrame = timelineFrame + segment.frameCount
-            timelineFrame = segmentEndFrame
-
-            if requestedFrame == segmentStartFrame, !nextSegments.isEmpty {
-                if segment.startsNewClip {
-                    nextSegments.append(segment)
-                } else {
-                    nextSegments.append(segment.withClipBoundary(true))
-                    didSplit = true
-                }
-                continue
-            }
-
-            guard requestedFrame > segmentStartFrame, requestedFrame < segmentEndFrame else {
-                nextSegments.append(segment)
-                continue
-            }
-
-            let beforeCount = requestedFrame - segmentStartFrame
-            let afterCount = segmentEndFrame - requestedFrame
-            nextSegments.append(slice(segment, offset: 0, count: beforeCount))
-            nextSegments.append(slice(segment, offset: beforeCount, count: afterCount).withClipBoundary(true))
-            didSplit = true
-        }
-
-        guard didSplit else {
-            return false
-        }
-
-        segments = Self.coalescedSegments(nextSegments)
-        timelineFrameCount = Self.totalFrameCount(segments)
-        return true
-    }
-
-    private static func smoothstep(_ progress: Float) -> Float {
-        let clampedProgress = min(max(progress, 0), 1)
-        return clampedProgress * clampedProgress * (3 - 2 * clampedProgress)
-    }
-
-    private static func fadeMultiplier(
-        for direction: AudioEditTimeline.FadeDirection,
-        selectedOffset: Int,
-        selectedFrameCount: Int
-    ) -> Float {
-        guard selectedFrameCount > 1 else {
-            return direction == .fadeIn ? 1 : 0
-        }
-
-        let progress = Float(min(max(selectedOffset, 0), selectedFrameCount - 1)) /
-            Float(selectedFrameCount - 1)
-        let curve = smoothstep(progress)
-        switch direction {
-        case .fadeIn:
-            return curve
-        case .fadeOut:
-            return 1 - curve
-        }
-    }
-
-    private static func coalescedSegments(_ segments: [Segment]) -> [Segment] {
-        var result: [Segment] = []
-        result.reserveCapacity(segments.count)
-
-        for rawSegment in segments where rawSegment.frameCount > 0 {
-            let segment = result.isEmpty ? rawSegment.withClipBoundary(false) : rawSegment
-            guard let previous = result.last else {
-                result.append(segment)
-                continue
-            }
-
-            if
-                !segment.startsNewClip,
-                previous.sourceEndFrame == segment.sourceStartFrame,
-                previous.hasConstantGain,
-                segment.hasConstantGain,
-                abs(previous.gainStart - segment.gainStart) <= Self.gainEpsilon
-            {
-                result[result.count - 1] = Segment(
-                    sourceStartFrame: previous.sourceStartFrame,
-                    frameCount: previous.frameCount + segment.frameCount,
-                    gainStart: previous.gainStart,
-                    gainEnd: previous.gainEnd,
-                    startsNewClip: previous.startsNewClip
-                )
-            } else {
-                result.append(segment)
-            }
-        }
-
-        return result
-    }
-
-    private static func totalFrameCount(_ segments: [Segment]) -> Int {
-        segments.reduce(0) { total, segment in
-            total + segment.frameCount
-        }
-    }
-
-    private static func validatedSegments(
-        _ segments: [Segment],
-        sourceFrameCount: Int
-    ) -> [Segment] {
-        coalescedSegments(segments.compactMap { segment in
-            guard
-                segment.sourceStartFrame >= 0,
-                segment.frameCount > 0,
-                segment.sourceStartFrame < sourceFrameCount,
-                segment.gainStart >= 0,
-                segment.gainStart.isFinite,
-                segment.gainEnd >= 0,
-                segment.gainEnd.isFinite
-            else {
-                return nil
-            }
-
-            let frameCount = min(segment.frameCount, sourceFrameCount - segment.sourceStartFrame)
-            guard frameCount > 0 else {
-                return nil
-            }
-
-            return Segment(
-                sourceStartFrame: segment.sourceStartFrame,
-                frameCount: frameCount,
-                gainStart: segment.gainStart,
-                gainEnd: segment.gainEnd,
-                startsNewClip: segment.startsNewClip
-            )
-        })
+    private static func persistentSegment(
+        _ segment: AudioTimelineSegment
+    ) -> PersistentSegment {
+        PersistentSegment(
+            sourceStartFrame: segment.sourceStartFrame,
+            frameCount: segment.frameCount,
+            gainStart: segment.gainStart,
+            gainEnd: segment.gainEnd,
+            startsNewClip: segment.startsNewClip ? true : nil
+        )
     }
 }
