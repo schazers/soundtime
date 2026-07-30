@@ -21,6 +21,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateCoordinator.restartBlockersProvider = { [weak self] in
             self?.windowControllers.flatMap { $0.applicationUpdateRestartBlockers() } ?? []
         }
+        updateCoordinator.presentationWindowProvider = { [weak self] in
+            NSApplication.shared.keyWindow ??
+                self?.windowControllers.last?.window
+        }
         updateCoordinator.startAfterLaunchSettles()
     }
 

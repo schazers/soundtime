@@ -49,6 +49,7 @@ enum ApplicationUpdateSmokeHarness {
         )
         try require(service.preferences.channel == .beta, "beta update preference was not preserved")
 
+        try validateStatusPresentations()
         let root = repositoryRoot()
         try validateBundleConfiguration(root: root)
         try validateAppcastFixture(root: root)
@@ -56,6 +57,39 @@ enum ApplicationUpdateSmokeHarness {
         try validateNoPrivateUpdateKey(root: root)
 
         print("Soundtime application update smoke passed")
+    }
+
+    private static func validateStatusPresentations() throws {
+        let unavailable = ApplicationUpdateFailure(
+            kind: .unavailable,
+            title: "Updates are unavailable",
+            message: "This development build is not packaged for application updates.",
+            recoverySuggestion: "Use a signed Soundtime application bundle to test updates."
+        )
+        let unavailablePresentation = ApplicationUpdateStatusPresentation.make(
+            for: .failed(unavailable)
+        )
+        try require(
+            unavailablePresentation?.title == unavailable.title,
+            "unavailable update title is not presented"
+        )
+        try require(
+            unavailablePresentation?.detail == unavailable.recoverySuggestion,
+            "unavailable update recovery suggestion is not presented"
+        )
+        try require(
+            unavailablePresentation?.primaryAction == .dismiss,
+            "unavailable update dialog must be dismissible"
+        )
+
+        let current = ApplicationVersion(displayVersion: "1.2.3", buildVersion: "123")
+        let upToDatePresentation = ApplicationUpdateStatusPresentation.make(
+            for: .upToDate(current: current)
+        )
+        try require(
+            upToDatePresentation?.message.contains(current.fullDescription) == true,
+            "up-to-date dialog must identify the installed version"
+        )
     }
 
     private static func validateBundleConfiguration(root: URL) throws {
