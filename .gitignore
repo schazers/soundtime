@@ -8,6 +8,9 @@ dist/
 *.xcuserstate
 *.DS_Store
 
+# Local development project.
+Three_tracks.soundtime
+
 # Generated shippability fixtures. Rebuild locally with:
 # swift run Soundtime --build-shippability-fixtures
 Fixtures/Shippability/v*/
