@@ -91,6 +91,9 @@ struct TimelineRenderTarget: @unchecked Sendable {
 }
 
 final class TimelineRenderer: NSObject, @unchecked Sendable {
+    // Reserved for future musical meter and measure boundaries.
+    private static let drawsRepeatedVerticalTimeGrid = false
+
     private struct TimelineVertex {
         var position: SIMD4<Float>
         var color: SIMD4<Float>
@@ -167,6 +170,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         var metrics: SIMD4<Float>
         var style: SIMD4<Float>
         var edgeHighlight: SIMD4<Float>
+        var cornerVisibility: SIMD4<Float>
         var fillColor: SIMD4<Float>
         var topColor: SIMD4<Float>
         var bottomColor: SIMD4<Float>
@@ -1187,6 +1191,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var selectionVertexScratch: [TimelineVertex] = []
     private var processingSelectionProgress: ProcessingSelectionProgress?
     private var selectionDragGlowVertexScratch: [TimelineVertex] = []
+    private var highlightedSelectionEndpoint: TimelineSelectionEndpoint?
     private var clipBoundaryVertexScratch: [TimelineVertex] = []
     private var loopRange = TimelineLoopRange.default
     private var isLoopRangeEnabled = true
@@ -1640,9 +1645,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let previousTrackIDs = Set(previousTrackIDsInOrder)
         let nextTrackIDs = Set(renderTracks.map(\.id))
         let hasSharedTransitionTracks = !previousTrackIDs.isDisjoint(with: nextTrackIDs)
+        let hasStableTrackLaneMapping = previousTrackIDsInOrder == nextTrackIDsInOrder
         let hasActiveDeletionEffects = hasDeletionEffectsInFlight()
         let canAnimateWaveformTransition =
             animateWaveformTransition &&
+            hasStableTrackLaneMapping &&
             !renderState.isPlaybackActive &&
             !nextRenderState.isPlaybackActive
         let canReuseResidentWaveformsForDeletion =
@@ -2172,7 +2179,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         if marksInteraction {
             markWaveformHotInteraction()
         }
-        gridCache = nil
+        if Self.drawsRepeatedVerticalTimeGrid {
+            gridCache = nil
+        }
         previousRenderedPlayheadX = nil
         previousRenderedPlayheadTime = nil
         renderState = renderState.withViewport(viewport)
@@ -2399,6 +2408,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         highlightedLoopEndpoint = endpoint
     }
 
+    func displayHighlightedSelectionEndpoint(_ endpoint: TimelineSelectionEndpoint?) {
+        guard highlightedSelectionEndpoint != endpoint else {
+            return
+        }
+
+        highlightedSelectionEndpoint = endpoint
+    }
+
     func displayHighlightedLoopRegion(_ isHighlighted: Bool) {
         guard isLoopRegionHighlighted != isHighlighted else {
             return
@@ -2466,6 +2483,41 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         return inverseFisheyeX(visualViewportProgress, fisheye: fisheye)
+    }
+
+    func visualViewportProgress(
+        forTimelineProgress timelineProgress: Float,
+        trackID: UUID?,
+        timestamp: CFTimeInterval
+    ) -> Float {
+        let presentationState = currentPresentationRenderState()
+        let viewportProgress = presentationState.viewport.viewportProgress(
+            forTimelineProgress: timelineProgress
+        )
+        guard waveformFisheyeEnabled else {
+            return viewportProgress
+        }
+
+        let playheadProgress = projectedPlayheadProgress(
+            at: timestamp,
+            renderState: presentationState
+        ) ?? presentationState.playheadProgress
+        let baseFisheye = waveformFisheyeParameters(
+            renderState: presentationState,
+            playheadProgress: playheadProgress,
+            displayTimestamp: timestamp
+        )
+        let fisheye = selectionFisheye(
+            for: TimelineSelection(
+                startProgress: Double(timelineProgress),
+                endProgress: Double(timelineProgress),
+                trackID: trackID
+            ),
+            renderState: presentationState,
+            baseFisheye: baseFisheye,
+            displayTimestamp: timestamp
+        )
+        return fisheyeX(viewportProgress, fisheye: fisheye)
     }
 
     private func deletionEffectVisualAnchor(
@@ -5626,6 +5678,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             SIMD3<Float>(0.78, 0.79, 0.80)
         let flashedFillAlpha = min(fillAlpha + flashBoost * 0.10, 0.55)
         let flashedEdgeAlpha = min(edgeAlpha + flashBoost * 0.16, 0.96)
+        let cornerVisibility = loopRange.cornerVisibility(in: renderState.viewport)
         let endpointHighlight: Float
         switch highlightedLoopEndpoint {
         case .start:
@@ -5659,6 +5712,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 endpointHighlight,
                 abs(endpointHighlight),
                 max(lineWidth, 1),
+                0
+            ),
+            cornerVisibility: SIMD4<Float>(
+                cornerVisibility.roundsLeftCorner ? 1 : 0,
+                cornerVisibility.roundsRightCorner ? 1 : 0,
+                0,
                 0
             ),
             fillColor: SIMD4<Float>(fillRGB.x, fillRGB.y, fillRGB.z, flashedFillAlpha),
@@ -6379,9 +6438,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             width: width,
             height: height,
             backingScale: backingScale,
-            projectDuration: renderState.duration ?? 0,
-            viewportStart: renderState.viewport.startProgress,
-            viewportDuration: renderState.viewport.durationProgress,
+            projectDuration: Self.drawsRepeatedVerticalTimeGrid ? renderState.duration ?? 0 : 0,
+            viewportStart: Self.drawsRepeatedVerticalTimeGrid ? renderState.viewport.startProgress : 0,
+            viewportDuration: Self.drawsRepeatedVerticalTimeGrid ? renderState.viewport.durationProgress : 0,
             trackCount: max(renderState.tracks.count, 1),
             trackHeight: trackLayout.trackHeight,
             trackScrollOffset: trackLayout.scrollOffset,
@@ -7293,6 +7352,16 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             }
         }
 
+        let highlightedEndpoint: Float
+        switch highlightedSelectionEndpoint {
+        case .start:
+            highlightedEndpoint = -1
+        case .end:
+            highlightedEndpoint = 1
+        case nil:
+            highlightedEndpoint = 0
+        }
+
         let seed = Float(UInt32(truncatingIfNeeded: selection.trackID?.hashValue ?? 0) & 0x00FF_FFFF)
         return SelectionOverlayUniform(
             rect: SIMD4<Float>(
@@ -7316,8 +7385,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             pulse: SIMD4<Float>(
                 copyFlash,
                 Float(selectionCopyFlashDuration),
-                0,
-                0
+                highlightedEndpoint,
+                abs(highlightedEndpoint)
             ),
             baseColor: baseColor,
             progressColor: progressColor,
@@ -7435,36 +7504,42 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return true
         }
 
-        if
-            let projectDuration = renderState.duration,
-            projectDuration.isFinite,
-            projectDuration > 0
-        {
-            let visibleSeconds = max(Double(viewport.durationProgress) * projectDuration, 0.000_001)
-            let approximateSecondsStep = visibleSeconds * Double(targetPixelStep / max(width, 1))
-            let secondsStep = max(niceSecondsStep(approximateSecondsStep), 0.000_001)
-            let visibleStartSeconds = Double(viewport.startProgress) * projectDuration
-            let visibleEndSeconds = Double(viewport.endProgress) * projectDuration
-            var gridSeconds = floor(visibleStartSeconds / secondsStep) * secondsStep
+        if Self.drawsRepeatedVerticalTimeGrid {
+            if
+                let projectDuration = renderState.duration,
+                projectDuration.isFinite,
+                projectDuration > 0
+            {
+                let visibleSeconds = max(Double(viewport.durationProgress) * projectDuration, 0.000_001)
+                let approximateSecondsStep = visibleSeconds * Double(targetPixelStep / max(width, 1))
+                let secondsStep = max(niceSecondsStep(approximateSecondsStep), 0.000_001)
+                let visibleStartSeconds = Double(viewport.startProgress) * projectDuration
+                let visibleEndSeconds = Double(viewport.endProgress) * projectDuration
+                var gridSeconds = floor(visibleStartSeconds / secondsStep) * secondsStep
 
-            while gridSeconds <= visibleEndSeconds + secondsStep {
-                let timelineProgress = Float(gridSeconds / projectDuration)
-                guard appendVerticalGridLine(at: viewport.viewportProgress(forTimelineProgress: timelineProgress)) else {
-                    break
+                while gridSeconds <= visibleEndSeconds + secondsStep {
+                    let timelineProgress = Float(gridSeconds / projectDuration)
+                    guard appendVerticalGridLine(
+                        at: viewport.viewportProgress(forTimelineProgress: timelineProgress)
+                    ) else {
+                        break
+                    }
+                    gridSeconds += secondsStep
                 }
-                gridSeconds += secondsStep
-            }
-        } else {
-            let approximateProgressStep = max(viewport.durationProgress * targetPixelStep / width, 0.0001)
-            let progressStep = niceProgressStep(approximateProgressStep)
-            let firstGridProgress = floor(viewport.startProgress / progressStep) * progressStep
-            var gridProgress = firstGridProgress
+            } else {
+                let approximateProgressStep = max(viewport.durationProgress * targetPixelStep / width, 0.0001)
+                let progressStep = niceProgressStep(approximateProgressStep)
+                let firstGridProgress = floor(viewport.startProgress / progressStep) * progressStep
+                var gridProgress = firstGridProgress
 
-            while gridProgress <= viewport.endProgress + progressStep {
-                guard appendVerticalGridLine(at: viewport.viewportProgress(forTimelineProgress: gridProgress)) else {
-                    break
+                while gridProgress <= viewport.endProgress + progressStep {
+                    guard appendVerticalGridLine(
+                        at: viewport.viewportProgress(forTimelineProgress: gridProgress)
+                    ) else {
+                        break
+                    }
+                    gridProgress += progressStep
                 }
-                gridProgress += progressStep
             }
         }
 
@@ -12445,6 +12520,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float4 metrics;
         float4 style;
         float4 edgeHighlight;
+        float4 cornerVisibility;
         float4 fillColor;
         float4 topColor;
         float4 bottomColor;
@@ -12548,6 +12624,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float4 metrics;
         float4 style;
         float4 edgeHighlight;
+        float4 cornerVisibility;
         float4 fillColor;
         float4 topColor;
         float4 bottomColor;
@@ -13087,17 +13164,23 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         return length(max(q, float2(0.0))) + min(max(q.x, q.y), 0.0);
     }
 
-    static float top_rounded_tab_signed_distance(float2 pixel, float width, float height, float radius) {
+    static float top_rounded_tab_signed_distance(
+        float2 pixel,
+        float width,
+        float height,
+        float radius,
+        float2 cornerVisibility
+    ) {
         float r = clamp(radius, 0.0, min(width * 0.5, height));
         if (r <= 0.5) {
             return box_signed_distance(pixel, float2(width, height) * 0.5, float2(width, height) * 0.5);
         }
 
         if (pixel.y < r) {
-            if (pixel.x < r) {
+            if (cornerVisibility.x > 0.5 && pixel.x < r) {
                 return length(pixel - float2(r, r)) - r;
             }
-            if (pixel.x > width - r) {
+            if (cornerVisibility.y > 0.5 && pixel.x > width - r) {
                 return length(pixel - float2(width - r, r)) - r;
             }
         }
@@ -13127,6 +13210,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         out.metrics = uniform.metrics;
         out.style = uniform.style;
         out.edgeHighlight = uniform.edgeHighlight;
+        out.cornerVisibility = uniform.cornerVisibility;
         out.fillColor = uniform.fillColor;
         out.topColor = uniform.topColor;
         out.bottomColor = uniform.bottomColor;
@@ -13144,7 +13228,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float edgeWidthPixels = max(in.metrics.w, 1.0);
         float2 pixel = float2(in.localPosition.x * widthPixels, in.localPosition.y * heightPixels);
 
-        float distance = top_rounded_tab_signed_distance(pixel, widthPixels, heightPixels, radiusPixels);
+        float distance = top_rounded_tab_signed_distance(
+            pixel,
+            widthPixels,
+            heightPixels,
+            radiusPixels,
+            in.cornerVisibility.xy
+        );
         float aa = max(fwidth(distance), 0.82);
         float coverage = 1.0 - smoothstep(-aa, aa, distance);
         if (coverage <= 0.0001) {
@@ -13302,6 +13392,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             max(4.0, radiusPixels * 0.35),
             max(distance, 0.0)
         );
+        float hoveredEdgeSide = clamp(pulse.z, -1.0, 1.0);
+        float hoveredEdgeAmount = clamp(pulse.w, 0.0, 1.0);
+        float hoveredEdgeX = hoveredEdgeSide < 0.0 ? 0.0 : widthPixels;
+        float hoveredEdgeDistance = abs(pixel.x - hoveredEdgeX);
+        float hoveredEdgeCore = 1.0 - smoothstep(0.0, 1.6, hoveredEdgeDistance);
+        float hoveredEdgeHalo = 1.0 - smoothstep(0.0, 8.0, hoveredEdgeDistance);
+        float hoveredEdgeGlow = hoveredEdgeAmount *
+            (hoveredEdgeCore * 0.72 + hoveredEdgeHalo * 0.28) *
+            (0.42 + rim * 0.58);
 
         float dragDirection = style.z >= 0.0 ? 1.0 : -1.0;
         float dragEdge = 0.0;
@@ -13328,16 +13427,29 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         float4 base = baseColor;
-        float glassAlpha = base.a * (0.78 + topSheen * 0.26 + rim * 0.42 + dragEdge * 0.22);
+        float glassAlpha = base.a * (
+            0.78 +
+            topSheen * 0.26 +
+            rim * 0.42 +
+            dragEdge * 0.22 +
+            hoveredEdgeGlow * 0.34
+        );
         float3 glassTint = base.rgb;
         glassTint = mix(glassTint, float3(0.78, 1.0, 1.0), 0.20 * topSheen + 0.12 * rim + 0.18 * dragEdge);
         glassTint = mix(glassTint, float3(0.02, 0.18, 0.19), 0.12 * lowerShade);
         glassTint += float3(0.18, 0.35, 0.38) * refractivePush * 0.18;
+        glassTint = mix(glassTint, float3(1.0), clamp(hoveredEdgeGlow * 0.74, 0.0, 0.82));
 
         float4 color = float4(glassTint, glassAlpha * coverage);
         float4 rimColor = float4(
             mix(float3(0.40, 0.96, 1.0), float3(1.0), clamp(rim * 0.35 + dragEdge * 0.45, 0.0, 1.0)),
-            coverage * (rim * 0.13 + innerRim * 0.045 + outerRim * 0.05 + dragEdge * 0.12)
+            coverage * (
+                rim * 0.13 +
+                innerRim * 0.045 +
+                outerRim * 0.05 +
+                dragEdge * 0.12 +
+                hoveredEdgeGlow * 0.24
+            )
         );
         color = source_over(color, rimColor);
 

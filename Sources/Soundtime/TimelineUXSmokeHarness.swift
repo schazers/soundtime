@@ -109,6 +109,16 @@ enum TimelineUXSmokeHarness {
         )
         complete("new project WAV import renders a track waveform")
 
+        try verifyPendingImportUsesFinalTrackLanes(
+            device: device,
+            pixelFormat: pixelFormat,
+            residentTrack: track,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        complete("pending track import keeps resident waveforms in their final lanes")
+
         try verifyInitialWaveformPublishSurvivesHover(
             waveformOverview: waveformOverview,
             device: device,
@@ -221,6 +231,27 @@ enum TimelineUXSmokeHarness {
 
         try verifyTrackLayoutGeometry()
         complete("track layout geometry keeps lanes aligned and hit-testable")
+
+        try verifySelectionEdgeResizeSemantics()
+        complete("selection edges resize around a fixed anchor without starting a new selection")
+
+        try verifyLoopRangeMoveSemantics()
+        complete("loop body movement preserves its width and clamps to timeline bounds")
+
+        try verifyLoopRangeViewportCornerSemantics()
+        complete("loop region rounds only endpoints visible inside the viewport")
+
+        try verifyEdgeAutoPanCurve()
+        complete("selection and loop edge autopan accelerates smoothly toward timeline boundaries")
+
+        try verifySelectionEdgeHoverRendering(
+            renderer: renderer,
+            track: track,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        complete("selection edge hover renders on the targeted rounded edge")
 
         try verifyScrolledTrackLanesRender(
             renderer: renderer,
@@ -409,6 +440,98 @@ enum TimelineUXSmokeHarness {
             backingScale: backingScale
         )
         try require(frame.summary.nonBackgroundPixelCount > 10_000, "new project WAV render was effectively blank")
+    }
+
+    private static func verifyPendingImportUsesFinalTrackLanes(
+        device: MTLDevice,
+        pixelFormat: MTLPixelFormat,
+        residentTrack: TimelineRenderState.Track,
+        texture: MTLTexture,
+        viewportSize: CGSize,
+        backingScale: Float
+    ) throws {
+        let renderer = try TimelineRenderer(device: device, pixelFormat: pixelFormat)
+        let timestamp = CACurrentMediaTime()
+        renderer.displayTracks([residentTrack], animateWaveformTransition: false)
+        renderer.displayTrackLayout(.default)
+        renderer.displayViewport(.full)
+        renderer.displayPlaybackActive(false)
+        renderer.displayPlayheadProgress(
+            0.25,
+            force: true,
+            anchorTimestamp: timestamp,
+            resetsTouchStart: true
+        )
+        try waitForVisibleWaveformBuffers(
+            renderer: renderer,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale,
+            displayTimestamp: timestamp
+        )
+
+        let pendingTrack = TimelineRenderState.Track(
+            id: UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-0000000000A2") ?? UUID(),
+            waveformVersion: 0,
+            waveformOverview: nil,
+            durationHint: residentTrack.durationHint,
+            volume: 1,
+            isMuted: false,
+            isSoloed: false,
+            hasWaveform: false
+        )
+        renderer.displayTracks(
+            [residentTrack, pendingTrack],
+            animateWaveformTransition: true,
+            allowImmediateWaveformPrewarm: false,
+            allowImmediateInteractiveWaveformPrewarm: false
+        )
+        let frame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: timestamp + 0.01,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+
+        let layout = TimelineTrackLayout.default.resolved(
+            totalTrackCount: 2,
+            viewportHeight: Float(frame.summary.height)
+        )
+        let firstLane = try requireValue(layout.laneFrame(forTrackIndex: 0), "pending import had no first lane")
+        let secondLane = try requireValue(layout.laneFrame(forTrackIndex: 1), "pending import had no second lane")
+        let firstRowStart = max(Int(ceil(firstLane.top * Float(frame.summary.height))) + 2, 0)
+        let firstRowEnd = min(
+            Int(floor(firstLane.bottom * Float(frame.summary.height))) - 2,
+            frame.summary.height
+        )
+        let secondRowStart = max(Int(ceil(secondLane.top * Float(frame.summary.height))) + 2, 0)
+        let secondRowEnd = min(
+            Int(floor(secondLane.bottom * Float(frame.summary.height))) - 2,
+            frame.summary.height
+        )
+        let firstRows = firstRowStart..<firstRowEnd
+        let secondRows = secondRowStart..<secondRowEnd
+        let firstLaneWaveformPixels = nonBackgroundPixelCount(
+            inRows: firstRows,
+            bytes: frame.bytes,
+            width: frame.summary.width,
+            backgroundLuminanceThreshold: 110
+        )
+        let secondLaneWaveformPixels = nonBackgroundPixelCount(
+            inRows: secondRows,
+            bytes: frame.bytes,
+            width: frame.summary.width,
+            backgroundLuminanceThreshold: 110
+        )
+        try require(
+            firstLaneWaveformPixels > 1_500,
+            "resident waveform did not move into its final first-track lane during import"
+        )
+        try require(
+            secondLaneWaveformPixels < firstLaneWaveformPixels / 4 + 500,
+            "resident waveform leaked into pending import lane: \(secondLaneWaveformPixels) vs \(firstLaneWaveformPixels)"
+        )
     }
 
     private static func verifyInitialWaveformPublishSurvivesHover(
@@ -1134,6 +1257,392 @@ enum TimelineUXSmokeHarness {
             )
             try require(count > 1_800, "scrolled visible lane \(trackIndex) rendered too few pixels: \(count)")
         }
+    }
+
+    private static func verifySelectionEdgeResizeSemantics() throws {
+        let trackID = UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-000000000077") ?? UUID()
+        let selection = TimelineSelection(
+            startProgress: 0.25,
+            endProgress: 0.65,
+            trackID: trackID
+        )
+
+        try require(
+            TimelineSelectionResizeInteraction.endpoint(
+                nearX: 247,
+                startX: 250,
+                endX: 650,
+                hitWidth: 14
+            ) == .start,
+            "selection start edge was not hit within its resize target"
+        )
+        try require(
+            TimelineSelectionResizeInteraction.endpoint(
+                nearX: 656,
+                startX: 250,
+                endX: 650,
+                hitWidth: 14
+            ) == .end,
+            "selection end edge was not hit within its resize target"
+        )
+        try require(
+            TimelineSelectionResizeInteraction.endpoint(
+                nearX: 450,
+                startX: 250,
+                endX: 650,
+                hitWidth: 14
+            ) == nil,
+            "selection center incorrectly behaved like a resize edge"
+        )
+
+        let verticalRect = CGRect(x: 0, y: 20, width: 1_000, height: 180)
+        try require(
+            TimelineSelectionResizeInteraction.endpoint(
+                at: CGPoint(x: 10, y: 100),
+                startX: 0,
+                endX: 650,
+                verticalRect: verticalRect,
+                viewportWidth: 1_000,
+                hitWidth: 14
+            ) == .start,
+            "selection resize cursor target and mouse-down target disagreed at the left viewport edge"
+        )
+        try require(
+            TimelineSelectionResizeInteraction.endpoint(
+                at: CGPoint(x: 990, y: 100),
+                startX: 250,
+                endX: 1_000,
+                verticalRect: verticalRect,
+                viewportWidth: 1_000,
+                hitWidth: 14
+            ) == .end,
+            "selection resize cursor target and mouse-down target disagreed at the right viewport edge"
+        )
+        try require(
+            TimelineSelectionResizeInteraction.endpoint(
+                at: CGPoint(x: 250, y: 205),
+                startX: 250,
+                endX: 650,
+                verticalRect: verticalRect,
+                viewportWidth: 1_000,
+                hitWidth: 14
+            ) == nil,
+            "selection resize endpoint accepted a point outside the selected track lane"
+        )
+
+        let resizedStart = TimelineSelectionResizeInteraction.resizedSelection(
+            selection,
+            moving: .start,
+            to: 0.15
+        )
+        try require(
+            abs(resizedStart.startProgress - 0.15) < 0.000_001 &&
+                abs(resizedStart.endProgress - 0.65) < 0.000_001 &&
+                resizedStart.trackID == trackID,
+            "resizing the selection start did not preserve the end anchor and track"
+        )
+
+        let resizedEnd = TimelineSelectionResizeInteraction.resizedSelection(
+            selection,
+            moving: .end,
+            to: 0.82
+        )
+        try require(
+            abs(resizedEnd.startProgress - 0.25) < 0.000_001 &&
+                abs(resizedEnd.endProgress - 0.82) < 0.000_001 &&
+                resizedEnd.trackID == trackID,
+            "resizing the selection end did not preserve the start anchor and track"
+        )
+
+        let crossedAnchor = TimelineSelectionResizeInteraction.resizedSelection(
+            selection,
+            moving: .start,
+            to: 0.78
+        )
+        try require(
+            abs(crossedAnchor.startProgress - 0.65) < 0.000_001 &&
+                abs(crossedAnchor.endProgress - 0.78) < 0.000_001 &&
+                crossedAnchor.trackID == trackID,
+            "selection resize did not remain normalized after crossing the fixed anchor"
+        )
+    }
+
+    private static func verifyLoopRangeMoveSemantics() throws {
+        let original = TimelineLoopRange(startProgress: 0.25, endProgress: 0.55)
+
+        let movedRight = original.moving(by: 0.18)
+        try require(
+            abs(movedRight.startProgress - 0.43) < 0.000_001 &&
+                abs(movedRight.endProgress - 0.73) < 0.000_001,
+            "moving a loop body did not translate both boundaries by the same amount"
+        )
+        try require(
+            abs(movedRight.durationProgress - original.durationProgress) < 0.000_001,
+            "moving a loop body changed its duration"
+        )
+
+        let clampedLeft = original.moving(by: -0.80)
+        try require(
+            abs(clampedLeft.startProgress) < 0.000_001 &&
+                abs(clampedLeft.endProgress - original.durationProgress) < 0.000_001,
+            "moving a loop body past the timeline start did not clamp as one range"
+        )
+
+        let clampedRight = original.moving(by: 0.80)
+        try require(
+            abs(clampedRight.endProgress - 1) < 0.000_001 &&
+                abs(clampedRight.startProgress - (1 - original.durationProgress)) < 0.000_001,
+            "moving a loop body past the timeline end did not clamp as one range"
+        )
+        try require(
+            abs(clampedRight.durationProgress - original.durationProgress) < 0.000_001,
+            "right-edge clamping changed the loop duration"
+        )
+    }
+
+    private static func verifyEdgeAutoPanCurve() throws {
+        let viewportWidth: CGFloat = 1_000
+        let activationDistance: CGFloat = 84
+
+        let centerVelocity = TimelineEdgeAutoPan.normalizedVelocity(
+            pointerX: viewportWidth * 0.5,
+            viewportWidth: viewportWidth,
+            activationDistance: activationDistance
+        )
+        try require(centerVelocity == 0, "edge autopan activated away from the timeline edge")
+
+        let leftEntryVelocity = TimelineEdgeAutoPan.normalizedVelocity(
+            pointerX: 72,
+            viewportWidth: viewportWidth,
+            activationDistance: activationDistance
+        )
+        let leftNearVelocity = TimelineEdgeAutoPan.normalizedVelocity(
+            pointerX: 12,
+            viewportWidth: viewportWidth,
+            activationDistance: activationDistance
+        )
+        let rightNearVelocity = TimelineEdgeAutoPan.normalizedVelocity(
+            pointerX: viewportWidth - 12,
+            viewportWidth: viewportWidth,
+            activationDistance: activationDistance
+        )
+        try require(
+            leftEntryVelocity < 0 &&
+                leftNearVelocity < leftEntryVelocity,
+            "left edge autopan did not accelerate toward the boundary"
+        )
+        try require(
+            rightNearVelocity > 0 &&
+                abs(leftNearVelocity + rightNearVelocity) < 0.000_001,
+            "edge autopan was not directionally symmetric"
+        )
+
+        let outsideLeftVelocity = TimelineEdgeAutoPan.normalizedVelocity(
+            pointerX: -40,
+            viewportWidth: viewportWidth,
+            activationDistance: activationDistance
+        )
+        let outsideRightVelocity = TimelineEdgeAutoPan.normalizedVelocity(
+            pointerX: viewportWidth + 40,
+            viewportWidth: viewportWidth,
+            activationDistance: activationDistance
+        )
+        try require(
+            outsideLeftVelocity == -1 && outsideRightVelocity == 1,
+            "edge autopan did not clamp to maximum speed outside the timeline"
+        )
+
+        let progressDelta = TimelineEdgeAutoPan.progressDelta(
+            normalizedVelocity: 0.5,
+            viewportDurationProgress: 0.2,
+            elapsedTime: 0.1,
+            maximumViewportWidthsPerSecond: 0.9
+        )
+        try require(
+            abs(progressDelta - 0.009) < 0.000_001,
+            "edge autopan progress was not time- and zoom-relative"
+        )
+    }
+
+    private static func verifyLoopRangeViewportCornerSemantics() throws {
+        let loopRange = TimelineLoopRange(startProgress: 0.20, endProgress: 0.80)
+
+        try require(
+            loopRange.cornerVisibility(in: .full) == TimelineLoopCornerVisibility(
+                roundsLeftCorner: true,
+                roundsRightCorner: true
+            ),
+            "fully visible loop range did not round both endpoint corners"
+        )
+        try require(
+            loopRange.cornerVisibility(
+                in: TimelineViewport(startProgress: 0.30, durationProgress: 0.70)
+            ) == TimelineLoopCornerVisibility(
+                roundsLeftCorner: false,
+                roundsRightCorner: true
+            ),
+            "left-clipped loop range still rounded its viewport continuation"
+        )
+        try require(
+            loopRange.cornerVisibility(
+                in: TimelineViewport(startProgress: 0, durationProgress: 0.70)
+            ) == TimelineLoopCornerVisibility(
+                roundsLeftCorner: true,
+                roundsRightCorner: false
+            ),
+            "right-clipped loop range still rounded its viewport continuation"
+        )
+        try require(
+            loopRange.cornerVisibility(
+                in: TimelineViewport(startProgress: 0.30, durationProgress: 0.30)
+            ) == TimelineLoopCornerVisibility(
+                roundsLeftCorner: false,
+                roundsRightCorner: false
+            ),
+            "loop range spanning both viewport edges rounded a clipped side"
+        )
+        try require(
+            loopRange.cornerVisibility(
+                in: TimelineViewport(startProgress: 0.20, durationProgress: 0.60)
+            ) == TimelineLoopCornerVisibility(
+                roundsLeftCorner: true,
+                roundsRightCorner: true
+            ),
+            "loop endpoints exactly on viewport boundaries were treated as clipped"
+        )
+    }
+
+    private static func verifySelectionEdgeHoverRendering(
+        renderer: TimelineRenderer,
+        track: TimelineRenderState.Track,
+        texture: MTLTexture,
+        viewportSize: CGSize,
+        backingScale: Float
+    ) throws {
+        let selection = TimelineSelection(
+            startProgress: 0.24,
+            endProgress: 0.68,
+            trackID: track.id
+        )
+        let timestamp = CACurrentMediaTime()
+        renderer.displayTracks([track], animateWaveformTransition: false)
+        renderer.displayTrackLayout(.default)
+        renderer.displayViewport(.full)
+        renderer.displayPlaybackActive(false)
+        renderer.displayPlayheadProgress(
+            0.08,
+            force: true,
+            anchorTimestamp: timestamp,
+            resetsTouchStart: true
+        )
+        renderer.displaySelection(selection, marksInteraction: false)
+        renderer.displayHighlightedSelectionEndpoint(nil)
+        try waitForVisibleWaveformBuffers(
+            renderer: renderer,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale,
+            displayTimestamp: timestamp
+        )
+        let baseFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: timestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+
+        renderer.displayHighlightedSelectionEndpoint(.start)
+        let startHoverFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: timestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        renderer.displayHighlightedSelectionEndpoint(.end)
+        let endHoverFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: timestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+
+        let width = baseFrame.summary.width
+        let height = baseFrame.summary.height
+        let startX = Int(
+            Float(width) * renderer.visualViewportProgress(
+                forTimelineProgress: selection.startProgressFloat,
+                trackID: selection.trackID,
+                timestamp: timestamp
+            )
+        )
+        let endX = Int(
+            Float(width) * renderer.visualViewportProgress(
+                forTimelineProgress: selection.endProgressFloat,
+                trackID: selection.trackID,
+                timestamp: timestamp
+            )
+        )
+        let rows = 0..<height
+        let startColumns = max(startX - 10, 0)..<min(startX + 11, width)
+        let endColumns = max(endX - 10, 0)..<min(endX + 11, width)
+        let startHoverAtStart = pixelDifferenceCount(
+            baseFrame.bytes,
+            startHoverFrame.bytes,
+            width: width,
+            columns: startColumns,
+            rows: rows,
+            threshold: 4
+        )
+        let startHoverAtEnd = pixelDifferenceCount(
+            baseFrame.bytes,
+            startHoverFrame.bytes,
+            width: width,
+            columns: endColumns,
+            rows: rows,
+            threshold: 4
+        )
+        let endHoverAtEnd = pixelDifferenceCount(
+            baseFrame.bytes,
+            endHoverFrame.bytes,
+            width: width,
+            columns: endColumns,
+            rows: rows,
+            threshold: 4
+        )
+        let endHoverAtStart = pixelDifferenceCount(
+            baseFrame.bytes,
+            endHoverFrame.bytes,
+            width: width,
+            columns: startColumns,
+            rows: rows,
+            threshold: 4
+        )
+        let startHoverTotal = pixelDifferenceCount(
+            baseFrame.bytes,
+            startHoverFrame.bytes,
+            threshold: 0
+        )
+        let endHoverTotal = pixelDifferenceCount(
+            baseFrame.bytes,
+            endHoverFrame.bytes,
+            threshold: 0
+        )
+        try require(
+            startHoverAtStart > 100 && startHoverAtStart > startHoverAtEnd * 2,
+            "selection start hover did not stay localized to the start edge " +
+                "(start=\(startHoverAtStart), end=\(startHoverAtEnd), total=\(startHoverTotal))"
+        )
+        try require(
+            endHoverAtEnd > 100 && endHoverAtEnd > endHoverAtStart * 2,
+            "selection end hover did not stay localized to the end edge " +
+                "(end=\(endHoverAtEnd), start=\(endHoverAtStart), total=\(endHoverTotal))"
+        )
+
+        renderer.displayHighlightedSelectionEndpoint(nil)
+        renderer.displaySelection(nil, marksInteraction: false)
     }
 
     private static func verifySelectionDragUpdatesStayResponsive(
@@ -2291,14 +2800,60 @@ enum TimelineUXSmokeHarness {
         let heartbeatStart = CACurrentMediaTime()
         sampler.updateTargetFramesPerSecond(144)
         sampler.updateRenderDemand(.idle)
-        sampler.recordMainThreadHeartbeat(at: heartbeatStart, isApplicationActive: true)
-        sampler.recordMainThreadHeartbeat(at: heartbeatStart + 0.12, isApplicationActive: true)
-        let heartbeatSnapshot = sampler.snapshot(at: heartbeatStart + 0.12)
+        sampler.recordMainThreadHeartbeat(
+            at: heartbeatStart,
+            isApplicationActive: false,
+            expectedInterval: 0.1
+        )
+        sampler.recordMainThreadHeartbeat(
+            at: heartbeatStart,
+            isApplicationActive: true,
+            expectedInterval: 0.1
+        )
+        sampler.recordMainThreadHeartbeat(
+            at: heartbeatStart + 0.1,
+            isApplicationActive: true,
+            expectedInterval: 0.1
+        )
+        let healthyHeartbeatSnapshot = sampler.snapshot(at: heartbeatStart + 0.1)
+        try require(
+            healthyHeartbeatSnapshot.timelineGraphFramesPerSecond == 144,
+            "healthy 10 Hz performance heartbeat reported a false frame drop"
+        )
+        sampler.recordMainThreadHeartbeat(
+            at: heartbeatStart + 0.22,
+            isApplicationActive: true,
+            expectedInterval: 0.1
+        )
+        let jitteredHeartbeatSnapshot = sampler.snapshot(at: heartbeatStart + 0.22)
+        try require(
+            jitteredHeartbeatSnapshot.timelineGraphFramesPerSecond == 144,
+            "normal performance timer jitter reported a false frame drop"
+        )
+        sampler.recordMainThreadHeartbeat(
+            at: heartbeatStart + 0.60,
+            isApplicationActive: true,
+            expectedInterval: 0.1
+        )
+        let heartbeatSnapshot = sampler.snapshot(at: heartbeatStart + 0.60)
         try require(
             heartbeatSnapshot.timelineGraphFramesPerSecond < 144,
             "idle main-thread stall did not lower effective frame health"
         )
-        sampler.recordMainThreadHeartbeat(at: heartbeatStart + 2, isApplicationActive: false)
+        let activeGraphFPS = PerformanceSampler.effectiveGraphFramesPerSecond(
+            renderHealthFramesPerSecond: 144,
+            mainThreadResponsivenessFramesPerSecond: 10,
+            renderDemand: .playback
+        )
+        try require(
+            activeGraphFPS == 144,
+            "diagnostics heartbeat overrode authoritative active render cadence"
+        )
+        sampler.recordMainThreadHeartbeat(
+            at: heartbeatStart + 2,
+            isApplicationActive: false,
+            expectedInterval: 0.1
+        )
     }
 
     private static func renderTimeline(
