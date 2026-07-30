@@ -19,6 +19,11 @@ struct TimelineTranscriptOverlayDiagnosticsSnapshot: Codable, Sendable {
     var lastLayoutBuildReason: String?
 }
 
+struct TimelineTranscriptOverlayLayerGeometrySnapshot {
+    var bandFrames: [CGRect]
+    var runFrames: [CGRect]
+}
+
 final class TimelineTranscriptOverlayView: NSView {
     private final class RunLayerBundle {
         let layoutRun: TranscriptTimelineLayout.Run
@@ -72,10 +77,11 @@ final class TimelineTranscriptOverlayView: NSView {
         let key: String
         let reuseKeyComponents: [String]
         let visibleProjectRange: TranscriptionTimeRange
-        let backgroundRects: [CGRect]
+        let backgrounds: [TranscriptTimelineLayout.Background]
         let runs: [VisibleTextRun]
         let wordRects: [UUID: CGRect]
         let segmentRects: [UUID: CGRect]
+        let usesWordRuns: Bool
     }
 
     private var tracks: [TimelineRenderState.Track] = []
@@ -89,6 +95,7 @@ final class TimelineTranscriptOverlayView: NSView {
     private let transcriptRunLayer = CALayer()
     private var transcriptBandLayers: [CALayer] = []
     private var transcriptRunLayers: [RunLayerBundle] = []
+    private var verticalGeometryByTrackID: [UUID: TranscriptTrackVerticalGeometry] = [:]
     private var diagnosticsConfigureCount = 0
     private var diagnosticsLayoutBuildCount = 0
     private var diagnosticsInteractionOnlyUpdateCount = 0
@@ -138,6 +145,7 @@ final class TimelineTranscriptOverlayView: NSView {
         self.timelineDuration = timelineDuration
         self.displayMode = displayMode
         self.interactionState = interactionState
+        rebuildVerticalGeometryCache()
         let isVisible = displayMode != .hidden
         isHidden = !isVisible
 
@@ -210,6 +218,7 @@ final class TimelineTranscriptOverlayView: NSView {
         self.trackLayout = trackLayout
         self.timelineDuration = timelineDuration
         self.displayMode = displayMode
+        rebuildVerticalGeometryCache()
         isHidden = displayMode == .hidden
 
         guard displayMode != .hidden, cachedLayout != nil else {
@@ -266,6 +275,12 @@ final class TimelineTranscriptOverlayView: NSView {
         guard cachedLayout.reuseKeyComponents == nextReuseKeyComponents else {
             return false
         }
+        guard cachedLayout.usesWordRuns == desiredWordRunMode(
+            viewport: viewport,
+            timelineDuration: timelineDuration
+        ) else {
+            return false
+        }
 
         let nextVisibleRange = TranscriptViewportGeometry.visibleProjectRange(
             viewport: viewport,
@@ -292,6 +307,15 @@ final class TimelineTranscriptOverlayView: NSView {
             expectedVisibleRunLayerCount: expectedVisibleRunLayerCountForDiagnostics(),
             visibleRunLayerCount: transcriptRunLayers.lazy.filter { !$0.containerLayer.isHidden }.count,
             lastLayoutBuildReason: diagnosticsLastLayoutBuildReason
+        )
+    }
+
+    func layerGeometrySnapshotForSmokeTesting() -> TimelineTranscriptOverlayLayerGeometrySnapshot {
+        TimelineTranscriptOverlayLayerGeometrySnapshot(
+            bandFrames: transcriptBandLayers.filter { !$0.isHidden }.map(\.frame),
+            runFrames: transcriptRunLayers
+                .filter { !$0.containerLayer.isHidden }
+                .map(\.containerLayer.frame)
         )
     }
 
@@ -439,8 +463,8 @@ final class TimelineTranscriptOverlayView: NSView {
                 return
             }
 
-            transcriptBandLayers.reserveCapacity(cachedLayout.backgroundRects.count)
-            for _ in cachedLayout.backgroundRects {
+            transcriptBandLayers.reserveCapacity(cachedLayout.backgrounds.count)
+            for _ in cachedLayout.backgrounds {
                 let bandLayer = CALayer()
                 bandLayer.backgroundColor = NSColor.black.withAlphaComponent(0.28).cgColor
                 bandLayer.borderColor = NSColor.white.withAlphaComponent(0.055).cgColor
@@ -486,14 +510,18 @@ final class TimelineTranscriptOverlayView: NSView {
 
         if let cachedLayout {
             for (index, bandLayer) in transcriptBandLayers.enumerated() {
-                guard cachedLayout.backgroundRects.indices.contains(index) else {
+                guard cachedLayout.backgrounds.indices.contains(index) else {
                     bandLayer.isHidden = true
                     continue
                 }
-                let rect = cachedLayout.backgroundRects[index].intersection(bounds)
+                let background = cachedLayout.backgrounds[index]
+                let rect = (
+                    verticalGeometryByTrackID[background.trackID]?.bandRect ??
+                    background.rect
+                ).intersection(bounds)
                 bandLayer.isHidden = rect.isNull || rect.width <= 0 || rect.height <= 0
                 if !bandLayer.isHidden {
-                    bandLayer.frame = rect
+                    bandLayer.frame = layerFrame(forTopDownRect: rect)
                 }
             }
         } else {
@@ -503,12 +531,7 @@ final class TimelineTranscriptOverlayView: NSView {
         }
 
         for bundle in transcriptRunLayers {
-            let displayRect = TranscriptViewportGeometry.displayRect(
-                for: bundle.layoutRun,
-                viewport: viewport,
-                timelineDuration: timelineDuration,
-                boundsWidth: bounds.width
-            )
+            let displayRect = projectedDisplayRect(for: bundle.layoutRun)
             let clippedRect = displayRect.intersection(bounds).insetBy(dx: 3, dy: 0)
             guard
                 !clippedRect.isNull,
@@ -520,7 +543,7 @@ final class TimelineTranscriptOverlayView: NSView {
             }
 
             bundle.containerLayer.isHidden = false
-            bundle.containerLayer.frame = clippedRect
+            bundle.containerLayer.frame = layerFrame(forTopDownRect: clippedRect)
             let localBounds = CGRect(origin: .zero, size: clippedRect.size)
             bundle.backgroundLayer.frame = localBounds
             bundle.backgroundLayer.cornerRadius = bundle.layoutRun.isWord
@@ -529,6 +552,15 @@ final class TimelineTranscriptOverlayView: NSView {
             let verticalTextInset = max((clippedRect.height - 14) * 0.5, 1)
             bundle.textLayer.frame = localBounds.insetBy(dx: 5, dy: verticalTextInset)
         }
+    }
+
+    private func layerFrame(forTopDownRect rect: CGRect) -> CGRect {
+        CGRect(
+            x: rect.minX,
+            y: bounds.height - rect.maxY,
+            width: rect.width,
+            height: rect.height
+        )
     }
 
     private func updateAllRunLayerStyles() {
@@ -628,6 +660,7 @@ final class TimelineTranscriptOverlayView: NSView {
 
     override func layout() {
         super.layout()
+        rebuildVerticalGeometryCache()
         updateLayerGeometry()
     }
 
@@ -693,10 +726,14 @@ final class TimelineTranscriptOverlayView: NSView {
                     viewport: viewport,
                     timelineDuration: timelineDuration
                 ),
-                backgroundRects: [],
+                backgrounds: [],
                 runs: [],
                 wordRects: [:],
-                segmentRects: [:]
+                segmentRects: [:],
+                usesWordRuns: desiredWordRunMode(
+                    viewport: viewport,
+                    timelineDuration: timelineDuration
+                )
             )
         }
 
@@ -726,10 +763,25 @@ final class TimelineTranscriptOverlayView: NSView {
                 viewport: viewport,
                 timelineDuration: timelineDuration
             ),
-            backgroundRects: layout.backgrounds.map(\.rect),
+            backgrounds: layout.backgrounds,
             runs: runs,
             wordRects: rectsByWordID(runs),
-            segmentRects: rectsBySegmentID(runs)
+            segmentRects: rectsBySegmentID(runs),
+            usesWordRuns: desiredWordRunMode(
+                viewport: viewport,
+                timelineDuration: timelineDuration
+            )
+        )
+    }
+
+    private func desiredWordRunMode(
+        viewport: TimelineViewport,
+        timelineDuration: TimeInterval
+    ) -> Bool {
+        TranscriptLayoutEngine.usesWordRuns(
+            viewport: viewport,
+            timelineDuration: timelineDuration,
+            boundsWidth: bounds.width
         )
     }
 
@@ -841,13 +893,48 @@ final class TimelineTranscriptOverlayView: NSView {
     private func displayRun(_ run: VisibleTextRun) -> VisibleTextRun {
         VisibleTextRun(
             layoutRun: run.layoutRun,
-            displayRect: TranscriptViewportGeometry.displayRect(
-                for: run.layoutRun,
-                viewport: viewport,
-                timelineDuration: timelineDuration,
-                boundsWidth: bounds.width
-            )
+            displayRect: projectedDisplayRect(for: run.layoutRun)
         )
+    }
+
+    private func projectedDisplayRect(
+        for run: TranscriptTimelineLayout.Run
+    ) -> CGRect {
+        let horizontalRect = TranscriptViewportGeometry.displayRect(
+            for: run,
+            viewport: viewport,
+            timelineDuration: timelineDuration,
+            boundsWidth: bounds.width
+        )
+        guard let verticalGeometry = verticalGeometryByTrackID[run.trackID] else {
+            return horizontalRect
+        }
+        return verticalGeometry.runRect(
+            x: horizontalRect.minX,
+            width: horizontalRect.width,
+            isWord: run.isWord
+        )
+    }
+
+    private func rebuildVerticalGeometryCache() {
+        let resolvedLayout = trackLayout.resolved(
+            totalTrackCount: tracks.count,
+            viewportHeight: Float(max(bounds.height, 1))
+        )
+        verticalGeometryByTrackID.removeAll(keepingCapacity: true)
+        verticalGeometryByTrackID.reserveCapacity(tracks.count)
+        for trackIndex in tracks.indices {
+            guard
+                let laneFrame = resolvedLayout.laneFrame(forTrackIndex: trackIndex),
+                let geometry = TranscriptLayoutEngine.verticalGeometry(
+                    for: laneFrame,
+                    bounds: bounds.size
+                )
+            else {
+                continue
+            }
+            verticalGeometryByTrackID[tracks[trackIndex].id] = geometry
+        }
     }
 
     private func union(_ existing: CGRect?, _ next: CGRect) -> CGRect {
@@ -1045,6 +1132,12 @@ final class TimelineTranscriptOverlayView: NSView {
             components.append(track.id.uuidString)
             components.append(track.transcript?.id.uuidString ?? "-")
             components.append("\(track.transcript?.segments.count ?? 0)")
+            components.append("\(track.transcript?.sourceRevision ?? -1)")
+            components.append(track.transcript?.validity?.rawValue ?? "-")
+            let transcriptWordCount = track.transcript?.segments.reduce(into: 0) { count, segment in
+                count += segment.words.count
+            } ?? 0
+            components.append("\(transcriptWordCount)")
             components.append("\(Int(((track.durationHint ?? 0) * 1_000).rounded()))")
             components.append("\(track.waveformSegments.count)")
             var segmentFingerprint = 0

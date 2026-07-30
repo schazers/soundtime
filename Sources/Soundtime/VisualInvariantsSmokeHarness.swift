@@ -270,6 +270,142 @@ enum VisualInvariantsSmokeHarness {
         controller.prepareForDeferredProjectRestore()
         let playbackStartedAt = CACurrentMediaTime()
         controller.restoreLastProjectAfterLaunchPreviewRender()
+        _ = try waitUntilElapsed(
+            since: playbackStartedAt,
+            timeoutMilliseconds: 3_000,
+            description: "\(manifestProject.id) playback prime did not become ready"
+        ) {
+            let snapshot = workspace.visualInvariantSmokeSnapshot()
+            return snapshot.playbackHasSource &&
+                snapshot.playbackPrimedTrackCount == expectedTrackCount
+        }
+
+        let startupEditTrackIndex = firstPaint.tracks.enumerated().max {
+            $0.element.durationSeconds < $1.element.durationSeconds
+        }?.offset ?? 0
+        let startupViewportStart: Float = 0.32
+        let startupViewportDuration: Float = 0.20
+        let startupZoomedViewportStart: Float = 0.34
+        let startupZoomedViewportDuration: Float = 0.08
+        let startupSelection = workspace.visualInvariantSmokePanAndSelectRange(
+            trackIndex: startupEditTrackIndex,
+            viewportStartProgress: startupViewportStart,
+            viewportDurationProgress: startupViewportDuration,
+            startViewportProgress: 0.20,
+            endViewportProgress: 0.26,
+            viewportAfterSelectionStartProgress: startupZoomedViewportStart,
+            viewportAfterSelectionDurationProgress: startupZoomedViewportDuration,
+            stagedZoomMomentumVelocity: -2.4
+        )
+        let startupBeforeDelete = workspace.visualInvariantSmokeSnapshot()
+        let startupTargetTrackID = startupBeforeDelete.selectedTrackID
+        let startupTrackDurationBeforeDelete = startupBeforeDelete.tracks.first {
+            $0.id == startupTargetTrackID
+        }?.durationSeconds
+        let startupExpectedSelectionStartProgress =
+            Double(startupViewportStart) + 0.20 * Double(startupViewportDuration)
+        let startupExpectedSelectionEndProgress =
+            Double(startupViewportStart) + 0.26 * Double(startupViewportDuration)
+        let startupExpectedDeleteStart =
+            startupExpectedSelectionStartProgress *
+                startupBeforeDelete.timelinePresentationDurationSeconds
+        let startupExpectedDeleteDuration =
+            (startupExpectedSelectionEndProgress - startupExpectedSelectionStartProgress) *
+                startupBeforeDelete.timelinePresentationDurationSeconds
+        let startupDelete = workspace.userPerceivedTimingSmokeDeleteSelection()
+        let startupImmediatelyAfterDelete = workspace.visualInvariantSmokeSnapshot()
+        let startupCommittedRange = workspace.visualInvariantSmokeLastCommittedEditRange()
+        let startupTrackDurationAfterDelete = startupImmediatelyAfterDelete.tracks.first {
+            $0.id == startupTargetTrackID
+        }?.durationSeconds
+        record(startupSelection.accepted, "startup-race pan-selection was rejected")
+        record(
+            approximatelyEqual(
+                startupBeforeDelete.timelineViewportStartProgress,
+                startupZoomedViewportStart,
+                tolerance: 0.000_001
+            ) &&
+                approximatelyEqual(
+                    startupBeforeDelete.timelineViewportDurationProgress,
+                    startupZoomedViewportDuration,
+                    tolerance: 0.000_001
+                ),
+            "startup-race select-then-zoom did not retain its live viewport"
+        )
+        record(
+            approximatelyEqual(
+                startupBeforeDelete.selectedRangeStartProgress,
+                startupExpectedSelectionStartProgress,
+                tolerance: 0.000_001
+            ) &&
+                approximatelyEqual(
+                    startupBeforeDelete.selectedRangeEndProgress,
+                    startupExpectedSelectionEndProgress,
+                    tolerance: 0.000_001
+                ),
+            "startup-race zoom remapped the previously selected project-time range"
+        )
+        record(startupDelete.accepted, "startup-race delete was rejected")
+        record(
+            !workspace.visualInvariantSmokeAdvancePendingZoomMomentum(),
+            "startup-race delete left zoom momentum active after capturing edit visuals"
+        )
+        let startupAfterMomentumProbe = workspace.visualInvariantSmokeSnapshot()
+        record(
+            approximatelyEqual(
+                startupAfterMomentumProbe.timelineViewportStartProgress,
+                startupZoomedViewportStart,
+                tolerance: 0.000_001
+            ) &&
+                approximatelyEqual(
+                    startupAfterMomentumProbe.timelineViewportDurationProgress,
+                    startupZoomedViewportDuration,
+                    tolerance: 0.000_001
+                ),
+            "startup-race delete allowed the viewport to move after capturing edit visuals"
+        )
+        record(
+            approximatelyEqual(
+                Double(startupImmediatelyAfterDelete.playheadProgress) *
+                    startupImmediatelyAfterDelete.timelinePresentationDurationSeconds,
+                startupExpectedDeleteStart,
+                tolerance: 0.01
+            ),
+            "startup-race delete playhead did not move to the selected project time " +
+                "(actual \(String(format: "%.6f", Double(startupImmediatelyAfterDelete.playheadProgress) * startupImmediatelyAfterDelete.timelinePresentationDurationSeconds)), " +
+                "expected \(String(format: "%.6f", startupExpectedDeleteStart)), " +
+                "progress \(String(format: "%.9f", startupImmediatelyAfterDelete.playheadProgress)), " +
+                "presentation \(String(format: "%.6f", startupImmediatelyAfterDelete.timelinePresentationDurationSeconds)))"
+        )
+        record(
+            approximatelyEqual(
+                startupCommittedRange?.lowerBound,
+                startupExpectedDeleteStart,
+                tolerance: 0.000_001
+            ) &&
+                approximatelyEqual(
+                    startupCommittedRange?.upperBound,
+                    startupExpectedDeleteStart + startupExpectedDeleteDuration,
+                    tolerance: 0.000_001
+                ),
+            "startup-race delete command did not preserve the exact visible project-time range"
+        )
+        if
+            let durationBefore = startupTrackDurationBeforeDelete,
+            let durationAfter = startupTrackDurationAfterDelete
+        {
+            record(
+                approximatelyEqual(
+                    durationAfter,
+                    durationBefore - startupExpectedDeleteDuration,
+                    tolerance: 0.02
+                ),
+                "startup-race delete removed a different range than the visible selection"
+            )
+        } else {
+            record(false, "startup-race delete track duration was unavailable")
+        }
+
         let playbackReadyMilliseconds = try waitUntilElapsed(
             since: playbackStartedAt,
             timeoutMilliseconds: 3_000,
@@ -280,12 +416,51 @@ enum VisualInvariantsSmokeHarness {
                 snapshot.playbackPrimedTrackCount == expectedTrackCount &&
                 !snapshot.isLoadingProject
         }
+        let startupAfterHydration = workspace.visualInvariantSmokeSnapshot()
+        let startupTrackDurationAfterHydration = startupAfterHydration.tracks.first {
+            $0.id == startupTargetTrackID
+        }?.durationSeconds
+        record(
+            approximatelyEqual(
+                startupTrackDurationAfterHydration,
+                startupTrackDurationAfterDelete ?? -1,
+                tolerance: 0.000_001
+            ),
+            "late hydration replaced the first user edit with stale track state"
+        )
+        let startupUndo = workspace.interactionReplaySmokeUndoLastEdit()
+        runMainLoop(milliseconds: 170)
+        let startupAfterUndo = workspace.visualInvariantSmokeSnapshot()
+        let startupTrackDurationAfterUndo = startupAfterUndo.tracks.first {
+            $0.id == startupTargetTrackID
+        }?.durationSeconds
+        record(startupUndo.accepted, "startup-race delete could not be undone")
+        record(
+            approximatelyEqual(
+                startupTrackDurationAfterUndo,
+                startupTrackDurationBeforeDelete ?? -1,
+                tolerance: 0.000_001
+            ),
+            "startup-race delete undo did not restore the exact track duration"
+        )
         let playbackReady = workspace.visualInvariantSmokeSnapshot()
         record(playbackReady.trackCount == expectedTrackCount, "hydration changed the track count")
         record(playbackReady.drawableWaveformTrackCount == expectedTrackCount, "hydration blanked cached waveform lanes")
         record(playbackReady.blankTrackCount == 0, "hydration left blank waveform lanes")
         record(playbackReady.playbackHasSource, "playback source was unavailable after hydration")
         record(playbackReady.playbackPrimedTrackCount == expectedTrackCount, "not every track was playback-primed")
+        record(
+            playbackReady.timelinePresentationMatchesProject,
+            "hydration left the visible timeline out of sync with the canonical edit projection"
+        )
+        record(
+            approximatelyEqual(
+                playbackReady.timelinePresentationDurationSeconds,
+                playbackReady.projectDurationSeconds,
+                tolerance: 0.000_001
+            ),
+            "hydration left visible and canonical project durations out of sync"
+        )
         if expectedTranscriptWordCount > 0 {
             record(playbackReady.transcriptTrackCount > 0, "hydration did not load transcript metadata")
             record(playbackReady.transcriptWordCount == expectedTranscriptWordCount, "hydration transcript word count was wrong")
@@ -350,8 +525,20 @@ enum VisualInvariantsSmokeHarness {
         let deleteResult = workspace.userPerceivedTimingSmokeDeleteSelection()
         runMainLoop(milliseconds: 170)
         let deleteSnapshot = workspace.visualInvariantSmokeSnapshot()
+        let expectedDeleteStartTime =
+            selectionStart * selectionSnapshot.timelinePresentationDurationSeconds
+        let renderedDeletePlayheadTime =
+            Double(deleteSnapshot.playheadProgress) * deleteSnapshot.projectDurationSeconds
         record(deleteResult.accepted, "delete visual command was rejected")
         record(deleteSnapshot.editAnimationGeneration > deleteGenerationBefore, "delete did not advance the edit animation generation")
+        record(
+            approximatelyEqual(
+                renderedDeletePlayheadTime,
+                expectedDeleteStartTime,
+                tolerance: 0.01
+            ),
+            "delete playhead did not land at the selected project time"
+        )
         record(deleteSnapshot.drawableWaveformTrackCount == expectedTrackCount, "delete handoff lost drawable waveform lanes")
         record(deleteSnapshot.blankTrackCount == 0, "delete handoff showed blank waveform lanes")
 

@@ -15,8 +15,8 @@ struct PerformanceMetricsSnapshot: Equatable, Sendable {
     var timelineFramesPerSecond: Double
     var timelineCompletedFramesPerSecond: Double
     var timelineGraphFramesPerSecond: Double
-    var timelineGraphIsIdle: Bool
-    var lastActiveTimelineFramesPerSecond: Double
+    var targetFramesPerSecond: Double
+    var mainThreadResponsivenessFramesPerSecond: Double
     var meterFramesPerSecond: Double
     var cpuPercent: Double
     var renderDemand: PerformanceRenderDemand
@@ -29,6 +29,11 @@ struct PerformanceMetricsSnapshot: Equatable, Sendable {
 }
 
 final class PerformanceSampler: @unchecked Sendable {
+    private struct MainThreadStallPenalty {
+        let timestamp: CFTimeInterval
+        let missedDisplayFrames: Double
+    }
+
     static let shared = PerformanceSampler()
 
     private let lock = NSLock()
@@ -40,8 +45,10 @@ final class PerformanceSampler: @unchecked Sendable {
     private var timelineCompletedTimestamps: [CFTimeInterval] = []
     private var meterPresentedTimestamps: [CFTimeInterval] = []
     private var timelineInputTimestamps: [CFTimeInterval] = []
+    private var mainThreadStallPenalties: [MainThreadStallPenalty] = []
     private var renderDemand: PerformanceRenderDemand = .idle
-    private var lastActiveTimelineFramesPerSecond: Double = 0
+    private var renderDemandStartedAt = CACurrentMediaTime()
+    private var lastMainThreadHeartbeatTimestamp: CFTimeInterval?
     private var targetFramesPerSecond: Double = 144
     private var latestCPUPercent: Double = 0
     private var latestTimelineInputEventKind = "-"
@@ -53,9 +60,6 @@ final class PerformanceSampler: @unchecked Sendable {
     func recordTimelineFramePresented(at timestamp: CFTimeInterval = CACurrentMediaTime()) {
         lock.lock()
         append(timestamp, to: &timelinePresentedTimestamps, now: timestamp)
-        if renderDemand != .idle {
-            updateLastActiveTimelineFramesPerSecond(now: timestamp)
-        }
         lock.unlock()
     }
 
@@ -80,6 +84,16 @@ final class PerformanceSampler: @unchecked Sendable {
 
     func updateRenderDemand(_ demand: PerformanceRenderDemand) {
         lock.lock()
+        if renderDemand == .idle, demand != .idle {
+            // A previous active interval must not contaminate the next one.
+            // Otherwise a fresh interaction can temporarily report a very low
+            // rate because its first frames are averaged with stale timestamps.
+            timelinePresentedTimestamps.removeAll(keepingCapacity: true)
+            timelineCompletedTimestamps.removeAll(keepingCapacity: true)
+            renderDemandStartedAt = CACurrentMediaTime()
+        } else if renderDemand != demand {
+            renderDemandStartedAt = CACurrentMediaTime()
+        }
         renderDemand = demand
         lock.unlock()
     }
@@ -88,6 +102,43 @@ final class PerformanceSampler: @unchecked Sendable {
         lock.lock()
         targetFramesPerSecond = Double(max(framesPerSecond, 1))
         lock.unlock()
+    }
+
+    func recordMainThreadHeartbeat(
+        at timestamp: CFTimeInterval = CACurrentMediaTime(),
+        isApplicationActive: Bool
+    ) {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+
+        trimMainThreadStallPenalties(now: timestamp)
+        guard isApplicationActive else {
+            lastMainThreadHeartbeatTimestamp = nil
+            mainThreadStallPenalties.removeAll(keepingCapacity: true)
+            return
+        }
+
+        defer {
+            lastMainThreadHeartbeatTimestamp = timestamp
+        }
+        guard let previousTimestamp = lastMainThreadHeartbeatTimestamp else {
+            return
+        }
+
+        let interval = max(timestamp - previousTimestamp, 0)
+        // The meter heartbeat normally runs at 30 Hz with timer tolerance.
+        // Only treat gaps beyond two normal ticks as a meaningful UI stall.
+        guard interval > 0.075 else {
+            return
+        }
+
+        let missedFrames = max(interval * targetFramesPerSecond - 1, 0)
+        mainThreadStallPenalties.append(MainThreadStallPenalty(
+            timestamp: timestamp,
+            missedDisplayFrames: min(missedFrames, targetFramesPerSecond)
+        ))
     }
 
     @discardableResult
@@ -132,11 +183,21 @@ final class PerformanceSampler: @unchecked Sendable {
         let inputAge = timelineInputTimestamps.last.map { timestamp - $0 }
         let demand = renderDemand
         let cpu = latestCPUPercent
-        let lastActive = lastActiveTimelineFramesPerSecond
         let targetFPS = targetFramesPerSecond
         let inputKind = latestTimelineInputEventKind
-        let isIdleGraphSample = demand == .idle
-        let graphFPS = isIdleGraphSample ? (lastActive > 1 ? lastActive : targetFPS) : presentedFPS
+        let demandAge = max(timestamp - renderDemandStartedAt, 0)
+        trimMainThreadStallPenalties(now: timestamp)
+        let responsivenessFPS = max(
+            targetFPS - mainThreadStallPenalties.reduce(0) { $0 + $1.missedDisplayFrames },
+            0
+        )
+        let renderHealthFPS = Self.effectiveFrameHealthFramesPerSecond(
+            measuredFramesPerSecond: presentedFPS,
+            targetFramesPerSecond: targetFPS,
+            renderDemand: demand,
+            activeDemandAge: demandAge
+        )
+        let graphFPS = min(renderHealthFPS, responsivenessFPS)
         lock.unlock()
 
         return PerformanceMetricsSnapshot(
@@ -144,8 +205,8 @@ final class PerformanceSampler: @unchecked Sendable {
             timelineFramesPerSecond: presentedFPS,
             timelineCompletedFramesPerSecond: completedFPS,
             timelineGraphFramesPerSecond: graphFPS,
-            timelineGraphIsIdle: isIdleGraphSample,
-            lastActiveTimelineFramesPerSecond: lastActive,
+            targetFramesPerSecond: targetFPS,
+            mainThreadResponsivenessFramesPerSecond: responsivenessFPS,
             meterFramesPerSecond: meterFPS,
             cpuPercent: cpu,
             renderDemand: demand,
@@ -158,10 +219,30 @@ final class PerformanceSampler: @unchecked Sendable {
         )
     }
 
-    private func updateLastActiveTimelineFramesPerSecond(now: CFTimeInterval) {
-        let measuredFPS = framesPerSecond(from: timelinePresentedTimestamps, now: now)
-        if measuredFPS > 1 {
-            lastActiveTimelineFramesPerSecond = measuredFPS
+    static func effectiveFrameHealthFramesPerSecond(
+        measuredFramesPerSecond: Double,
+        targetFramesPerSecond: Double,
+        renderDemand: PerformanceRenderDemand,
+        activeDemandAge: CFTimeInterval
+    ) -> Double {
+        let target = max(targetFramesPerSecond, 1)
+        guard renderDemand != .idle else {
+            return target
+        }
+
+        if measuredFramesPerSecond > 0 {
+            return min(measuredFramesPerSecond, target)
+        }
+
+        // It takes two presentation timestamps to establish a cadence. Do not
+        // report a false zero during that short measurement warm-up.
+        return activeDemandAge <= 0.10 ? target : 0
+    }
+
+    private func trimMainThreadStallPenalties(now: CFTimeInterval) {
+        let oldestTimestamp = now - rateWindow
+        while let first = mainThreadStallPenalties.first, first.timestamp < oldestTimestamp {
+            mainThreadStallPenalties.removeFirst()
         }
     }
 

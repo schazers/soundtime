@@ -1,6 +1,11 @@
 import Foundation
 
 struct TranscriptSourceTimeMap: Codable, Equatable, Sendable {
+    struct Projection: Equatable, Sendable {
+        var sourceRange: Range<TimeInterval>
+        var outputRange: Range<TimeInterval>
+    }
+
     struct Segment: Codable, Equatable, Sendable {
         var outputStartTime: TimeInterval
         var outputEndTime: TimeInterval
@@ -108,14 +113,39 @@ struct TranscriptSourceTimeMap: Codable, Equatable, Sendable {
     }
 
     static func fromTimeline(_ timeline: AudioFileEditTimeline) -> TranscriptSourceTimeMap {
-        let sampleRate = timeline.sourceSampleRate
+        fromPlaybackSegments(
+            timeline.playbackSegments,
+            sampleRate: timeline.sourceSampleRate,
+            sourceFrameCount: timeline.sourceFrameCount,
+            timelineFrameCount: timeline.frameCount
+        )
+    }
+
+    static func fromTimeline(_ timeline: AudioEditTimeline) -> TranscriptSourceTimeMap {
+        fromPlaybackSegments(
+            timeline.playbackSegments,
+            sampleRate: timeline.sourceAudioBuffer.sampleRate,
+            sourceFrameCount: timeline.sourceAudioBuffer.frameCount,
+            timelineFrameCount: timeline.frameCount
+        )
+    }
+
+    private static func fromPlaybackSegments(
+        _ playbackSegments: [AudioEditTimeline.PlaybackSegment],
+        sampleRate: Double,
+        sourceFrameCount: Int,
+        timelineFrameCount: Int
+    ) -> TranscriptSourceTimeMap {
         guard sampleRate > 0 else {
             return .identity(duration: 0)
         }
-        let sourceDuration = TimeInterval(timeline.sourceFrameCount) / sampleRate
-        let timelineDuration = timeline.duration
-        let segments = timeline.playbackSegments.map { segment in
-            Segment(
+        let sourceDuration = TimeInterval(sourceFrameCount) / sampleRate
+        let timelineDuration = TimeInterval(timelineFrameCount) / sampleRate
+        let segments = playbackSegments.compactMap { segment -> Segment? in
+            guard max(segment.gainStart, segment.gainEnd) > AudioSegmentArrangement.gainEpsilon else {
+                return nil
+            }
+            return Segment(
                 outputStartTime: TimeInterval(segment.outputStartFrame) / sampleRate,
                 outputEndTime: TimeInterval(segment.outputStartFrame + segment.frameCount) / sampleRate,
                 sourceStartTime: TimeInterval(segment.sourceStartFrame) / sampleRate,
@@ -168,7 +198,37 @@ struct TranscriptSourceTimeMap: Codable, Equatable, Sendable {
     }
 
     func projectRanges(forSourceRange sourceRange: Range<TimeInterval>) -> [Range<TimeInterval>] {
-        segments.compactMap { $0.outputRange(forSourceRange: sourceRange) }
+        projections(forSourceRange: sourceRange).map(\.outputRange)
+    }
+
+    func projections(forSourceRange sourceRange: Range<TimeInterval>) -> [Projection] {
+        segments.compactMap { segment in
+            let segmentSourceRange = Range(
+                uncheckedBounds: (
+                    lower: min(segment.sourceStartTime, segment.sourceEndTime),
+                    upper: max(segment.sourceStartTime, segment.sourceEndTime)
+                )
+            )
+            let overlapStart = max(sourceRange.lowerBound, segmentSourceRange.lowerBound)
+            let overlapEnd = min(sourceRange.upperBound, segmentSourceRange.upperBound)
+            guard overlapEnd > overlapStart,
+                  let outputRange = segment.outputRange(
+                      forSourceRange: overlapStart..<overlapEnd
+                  )
+            else {
+                return nil
+            }
+            return Projection(
+                sourceRange: overlapStart..<overlapEnd,
+                outputRange: outputRange
+            )
+        }
+        .sorted { lhs, rhs in
+            if lhs.outputRange.lowerBound == rhs.outputRange.lowerBound {
+                return lhs.outputRange.upperBound < rhs.outputRange.upperBound
+            }
+            return lhs.outputRange.lowerBound < rhs.outputRange.lowerBound
+        }
     }
 
     func sourceRangeCoveringProjectRange(_ projectRange: Range<TimeInterval>) -> Range<TimeInterval>? {

@@ -40,15 +40,15 @@ struct TimelineFrameStats: Equatable, Sendable {
 struct SelectionDragWaveformTuning: Equatable, Sendable {
     static let defaultValue = SelectionDragWaveformTuning()
 
-    var minimumSpeedPixelsPerSecond: Float = 120
-    var fullSpeedPixelsPerSecond: Float = 1_800
-    var contactLifetime: CFTimeInterval = 0.174
-    var frontRadiusPixels: Float = 10
-    var backRadiusPixels: Float = 38
-    var contactCoreRadiusPixels: Float = 3
-    var maximumExpansion: Float = 0.38
-    var maximumWhitening: Float = 0.65
-    var maximumContactCount: Int = 4
+    var minimumSpeedPixelsPerSecond: Float = 487
+    var fullSpeedPixelsPerSecond: Float = 928
+    var contactLifetime: CFTimeInterval = 0.231
+    var frontRadiusPixels: Float = 18
+    var backRadiusPixels: Float = 61
+    var contactCoreRadiusPixels: Float = 11
+    var maximumExpansion: Float = 0.30
+    var maximumWhitening: Float = 0.50
+    var maximumContactCount: Int = 1
     var particleLimit: Int = 56
 
     var sanitized: SelectionDragWaveformTuning {
@@ -755,6 +755,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
 
     private final class TimelineInteractionStateStore {
+        struct FrameSnapshot {
+            let renderState: TimelineRenderState
+            let selectionDragSnapshot: TimelineSelectionDragSnapshot?
+            let selectionDragWaveformContacts: [SelectionDragWaveformContact]
+            let loopRange: TimelineLoopRange?
+        }
+
         private let lock = NSLock()
         private var viewport: TimelineViewport?
         private var selection: TimelineSelection?
@@ -762,6 +769,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         private var selectionDragWaveformContacts: [SelectionDragWaveformContact] = []
         private var hoverProgress: Float?
         private var isHoverArmed = false
+        private var loopRange: TimelineLoopRange?
 
         func publishViewport(_ viewport: TimelineViewport) {
             lock.lock()
@@ -827,18 +835,43 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             isHoverArmed = isArmed
         }
 
+        func publishLoopRange(_ loopRange: TimelineLoopRange?) {
+            lock.lock()
+            defer {
+                lock.unlock()
+            }
+            self.loopRange = loopRange
+        }
+
         func applying(to state: TimelineRenderState) -> TimelineRenderState {
             lock.lock()
             defer {
                 lock.unlock()
             }
-            var state = state
-            if let viewport {
-                state = state.withViewport(viewport)
+            return applyingInteractionState(to: state)
+        }
+
+        func frameSnapshot(
+            applyingTo state: TimelineRenderState,
+            displayTimestamp: CFTimeInterval,
+            contactLifetime: CFTimeInterval,
+            maximumContactCount: Int
+        ) -> FrameSnapshot {
+            lock.lock()
+            defer {
+                lock.unlock()
             }
-            return state
-                .withSelection(selection)
-                .withHover(progress: hoverProgress, isArmed: isHoverArmed)
+            pruneSelectionDragWaveformContacts(
+                displayTimestamp: displayTimestamp,
+                lifetime: contactLifetime,
+                maximumCount: maximumContactCount
+            )
+            return FrameSnapshot(
+                renderState: applyingInteractionState(to: state),
+                selectionDragSnapshot: selectionDragSnapshot,
+                selectionDragWaveformContacts: selectionDragWaveformContacts,
+                loopRange: loopRange
+            )
         }
 
         func currentSelectionDragSnapshot() -> TimelineSelectionDragSnapshot? {
@@ -847,23 +880,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 lock.unlock()
             }
             return selectionDragSnapshot
-        }
-
-        func selectionDragWaveformContactsSnapshot(
-            displayTimestamp: CFTimeInterval,
-            lifetime: CFTimeInterval,
-            maximumCount: Int
-        ) -> [SelectionDragWaveformContact] {
-            lock.lock()
-            defer {
-                lock.unlock()
-            }
-            pruneSelectionDragWaveformContacts(
-                displayTimestamp: displayTimestamp,
-                lifetime: lifetime,
-                maximumCount: maximumCount
-            )
-            return selectionDragWaveformContacts
         }
 
         private func pruneSelectionDragWaveformContacts(
@@ -882,6 +898,16 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                     selectionDragWaveformContacts.count - storageMaximumCount
                 )
             }
+        }
+
+        private func applyingInteractionState(to state: TimelineRenderState) -> TimelineRenderState {
+            var state = state
+            if let viewport {
+                state = state.withViewport(viewport)
+            }
+            return state
+                .withSelection(selection)
+                .withHover(progress: hoverProgress, isArmed: isHoverArmed)
         }
     }
 
@@ -2342,12 +2368,18 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
 
     func displayLoopRange(_ loopRange: TimelineLoopRange) {
+        interactionStateStore.publishLoopRange(nil)
         guard self.loopRange != loopRange else {
             return
         }
 
         markWaveformHotInteraction()
         self.loopRange = loopRange
+    }
+
+    func publishInteractionLoopRange(_ loopRange: TimelineLoopRange) {
+        markWaveformHotInteraction()
+        interactionStateStore.publishLoopRange(loopRange)
     }
 
     func displayLoopRangeEnabled(_ isEnabled: Bool) {
@@ -2416,9 +2448,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return visualViewportProgress
         }
 
-        let playheadProgress = projectedPlayheadProgress(at: timestamp) ?? renderState.playheadProgress
+        let presentationState = currentPresentationRenderState()
+        let playheadProgress = projectedPlayheadProgress(
+            at: timestamp,
+            renderState: presentationState
+        ) ?? presentationState.playheadProgress
         var fisheye = waveformFisheyeParameters(
-            renderState: renderState,
+            renderState: presentationState,
             playheadProgress: playheadProgress,
             displayTimestamp: timestamp
         )
@@ -2436,23 +2472,27 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         for selection: TimelineSelection,
         displayTimestamp: CFTimeInterval
     ) -> SIMD4<Float> {
-        let playheadProgress = projectedPlayheadProgress(at: displayTimestamp) ?? renderState.playheadProgress
+        let presentationState = currentPresentationRenderState()
+        let playheadProgress = projectedPlayheadProgress(
+            at: displayTimestamp,
+            renderState: presentationState
+        ) ?? presentationState.playheadProgress
         let baseFisheye = waveformFisheyeParameters(
-            renderState: renderState,
+            renderState: presentationState,
             playheadProgress: playheadProgress,
             displayTimestamp: displayTimestamp
         )
         let effectFisheye = selectionFisheye(
             for: selection,
-            renderState: renderState,
+            renderState: presentationState,
             baseFisheye: baseFisheye,
             displayTimestamp: displayTimestamp
         )
 
-        var left = renderState.viewport.viewportProgress(
+        var left = presentationState.viewport.viewportProgress(
             forTimelineProgress: selection.startProgressFloat
         )
-        var right = renderState.viewport.viewportProgress(
+        var right = presentationState.viewport.viewportProgress(
             forTimelineProgress: selection.endProgressFloat
         )
         left = fisheyeX(left, fisheye: effectFisheye)
@@ -2462,6 +2502,18 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         return SIMD4<Float>(left, right, right, 0)
+    }
+
+    private func currentPresentationRenderState() -> TimelineRenderState {
+        interactionStateStore.applying(to: renderStateStore.snapshot())
+    }
+
+    func currentPresentationViewportProgress(
+        forTimelineProgress progress: Float
+    ) -> Float {
+        currentPresentationRenderState().viewport.viewportProgress(
+            forTimelineProgress: progress
+        )
     }
 
     func triggerDeletionEffect(selection: TimelineSelection, sourceSelection: TimelineSelection? = nil) {
@@ -2737,7 +2789,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         encoder.endEncoding()
 
         commandBuffer.present(target.drawable)
-        PerformanceSampler.shared.recordTimelineFramePresented()
+        PerformanceSampler.shared.recordTimelineFramePresented(at: target.displayTimestamp)
         commandBuffer.addCompletedHandler { _ in
             PerformanceSampler.shared.recordTimelineFrameCompleted()
         }
@@ -2786,14 +2838,17 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         publishesFrameStats: Bool
     ) {
         resetFrameDiagnosticsForNextFrame()
-        let renderState = interactionStateStore.applying(to: renderStateStore.snapshot())
-        let selectionDragSnapshot = interactionStateStore.currentSelectionDragSnapshot()
         let selectionDragTuning = selectionDragWaveformTuning
-        let selectionDragWaveformContacts = interactionStateStore.selectionDragWaveformContactsSnapshot(
+        let interactionFrame = interactionStateStore.frameSnapshot(
+            applyingTo: renderStateStore.snapshot(),
             displayTimestamp: displayTimestamp,
-            lifetime: selectionDragTuning.contactLifetime,
-            maximumCount: selectionDragTuning.maximumContactCount
+            contactLifetime: selectionDragTuning.contactLifetime,
+            maximumContactCount: selectionDragTuning.maximumContactCount
         )
+        let renderState = interactionFrame.renderState
+        let selectionDragSnapshot = interactionFrame.selectionDragSnapshot
+        let selectionDragWaveformContacts = interactionFrame.selectionDragWaveformContacts
+        let presentedLoopRange = interactionFrame.loopRange ?? loopRange
         let isSelectionDragFrame = isSelectionDragEffectActive(
             selectionDragSnapshot,
             displayTimestamp: displayTimestamp
@@ -3007,6 +3062,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             drawableSize: viewportSize,
             backingScale: backingScale,
             renderState: renderState,
+            loopRange: presentedLoopRange,
             displayTimestamp: displayTimestamp
         )
         let trimPreviewVertices = makeTrimPreviewVertices(
@@ -5507,6 +5563,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         drawableSize: CGSize,
         backingScale: Float,
         renderState: TimelineRenderState,
+        loopRange: TimelineLoopRange,
         displayTimestamp: CFTimeInterval
     ) -> LoopRegionUniform? {
         guard
@@ -12991,14 +13048,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         return color;
     }
 
-    static float hash11(float value) {
-        return fract(sin(value * 12.9898) * 43758.5453123);
-    }
-
-    static float hash21(float2 value) {
-        return fract(sin(dot(value, float2(127.1, 311.7))) * 43758.5453123);
-    }
-
     vertex SelectionOverlayRasterizedVertex selection_overlay_vertex(
         uint vertexID [[vertex_id]],
         constant WaveformShaderQuadVertex *vertices [[buffer(0)]],
@@ -13167,6 +13216,60 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float4 baseColor,
         float4 progressFillColor
     ) {
+        // Most of a large selection is a stable translucent fill. Blend from
+        // the detailed perimeter into that fill using the rounded-rect signed
+        // distance, then take the cheap path once the blend is complete.
+        float dragEdgeLocalX = style.x;
+        float dragStrength = clamp(style.y, 0.0, 1.0);
+        float edgeBandPixels = max(radiusPixels + 7.0, 20.0);
+        float interiorDepth = min(
+            min(pixel.x, widthPixels - pixel.x),
+            min(pixel.y, heightPixels - pixel.y)
+        );
+        float transitionStart = max(edgeBandPixels - 8.0, 0.0);
+        float transitionEnd = edgeBandPixels + 8.0;
+        float interiorBlend = smoothstep(transitionStart, transitionEnd, interiorDepth);
+        if (dragEdgeLocalX >= 0.0 && dragEdgeLocalX <= 1.0 && dragStrength > 0.001) {
+            float dragEdgePixels = dragEdgeLocalX * widthPixels;
+            float dragBandPixels = 24.0 + dragStrength * 20.0;
+            float dragBandBlend = 1.0 - smoothstep(
+                dragBandPixels,
+                dragBandPixels + 10.0,
+                abs(pixel.x - dragEdgePixels)
+            );
+            interiorBlend *= 1.0 - dragBandBlend;
+        }
+
+        // Keep the broad center fill intentionally flat and cheap. The
+        // detailed perimeter converges continuously to this exact color.
+        float4 interiorColor = float4(baseColor.rgb, baseColor.a * 0.78);
+
+        if (progressFraction >= 0.0 && localPosition.x <= progressFraction) {
+            float4 progressColor = float4(
+                progressFillColor.rgb,
+                progressFillColor.a * 0.76
+            );
+            interiorColor = source_over(interiorColor, progressColor);
+        }
+
+        float copyPulse = clamp(pulse.x, 0.0, 1.0);
+        if (copyPulse > 0.001) {
+            interiorColor = source_over(
+                interiorColor,
+                float4(
+                    mix(float3(0.42, 0.96, 1.0), float3(1.0), 0.56),
+                    0.10 + 0.32 * copyPulse
+                )
+            );
+        }
+
+        if (interiorBlend >= 0.999) {
+            return float4(
+                clamp(interiorColor.rgb, float3(0.0), float3(1.0)),
+                clamp(interiorColor.a, 0.0, 1.0)
+            );
+        }
+
         float2 centered = pixel - float2(widthPixels, heightPixels) * 0.5;
         float distance = rounded_rect_signed_distance(
             centered,
@@ -13179,18 +13282,27 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return float4(0.0);
         }
 
+        float topAmount = max(1.0 - localPosition.y, 0.0);
+        float topSheen = topAmount * topAmount;
+        float lowerAmount = max(localPosition.y, 0.0);
+        float lowerShade = lowerAmount * lowerAmount * lowerAmount;
         float edgeDistance = abs(distance);
-        float rim = exp(-(edgeDistance * edgeDistance) / max(18.0, 16.0 + radiusPixels * 0.35));
-        float innerRim = exp(-pow(max(-distance, 0.0) / max(6.0, radiusPixels * 0.55), 2.0));
-        float outerRim = exp(-pow(max(distance, 0.0) / max(5.0, radiusPixels * 0.35), 2.0));
-        float topSheen = pow(max(1.0 - localPosition.y, 0.0), 2.35);
-        float lowerShade = pow(max(localPosition.y, 0.0), 2.8);
-        float caustic = hash21(floor(pixel * float2(0.115, 0.073) + style.w));
-        caustic = smoothstep(0.46, 1.0, caustic) * 0.42;
-        float wave = 0.5 + 0.5 * sin((pixel.x * 0.055 - pixel.y * 0.018) + style.w * 0.24);
+        float rim = 1.0 - smoothstep(
+            0.0,
+            max(4.0, 4.0 + radiusPixels * 0.10),
+            edgeDistance
+        );
+        float innerRim = 1.0 - smoothstep(
+            0.0,
+            max(6.0, radiusPixels * 0.55),
+            max(-distance, 0.0)
+        );
+        float outerRim = 1.0 - smoothstep(
+            0.0,
+            max(4.0, radiusPixels * 0.35),
+            max(distance, 0.0)
+        );
 
-        float dragEdgeLocalX = style.x;
-        float dragStrength = clamp(style.y, 0.0, 1.0);
         float dragDirection = style.z >= 0.0 ? 1.0 : -1.0;
         float dragEdge = 0.0;
         float refractivePush = 0.0;
@@ -13199,10 +13311,20 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             float distX = abs(pixel.x - edgeX);
             float insideSide = dragDirection > 0.0 ? step(pixel.x, edgeX) : step(edgeX, pixel.x);
             float outsideDistance = dragDirection > 0.0 ? max(pixel.x - edgeX, 0.0) : max(edgeX - pixel.x, 0.0);
-            float outsideLimiter = exp(-(outsideDistance * outsideDistance) / max(14.0, 6.0 + dragStrength * 12.0));
-            float insideTrail = exp(-(distX * distX) / max(72.0, 30.0 + dragStrength * 95.0));
+            float outsideLimiter = 1.0 - smoothstep(
+                0.0,
+                2.5 + dragStrength * 2.0,
+                outsideDistance
+            );
+            float insideTrail = 1.0 - smoothstep(
+                0.0,
+                8.5 + dragStrength * 3.0,
+                distX
+            );
             dragEdge = mix(outsideLimiter * 0.34, insideTrail, insideSide) * dragStrength;
-            refractivePush = exp(-(distX * distX) / max(20.0, 10.0 + dragStrength * 26.0)) * dragStrength;
+            refractivePush = (
+                1.0 - smoothstep(0.0, 3.2 + dragStrength * 2.8, distX)
+            ) * dragStrength;
         }
 
         float4 base = baseColor;
@@ -13210,7 +13332,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float3 glassTint = base.rgb;
         glassTint = mix(glassTint, float3(0.78, 1.0, 1.0), 0.20 * topSheen + 0.12 * rim + 0.18 * dragEdge);
         glassTint = mix(glassTint, float3(0.02, 0.18, 0.19), 0.12 * lowerShade);
-        glassTint += float3(0.06, 0.10, 0.11) * caustic * (0.25 + 0.35 * wave);
         glassTint += float3(0.18, 0.35, 0.38) * refractivePush * 0.18;
 
         float4 color = float4(glassTint, glassAlpha * coverage);
@@ -13229,7 +13350,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             color = source_over(color, progressColor);
         }
 
-        float copyPulse = clamp(pulse.x, 0.0, 1.0);
         if (copyPulse > 0.001) {
             float4 pulseColor = float4(
                 mix(float3(0.42, 0.96, 1.0), float3(1.0), 0.56),
@@ -13238,6 +13358,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             color = source_over(color, pulseColor);
         }
 
+        color = mix(color, interiorColor, interiorBlend);
         return float4(clamp(color.rgb, float3(0.0), float3(1.0)), clamp(color.a, 0.0, 1.0));
     }
 
@@ -13295,11 +13416,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     ) {
         float widthPixels = max(in.metrics.x, 1.0);
         float heightPixels = max(in.metrics.y, 1.0);
-        float halfWidthPixels = max(in.metrics.z, 1.0);
         float edgeLocalX = clamp(in.metrics.w, 0.0, 1.0);
         float strength = clamp(in.effect.x, 0.0, 1.0);
-        float age = max(in.effect.y, 0.0);
-        float seed = in.effect.z;
         float direction = in.effect.w >= 0.0 ? 1.0 : -1.0;
 
         float2 pixel = float2(in.localPosition.x * widthPixels, in.localPosition.y * heightPixels);
@@ -13329,18 +13447,21 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float capsuleDistance = length(pixel - float2(edgeX, clampedY));
 
         float glowWidth = 6.0 + 14.0 * strength;
-        float glow = exp(-(capsuleDistance * capsuleDistance) / max(glowWidth * glowWidth, 0.001));
-        float aura = exp(-(capsuleDistance * capsuleDistance) / max(pow(glowWidth * 1.85, 2.0), 0.001));
+        float glow = 1.0 - smoothstep(0.0, glowWidth, capsuleDistance);
+        float aura = 1.0 - smoothstep(
+            glowWidth * 0.45,
+            glowWidth * 1.85,
+            capsuleDistance
+        );
 
         float trailingSide = direction > 0.0 ? step(pixel.x, edgeX) : step(edgeX, pixel.x);
         float outsideDistance = direction > 0.0 ? max(pixel.x - edgeX, 0.0) : max(edgeX - pixel.x, 0.0);
         float outsideWidth = 2.2 + 1.3 * strength;
         float outsideLimiter = mix(
-            exp(-(outsideDistance * outsideDistance) / max(outsideWidth * outsideWidth, 0.001)),
+            1.0 - smoothstep(0.0, outsideWidth, outsideDistance),
             1.0,
             trailingSide
         );
-        float trailDistance = direction > 0.0 ? max(edgeX - pixel.x, 0.0) : max(pixel.x - edgeX, 0.0);
         float alpha = in.color.a * strength * outsideLimiter * roundedSelectionCoverage * (glow * 0.32 + aura * 0.12);
         float3 glowColor = mix(float3(0.22, 0.86, 1.0), float3(1.0), min(glow * 0.18, 1.0));
         float3 color = mix(in.color.rgb, glowColor, 0.42 + 0.36 * strength);

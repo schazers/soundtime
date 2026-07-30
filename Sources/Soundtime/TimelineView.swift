@@ -501,6 +501,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         viewport
     }
 
+    var currentTimelineDuration: TimeInterval {
+        timelineDuration
+    }
+
     func restoreViewport(_ restoredViewport: TimelineViewport?) {
         guard let restoredViewport else {
             pendingRestoredViewport = nil
@@ -821,6 +825,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             isDraggingSelection = false
             isDraggingTrim = false
             isDraggingLoop = false
+            let committedLoopRange = loopRange
+            updateTimelineRendererImmediately { renderer in
+                renderer.displayLoopRange(committedLoopRange)
+            }
             activeTranscriptDrag = nil
             activeLoopDragOffsetX = 0
             displayHoverProgress(nil)
@@ -970,6 +978,73 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
         requestTimelineRender()
         return submissionMilliseconds
+    }
+
+    func visualInvariantSmokePanAndSelectRange(
+        trackID: UUID,
+        viewport: TimelineViewport,
+        startViewportProgress: Double,
+        endViewportProgress: Double,
+        viewportAfterSelection: TimelineViewport? = nil,
+        stagedZoomMomentumVelocity: Float? = nil
+    ) -> TimelineSelection? {
+        guard
+            let trackIndex = currentTrackIDs.firstIndex(of: trackID),
+            bounds.width > 0,
+            bounds.height > 0,
+            let laneFrame = resolvedTrackLayoutForCurrentBounds().laneFrame(forTrackIndex: trackIndex)
+        else {
+            return nil
+        }
+
+        setViewport(
+            viewport,
+            transcriptCadence: .coalescedInteraction,
+            invalidatesCursorRects: false,
+            renderCadence: .coalescedInteraction
+        )
+
+        let yFromTop = (CGFloat(laneFrame.clampedTop) + CGFloat(laneFrame.clampedBottom)) *
+            bounds.height * 0.5
+        let y = bounds.height - yFromTop
+        let startPoint = CGPoint(
+            x: min(max(startViewportProgress, 0), 1) * bounds.width,
+            y: y
+        )
+        let endPoint = CGPoint(
+            x: min(max(endViewportProgress, 0), 1) * bounds.width,
+            y: y
+        )
+        selectionAnchorTrackID = trackID
+        let startProgress = preciseProgress(for: startPoint)
+        let endProgress = preciseProgress(for: endPoint)
+        updateSelection(
+            from: startProgress,
+            to: endProgress,
+            notifyChange: true
+        )
+        selectionAnchorTrackID = nil
+        if let viewportAfterSelection {
+            setViewport(
+                viewportAfterSelection,
+                transcriptCadence: .coalescedInteraction,
+                invalidatesCursorRects: false,
+                renderCadence: .coalescedInteraction
+            )
+        }
+        if let stagedZoomMomentumVelocity {
+            stopZoomMomentum()
+            zoomMomentumAnchorProgress = 0.5
+            zoomVelocityLogScalePerSecond = stagedZoomMomentumVelocity
+            zoomMomentumLastTime = CFAbsoluteTimeGetCurrent() - (1 / 120)
+        }
+        return currentSelection
+    }
+
+    func visualInvariantSmokeAdvancePendingZoomMomentum() -> Bool {
+        let previousViewport = viewport
+        stepZoomMomentum()
+        return viewport != previousViewport
     }
 
     func interactionReplaySmokeTranscriptHoverClickSelect() -> Bool {
@@ -1203,6 +1278,17 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
     }
 
+    func prepareForEditTransaction() {
+        stopRightPanMomentum()
+        stopZoomMomentum()
+        scrollGestureMode = nil
+        flushPendingCursorRectInvalidationIfNeeded()
+        let stableViewport = viewport
+        updateTimelineRendererImmediately { renderer in
+            renderer.commitViewport(stableViewport, marksInteraction: true)
+        }
+    }
+
     func triggerDeletionEffect(selection: TimelineSelection, sourceSelection: TimelineSelection? = nil) {
         triggerDeletionEffects([
             TimelineDeletionEffectRequest(
@@ -1275,6 +1361,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
         updatePreferredFrameRate()
+        requestTimelineRender()
+    }
+
+    override func viewDidEndLiveResize() {
+        super.viewDidEndLiveResize()
+        updateTrackLayoutForCurrentBounds(requestRender: false)
+        performTranscriptOverlayUpdate(forceLayoutRebuild: true)
+        invalidateTimelineCursorRects()
         requestTimelineRender()
     }
 
@@ -2967,13 +3061,23 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                         invalidatesCursorRects: false
                     )
                     displayHoverProgress(dragProgress, isArmed: true, renderCadence: .coalescedInteraction)
-                } else {
+                } else if isDraggingLoop {
                     updateLoopRange(
                         for: activeDragMode,
                         progress: dragProgress,
                         renderCadence: .coalescedInteraction,
                         invalidatesCursorRects: false
                     )
+                    if let endpoint = loopEndpoint(for: activeDragMode) {
+                        let boundaryProgress = endpoint == .start ?
+                            loopRange.startProgress :
+                            loopRange.endProgress
+                        displayHoverProgress(
+                            boundaryProgress,
+                            isArmed: true,
+                            renderCadence: .coalescedInteraction
+                        )
+                    }
                 }
             }
             return
@@ -3820,7 +3924,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
     }
 
-    private func performTranscriptOverlayUpdate() {
+    private func performTranscriptOverlayUpdate(forceLayoutRebuild: Bool = false) {
         if transcriptOverlayView.requiresLayoutRebuild(
             tracks: currentRenderTracks,
             viewport: viewport,
@@ -3835,13 +3939,15 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                 timelineDuration: timelineDuration,
                 displayMode: transcriptDisplayMode
             )
-            if canReuseLiveGeometry {
+            if canReuseLiveGeometry && !forceLayoutRebuild {
                 updateTranscriptOverlayLiveGeometry()
                 return
             }
-            if shouldDeferTranscriptOverlayLayoutForNonViewportHotPath ||
+            if !forceLayoutRebuild && (
+                shouldDeferTranscriptOverlayLayoutForNonViewportHotPath ||
                 (shouldDeferTranscriptOverlayLayoutForHotPath &&
-                    !isTranscriptViewportRelayoutAllowed) {
+                    !isTranscriptViewportRelayoutAllowed)
+            ) {
                 updateTranscriptOverlayLiveGeometry()
                 scheduleTranscriptOverlayUpdate(after: transcriptOverlayHotPathDeferralInterval)
                 return
@@ -4322,12 +4428,21 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         guard nextRange != loopRange else {
+            if renderCadence == .immediate {
+                updateTimelineRendererImmediately { renderer in
+                    renderer.displayLoopRange(nextRange)
+                }
+            }
             return
         }
 
         loopRange = nextRange
-        updateTimelineRendererImmediately { renderer in
-            renderer.displayLoopRange(nextRange)
+        if renderCadence == .coalescedInteraction {
+            timelineRenderer?.publishInteractionLoopRange(nextRange)
+        } else {
+            updateTimelineRendererImmediately { renderer in
+                renderer.displayLoopRange(nextRange)
+            }
         }
         if invalidatesCursorRects {
             invalidateTimelineCursorRects()
@@ -4356,12 +4471,21 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         guard nextRange != loopRange else {
+            if renderCadence == .immediate {
+                updateTimelineRendererImmediately { renderer in
+                    renderer.displayLoopRange(nextRange)
+                }
+            }
             return
         }
 
         loopRange = nextRange
-        updateTimelineRendererImmediately { renderer in
-            renderer.displayLoopRange(nextRange)
+        if renderCadence == .coalescedInteraction {
+            timelineRenderer?.publishInteractionLoopRange(nextRange)
+        } else {
+            updateTimelineRendererImmediately { renderer in
+                renderer.displayLoopRange(nextRange)
+            }
         }
         if invalidatesCursorRects {
             invalidateTimelineCursorRects()

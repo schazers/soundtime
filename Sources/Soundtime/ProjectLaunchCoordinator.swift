@@ -288,8 +288,7 @@ enum ProjectLaunchCoordinator {
         }
 
         let overlay = SoundtimeProjectStore.rememberedLaunchStateOverlay(for: projectURL)
-        let manifest = ProjectLaunchCacheBundleStore.loadManifest(for: projectURL) ??
-            ProjectLaunchManifestStore.load(for: projectURL)
+        let manifest = ProjectLaunchCacheStore.manifest(for: projectURL)
         return overlay?.windowLayout ??
             manifest?.windowLayout ??
             SoundtimeProjectStore.rememberedWindowLayout(for: projectURL)
@@ -303,9 +302,7 @@ enum ProjectLaunchCoordinator {
         let standardizedProjectURL = projectURL.standardizedFileURL
         let startedAt = CACurrentMediaTime()
 
-        if let manifest = ProjectLaunchCacheBundleStore.loadManifest(for: standardizedProjectURL) ??
-            ProjectLaunchManifestStore.load(for: standardizedProjectURL)
-        {
+        if let manifest = ProjectLaunchCacheStore.manifest(for: standardizedProjectURL) {
             let summary = ProjectLaunchReadinessClassifier.summarize(manifest: manifest)
             guard summary.hasTracks else {
                 return nil
@@ -321,8 +318,9 @@ enum ProjectLaunchCoordinator {
 
         if
             SoundtimeFeatureFlags.firstFrameWaveformPacket,
-            let packet = ProjectFirstFrameWaveformPacketStore
-                .loadShellForFirstPaintIfAvailable(for: standardizedProjectURL)
+            let packet = ProjectLaunchCacheStore.firstFramePacketShell(
+                for: standardizedProjectURL
+            )
         {
             let summary = ProjectLaunchReadinessClassifier.summarize(packet: packet)
             guard summary.hasTracks else {
@@ -337,8 +335,9 @@ enum ProjectLaunchCoordinator {
             )
         }
 
-        guard let snapshot = ProjectLaunchSnapshotStore
-            .loadShellForFirstPaintIfAvailable(for: standardizedProjectURL)
+        guard let snapshot = ProjectLaunchCacheStore.snapshotShell(
+            for: standardizedProjectURL
+        )
         else {
             return nil
         }
@@ -441,8 +440,7 @@ enum ProjectLaunchCoordinator {
         let startedAt = CACurrentMediaTime()
 
         if
-            let snapshot = (try? ProjectLaunchCacheBundleStore.loadSnapshot(for: standardizedProjectURL)) ??
-                (try? ProjectLaunchSnapshotStore.load(for: standardizedProjectURL)),
+            let snapshot = try? ProjectLaunchCacheStore.snapshot(for: standardizedProjectURL),
             snapshot.isDrawable
         {
             let summary = ProjectLaunchReadinessClassifier.summarize(snapshot: snapshot)
@@ -494,15 +492,13 @@ enum ProjectLaunchCoordinator {
     private static func loadPacketFirstFrame(projectURL: URL) -> ProjectLaunchFirstFrame? {
         let startedAt = CACurrentMediaTime()
         guard
-            let packet = ProjectLaunchCacheBundleStore.loadFirstFramePacketForFirstPaintIfAvailable(for: projectURL) ??
-                ProjectFirstFrameWaveformPacketStore.loadForFirstPaintIfAvailable(for: projectURL),
+            let packet = ProjectLaunchCacheStore.firstFramePacket(for: projectURL),
             packet.isDrawable
         else {
             return nil
         }
         if
-            let manifest = ProjectLaunchCacheBundleStore.loadManifest(for: projectURL) ??
-                ProjectLaunchManifestStore.load(for: projectURL),
+            let manifest = ProjectLaunchCacheStore.manifest(for: projectURL),
             let packetFingerprint = packet.visualFingerprint,
             packetFingerprint != manifest.visualFingerprint
         {
@@ -536,15 +532,13 @@ enum ProjectLaunchCoordinator {
     private static func loadSnapshotFirstFrame(projectURL: URL) -> ProjectLaunchFirstFrame? {
         let startedAt = CACurrentMediaTime()
         guard
-            let snapshot = ProjectLaunchCacheBundleStore.loadSnapshotForFirstPaintIfAvailable(for: projectURL) ??
-                ProjectLaunchSnapshotStore.loadForFirstPaintIfAvailable(for: projectURL),
+            let snapshot = ProjectLaunchCacheStore.snapshotForFirstPaint(for: projectURL),
             snapshot.isDrawable
         else {
             return nil
         }
         if
-            let manifest = ProjectLaunchCacheBundleStore.loadManifest(for: projectURL) ??
-                ProjectLaunchManifestStore.load(for: projectURL),
+            let manifest = ProjectLaunchCacheStore.manifest(for: projectURL),
             let snapshotFingerprint = snapshot.visualFingerprint,
             snapshotFingerprint != manifest.visualFingerprint
         {

@@ -579,33 +579,27 @@ private final class PerformanceDashboardView: NSView {
             renderCard.update(lines: ["Renderer      waiting", "GPU draws     0", "Uploads       0", "GPU cache     0 MB"])
         }
 
-        let fpsValue: String
-        let fpsUnit: String
         let fpsSubtitle: String
-        if performanceSnapshot.timelineGraphIsIdle {
-            fpsValue = "idle"
-            fpsUnit = ""
+        if performanceSnapshot.renderDemand == .idle {
             fpsSubtitle = String(
-                format: "last %.0f fps  meter %.0f fps",
-                performanceSnapshot.lastActiveTimelineFramesPerSecond,
-                performanceSnapshot.meterFramesPerSecond
+                format: "responsive %.0f  target %.0f Hz",
+                performanceSnapshot.mainThreadResponsivenessFramesPerSecond,
+                performanceSnapshot.targetFramesPerSecond
             )
         } else {
-            fpsValue = "\(Int(performanceSnapshot.timelineFramesPerSecond.rounded()))"
-            fpsUnit = "fps"
             fpsSubtitle = String(
-                format: "%@  gpu done %.0f fps  meter %.0f fps",
+                format: "%@  presented %.0f  gpu done %.0f",
                 performanceSnapshot.renderDemand.rawValue,
+                performanceSnapshot.timelineFramesPerSecond,
                 performanceSnapshot.timelineCompletedFramesPerSecond,
-                performanceSnapshot.meterFramesPerSecond
             )
         }
         fpsCard.update(
-            value: fpsValue,
-            unit: fpsUnit,
+            value: "\(Int(performanceSnapshot.timelineGraphFramesPerSecond.rounded()))",
+            unit: "fps",
             subtitle: fpsSubtitle,
             sample: CGFloat(performanceSnapshot.timelineGraphFramesPerSecond),
-            maximum: 144
+            maximum: max(CGFloat(performanceSnapshot.targetFramesPerSecond), 60)
         )
 
         cpuCard.update(

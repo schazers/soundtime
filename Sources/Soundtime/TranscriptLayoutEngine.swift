@@ -38,6 +38,7 @@ struct TranscriptTimelineLayoutInput: Sendable {
 
 struct TranscriptTimelineLayout: Sendable {
     struct Background: Sendable {
+        var trackID: UUID
         var rect: CGRect
     }
 
@@ -58,12 +59,47 @@ struct TranscriptTimelineLayout: Sendable {
     var runs: [Run]
 }
 
+struct TranscriptTrackVerticalGeometry: Sendable {
+    let bandRect: CGRect
+    let wordRunHeight: CGFloat
+    let segmentRunHeight: CGFloat
+
+    func runRect(
+        x: CGFloat,
+        width: CGFloat,
+        isWord: Bool
+    ) -> CGRect {
+        let height = isWord ? wordRunHeight : segmentRunHeight
+        return CGRect(
+            x: x,
+            y: bandRect.midY - height * 0.5,
+            width: width,
+            height: height
+        )
+    }
+}
+
 enum TranscriptLayoutEngine {
+    private static let minimumRetainedWordCoverage = 0.5
+
     // These limits bound the prefetched cache, not just the pixels currently
     // visible. They are intentionally large enough for several screens of
     // spoken audio so a normal pan does not synchronously rebuild text.
     static let maximumVisibleWordRuns = 512
     static let maximumVisibleSegmentRuns = 160
+
+    static func usesWordRuns(
+        viewport: TimelineViewport,
+        timelineDuration: TimeInterval,
+        boundsWidth: CGFloat
+    ) -> Bool {
+        let visibleRange = visibleProjectRange(
+            viewport: viewport,
+            timelineDuration: timelineDuration
+        )
+        let secondsPerPixel = visibleRange.duration / max(TimeInterval(boundsWidth), 1)
+        return secondsPerPixel < 0.035
+    }
 
     static func makeLayout(_ input: TranscriptTimelineLayoutInput) -> TranscriptTimelineLayout {
         guard
@@ -93,12 +129,11 @@ enum TranscriptLayoutEngine {
             viewport: input.viewport,
             timelineDuration: input.timelineDuration
         )
-        let densityOutputRange = visibleProjectRange(
+        let useWordRuns = usesWordRuns(
             viewport: input.densityViewport,
-            timelineDuration: input.timelineDuration
+            timelineDuration: input.timelineDuration,
+            boundsWidth: input.bounds.width
         )
-        let secondsPerPixel = densityOutputRange.duration / max(TimeInterval(input.bounds.width), 1)
-        let useWordRuns = secondsPerPixel < 0.035
 
         for trackIndex in visibleTrackRange where input.tracks.indices.contains(trackIndex) {
             let track = input.tracks[trackIndex]
@@ -109,11 +144,16 @@ enum TranscriptLayoutEngine {
                 continue
             }
 
-            let laneRect = rect(for: laneFrame, bounds: input.bounds)
-            guard laneRect.height > 20 else {
+            guard let verticalGeometry = verticalGeometry(
+                for: laneFrame,
+                bounds: input.bounds
+            ) else {
                 continue
             }
-            backgrounds.append(TranscriptTimelineLayout.Background(rect: transcriptBandRect(in: laneRect)))
+            backgrounds.append(TranscriptTimelineLayout.Background(
+                trackID: track.id,
+                rect: verticalGeometry.bandRect
+            ))
 
             let timeMap = transcript.sourceTimeMap ?? TranscriptSourceTimeMap.fromRenderTrack(track)
             if useWordRuns {
@@ -122,12 +162,12 @@ enum TranscriptLayoutEngine {
                     track: track,
                     timeMap: timeMap,
                     visibleOutputRange: visibleOutputRange,
-                    laneRect: laneRect,
+                    verticalGeometry: verticalGeometry,
                     bounds: input.bounds,
                     viewport: input.viewport,
                     timelineDuration: input.timelineDuration
                 )
-                if wordRuns.count <= maximumVisibleWordRuns {
+                if !wordRuns.isEmpty, wordRuns.count <= maximumVisibleWordRuns {
                     runs.append(contentsOf: wordRuns)
                     continue
                 }
@@ -138,7 +178,7 @@ enum TranscriptLayoutEngine {
                 track: track,
                 timeMap: timeMap,
                 visibleOutputRange: visibleOutputRange,
-                laneRect: laneRect,
+                verticalGeometry: verticalGeometry,
                 bounds: input.bounds,
                 viewport: input.viewport,
                 timelineDuration: input.timelineDuration
@@ -163,7 +203,7 @@ enum TranscriptLayoutEngine {
         track: TimelineRenderState.Track,
         timeMap: TranscriptSourceTimeMap,
         visibleOutputRange: TranscriptionTimeRange,
-        laneRect: CGRect,
+        verticalGeometry: TranscriptTrackVerticalGeometry,
         bounds: CGSize,
         viewport: TimelineViewport,
         timelineDuration: TimeInterval
@@ -192,7 +232,18 @@ enum TranscriptLayoutEngine {
                     continue
                 }
 
-                for outputRange in timeMap.projectRanges(forSourceRange: word.startTime..<max(word.endTime, word.startTime + 0.05)) {
+                let wordSourceRange = word.startTime..<max(
+                    word.endTime,
+                    word.startTime + 0.05
+                )
+                for projection in timeMap.projections(forSourceRange: wordSourceRange) {
+                    guard retainedCoverage(
+                        of: wordSourceRange,
+                        in: projection.sourceRange
+                    ) >= minimumRetainedWordCoverage else {
+                        continue
+                    }
+                    let outputRange = projection.outputRange
                     guard outputRange.upperBound >= visibleOutputRange.startTime,
                           outputRange.lowerBound <= visibleOutputRange.endTime
                     else {
@@ -211,11 +262,10 @@ enum TranscriptLayoutEngine {
                         timelineDuration: timelineDuration,
                         boundsWidth: bounds.width
                     )
-                    let rect = CGRect(
+                    let rect = verticalGeometry.runRect(
                         x: x0,
-                        y: laneRect.minY + 14,
                         width: max(x1 - x0, 18),
-                        height: min(max(laneRect.height * 0.20, 22), 28)
+                        isWord: true
                     )
                     guard rect.maxX >= 0, rect.minX <= bounds.width else {
                         continue
@@ -232,7 +282,7 @@ enum TranscriptLayoutEngine {
                         confidence: word.confidence,
                         speakerID: word.speakerID
                     ))
-                    if output.count >= maximumVisibleWordRuns {
+                    if output.count > maximumVisibleWordRuns {
                         return output
                     }
                 }
@@ -247,7 +297,7 @@ enum TranscriptLayoutEngine {
         track: TimelineRenderState.Track,
         timeMap: TranscriptSourceTimeMap,
         visibleOutputRange: TranscriptionTimeRange,
-        laneRect: CGRect,
+        verticalGeometry: TranscriptTrackVerticalGeometry,
         bounds: CGSize,
         viewport: TimelineViewport,
         timelineDuration: TimeInterval
@@ -269,10 +319,22 @@ enum TranscriptLayoutEngine {
                 break
             }
 
-            for outputRange in timeMap.projectRanges(forSourceRange: segment.startTime..<max(segment.endTime, segment.startTime + 0.2)) {
+            let segmentSourceRange = segment.startTime..<max(
+                segment.endTime,
+                segment.startTime + 0.2
+            )
+            for projection in timeMap.projections(forSourceRange: segmentSourceRange) {
+                let outputRange = projection.outputRange
                 guard outputRange.upperBound >= visibleOutputRange.startTime,
                       outputRange.lowerBound <= visibleOutputRange.endTime
                 else {
+                    continue
+                }
+                let projectedText = segmentText(
+                    segment,
+                    retainedIn: projection.sourceRange
+                )
+                guard !projectedText.isEmpty else {
                     continue
                 }
 
@@ -288,11 +350,10 @@ enum TranscriptLayoutEngine {
                     timelineDuration: timelineDuration,
                     boundsWidth: bounds.width
                 )
-                let rect = CGRect(
+                let rect = verticalGeometry.runRect(
                     x: x0,
-                    y: laneRect.minY + 14,
                     width: max(x1 - x0, 36),
-                    height: min(max(laneRect.height * 0.22, 24), 30)
+                    isWord: false
                 )
                 guard rect.maxX >= 0, rect.minX <= bounds.width else {
                     continue
@@ -304,7 +365,7 @@ enum TranscriptLayoutEngine {
                     sourceRange: TranscriptionTimeRange(startTime: segment.startTime, endTime: segment.endTime),
                     projectRange: TranscriptionTimeRange(startTime: outputRange.lowerBound, endTime: outputRange.upperBound),
                     rect: rect,
-                    text: segment.text,
+                    text: projectedText,
                     isWord: false,
                     confidence: segment.confidence,
                     speakerID: segment.speakerID
@@ -318,14 +379,81 @@ enum TranscriptLayoutEngine {
         return output
     }
 
+    private static func segmentText(
+        _ segment: TranscriptSegment,
+        retainedIn sourceRange: Range<TimeInterval>
+    ) -> String {
+        guard !segment.words.isEmpty else {
+            let segmentRange = segment.startTime..<max(
+                segment.endTime,
+                segment.startTime + 0.2
+            )
+            return retainedCoverage(of: segmentRange, in: sourceRange) >=
+                minimumRetainedWordCoverage ? segment.text : ""
+        }
+
+        return segment.words.compactMap { word in
+            let wordRange = word.startTime..<max(
+                word.endTime,
+                word.startTime + 0.05
+            )
+            return retainedCoverage(of: wordRange, in: sourceRange) >=
+                minimumRetainedWordCoverage ? word.text : nil
+        }
+        .joined(separator: " ")
+    }
+
+    private static func retainedCoverage(
+        of range: Range<TimeInterval>,
+        in retainedRange: Range<TimeInterval>
+    ) -> Double {
+        let overlap = max(
+            min(range.upperBound, retainedRange.upperBound) -
+                max(range.lowerBound, retainedRange.lowerBound),
+            0
+        )
+        return overlap / max(range.upperBound - range.lowerBound, 0.000_001)
+    }
+
+    static func verticalGeometry(
+        for laneFrame: TimelineTrackLaneFrame,
+        bounds: CGSize
+    ) -> TranscriptTrackVerticalGeometry? {
+        let laneRect = rect(for: laneFrame, bounds: bounds)
+        guard laneRect.height > 20 else {
+            return nil
+        }
+
+        let bandRect = transcriptBandRect(in: laneRect)
+        return TranscriptTrackVerticalGeometry(
+            bandRect: bandRect,
+            wordRunHeight: transcriptRunHeight(
+                preferredHeight: min(max(laneRect.height * 0.20, 22), 28),
+                bandRect: bandRect
+            ),
+            segmentRunHeight: transcriptRunHeight(
+                preferredHeight: min(max(laneRect.height * 0.22, 24), 30),
+                bandRect: bandRect
+            )
+        )
+    }
+
     private static func transcriptBandRect(in laneRect: CGRect) -> CGRect {
-        let textBandHeight = min(max(laneRect.height * 0.32, 34), 54)
+        let availableHeight = max(laneRect.height - 16, 1)
+        let textBandHeight = min(min(max(laneRect.height * 0.32, 34), 54), availableHeight)
         return CGRect(
             x: laneRect.minX + 8,
             y: laneRect.minY + 8,
             width: max(laneRect.width - 16, 1),
             height: textBandHeight
         )
+    }
+
+    private static func transcriptRunHeight(
+        preferredHeight: CGFloat,
+        bandRect: CGRect
+    ) -> CGFloat {
+        min(preferredHeight, max(bandRect.height - 12, 1))
     }
 
     private static func rect(for laneFrame: TimelineTrackLaneFrame, bounds: CGSize) -> CGRect {

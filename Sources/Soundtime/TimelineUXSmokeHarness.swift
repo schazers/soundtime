@@ -241,6 +241,14 @@ enum TimelineUXSmokeHarness {
         )
         complete("rapid selection drag updates stay responsive and visible")
 
+        try verifyRetinaSelectionDragStaysWithinFrameBudget(
+            renderer: renderer,
+            track: track,
+            device: device,
+            pixelFormat: pixelFormat
+        )
+        complete("Retina selection drag stays within the 144 Hz frame budget")
+
         try verifyHoverGuideUpdatesStayResponsive(
             renderer: renderer,
             track: track,
@@ -309,8 +317,10 @@ enum TimelineUXSmokeHarness {
             try verifyMainFPSGraphPixels()
             try verifyPerformanceDashboardGraphPixels()
         }
+        try verifyFrameHealthMetricSemantics()
         complete("main FPS graph draws visible cyan/red pixels")
         complete("performance monitor FPS/CPU graphs draw visible pixels")
+        complete("FPS meter reports target health while idle and measured drops while active")
 
         if let reportURL = StabilityReportWriter.writePassedSuite(
             name: "timeline-ux-smoke",
@@ -1311,8 +1321,130 @@ enum TimelineUXSmokeHarness {
         )
 
         let changedPixels = pixelDifferenceCount(firstFrame.bytes, lastFrame.bytes, threshold: 8)
+        renderer.publishInteractionSelectionDragSnapshot(nil)
+        renderer.publishInteractionSelection(nil)
         renderer.displaySelection(nil)
         try require(changedPixels > 8_000, "selection drag did not visibly update final selection: \(changedPixels)")
+    }
+
+    private static func verifyRetinaSelectionDragStaysWithinFrameBudget(
+        renderer: TimelineRenderer,
+        track: TimelineRenderState.Track,
+        device: MTLDevice,
+        pixelFormat: MTLPixelFormat
+    ) throws {
+        // Exercise the actual high-fill-rate case that exposed the regression:
+        // a nearly full-screen selection over a multi-track project in a large
+        // Retina editor window, with the loop overlay present too.
+        let viewportSize = CGSize(width: 1_920, height: 900)
+        let backingScale: Float = 2
+        let tracks = [
+            track,
+            renderTrack(
+                from: track,
+                id: UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-000000000102") ?? UUID(),
+                volume: 0.72
+            ),
+            renderTrack(
+                from: track,
+                id: UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-000000000103") ?? UUID(),
+                volume: 0.48
+            ),
+        ]
+        let texture = try makeTexture(
+            device: device,
+            pixelFormat: pixelFormat,
+            width: Int(viewportSize.width * CGFloat(backingScale)),
+            height: Int(viewportSize.height * CGFloat(backingScale))
+        )
+        let baseTimestamp = CACurrentMediaTime()
+        var frameDurations: [Double] = []
+        frameDurations.reserveCapacity(32)
+
+        defer {
+            renderer.publishInteractionSelectionDragSnapshot(nil)
+            renderer.publishInteractionSelection(nil)
+            renderer.displayLoopRange(.default)
+            renderer.displayTracks([track], animateWaveformTransition: false)
+            renderer.displaySelection(nil)
+        }
+
+        renderer.displayTracks(tracks, animateWaveformTransition: false)
+        renderer.displayTrackLayout(.default)
+        renderer.displayViewport(.full)
+        renderer.displayLoopRange(TimelineLoopRange(startProgress: 0.18, endProgress: 0.72))
+        renderer.displayLoopRangeEnabled(true)
+        renderer.displayPlaybackActive(false)
+        renderer.displayPlayheadProgress(
+            0.10,
+            force: true,
+            anchorTimestamp: baseTimestamp,
+            resetsTouchStart: true
+        )
+        try waitForVisibleWaveformBuffers(
+            renderer: renderer,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale,
+            displayTimestamp: baseTimestamp
+        )
+
+        func publishDrag(frameIndex: Int) {
+            let progress = 0.16 + Double(frameIndex) / 39.0 * 0.70
+            let selection = TimelineSelection(
+                startProgress: 0.08,
+                endProgress: progress,
+                trackID: track.id
+            )
+            renderer.publishInteractionSelectionDragSnapshot(TimelineSelectionDragSnapshot(
+                selection: selection,
+                leadingProgress: selection.endProgressFloat,
+                velocityPixelsPerSecond: 1_450,
+                direction: 1,
+                timestamp: baseTimestamp + Double(frameIndex) / 144.0
+            ))
+        }
+
+        for warmupIndex in 0..<8 {
+            publishDrag(frameIndex: warmupIndex)
+            let commandBuffer = renderer.renderOffscreen(
+                renderPassDescriptor: makeRenderPassDescriptor(texture: texture),
+                viewportSize: viewportSize,
+                backingScale: backingScale,
+                displayTimestamp: baseTimestamp + Double(warmupIndex) / 144.0,
+                waitUntilCompleted: false
+            )
+            commandBuffer?.waitUntilCompleted()
+        }
+
+        for frameIndex in 8..<40 {
+            publishDrag(frameIndex: frameIndex)
+            let loopEnd = 0.58 + Float(frameIndex - 8) / 31 * 0.22
+            renderer.publishInteractionLoopRange(
+                TimelineLoopRange(startProgress: 0.18, endProgress: loopEnd)
+            )
+            let startedAt = CACurrentMediaTime()
+            let commandBuffer = renderer.renderOffscreen(
+                renderPassDescriptor: makeRenderPassDescriptor(texture: texture),
+                viewportSize: viewportSize,
+                backingScale: backingScale,
+                displayTimestamp: baseTimestamp + Double(frameIndex) / 144.0,
+                waitUntilCompleted: false
+            )
+            commandBuffer?.waitUntilCompleted()
+            frameDurations.append((CACurrentMediaTime() - startedAt) * 1_000)
+        }
+
+        let p95Milliseconds = percentile(frameDurations, percentile: 0.95)
+        let maxMilliseconds = frameDurations.max() ?? 0
+        try require(
+            p95Milliseconds < 6.9,
+            String(format: "Retina selection drag render p95 missed 144 Hz: %.2fms", p95Milliseconds)
+        )
+        try require(
+            maxMilliseconds < 14,
+            String(format: "Retina selection drag render had a severe outlier: %.2fms", maxMilliseconds)
+        )
     }
 
     private static func verifyHoverGuideUpdatesStayResponsive(
@@ -1510,6 +1642,10 @@ enum TimelineUXSmokeHarness {
         }
 
         let burstTimestamp = baseTimestamp + 0.72
+        let finalInteractionViewport = TimelineViewport(
+            startProgress: 0.30,
+            durationProgress: 0.18
+        )
         for burstIndex in 0..<240 {
             let t = Float(burstIndex) / 239.0
             renderer.publishInteractionViewport(TimelineViewport(
@@ -1517,6 +1653,21 @@ enum TimelineUXSmokeHarness {
                 durationProgress: 0.18
             ))
         }
+        let probeViewportProgress: Float = 0.20
+        let probeTimelineProgress = finalInteractionViewport.timelineProgress(
+            forViewportProgress: probeViewportProgress
+        )
+        let resolvedProbeViewportProgress = renderer.currentPresentationViewportProgress(
+            forTimelineProgress: probeTimelineProgress
+        )
+        try require(
+            abs(resolvedProbeViewportProgress - probeViewportProgress) < 0.000_01,
+            String(
+                format: "interactive viewport mapping was stale after pan: expected %.5f, got %.5f",
+                probeViewportProgress,
+                resolvedProbeViewportProgress
+            )
+        )
         let burstRenderPassDescriptor = makeRenderPassDescriptor(texture: texture)
         let burstStartTime = CACurrentMediaTime()
         let burstCommandBuffer = renderer.renderOffscreen(
@@ -2101,6 +2252,53 @@ enum TimelineUXSmokeHarness {
 
         let cpuSummary = try PerformanceDashboardWindowController.smokeRenderCPUGraphPixelSummary(values: [10, 35, 82, 50, 125])
         try require(cpuSummary.brightPixelCount > 12, "performance monitor CPU graph was blank")
+    }
+
+    private static func verifyFrameHealthMetricSemantics() throws {
+        let idleHealth = PerformanceSampler.effectiveFrameHealthFramesPerSecond(
+            measuredFramesPerSecond: 23,
+            targetFramesPerSecond: 144,
+            renderDemand: .idle,
+            activeDemandAge: 12
+        )
+        try require(idleHealth == 144, "idle frame health retained sparse render cadence")
+
+        let warmupHealth = PerformanceSampler.effectiveFrameHealthFramesPerSecond(
+            measuredFramesPerSecond: 0,
+            targetFramesPerSecond: 144,
+            renderDemand: .interaction,
+            activeDemandAge: 0.04
+        )
+        try require(warmupHealth == 144, "active measurement warm-up reported a false frame drop")
+
+        let droppedHealth = PerformanceSampler.effectiveFrameHealthFramesPerSecond(
+            measuredFramesPerSecond: 72,
+            targetFramesPerSecond: 144,
+            renderDemand: .playback,
+            activeDemandAge: 1
+        )
+        try require(droppedHealth == 72, "active frame drop was hidden by the target rate")
+
+        let stalledHealth = PerformanceSampler.effectiveFrameHealthFramesPerSecond(
+            measuredFramesPerSecond: 0,
+            targetFramesPerSecond: 144,
+            renderDemand: .animation,
+            activeDemandAge: 0.5
+        )
+        try require(stalledHealth == 0, "active render stall was hidden by the target rate")
+
+        let sampler = PerformanceSampler.shared
+        let heartbeatStart = CACurrentMediaTime()
+        sampler.updateTargetFramesPerSecond(144)
+        sampler.updateRenderDemand(.idle)
+        sampler.recordMainThreadHeartbeat(at: heartbeatStart, isApplicationActive: true)
+        sampler.recordMainThreadHeartbeat(at: heartbeatStart + 0.12, isApplicationActive: true)
+        let heartbeatSnapshot = sampler.snapshot(at: heartbeatStart + 0.12)
+        try require(
+            heartbeatSnapshot.timelineGraphFramesPerSecond < 144,
+            "idle main-thread stall did not lower effective frame health"
+        )
+        sampler.recordMainThreadHeartbeat(at: heartbeatStart + 2, isApplicationActive: false)
     }
 
     private static func renderTimeline(

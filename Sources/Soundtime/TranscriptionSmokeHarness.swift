@@ -78,7 +78,12 @@ enum TranscriptionSmokeHarness {
         try verifyChunkingAndStitching(trackID: trackID)
         try verifyDeepgramParser(trackID: trackID)
         try verifyTranscriptionScopeAndTimeMap(trackID: trackID)
-        try verifyTranscriptLayoutExportAndEdits(trackID: trackID)
+        try MainActor.assumeIsolated {
+            try verifyRippleDeleteTranscriptProjection(trackID: trackID)
+        }
+        try MainActor.assumeIsolated {
+            try verifyTranscriptLayoutExportAndEdits(trackID: trackID)
+        }
         try verifyTranscriptValidityAndJobSnapshot(trackID: trackID)
         try verifyTranscriptInteractionModel(trackID: trackID)
         try verifyTranscriptSidecarPersistence(trackID: trackID)
@@ -94,6 +99,7 @@ enum TranscriptionSmokeHarness {
                 "long-form transcription chunking and stitching is deterministic",
                 "Deepgram parser preserves words, utterances, speaker metadata, and request ID",
                 "transcription scopes preserve render mode, domain, and source time maps",
+                "ripple delete removes deleted transcript words and shifts surviving words for decoded timelines",
                 "transcript layout aligns runs through edit-graph source remapping",
                 "transcript overlay live geometry tracks viewport changes without layout rebuilds",
                 "transcript export emits TXT, SRT, VTT, and JSON",
@@ -471,6 +477,139 @@ enum TranscriptionSmokeHarness {
         try require(abs((outputRanges.first?.lowerBound ?? 0) - 3.5) < 0.000_1, "source range mapped to wrong project start")
     }
 
+    @MainActor
+    private static func verifyRippleDeleteTranscriptProjection(trackID: UUID) throws {
+        let sampleRate = 100.0
+        let sourceFrameCount = 1_000
+        let sourceBuffer = DecodedAudioBuffer(
+            url: URL(fileURLWithPath: "/tmp/SoundtimeTranscriptRippleDelete.wav"),
+            sampleRate: sampleRate,
+            channelCount: 1,
+            frameCount: sourceFrameCount,
+            samplesByChannel: [[Float](repeating: 0, count: sourceFrameCount)]
+        )
+        var timeline = AudioEditTimeline(sourceBuffer: sourceBuffer)
+        try require(
+            timeline.delete(frameRange: 200..<400) == 200,
+            "transcript ripple smoke did not delete the requested audio frames"
+        )
+
+        let timeMap = TranscriptSourceTimeMap.fromTimeline(timeline)
+        try require(
+            abs(timeMap.timelineDuration - 8) < 0.000_1,
+            "decoded transcript time map kept the pre-delete duration"
+        )
+        try require(
+            timeMap.projectRanges(forSourceRange: 2.2..<2.8).isEmpty,
+            "fully deleted transcript source time remained visible"
+        )
+        let shiftedRanges = timeMap.projectRanges(forSourceRange: 4.5..<5.0)
+        try require(
+            shiftedRanges.count == 1 &&
+                abs((shiftedRanges.first?.lowerBound ?? 0) - 2.5) < 0.000_1 &&
+                abs((shiftedRanges.first?.upperBound ?? 0) - 3.0) < 0.000_1,
+            "surviving transcript word did not ripple left with its audio"
+        )
+
+        let beforeWord = TranscriptWord(
+            text: "before",
+            startTime: 0.5,
+            endTime: 1.0
+        )
+        let partialWord = TranscriptWord(
+            text: "partial",
+            startTime: 1.8,
+            endTime: 2.4
+        )
+        let deletedWord = TranscriptWord(
+            text: "deleted",
+            startTime: 2.2,
+            endTime: 2.8
+        )
+        let afterWord = TranscriptWord(
+            text: "after",
+            startTime: 4.5,
+            endTime: 5.0
+        )
+        let sourceTranscript = TranscriptDocument(
+            trackID: trackID,
+            sourceRevision: 0,
+            sourceDuration: 10,
+            providerIdentifier: "smoke.transcription",
+            providerDisplayName: "Smoke Transcription",
+            segments: [
+                TranscriptSegment(
+                    startTime: 0.5,
+                    endTime: 5.0,
+                    text: "before partial deleted after",
+                    words: [beforeWord, partialWord, deletedWord, afterWord]
+                ),
+            ]
+        )
+        let remapped = TranscriptValidityPolicy.reconciledTranscript(
+            sourceTranscript,
+            currentSourceRevision: 1,
+            currentSourceFingerprint: "ripple-delete-smoke",
+            timeMap: timeMap
+        )
+        try require(
+            remapped.sourceTimeMap == timeMap && remapped.validity == .remapped,
+            "ripple delete did not atomically attach its transcript time map"
+        )
+
+        let renderTrack = TimelineRenderState.Track(
+            id: trackID,
+            waveformVersion: 1,
+            waveformOverview: nil,
+            durationHint: timeline.duration,
+            volume: 1,
+            isMuted: false,
+            isSoloed: false,
+            hasWaveform: true,
+            transcript: remapped
+        )
+        let wordLayout = TranscriptLayoutEngine.makeLayout(TranscriptTimelineLayoutInput(
+            tracks: [renderTrack],
+            viewport: .full,
+            trackLayout: .default,
+            timelineDuration: timeline.duration,
+            bounds: CGSize(width: 800, height: 160),
+            displayMode: .waveformOverlay
+        ))
+        let visibleWords = Set(wordLayout.runs.compactMap(\.wordID))
+        try require(visibleWords.contains(beforeWord.id), "word before ripple delete disappeared")
+        try require(visibleWords.contains(afterWord.id), "word after ripple delete disappeared")
+        try require(!visibleWords.contains(deletedWord.id), "deleted word remained in transcript layout")
+        try require(!visibleWords.contains(partialWord.id), "mostly deleted boundary word remained in transcript layout")
+        let afterRun = try requireValue(
+            wordLayout.runs.first(where: { $0.wordID == afterWord.id }),
+            "shifted word did not produce a transcript run"
+        )
+        try require(
+            abs(afterRun.projectRange.startTime - 2.5) < 0.000_1,
+            "shifted transcript run used its pre-delete project time"
+        )
+
+        let segmentLayout = TranscriptLayoutEngine.makeLayout(TranscriptTimelineLayoutInput(
+            tracks: [renderTrack],
+            viewport: .full,
+            trackLayout: .default,
+            timelineDuration: timeline.duration,
+            bounds: CGSize(width: 100, height: 160),
+            displayMode: .waveformOverlay
+        ))
+        let visibleSegmentText = segmentLayout.runs.map(\.text).joined(separator: " ")
+        try require(
+            visibleSegmentText.contains("before") && visibleSegmentText.contains("after"),
+            "zoomed-out transcript dropped surviving words"
+        )
+        try require(
+            !visibleSegmentText.contains("deleted") && !visibleSegmentText.contains("partial"),
+            "zoomed-out transcript reused stale pre-delete segment text"
+        )
+    }
+
+    @MainActor
     private static func verifyTranscriptLayoutExportAndEdits(trackID: UUID) throws {
         let wordA = TranscriptWord(
             id: UUID(uuidString: "00000000-0000-0000-0000-000000000101") ?? UUID(),
@@ -544,6 +683,62 @@ enum TranscriptionSmokeHarness {
         ))
         try require(!layout.backgrounds.isEmpty, "transcript layout did not create background")
         try require(!layout.runs.isEmpty, "transcript layout did not create text runs")
+        let transcriptBand = try requireValue(layout.backgrounds.first?.rect, "missing transcript background")
+        let resolvedTrackLayout = TimelineTrackLayout.default.resolved(
+            totalTrackCount: 1,
+            viewportHeight: 160
+        )
+        let transcriptTrackLane = try requireValue(
+            resolvedTrackLayout.laneFrame(forTrackIndex: 0),
+            "missing transcript track lane"
+        )
+        let transcriptTrackTop = CGFloat(transcriptTrackLane.clampedTop) * 160
+        let transcriptTrackBottom = CGFloat(transcriptTrackLane.clampedBottom) * 160
+        try require(
+            abs(transcriptBand.minY - (transcriptTrackTop + 8)) < 0.001,
+            "transcript background was not anchored to the top of its track"
+        )
+        try require(
+            transcriptBand.maxY <= (transcriptTrackTop + transcriptTrackBottom) * 0.5,
+            "transcript background extended into the bottom half of its track"
+        )
+        for run in layout.runs {
+            let topPadding = run.rect.minY - transcriptBand.minY
+            let bottomPadding = transcriptBand.maxY - run.rect.maxY
+            try require(
+                abs(topPadding - bottomPadding) < 0.001,
+                "transcript bubble did not have equal vertical padding inside its background"
+            )
+        }
+        let overlayView = TimelineTranscriptOverlayView(
+            frame: CGRect(x: 0, y: 0, width: 700, height: 160)
+        )
+        _ = overlayView.configure(
+            tracks: [renderTrack],
+            viewport: .full,
+            trackLayout: .default,
+            timelineDuration: 7,
+            displayMode: .waveformOverlay
+        )
+        let layerGeometry = overlayView.layerGeometrySnapshotForSmokeTesting()
+        let firstBandLayerFrame = try requireValue(
+            layerGeometry.bandFrames.first,
+            "transcript overlay did not create a visible band layer"
+        )
+        try require(
+            abs(firstBandLayerFrame.minY - (160 - transcriptBand.maxY)) < 0.001,
+            "transcript band layer did not convert top-down layout into Core Animation coordinates"
+        )
+        let firstRunLayerFrame = try requireValue(
+            layerGeometry.runFrames.first,
+            "transcript overlay did not create a visible text layer"
+        )
+        let firstLayoutRun = try requireValue(layout.runs.first, "missing transcript run")
+        try require(
+            abs(firstRunLayerFrame.minY - (160 - firstLayoutRun.rect.maxY)) < 0.001,
+            "transcript run layer did not convert top-down layout into Core Animation coordinates"
+        )
+        try verifyTranscriptLiveResizeGeometry(renderTrack: renderTrack)
         let firstRun = try requireValue(layout.runs.first, "missing transcript run")
         try require(firstRun.rect.minX >= 345 && firstRun.rect.minX <= 355, "transcript run was not horizontally aligned through time map")
         try verifyTranscriptLiveViewportGeometry(renderTrack: renderTrack, wordID: wordA.id)
@@ -589,6 +784,130 @@ enum TranscriptionSmokeHarness {
             denseLayout.runs.count <= TranscriptLayoutEngine.maximumVisibleWordRuns,
             "dense transcript layout exceeded visible word run budget"
         )
+        let densityOverlay = TimelineTranscriptOverlayView(
+            frame: CGRect(x: 0, y: 0, width: 900, height: 180)
+        )
+        _ = densityOverlay.configure(
+            tracks: [denseTrack],
+            viewport: .full,
+            trackLayout: .default,
+            timelineDuration: 120,
+            displayMode: .waveformOverlay
+        )
+        try require(
+            densityOverlay.visibleRunsSnapshot().allSatisfy { !$0.isWord },
+            "zoomed-out transcript overlay did not use segment runs"
+        )
+        let wordViewport = TimelineViewport(startProgress: 0.2, durationProgress: 0.08)
+        try require(
+            !densityOverlay.canReuseLayoutForLiveGeometry(
+                tracks: [denseTrack],
+                viewport: wordViewport,
+                trackLayout: .default,
+                timelineDuration: 120,
+                displayMode: .waveformOverlay
+            ),
+            "segment transcript cache was incorrectly reusable at word-level zoom"
+        )
+        _ = densityOverlay.configure(
+            tracks: [denseTrack],
+            viewport: wordViewport,
+            trackLayout: .default,
+            timelineDuration: 120,
+            displayMode: .waveformOverlay
+        )
+        let wordDensityRuns = densityOverlay.visibleRunsSnapshot()
+        try require(
+            !wordDensityRuns.isEmpty && wordDensityRuns.allSatisfy { $0.isWord },
+            "zoomed-in transcript overlay did not promote segment text to word bubbles"
+        )
+
+        let segmentOnlyTranscript = TranscriptDocument(
+            trackID: trackID,
+            sourceRevision: 1,
+            sourceDuration: 12,
+            providerIdentifier: "smoke.transcription",
+            providerDisplayName: "Smoke Transcription",
+            segments: [
+                TranscriptSegment(
+                    startTime: 1,
+                    endTime: 4,
+                    text: "segment timing only"
+                ),
+            ]
+        )
+        let segmentOnlyTrack = TimelineRenderState.Track(
+            id: trackID,
+            waveformVersion: 3,
+            waveformOverview: nil,
+            durationHint: 12,
+            volume: 1,
+            isMuted: false,
+            isSoloed: false,
+            hasWaveform: true,
+            transcript: segmentOnlyTranscript
+        )
+        let segmentFallbackLayout = TranscriptLayoutEngine.makeLayout(TranscriptTimelineLayoutInput(
+            tracks: [segmentOnlyTrack],
+            viewport: TimelineViewport(startProgress: 0, durationProgress: 0.1),
+            trackLayout: .default,
+            timelineDuration: 12,
+            bounds: CGSize(width: 900, height: 180),
+            displayMode: .waveformOverlay
+        ))
+        try require(
+            !segmentFallbackLayout.runs.isEmpty && segmentFallbackLayout.runs.allSatisfy { !$0.isWord },
+            "word-level zoom hid transcripts that only had segment timing"
+        )
+
+        var transcriptBeforeWordHydration = denseTranscript
+        transcriptBeforeWordHydration.segments = denseTranscript.segments.map { segment in
+            var metadataOnlySegment = segment
+            metadataOnlySegment.words = []
+            return metadataOnlySegment
+        }
+        let trackBeforeWordHydration = TimelineRenderState.Track(
+            id: trackID,
+            waveformVersion: 2,
+            waveformOverview: nil,
+            durationHint: 120,
+            volume: 1,
+            isMuted: false,
+            isSoloed: false,
+            hasWaveform: true,
+            transcript: transcriptBeforeWordHydration
+        )
+        let hydrationOverlay = TimelineTranscriptOverlayView(
+            frame: CGRect(x: 0, y: 0, width: 900, height: 180)
+        )
+        _ = hydrationOverlay.configure(
+            tracks: [trackBeforeWordHydration],
+            viewport: wordViewport,
+            trackLayout: .default,
+            timelineDuration: 120,
+            displayMode: .waveformOverlay
+        )
+        try require(
+            !hydrationOverlay.canReuseLayoutForLiveGeometry(
+                tracks: [denseTrack],
+                viewport: wordViewport,
+                trackLayout: .default,
+                timelineDuration: 120,
+                displayMode: .waveformOverlay
+            ),
+            "transcript overlay reused a segment-only cache after word timing hydrated"
+        )
+        _ = hydrationOverlay.configure(
+            tracks: [denseTrack],
+            viewport: wordViewport,
+            trackLayout: .default,
+            timelineDuration: 120,
+            displayMode: .waveformOverlay
+        )
+        try require(
+            hydrationOverlay.visibleRunsSnapshot().contains { $0.isWord },
+            "transcript overlay did not reveal word bubbles after timing hydration"
+        )
 
         let selection = try requireValue(
             TranscriptEditPlanner.selection(
@@ -613,6 +932,108 @@ enum TranscriptionSmokeHarness {
         try require(srt.contains("-->"), "SRT export did not include cue timing")
         try require(vtt.hasPrefix("WEBVTT"), "VTT export missing header")
         try require(!json.isEmpty, "JSON export was empty")
+    }
+
+    @MainActor
+    private static func verifyTranscriptLiveResizeGeometry(
+        renderTrack: TimelineRenderState.Track
+    ) throws {
+        func emptyTrack(id: UUID) -> TimelineRenderState.Track {
+            TimelineRenderState.Track(
+                id: id,
+                waveformVersion: 1,
+                waveformOverview: nil,
+                durationHint: renderTrack.durationHint,
+                volume: 1,
+                isMuted: false,
+                isSoloed: false,
+                hasWaveform: true
+            )
+        }
+
+        let resizeTracks = [
+            emptyTrack(id: UUID()),
+            renderTrack,
+            emptyTrack(id: UUID()),
+        ]
+        let initialSize = CGSize(width: 900, height: 540)
+        let resizedSize = CGSize(width: 900, height: 330)
+        let overlay = TimelineTranscriptOverlayView(
+            frame: CGRect(origin: .zero, size: initialSize)
+        )
+        _ = overlay.configure(
+            tracks: resizeTracks,
+            viewport: .full,
+            trackLayout: .default,
+            timelineDuration: 7,
+            displayMode: .waveformOverlay
+        )
+        let initialRun = try requireValue(
+            overlay.visibleRunsSnapshot().first,
+            "live resize fixture did not create a transcript run"
+        )
+        let initialBuildCount = overlay
+            .diagnosticsSnapshotForSmokeTesting()
+            .layoutBuildCount
+
+        overlay.frame.size = resizedSize
+        _ = overlay.updateLiveGeometry(
+            viewport: .full,
+            trackLayout: .default,
+            timelineDuration: 7,
+            displayMode: .waveformOverlay
+        )
+        overlay.layoutSubtreeIfNeeded()
+
+        let resizedRun = try requireValue(
+            overlay.visibleRunsSnapshot().first,
+            "live resize hid the transcript run"
+        )
+        let resolvedLayout = TimelineTrackLayout.default.resolved(
+            totalTrackCount: resizeTracks.count,
+            viewportHeight: Float(resizedSize.height)
+        )
+        let transcriptLane = try requireValue(
+            resolvedLayout.laneFrame(forTrackIndex: 1),
+            "live resize fixture lost the transcript track lane"
+        )
+        let expectedGeometry = try requireValue(
+            TranscriptLayoutEngine.verticalGeometry(
+                for: transcriptLane,
+                bounds: resizedSize
+            ),
+            "live resize fixture could not resolve transcript geometry"
+        )
+        let expectedRunRect = expectedGeometry.runRect(
+            x: resizedRun.rect.minX,
+            width: resizedRun.rect.width,
+            isWord: resizedRun.isWord
+        )
+        try require(
+            abs(resizedRun.rect.minY - expectedRunRect.minY) < 0.001,
+            "transcript run did not follow its track during live resize"
+        )
+        try require(
+            abs(resizedRun.rect.height - expectedRunRect.height) < 0.001,
+            "transcript run height did not follow its track during live resize"
+        )
+        try require(
+            abs(initialRun.rect.minY - resizedRun.rect.minY) > 1,
+            "live resize fixture did not exercise a vertical track movement"
+        )
+        try require(
+            overlay.diagnosticsSnapshotForSmokeTesting().layoutBuildCount == initialBuildCount,
+            "live resize rebuilt transcript text instead of projecting existing layers"
+        )
+
+        let layerFrame = try requireValue(
+            overlay.layerGeometrySnapshotForSmokeTesting().runFrames.first,
+            "live resize did not preserve a visible transcript layer"
+        )
+        try require(
+            abs(layerFrame.minY - (resizedSize.height - resizedRun.rect.maxY)) < 0.001,
+            "live resize left the transcript CALayer at stale vertical coordinates"
+        )
     }
 
     private static func verifyTranscriptLiveViewportGeometry(
@@ -828,6 +1249,18 @@ enum TranscriptionSmokeHarness {
         try require(reconciled.validity == .remapped, "edited transcript was not marked remapped")
         try require(reconciled.sourceRevision == 2, "remapped transcript did not update source revision")
         try require(reconciled.sourceFingerprint == "new", "remapped transcript did not update fingerprint")
+        var sameRevisionStaleMap = reconciled
+        sameRevisionStaleMap.sourceTimeMap = .identity(duration: 5)
+        let repaired = TranscriptValidityPolicy.reconciledTranscript(
+            sameRevisionStaleMap,
+            currentSourceRevision: 2,
+            currentSourceFingerprint: "new",
+            timeMap: remap
+        )
+        try require(
+            repaired.sourceTimeMap == remap && repaired.validity == .remapped,
+            "same-revision transcript kept a stale persisted time map"
+        )
 
         var job = TranscriptionJob(
             requestID: UUID(),
@@ -983,12 +1416,32 @@ enum TranscriptionSmokeHarness {
     }
 
     private static func verifyTranscriptSidecarPersistence(trackID: UUID) throws {
+        let persistedTimeMap = TranscriptSourceTimeMap(
+            sourceDuration: 4,
+            timelineDuration: 3,
+            segments: [
+                TranscriptSourceTimeMap.Segment(
+                    outputStartTime: 0,
+                    outputEndTime: 1,
+                    sourceStartTime: 0,
+                    sourceEndTime: 1
+                ),
+                TranscriptSourceTimeMap.Segment(
+                    outputStartTime: 1,
+                    outputEndTime: 3,
+                    sourceStartTime: 2,
+                    sourceEndTime: 4
+                ),
+            ]
+        )
         let transcript = TranscriptDocument(
             trackID: trackID,
             sourceRevision: 4,
             sourceDuration: 4,
             providerIdentifier: "smoke.transcription",
             providerDisplayName: "Smoke Transcription",
+            validity: .remapped,
+            sourceTimeMap: persistedTimeMap,
             segments: [
                 TranscriptSegment(
                     startTime: 0.5,
@@ -1038,6 +1491,11 @@ enum TranscriptionSmokeHarness {
         let loadedTranscript = try requireValue(loaded.tracks.first?.transcript, "sidecar load dropped transcript")
         try require(loadedTranscript.words.count == transcript.words.count, "sidecar load did not restore words")
         try require(loadedTranscript.segments.count == transcript.segments.count, "sidecar load did not restore segments")
+        try require(
+            loadedTranscript.sourceTimeMap == persistedTimeMap &&
+                loadedTranscript.validity == .remapped,
+            "sidecar load did not restore the edited transcript projection"
+        )
 
         var editedTranscript = transcript
         editedTranscript.segments = [

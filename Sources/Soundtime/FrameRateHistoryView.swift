@@ -132,7 +132,7 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
     func display(performanceSnapshot snapshot: PerformanceMetricsSnapshot) {
         display(
             value: Float(max(snapshot.timelineGraphFramesPerSecond, 0)),
-            state: snapshot.timelineGraphIsIdle ? 1 : 0
+            state: 0
         )
     }
 
@@ -354,10 +354,9 @@ final class FrameRateHistoryView: TimelineMetalLayerView {
                         reserved: 0
                     ), at: 0)
                 }
-                // The timeline display link intentionally sleeps while idle. Hold
-                // the most recent active value briefly so the graph does not snap
-                // to zero, then let it age out as historical data instead of
-                // pretending stale FPS is the current frame rate forever.
+                // Continue the latest effective-health sample to the current
+                // graph time. PerformanceSampler publishes idle target-rate
+                // samples continuously, so this only bridges timer jitter.
                 if now - latestSample.timestamp <= staleSampleHoldDuration {
                     renderSamples.append(HistorySample(
                         timestamp: now,

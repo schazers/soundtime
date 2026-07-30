@@ -11,8 +11,12 @@ enum TranscriptValidityPolicy {
             var current = transcript
             current.sourceFingerprint = current.sourceFingerprint ?? currentSourceFingerprint
             current.validity = current.validity ?? .valid
-            if current.sourceTimeMap == nil {
+            if let timeMap, current.sourceTimeMap != timeMap {
+                let replacesExistingMap = current.sourceTimeMap != nil
                 current.sourceTimeMap = timeMap
+                if replacesExistingMap {
+                    current.validity = .remapped
+                }
             }
             return current
         }
