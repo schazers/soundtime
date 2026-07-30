@@ -83,6 +83,26 @@ struct TimelineRenderState: Sendable {
             self.waveformTileSource = waveformTileSource
             self.transcript = transcript
         }
+
+        func applying(_ mix: ProjectPlaybackTrackMix) -> Track {
+            guard id == mix.id else {
+                return self
+            }
+            return Track(
+                id: id,
+                waveformVersion: waveformVersion,
+                waveformOverview: waveformOverview,
+                durationHint: durationHint,
+                volume: mix.volume,
+                isMuted: mix.isMuted,
+                isSoloed: mix.isSoloed,
+                hasWaveform: hasWaveform,
+                clipRanges: clipRanges,
+                waveformSegments: waveformSegments,
+                waveformTileSource: waveformTileSource,
+                transcript: transcript
+            )
+        }
     }
 
     struct GainPreview: Sendable {

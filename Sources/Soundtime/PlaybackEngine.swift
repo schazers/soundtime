@@ -3,8 +3,23 @@ import Foundation
 struct PlaybackSnapshot {
     let frameIndex: Int
     let frameCount: Int
+    let sampleRate: Double
     let isPlaying: Bool
     let hostTimestamp: TimeInterval
+
+    init(
+        frameIndex: Int,
+        frameCount: Int,
+        sampleRate: Double = 0,
+        isPlaying: Bool,
+        hostTimestamp: TimeInterval
+    ) {
+        self.frameIndex = frameIndex
+        self.frameCount = frameCount
+        self.sampleRate = sampleRate
+        self.isPlaying = isPlaying
+        self.hostTimestamp = hostTimestamp
+    }
 
     var progress: Float {
         guard frameCount > 0 else {
@@ -16,6 +31,35 @@ struct PlaybackSnapshot {
 
     var isAtEnd: Bool {
         frameCount > 0 && frameIndex >= frameCount
+    }
+
+    var projectTime: TimeInterval? {
+        guard sampleRate.isFinite, sampleRate > 0 else {
+            return nil
+        }
+
+        return TimeInterval(frameIndex) / sampleRate
+    }
+
+    var duration: TimeInterval? {
+        guard sampleRate.isFinite, sampleRate > 0 else {
+            return nil
+        }
+
+        return TimeInterval(frameCount) / sampleRate
+    }
+
+    func progressPreservingProjectTime(from previousSnapshot: PlaybackSnapshot) -> Float {
+        guard
+            let previousProjectTime = previousSnapshot.projectTime,
+            let duration,
+            duration.isFinite,
+            duration > 0
+        else {
+            return previousSnapshot.progress
+        }
+
+        return Float(min(max(previousProjectTime / duration, 0), 1))
     }
 }
 

@@ -106,7 +106,8 @@ final class PerformanceSampler: @unchecked Sendable {
 
     func recordMainThreadHeartbeat(
         at timestamp: CFTimeInterval = CACurrentMediaTime(),
-        isApplicationActive: Bool
+        isApplicationActive: Bool,
+        expectedInterval: CFTimeInterval
     ) {
         lock.lock()
         defer {
@@ -128,13 +129,15 @@ final class PerformanceSampler: @unchecked Sendable {
         }
 
         let interval = max(timestamp - previousTimestamp, 0)
-        // The meter heartbeat normally runs at 30 Hz with timer tolerance.
-        // Only treat gaps beyond two normal ticks as a meaningful UI stall.
-        guard interval > 0.075 else {
+        let missedFrames = Self.missedDisplayFrames(
+            heartbeatInterval: interval,
+            expectedHeartbeatInterval: expectedInterval,
+            targetFramesPerSecond: targetFramesPerSecond
+        )
+        guard missedFrames > 0 else {
             return
         }
 
-        let missedFrames = max(interval * targetFramesPerSecond - 1, 0)
         mainThreadStallPenalties.append(MainThreadStallPenalty(
             timestamp: timestamp,
             missedDisplayFrames: min(missedFrames, targetFramesPerSecond)
@@ -197,7 +200,11 @@ final class PerformanceSampler: @unchecked Sendable {
             renderDemand: demand,
             activeDemandAge: demandAge
         )
-        let graphFPS = min(renderHealthFPS, responsivenessFPS)
+        let graphFPS = Self.effectiveGraphFramesPerSecond(
+            renderHealthFramesPerSecond: renderHealthFPS,
+            mainThreadResponsivenessFramesPerSecond: responsivenessFPS,
+            renderDemand: demand
+        )
         lock.unlock()
 
         return PerformanceMetricsSnapshot(
@@ -237,6 +244,53 @@ final class PerformanceSampler: @unchecked Sendable {
         // It takes two presentation timestamps to establish a cadence. Do not
         // report a false zero during that short measurement warm-up.
         return activeDemandAge <= 0.10 ? target : 0
+    }
+
+    static func effectiveGraphFramesPerSecond(
+        renderHealthFramesPerSecond: Double,
+        mainThreadResponsivenessFramesPerSecond: Double,
+        renderDemand: PerformanceRenderDemand
+    ) -> Double {
+        guard renderDemand == .idle else {
+            // Active rendering is sampled from timeline submissions driven by
+            // CAMetalDisplayLink. A low-frequency diagnostics heartbeat must
+            // never override that authoritative cadence.
+            return max(renderHealthFramesPerSecond, 0)
+        }
+
+        return max(
+            min(
+                renderHealthFramesPerSecond,
+                mainThreadResponsivenessFramesPerSecond
+            ),
+            0
+        )
+    }
+
+    static func missedDisplayFrames(
+        heartbeatInterval: CFTimeInterval,
+        expectedHeartbeatInterval: CFTimeInterval,
+        targetFramesPerSecond: Double
+    ) -> Double {
+        guard
+            heartbeatInterval.isFinite,
+            expectedHeartbeatInterval.isFinite,
+            targetFramesPerSecond.isFinite,
+            heartbeatInterval >= 0,
+            expectedHeartbeatInterval > 0,
+            targetFramesPerSecond > 0
+        else {
+            return 0
+        }
+
+        // Foundation timers are deliberately coalesced and the performance
+        // timer has its own tolerance. Ignore normal scheduling variation and
+        // count only the delay beyond a healthy heartbeat interval.
+        let schedulingTolerance = max(expectedHeartbeatInterval * 0.5, 0.025)
+        let excessDelay = heartbeatInterval -
+            expectedHeartbeatInterval -
+            schedulingTolerance
+        return max(excessDelay * targetFramesPerSecond, 0)
     }
 
     private func trimMainThreadStallPenalties(now: CFTimeInterval) {

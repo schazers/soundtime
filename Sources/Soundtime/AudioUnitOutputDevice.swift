@@ -226,7 +226,9 @@ private let audioUnitOutputRenderCallback: AURenderCallback = {
     }
 
     let corePointer = OpaquePointer(refCon)
-    let hostTime = timestamp.pointee.mHostTime
+    let hostTimeIsValid =
+        timestamp.pointee.mFlags.contains(.hostTimeValid)
+    let hostTime = hostTimeIsValid ? timestamp.pointee.mHostTime : 0
     let hostTimestamp = hostTime > 0 ?
         Double(AudioConvertHostTimeToNanos(hostTime)) / 1_000_000_000 :
         0

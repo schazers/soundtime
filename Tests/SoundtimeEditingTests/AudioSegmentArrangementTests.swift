@@ -41,6 +41,33 @@ final class AudioSegmentArrangementTests: XCTestCase {
         XCTAssertNil(selection.timeRange(in: .nan))
     }
 
+    func testTimelineSegmentsProjectAcrossSampleRatesWithoutChangingTime() throws {
+        let nativeSegment = AudioTimelinePlaybackSegment(
+            outputStartFrame: 44_100,
+            sourceStartFrame: 22_050,
+            frameCount: 88_200,
+            sourceFrameScale: 1,
+            gainStart: 0.75,
+            gainEnd: 0.5,
+            startsNewClip: false
+        )
+
+        let projected = try XCTUnwrap(
+            AudioTimelineSampleRateProjection.project(
+                nativeSegment,
+                timelineSampleRate: 44_100,
+                outputSampleRate: 48_000
+            )
+        )
+
+        XCTAssertEqual(projected.outputStartFrame, 48_000)
+        XCTAssertEqual(projected.frameCount, 96_000)
+        XCTAssertEqual(projected.sourceStartFrame, 22_050)
+        XCTAssertEqual(projected.sourceFrameScale, 44_100.0 / 48_000.0, accuracy: 0.000_000_001)
+        XCTAssertEqual(projected.gainStart, 0.75)
+        XCTAssertEqual(projected.gainEnd, 0.5)
+    }
+
     func testDeferredEditStateCanPublishOnlyAtCapturedRevision() {
         XCTAssertTrue(
             DeferredEditStatePublicationPolicy.mayReplaceCurrentState(

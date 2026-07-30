@@ -181,7 +181,11 @@ final class HybridPlaybackEngine: PlaybackEngine {
             do {
                 try realtimeEngine.loadProjectTracks(tracks)
                 realtimeEngine.setPerceptualVolume(perceptualVolume)
-                try realtimeEngine.seekExactly(toProgress: previousSnapshot.progress)
+                try realtimeEngine.seekExactly(
+                    toProgress: realtimeEngine.snapshot().progressPreservingProjectTime(
+                        from: previousSnapshot
+                    )
+                )
                 if previousSnapshot.isPlaying {
                     multitrackEngine.pause()
                     try realtimeEngine.play()
@@ -265,7 +269,11 @@ final class HybridPlaybackEngine: PlaybackEngine {
                 zeroCrossingIndex: zeroCrossingIndex
             )
             realtimeEngine.setPerceptualVolume(perceptualVolume)
-            try realtimeEngine.seek(toProgress: previousSnapshot.progress)
+            try realtimeEngine.seekExactly(
+                toProgress: realtimeEngine.snapshot().progressPreservingProjectTime(
+                    from: previousSnapshot
+                )
+            )
 
             if shouldResume {
                 previewEngine.pause()

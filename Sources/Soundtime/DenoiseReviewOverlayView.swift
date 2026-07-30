@@ -965,7 +965,13 @@ private final class DenoiseReviewPreviewPlayer {
 
     func snapshot() -> PlaybackSnapshot {
         guard let buffer = activeBuffer, sharedFrameCount > 0 else {
-            return PlaybackSnapshot(frameIndex: 0, frameCount: 0, isPlaying: false, hostTimestamp: CACurrentMediaTime())
+            return PlaybackSnapshot(
+                frameIndex: 0,
+                frameCount: 0,
+                sampleRate: 0,
+                isPlaying: false,
+                hostTimestamp: CACurrentMediaTime()
+            )
         }
         let now = CACurrentMediaTime()
         stateLock.lock()
@@ -975,6 +981,7 @@ private final class DenoiseReviewPreviewPlayer {
         return PlaybackSnapshot(
             frameIndex: frameIndex,
             frameCount: min(buffer.frameCount, sharedFrameCount),
+            sampleRate: buffer.sampleRate,
             isPlaying: playing,
             hostTimestamp: now
         )

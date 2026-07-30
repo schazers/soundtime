@@ -277,11 +277,12 @@ private final class CanonicalAudioExportRenderContext: AudioExportBlockRendering
             playbackSegments = timeline.playbackSegments
         }
 
-        let segments = playbackSegments.map { segment in
-            convertedSegment(
+        let segments = try playbackSegments.map { segment in
+            try convertedSegment(
                 segment,
                 sourceSampleRate: source.sampleRate,
-                outputSampleRate: outputSampleRate
+                outputSampleRate: outputSampleRate,
+                trackName: track.name
             )
         }
         let gain: Float
@@ -302,31 +303,24 @@ private final class CanonicalAudioExportRenderContext: AudioExportBlockRendering
     private static func convertedSegment(
         _ segment: AudioEditTimeline.PlaybackSegment,
         sourceSampleRate: Double,
-        outputSampleRate: Double
-    ) -> PreparedRealtimeAudioSegment {
-        let sourceRate = max(sourceSampleRate, 1)
-        let outputRate = max(outputSampleRate, 1)
-        let outputStartFrame = Int(
-            (Double(segment.outputStartFrame) / sourceRate * outputRate).rounded()
-        )
-        let outputEndFrame = Int(
-            (
-                Double(segment.outputStartFrame + segment.frameCount) /
-                    sourceRate *
-                    outputRate
-            ).rounded()
-        )
-        let timelineSourceScale = segment.sourceFrameScale > 0 ?
-            segment.sourceFrameScale :
-            1
+        outputSampleRate: Double,
+        trackName: String
+    ) throws -> PreparedRealtimeAudioSegment {
+        guard let projected = AudioTimelineSampleRateProjection.project(
+            segment,
+            timelineSampleRate: sourceSampleRate,
+            outputSampleRate: outputSampleRate
+        ) else {
+            throw AudioExportRenderer.RenderError.invalidSource(trackName)
+        }
 
         return PreparedRealtimeAudioSegment(
-            outputStartFrame: outputStartFrame,
-            sourceStartFrame: segment.sourceStartFrame,
-            frameCount: max(outputEndFrame - outputStartFrame, 0),
-            sourceFrameScale: timelineSourceScale * sourceRate / outputRate,
-            gainStart: segment.gainStart,
-            gainEnd: segment.gainEnd
+            outputStartFrame: projected.outputStartFrame,
+            sourceStartFrame: projected.sourceStartFrame,
+            frameCount: projected.frameCount,
+            sourceFrameScale: projected.sourceFrameScale,
+            gainStart: projected.gainStart,
+            gainEnd: projected.gainEnd
         )
     }
 }

@@ -31,7 +31,11 @@ final class AVAudioSourceNodeOutputDevice: RealtimeAudioOutputDevice {
 
         if sourceNode == nil {
             let sourceNode = AVAudioSourceNode { _, timestamp, frameCount, audioBufferList in
-                let hostTimestamp = AVAudioTime.seconds(forHostTime: timestamp.pointee.mHostTime)
+                let hostTimeIsValid =
+                    timestamp.pointee.mFlags.contains(.hostTimeValid)
+                let hostTimestamp = hostTimeIsValid ?
+                    AVAudioTime.seconds(forHostTime: timestamp.pointee.mHostTime) :
+                    0
                 let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
                 let leftOutput = buffers.count > 0 ?
                     buffers[0].mData?.assumingMemoryBound(to: Float.self) :

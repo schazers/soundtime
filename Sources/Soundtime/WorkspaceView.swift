@@ -603,6 +603,21 @@ final class WorkspaceView: NSView {
                     $0.audioTimeline?.sourceAudioBuffer.sampleRate ??
                     $0.decodedAudioBuffer?.sampleRate
             }.first ?? 0
+        let mixes = projectPlaybackTrackMixes()
+        let capturedRenderTracks = applyingProjectTrackMixes(
+            mixes,
+            to: renderTracks ??
+                (publishedTimelineRenderTracks.count == projectTracks.count ?
+                    publishedTimelineRenderTracks :
+                    timelineRenderTracks())
+        )
+        let capturedPlaybackTracks = ProjectPlaybackProjection.applyingMixes(
+            mixes,
+            to: playbackTracks ??
+                (publishedProjectPlaybackTracks.count == projectTracks.count ?
+                    publishedProjectPlaybackTracks :
+                    projectPlaybackTracks())
+        )
         return ProjectEditTransactionState(
             revision: projectEditRevision(),
             tracksByID: Dictionary(
@@ -618,14 +633,8 @@ final class WorkspaceView: NSView {
                 Int((projectDuration * sampleRate).rounded(.up)) :
                 0,
             editGraph: projectEditGraph,
-            renderTracks: renderTracks ??
-                (publishedTimelineRenderTracks.count == projectTracks.count ?
-                    publishedTimelineRenderTracks :
-                    timelineRenderTracks()),
-            playbackTracks: playbackTracks ??
-                (publishedProjectPlaybackTracks.count == projectTracks.count ?
-                    publishedProjectPlaybackTracks :
-                    projectPlaybackTracks()),
+            renderTracks: capturedRenderTracks,
+            playbackTracks: capturedPlaybackTracks,
             activeTrackID: activeTrackID,
             selectedTrackID: selectedTrackID,
             selectedTrackIDs: selectedTrackIDs,
@@ -638,48 +647,47 @@ final class WorkspaceView: NSView {
     private func transactionRenderTracks(
         replacing changedTrackIDs: Set<UUID>
     ) -> [TimelineRenderState.Track] {
-        guard publishedTimelineRenderTracks.count == projectTracks.count else {
-            return timelineRenderTracks()
-        }
-        var tracks = publishedTimelineRenderTracks
-        for index in projectTracks.indices {
-            let projectTrack = projectTracks[index]
+        let previousTracksByID = Dictionary(
+            uniqueKeysWithValues: publishedTimelineRenderTracks.map { ($0.id, $0) }
+        )
+        let mixesByID = Dictionary(
+            uniqueKeysWithValues: projectPlaybackTrackMixes().map { ($0.id, $0) }
+        )
+        return projectTracks.map { projectTrack in
             guard
-                changedTrackIDs.contains(projectTrack.id) ||
-                tracks[index].id != projectTrack.id
+                let previousTrack = previousTracksByID[projectTrack.id],
+                !changedTrackIDs.contains(projectTrack.id)
             else {
-                continue
+                return timelineRenderTrack(for: projectTrack)
             }
-            tracks[index] = timelineRenderTrack(
-                for: projectTrack,
-                reusing: tracks[index]
-            )
+            guard let mix = mixesByID[projectTrack.id] else {
+                return previousTrack
+            }
+            return previousTrack.applying(mix)
         }
-        return tracks
     }
 
     private func transactionPlaybackTracks(
         replacing changedTrackIDs: Set<UUID>
     ) -> [ProjectPlaybackTrack] {
-        guard publishedProjectPlaybackTracks.count == projectTracks.count else {
-            return projectPlaybackTracks()
-        }
-        var tracks = publishedProjectPlaybackTracks
-        for index in projectTracks.indices.reversed() {
-            let projectTrack = projectTracks[index]
+        let previousTracksByID = Dictionary(
+            uniqueKeysWithValues: publishedProjectPlaybackTracks.map { ($0.id, $0) }
+        )
+        let mixesByID = Dictionary(
+            uniqueKeysWithValues: projectPlaybackTrackMixes().map { ($0.id, $0) }
+        )
+        return projectTracks.compactMap { projectTrack in
             guard
-                changedTrackIDs.contains(projectTrack.id) ||
-                tracks[index].id != projectTrack.id
+                let previousTrack = previousTracksByID[projectTrack.id],
+                !changedTrackIDs.contains(projectTrack.id)
             else {
-                continue
+                return projectPlaybackTrack(for: projectTrack)
             }
-            if let playbackTrack = projectPlaybackTrack(for: projectTrack) {
-                tracks[index] = playbackTrack
-            } else {
-                tracks.remove(at: index)
+            guard let mix = mixesByID[projectTrack.id] else {
+                return previousTrack
             }
+            return previousTrack.applying(mix)
         }
-        return tracks
     }
 
     private func editTrackDescriptor(for track: ProjectTrack) -> EditTrackDescriptor {
@@ -754,7 +762,6 @@ final class WorkspaceView: NSView {
             guard renderTrack.id == projectTrack.id else {
                 return false
             }
-
             let duration = trackDuration(for: projectTrack)
             guard abs((renderTrack.durationHint ?? 0) - duration) <= 0.000_001 else {
                 return false
@@ -5231,7 +5238,29 @@ final class WorkspaceView: NSView {
         if !isDenoiseModalInteractionLocked, activeDenoiseRequestID == nil, pendingDenoiseReview == nil {
             timelineSurface.setInteractionSuppressed(false)
         }
+        let mixes = projectPlaybackTrackMixes()
+        publishedTimelineRenderTracks = applyingProjectTrackMixes(
+            mixes,
+            to: publishedTimelineRenderTracks
+        )
+        publishedProjectPlaybackTracks = ProjectPlaybackProjection.applyingMixes(
+            mixes,
+            to: publishedProjectPlaybackTracks
+        )
         timelineSurface.displayTrackMixSettings(timelineMixRenderTracks())
+    }
+
+    private func applyingProjectTrackMixes(
+        _ mixes: [ProjectPlaybackTrackMix],
+        to renderTracks: [TimelineRenderState.Track]
+    ) -> [TimelineRenderState.Track] {
+        let mixesByID = Dictionary(uniqueKeysWithValues: mixes.map { ($0.id, $0) })
+        return renderTracks.map { track in
+            guard let mix = mixesByID[track.id] else {
+                return track
+            }
+            return track.applying(mix)
+        }
     }
 
     private func timelineRenderTracks() -> [TimelineRenderState.Track] {
@@ -8571,7 +8600,6 @@ final class WorkspaceView: NSView {
         scheduledPlaybackReloadWorkItem = nil
 
         let previousSnapshot = playbackController.snapshot()
-        let previousProgress = targetProgress ?? previousSnapshot.progress
         let shouldResume = resumeIfPlaying ?? (preserveProgress && previousSnapshot.isPlaying)
         let playbackTracks = playbackTracksOverride ?? projectPlaybackTracks()
         publishedProjectPlaybackTracks = playbackTracks
@@ -8594,7 +8622,12 @@ final class WorkspaceView: NSView {
                 try playbackController.loadProjectTracks(playbackTracks)
             }
             if preserveProgress || targetProgress != nil {
-                try playbackController.seek(toProgress: previousProgress)
+                let updatedSnapshot = playbackController.snapshot()
+                let restoredProgress = targetProgress ??
+                    updatedSnapshot.progressPreservingProjectTime(
+                        from: previousSnapshot
+                    )
+                try playbackController.seekExactly(toProgress: restoredProgress)
                 if shouldResume && !playbackController.isPlaying {
                     try playbackController.play()
                 }
@@ -13533,9 +13566,13 @@ final class WorkspaceView: NSView {
             self.postDeleteRefreshWorkItem = nil
             self.timelineSurface.clearDeletionEffects()
             self.updateProjectDisplayTiming()
-            self.publishedTimelineRenderTracks = state.renderTracks
+            let renderTracks = self.applyingProjectTrackMixes(
+                self.projectPlaybackTrackMixes(),
+                to: state.renderTracks
+            )
+            self.publishedTimelineRenderTracks = renderTracks
             self.timelineSurface.displayTracks(
-                state.renderTracks,
+                renderTracks,
                 animateWaveformTransition: false,
                 allowImmediateWaveformPrewarm: false,
                 allowImmediateInteractiveWaveformPrewarm: false
@@ -16364,9 +16401,14 @@ final class WorkspaceView: NSView {
         timelineSurface.clearDeletionEffects()
         timelineSurface.displaySelection(selectedTimelineRange)
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
-        publishedTimelineRenderTracks = state.renderTracks
+        let mixes = projectPlaybackTrackMixes()
+        let renderTracks = applyingProjectTrackMixes(
+            mixes,
+            to: state.renderTracks
+        )
+        publishedTimelineRenderTracks = renderTracks
         timelineSurface.displayTracks(
-            state.renderTracks,
+            renderTracks,
             animateWaveformTransition: false,
             allowImmediateWaveformPrewarm: false,
             allowImmediateInteractiveWaveformPrewarm: false
@@ -16379,7 +16421,10 @@ final class WorkspaceView: NSView {
         reloadPlaybackFromProjectTracks(
             preserveProgress: false,
             targetProgress: Float(min(max(state.playheadTime.seconds / duration, 0), 1)),
-            playbackTracksOverride: state.playbackTracks,
+            playbackTracksOverride: ProjectPlaybackProjection.applyingMixes(
+                mixes,
+                to: state.playbackTracks
+            ),
             publishesVisualState: false
         )
         publishedPlaybackEditRevision = nextRevision.rawValue
@@ -20242,7 +20287,8 @@ final class WorkspaceView: NSView {
         let timestamp = CACurrentMediaTime()
         PerformanceSampler.shared.recordMainThreadHeartbeat(
             at: timestamp,
-            isApplicationActive: NSApp.isActive
+            isApplicationActive: NSApp.isActive,
+            expectedInterval: 1 / performanceMeterRefreshRate
         )
         let snapshot = PerformanceSampler.shared.sampleAndSnapshot(at: timestamp)
         frameRateHistoryView.display(performanceSnapshot: snapshot)

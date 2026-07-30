@@ -5,6 +5,8 @@ typealias TimelineSelectionDragSnapshot = SoundtimeEditing.TimelineSelectionDrag
 typealias TimelineTrimRange = SoundtimeEditing.TimelineTrimRange
 typealias AudioTimelineFadeDirection = SoundtimeEditing.AudioTimelineFadeDirection
 typealias AudioTimelinePlaybackSegment = SoundtimeEditing.AudioTimelinePlaybackSegment
+typealias AudioTimelineSampleRateProjection =
+    SoundtimeEditing.AudioTimelineSampleRateProjection
 typealias AudioTimelineClipRange = SoundtimeEditing.AudioTimelineClipRange
 typealias AudioTimelineClipEdge = SoundtimeEditing.AudioTimelineClipEdge
 typealias AudioTimelineSegment = SoundtimeEditing.AudioTimelineSegment

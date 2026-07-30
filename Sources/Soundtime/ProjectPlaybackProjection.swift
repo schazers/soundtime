@@ -70,4 +70,34 @@ enum ProjectPlaybackProjection {
             )
         }
     }
+
+    static func applyingMixes(
+        _ mixes: [ProjectPlaybackTrackMix],
+        to tracks: [ProjectPlaybackTrack]
+    ) -> [ProjectPlaybackTrack] {
+        let mixesByID = Dictionary(uniqueKeysWithValues: mixes.map { ($0.id, $0) })
+        return tracks.map { track in
+            guard let mix = mixesByID[track.id] else {
+                return track
+            }
+            return track.applying(mix)
+        }
+    }
+
+}
+
+extension ProjectPlaybackTrack {
+    func applying(_ mix: ProjectPlaybackTrackMix) -> ProjectPlaybackTrack {
+        guard id == mix.id else {
+            return self
+        }
+        return ProjectPlaybackTrack(
+            id: id,
+            source: source,
+            sourceRevision: sourceRevision,
+            volume: mix.volume,
+            isMuted: mix.isMuted,
+            isSoloed: mix.isSoloed
+        )
+    }
 }

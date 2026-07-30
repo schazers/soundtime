@@ -10,6 +10,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         let sourceID: UUID?
         let source: PreparedRealtimeAudioSource
         let segments: [PreparedRealtimeAudioSegment]
+        let segmentTimelineSampleRate: Double
         let zeroCrossingIndex: AudioZeroCrossingIndex?
         let zeroCrossingProbe: WAVZeroCrossingProbe?
         var volume: Float
@@ -31,6 +32,9 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
     private var mirroredIsPlaying = false
     private var mirroredHostTimestamp = CACurrentMediaTime()
     private var pendingCommandRenderedFrameCount: Int?
+    private var latestClockSample: RealtimeAudioClockSample?
+    private var previousClockRenderedFrameCount: Int?
+    private var clockProjectionFrameLimit = 0
 
     var isPlaying: Bool {
         snapshot().isPlaying
@@ -84,6 +88,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         mirroredIsPlaying = false
         mirroredHostTimestamp = CACurrentMediaTime()
         pendingCommandRenderedFrameCount = nil
+        resetClockMirror()
         self.zeroCrossingIndex = zeroCrossingIndex
         zeroCrossingProbe = nil
         sourceLoaded = true
@@ -107,6 +112,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         mirroredIsPlaying = false
         mirroredHostTimestamp = CACurrentMediaTime()
         pendingCommandRenderedFrameCount = nil
+        resetClockMirror()
         zeroCrossingIndex = nil
         self.zeroCrossingProbe = zeroCrossingProbe
         preparedProjectTracks.removeAll()
@@ -128,7 +134,10 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             throw PlaybackError.invalidFormat
         }
 
-        let didLoad = core.setPreparedTracks(realtimeTracks(from: preparedTracks))
+        let didLoad = core.setPreparedTracks(
+            realtimeTracks(from: preparedTracks, projectSampleRate: sampleRate),
+            sampleRate: sampleRate
+        )
         guard didLoad else {
             throw PlaybackError.invalidFormat
         }
@@ -140,6 +149,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         mirroredIsPlaying = false
         mirroredHostTimestamp = CACurrentMediaTime()
         pendingCommandRenderedFrameCount = nil
+        resetClockMirror()
         preparedProjectTracks = preparedTracks
         let referenceTrack = zeroCrossingReferenceTrack(in: preparedTracks)
         zeroCrossingIndex = referenceTrack?.zeroCrossingIndex
@@ -169,17 +179,23 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         }
 
         if abs(sampleRate - self.sampleRate) > 0.000_001 {
-            let previousProgress = previousSnapshot.progress
             let shouldResume = previousSnapshot.isPlaying
             try loadProjectTracks(tracks)
-            try seek(toProgress: previousProgress)
+            let updatedSnapshot = snapshot()
+            try seekExactly(
+                toProgress: updatedSnapshot.progressPreservingProjectTime(
+                    from: previousSnapshot
+                )
+            )
             if shouldResume {
                 try play()
             }
             return
         }
 
-        let didPublish = core.updatePreparedTracks(realtimeTracks(from: preparedTracks))
+        let didPublish = core.updatePreparedTracks(
+            realtimeTracks(from: preparedTracks, projectSampleRate: sampleRate)
+        )
         guard didPublish else {
             throw PlaybackError.invalidFormat
         }
@@ -234,7 +250,11 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
 
         let previousSnapshot = snapshot()
         try load(decodedAudioBuffer, zeroCrossingIndex: zeroCrossingIndex)
-        try seek(toProgress: previousSnapshot.progress)
+        try seekExactly(
+            toProgress: snapshot().progressPreservingProjectTime(
+                from: previousSnapshot
+            )
+        )
 
         if previousSnapshot.isPlaying {
             try play()
@@ -250,6 +270,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         mirroredIsPlaying = false
         mirroredHostTimestamp = CACurrentMediaTime()
         pendingCommandRenderedFrameCount = nil
+        resetClockMirror()
         zeroCrossingIndex = nil
         zeroCrossingProbe = nil
         preparedProjectTracks.removeAll()
@@ -302,8 +323,8 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         let pauseTimestamp = CACurrentMediaTime()
         let detailedSnapshot = core.detailedSnapshot()
         pause(
-            atFrame: projectedFrameIndex(
-                from: detailedSnapshot,
+            atFrame: currentProjectedFrameIndex(
+                detailedSnapshot: detailedSnapshot,
                 at: pauseTimestamp
             ),
             detailedSnapshot: detailedSnapshot,
@@ -400,7 +421,9 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             updatedPreparedTracks[preparedTrackIndex].isSoloed = track.isSoloed
         }
 
-        let didPublish = core.updatePreparedTracks(realtimeTracks(from: updatedPreparedTracks))
+        let didPublish = core.updatePreparedTracks(
+            realtimeTracks(from: updatedPreparedTracks, projectSampleRate: sampleRate)
+        )
         if didPublish {
             preparedProjectTracks = updatedPreparedTracks
         }
@@ -410,38 +433,57 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         let detailedSnapshot = core.detailedSnapshot()
         SoundtimeDiagnostics.shared.recordAudioCoreSnapshot(detailedSnapshot)
         let snapshotTimestamp = CACurrentMediaTime()
+        let clockSample = consumeLatestClockSample()
         if
             let pendingCommandRenderedFrameCount,
             !hasCoreReachedPendingCommand(
-                detailedSnapshot,
+                clockSample: clockSample,
+                detailedSnapshot: detailedSnapshot,
                 pendingCommandRenderedFrameCount: pendingCommandRenderedFrameCount
             )
         {
             return PlaybackSnapshot(
                 frameIndex: mirroredFrameIndex,
                 frameCount: mirroredFrameCount,
+                sampleRate: sampleRate,
                 isPlaying: mirroredIsPlaying,
                 hostTimestamp: mirroredHostTimestamp
             )
         }
 
         pendingCommandRenderedFrameCount = nil
-        mirroredFrameCount = detailedSnapshot.frameCount
-        mirroredIsPlaying = detailedSnapshot.isPlaying
-        if detailedSnapshot.isPlaying {
+        mirroredFrameCount = frameCount
+        let clockIsCurrent = clockSample.map {
+            $0.renderedFrameCount >= detailedSnapshot.renderedFrameCount
+        } ?? false
+        if let clockSample, clockIsCurrent {
+            mirroredIsPlaying = clockSample.isPlaying
             mirroredFrameIndex = projectedFrameIndex(
-                from: detailedSnapshot,
+                baseFrameIndex: clockSample.frameIndex,
+                baseHostTimestamp: clockSample.hostTimestamp,
+                isPlaying: clockSample.isPlaying,
                 at: snapshotTimestamp
             )
+        } else {
+            mirroredIsPlaying = detailedSnapshot.isPlaying
+            mirroredFrameIndex = projectedFrameIndex(
+                baseFrameIndex: detailedSnapshot.frameIndex,
+                baseHostTimestamp: detailedSnapshot.hostTimestamp,
+                isPlaying: detailedSnapshot.isPlaying,
+                at: snapshotTimestamp
+            )
+        }
+        if mirroredIsPlaying {
             mirroredHostTimestamp = snapshotTimestamp
         } else {
-            mirroredFrameIndex = detailedSnapshot.frameIndex
-            mirroredHostTimestamp = detailedSnapshot.hostTimestamp
+            mirroredHostTimestamp = clockSample?.hostTimestamp ??
+                detailedSnapshot.hostTimestamp
         }
 
         return PlaybackSnapshot(
             frameIndex: mirroredFrameIndex,
             frameCount: mirroredFrameCount,
+            sampleRate: sampleRate,
             isPlaying: mirroredIsPlaying,
             hostTimestamp: mirroredHostTimestamp
         )
@@ -452,9 +494,22 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
     }
 
     private func hasCoreReachedPendingCommand(
-        _ detailedSnapshot: RealtimeAudioCoreSnapshot,
+        clockSample: RealtimeAudioClockSample?,
+        detailedSnapshot: RealtimeAudioCoreSnapshot,
         pendingCommandRenderedFrameCount: Int
     ) -> Bool {
+        if
+            let clockSample,
+            clockSample.renderedFrameCount > pendingCommandRenderedFrameCount
+        {
+            if mirroredIsPlaying {
+                return clockSample.isPlaying
+            }
+
+            return !clockSample.isPlaying &&
+                abs(clockSample.frameIndex - mirroredFrameIndex) <= 1
+        }
+
         guard detailedSnapshot.renderedFrameCount > pendingCommandRenderedFrameCount else {
             return false
         }
@@ -481,28 +536,48 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         return []
     }
 
-    private func projectedFrameIndex(
-        from detailedSnapshot: RealtimeAudioCoreSnapshot,
+    private func currentProjectedFrameIndex(
+        detailedSnapshot: RealtimeAudioCoreSnapshot,
         at timestamp: TimeInterval
     ) -> Int {
-        let baseFrameIndex: Int
-        let baseHostTimestamp: TimeInterval
-        let baseIsPlaying: Bool
+        let clockSample = consumeLatestClockSample()
         if
             let pendingCommandRenderedFrameCount,
             detailedSnapshot.renderedFrameCount <= pendingCommandRenderedFrameCount
         {
-            baseFrameIndex = mirroredFrameIndex
-            baseHostTimestamp = mirroredHostTimestamp
-            baseIsPlaying = mirroredIsPlaying
-        } else {
-            baseFrameIndex = detailedSnapshot.frameIndex
-            baseHostTimestamp = detailedSnapshot.hostTimestamp
-            baseIsPlaying = detailedSnapshot.isPlaying
+            return projectedFrameIndex(
+                baseFrameIndex: mirroredFrameIndex,
+                baseHostTimestamp: mirroredHostTimestamp,
+                isPlaying: mirroredIsPlaying,
+                at: timestamp
+            )
         }
 
+        if let clockSample {
+            return projectedFrameIndex(
+                baseFrameIndex: clockSample.frameIndex,
+                baseHostTimestamp: clockSample.hostTimestamp,
+                isPlaying: clockSample.isPlaying,
+                at: timestamp
+            )
+        }
+
+        return projectedFrameIndex(
+            baseFrameIndex: detailedSnapshot.frameIndex,
+            baseHostTimestamp: detailedSnapshot.hostTimestamp,
+            isPlaying: detailedSnapshot.isPlaying,
+            at: timestamp
+        )
+    }
+
+    private func projectedFrameIndex(
+        baseFrameIndex: Int,
+        baseHostTimestamp: TimeInterval,
+        isPlaying: Bool,
+        at timestamp: TimeInterval
+    ) -> Int {
         guard
-            baseIsPlaying,
+            isPlaying,
             sampleRate.isFinite,
             sampleRate > 0,
             baseHostTimestamp > 0
@@ -511,8 +586,47 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         }
 
         let elapsedTime = timestamp - baseHostTimestamp
-        let elapsedFrames = Int((elapsedTime * sampleRate).rounded(.towardZero))
+        let unboundedElapsedFrames = Int(
+            (elapsedTime * sampleRate).rounded(.towardZero)
+        )
+        let elapsedFrames: Int
+        if clockProjectionFrameLimit > 0 {
+            elapsedFrames = min(
+                max(unboundedElapsedFrames, -clockProjectionFrameLimit),
+                clockProjectionFrameLimit
+            )
+        } else {
+            elapsedFrames = 0
+        }
         return min(max(baseFrameIndex + elapsedFrames, 0), frameCount)
+    }
+
+    private func consumeLatestClockSample() -> RealtimeAudioClockSample? {
+        var newestSample = latestClockSample
+        while let sample = core.popClockSample() {
+            let previousRenderedFrameCount = previousClockRenderedFrameCount ??
+                pendingCommandRenderedFrameCount
+            if
+                let previousRenderedFrameCount,
+                sample.renderedFrameCount > previousRenderedFrameCount
+            {
+                clockProjectionFrameLimit = max(
+                    sample.renderedFrameCount - previousRenderedFrameCount,
+                    1
+                )
+            }
+            previousClockRenderedFrameCount = sample.renderedFrameCount
+            newestSample = sample
+        }
+        latestClockSample = newestSample
+        return newestSample
+    }
+
+    private func resetClockMirror() {
+        latestClockSample = nil
+        previousClockRenderedFrameCount = nil
+        clockProjectionFrameLimit = 0
+        while core.popClockSample() != nil {}
     }
 
     private func configureOutputDevice(sampleRate: Double) throws {
@@ -523,13 +637,19 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         try outputDevice.configure(corePointer: corePointer, sampleRate: sampleRate)
     }
 
-    private func realtimeTracks(from preparedTracks: [PreparedProjectTrack]) -> [PreparedRealtimeAudioTrack] {
+    private func realtimeTracks(
+        from preparedTracks: [PreparedProjectTrack],
+        projectSampleRate: Double
+    ) -> [PreparedRealtimeAudioTrack] {
         let anySoloedTrack = preparedTracks.contains { $0.isSoloed }
         return preparedTracks.map { preparedTrack in
             PreparedRealtimeAudioTrack(
                 source: preparedTrack.source,
                 gain: effectiveTrackGain(preparedTrack, anySoloedTrack: anySoloedTrack),
-                segments: preparedTrack.segments
+                segments: projectSegments(
+                    for: preparedTrack,
+                    projectSampleRate: projectSampleRate
+                )
             )
         }
     }
@@ -540,6 +660,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
     ) throws -> PreparedProjectTrack {
         let preparedSource: PreparedRealtimeAudioSource
         let segments: [PreparedRealtimeAudioSegment]
+        let segmentTimelineSampleRate: Double
         let zeroCrossingIndex: AudioZeroCrossingIndex?
         let zeroCrossingProbe: WAVZeroCrossingProbe?
         let stableSourceIdentity = sourceIdentity(for: track.source)
@@ -555,6 +676,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             {
                 preparedSource = existingPreparedTrack.source
                 segments = existingPreparedTrack.segments
+                segmentTimelineSampleRate = existingPreparedTrack.segmentTimelineSampleRate
                 zeroCrossingIndex = sourceZeroCrossingIndex
                 zeroCrossingProbe = nil
                 break
@@ -565,6 +687,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             }
             preparedSource = source
             segments = []
+            segmentTimelineSampleRate = source.sampleRate
             zeroCrossingIndex = sourceZeroCrossingIndex
             zeroCrossingProbe = nil
         case let .file(url, sourceZeroCrossingProbe):
@@ -575,6 +698,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             {
                 preparedSource = existingPreparedTrack.source
                 segments = []
+                segmentTimelineSampleRate = existingPreparedTrack.source.sampleRate
                 zeroCrossingIndex = nil
                 zeroCrossingProbe = sourceZeroCrossingProbe
                 break
@@ -585,6 +709,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             }
             preparedSource = source
             segments = []
+            segmentTimelineSampleRate = source.sampleRate
             zeroCrossingIndex = nil
             zeroCrossingProbe = sourceZeroCrossingProbe
         case let .fileTimeline(url, audioFileTimeline, sourceZeroCrossingProbe):
@@ -610,6 +735,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
                     gainEnd: segment.gainEnd
                 )
             }
+            segmentTimelineSampleRate = audioFileTimeline.sourceSampleRate
             zeroCrossingIndex = nil
             zeroCrossingProbe = sourceZeroCrossingProbe
         case let .timeline(audioTimeline, sourceZeroCrossingIndex):
@@ -638,6 +764,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
                     gainEnd: segment.gainEnd
                 )
             }
+            segmentTimelineSampleRate = sourceBuffer.sampleRate
             zeroCrossingIndex = sourceZeroCrossingIndex
             zeroCrossingProbe = nil
         }
@@ -649,6 +776,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             sourceID: sourceID(for: track.source),
             source: preparedSource,
             segments: segments,
+            segmentTimelineSampleRate: segmentTimelineSampleRate,
             zeroCrossingIndex: zeroCrossingIndex,
             zeroCrossingProbe: zeroCrossingProbe,
             volume: track.volume,
@@ -782,7 +910,11 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         }
 
         let duration = tracks.reduce(0.0) { longestDuration, track in
-            let segmentedFrameCount = track.segments.reduce(0) { result, segment in
+            let projectSegments = projectSegments(
+                for: track,
+                projectSampleRate: sampleRate
+            )
+            let segmentedFrameCount = projectSegments.reduce(0) { result, segment in
                 max(result, segment.outputStartFrame + segment.frameCount)
             }
             if segmentedFrameCount > 0 {
@@ -958,11 +1090,15 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         containingProjectFrame projectFrame: Int,
         in track: PreparedProjectTrack
     ) -> PreparedRealtimeAudioSegment? {
+        let segments = projectSegments(
+            for: track,
+            projectSampleRate: sampleRate
+        )
         var lowerBound = 0
-        var upperBound = track.segments.count
+        var upperBound = segments.count
         while lowerBound < upperBound {
             let middle = lowerBound + (upperBound - lowerBound) / 2
-            let segment = track.segments[middle]
+            let segment = segments[middle]
             if projectFrame < segment.outputStartFrame {
                 upperBound = middle
             } else if projectFrame >= segment.outputStartFrame + segment.frameCount {
@@ -973,6 +1109,42 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         }
 
         return nil
+    }
+
+    private func projectSegments(
+        for track: PreparedProjectTrack,
+        projectSampleRate: Double
+    ) -> [PreparedRealtimeAudioSegment] {
+        guard !track.segments.isEmpty else {
+            return []
+        }
+
+        return track.segments.compactMap { segment in
+            let timelineSegment = AudioTimelinePlaybackSegment(
+                outputStartFrame: segment.outputStartFrame,
+                sourceStartFrame: segment.sourceStartFrame,
+                frameCount: segment.frameCount,
+                sourceFrameScale: segment.sourceFrameScale,
+                gainStart: segment.gainStart,
+                gainEnd: segment.gainEnd,
+                startsNewClip: false
+            )
+            guard let projected = AudioTimelineSampleRateProjection.project(
+                timelineSegment,
+                timelineSampleRate: track.segmentTimelineSampleRate,
+                outputSampleRate: projectSampleRate
+            ) else {
+                return nil
+            }
+            return PreparedRealtimeAudioSegment(
+                outputStartFrame: projected.outputStartFrame,
+                sourceStartFrame: projected.sourceStartFrame,
+                frameCount: projected.frameCount,
+                sourceFrameScale: projected.sourceFrameScale,
+                gainStart: projected.gainStart,
+                gainEnd: projected.gainEnd
+            )
+        }
     }
 
     private func effectiveSourceFrameScale(

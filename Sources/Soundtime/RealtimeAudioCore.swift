@@ -62,6 +62,7 @@ struct RealtimeAudioCoreSnapshot {
         PlaybackSnapshot(
             frameIndex: frameIndex,
             frameCount: frameCount,
+            sampleRate: sampleRate,
             isPlaying: isPlaying,
             hostTimestamp: hostTimestamp
         )

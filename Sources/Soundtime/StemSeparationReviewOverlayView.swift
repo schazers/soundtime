@@ -865,7 +865,13 @@ private final class StemSeparationPreviewPlayer {
 
     func snapshot() -> PlaybackSnapshot {
         guard sharedFrameCount > 0 else {
-            return PlaybackSnapshot(frameIndex: 0, frameCount: 0, isPlaying: false, hostTimestamp: CACurrentMediaTime())
+            return PlaybackSnapshot(
+                frameIndex: 0,
+                frameCount: 0,
+                sampleRate: 0,
+                isPlaying: false,
+                hostTimestamp: CACurrentMediaTime()
+            )
         }
         let now = CACurrentMediaTime()
         stateLock.lock()
@@ -875,6 +881,7 @@ private final class StemSeparationPreviewPlayer {
         return PlaybackSnapshot(
             frameIndex: frameIndex,
             frameCount: sharedFrameCount,
+            sampleRate: activeBuffer?.sampleRate ?? 0,
             isPlaying: playing,
             hostTimestamp: now
         )

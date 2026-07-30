@@ -34,6 +34,9 @@ enum EditTransactionSmokeHarness {
         try verifySourceIdentityProtection()
         checks.append("clip references cannot be pasted into an unrelated source")
 
+        try verifyPublishedMixReconciliationUsesTrackIdentity()
+        checks.append("delete publication preserves mute and solo state by stable track identity")
+
         let cycleCount = arguments.contains("--edit-transaction-smoke-quick") ? 250 : 1_000
         let historyMetrics = try verifyHistoryCycles(cycleCount: cycleCount)
         checks.append("\(cycleCount) delete, cut, paste, undo, and redo cycles remain deterministic")
@@ -305,6 +308,100 @@ enum EditTransactionSmokeHarness {
         try require(
             second.insert(clip, atFrame: 0) == nil,
             "unrelated memory sources accepted a borrowed clip"
+        )
+    }
+
+    private static func verifyPublishedMixReconciliationUsesTrackIdentity() throws {
+        let buffer = syntheticBuffer(frameCount: 100)
+        let ids = (0..<3).map(fixedUUID)
+        let staleTracks = [
+            ProjectPlaybackTrack(
+                id: ids[0],
+                source: .decoded(decodedAudioBuffer: buffer, zeroCrossingIndex: nil),
+                sourceRevision: 0,
+                volume: 1,
+                isMuted: true,
+                isSoloed: false
+            ),
+            ProjectPlaybackTrack(
+                id: ids[1],
+                source: .decoded(decodedAudioBuffer: buffer, zeroCrossingIndex: nil),
+                sourceRevision: 0,
+                volume: 1,
+                isMuted: false,
+                isSoloed: true
+            ),
+            ProjectPlaybackTrack(
+                id: ids[2],
+                source: .decoded(decodedAudioBuffer: buffer, zeroCrossingIndex: nil),
+                sourceRevision: 1,
+                volume: 1,
+                isMuted: true,
+                isSoloed: false
+            ),
+        ]
+        let canonicalMixes = [
+            ProjectPlaybackTrackMix(
+                id: ids[2],
+                volume: 0.9,
+                isMuted: false,
+                isSoloed: false
+            ),
+            ProjectPlaybackTrackMix(
+                id: ids[0],
+                volume: 0.7,
+                isMuted: true,
+                isSoloed: false
+            ),
+            ProjectPlaybackTrackMix(
+                id: ids[1],
+                volume: 0.8,
+                isMuted: true,
+                isSoloed: false
+            ),
+        ]
+
+        let reconciled = ProjectPlaybackProjection.applyingMixes(
+            canonicalMixes,
+            to: staleTracks
+        )
+        try require(reconciled.map(\.id) == ids, "mix reconciliation changed track order")
+        let reconciledByID = Dictionary(uniqueKeysWithValues: reconciled.map { ($0.id, $0) })
+        for mix in canonicalMixes {
+            let track = try requireValue(
+                reconciledByID[mix.id],
+                "mix reconciliation dropped track \(mix.id)"
+            )
+            try require(track.volume == mix.volume, "volume moved to the wrong track")
+            try require(track.isMuted == mix.isMuted, "mute moved to the wrong track")
+            try require(track.isSoloed == mix.isSoloed, "solo moved to the wrong track")
+        }
+        try require(
+            reconciled.allSatisfy { !$0.isSoloed },
+            "a stale solo bit survived edit publication"
+        )
+
+        let staleRenderTrack = TimelineRenderState.Track(
+            id: ids[1],
+            waveformVersion: 7,
+            waveformOverview: nil,
+            durationHint: 12,
+            volume: 1,
+            isMuted: false,
+            isSoloed: true,
+            hasWaveform: true
+        )
+        let canonicalMiddleMix = try requireValue(
+            canonicalMixes.first(where: { $0.id == ids[1] }),
+            "canonical middle-track mix was missing"
+        )
+        let reconciledRenderTrack = staleRenderTrack.applying(canonicalMiddleMix)
+        try require(reconciledRenderTrack.isMuted, "renderer kept a stale mute value")
+        try require(!reconciledRenderTrack.isSoloed, "renderer kept a stale solo value")
+        try require(
+            reconciledRenderTrack.waveformVersion == staleRenderTrack.waveformVersion &&
+                reconciledRenderTrack.hasWaveform == staleRenderTrack.hasWaveform,
+            "mix reconciliation replaced reusable waveform state"
         )
     }
 

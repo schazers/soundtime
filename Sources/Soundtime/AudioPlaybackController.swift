@@ -326,6 +326,7 @@ final class AudioPlaybackController: PlaybackEngine {
             return PlaybackSnapshot(
                 frameIndex: 0,
                 frameCount: 0,
+                sampleRate: 0,
                 isPlaying: false,
                 hostTimestamp: CACurrentMediaTime()
             )
@@ -348,6 +349,7 @@ final class AudioPlaybackController: PlaybackEngine {
         return PlaybackSnapshot(
             frameIndex: min(frameIndex, sourceFrameCount),
             frameCount: sourceFrameCount,
+            sampleRate: playbackSource.sampleRate,
             isPlaying: isPlaying,
             hostTimestamp: timedFrame.hostTimestamp
         )

@@ -149,7 +149,11 @@ final class MultitrackPlaybackController: PlaybackEngine {
         let shouldResume = previousSnapshot.isPlaying
 
         try load(decodedAudioBuffer, zeroCrossingIndex: zeroCrossingIndex)
-        try seek(toProgress: previousSnapshot.progress)
+        try seekExactly(
+            toProgress: snapshot().progressPreservingProjectTime(
+                from: previousSnapshot
+            )
+        )
 
         if shouldResume {
             try play()
@@ -381,6 +385,7 @@ final class MultitrackPlaybackController: PlaybackEngine {
             return PlaybackSnapshot(
                 frameIndex: 0,
                 frameCount: 0,
+                sampleRate: 0,
                 isPlaying: false,
                 hostTimestamp: CACurrentMediaTime()
             )
@@ -403,6 +408,7 @@ final class MultitrackPlaybackController: PlaybackEngine {
         return PlaybackSnapshot(
             frameIndex: min(frameIndex, frameCount),
             frameCount: frameCount,
+            sampleRate: projectSampleRate(),
             isPlaying: isPlaying,
             hostTimestamp: timedFrame.hostTimestamp
         )

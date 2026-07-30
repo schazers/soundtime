@@ -176,6 +176,8 @@ enum AudioSafetySmokeHarness {
 
         try verifyOutputDeviceConfiguration(metrics: &metrics)
         try verifySeekFramePosition(metrics: &metrics)
+        try verifyTransportClockDoesNotRunAhead(metrics: &metrics)
+        try verifyMixedRateTrackEndpointAlignment(metrics: &metrics)
         try verifyLoopWrapSampleConsistency(metrics: &metrics)
         try verifyEditGraphSwapSafety(mode: mode, metrics: &metrics)
         if coreOnly {
@@ -197,6 +199,8 @@ enum AudioSafetySmokeHarness {
             "no underruns or dropped realtime commands",
             "output device configure/refresh matches engine core and sample rate",
             "seek lands on expected frame position",
+            "visual transport clock cannot outrun rendered audio callbacks",
+            "mixed-rate track audio ends at its canonical visual endpoint",
             "loop wrap returns sample-consistently to loop start",
             "edit graph swaps do not block realtime render",
         ]
@@ -318,6 +322,173 @@ enum AudioSafetySmokeHarness {
         metrics.seekCheckCount += 1
         try require(abs(playingSnapshot.frameIndex - expectedFrame) <= 1, "playing seek did not mirror exact frame immediately")
         render(corePointer: corePointer, blockCount: 4, frameCount: 256, sampleRate: sampleRate)
+        playbackEngine.pause()
+        metrics.absorb(playbackEngine.realtimeSnapshotForSafetySmoke())
+    }
+
+    private static func verifyTransportClockDoesNotRunAhead(
+        metrics: inout SafetyMetrics
+    ) throws {
+        let outputDevice = AudioSafetySmokeOutputDevice()
+        guard let playbackEngine = RealtimeCorePlaybackEngine(outputDevice: outputDevice) else {
+            throw SmokeError.failed("could not create realtime playback engine for transport clock safety")
+        }
+
+        let sampleRate = 48_000.0
+        let callbackFrameCount = 256
+        let buffer = syntheticAudioBuffer(frameCount: Int(sampleRate * 2), sampleRate: sampleRate)
+        try playbackEngine.load(buffer, zeroCrossingIndex: nil)
+        try playbackEngine.play()
+        let corePointer = try requireValue(
+            outputDevice.corePointer,
+            "transport clock output device did not receive core pointer"
+        )
+        renderAtHostTime(
+            corePointer: corePointer,
+            frameCount: callbackFrameCount,
+            hostTimestamp: CACurrentMediaTime()
+        )
+        let callbackCommittedSnapshot = playbackEngine.snapshot()
+
+        Thread.sleep(forTimeInterval: 0.08)
+        let stalledCallbackSnapshot = playbackEngine.snapshot()
+        let visualLeadFrames = max(
+            stalledCallbackSnapshot.frameIndex - callbackCommittedSnapshot.frameIndex,
+            0
+        )
+        try require(
+            visualLeadFrames <= callbackFrameCount * 2,
+            "visual transport ran \(visualLeadFrames) frames ahead while audio callbacks were stalled"
+        )
+        playbackEngine.pause()
+        metrics.absorb(playbackEngine.realtimeSnapshotForSafetySmoke())
+    }
+
+    private static func verifyMixedRateTrackEndpointAlignment(
+        metrics: inout SafetyMetrics
+    ) throws {
+        let outputDevice = AudioSafetySmokeOutputDevice()
+        guard let playbackEngine = RealtimeCorePlaybackEngine(outputDevice: outputDevice) else {
+            throw SmokeError.failed("could not create realtime playback engine for endpoint alignment")
+        }
+
+        let projectSampleRate = 48_000.0
+        let shorterDuration = 1.5
+        let longerDuration = 1.8
+        let shorterBuffer = syntheticAudioBuffer(
+            frameCount: Int(projectSampleRate * shorterDuration),
+            sampleRate: projectSampleRate
+        )
+        let longerSampleRate = 44_100.0
+        let longerBuffer = syntheticAudioBuffer(
+            frameCount: Int(longerSampleRate * longerDuration),
+            sampleRate: longerSampleRate
+        )
+        let shorterTimeline = AudioEditTimeline(sourceBuffer: shorterBuffer)
+        let longerTimeline = AudioEditTimeline(sourceBuffer: longerBuffer)
+        let shorterTrack = ProjectPlaybackTrack(
+            id: stableUUID("00000000-0000-4000-a200-%012d", 1),
+            source: .timeline(
+                audioTimeline: shorterTimeline,
+                zeroCrossingIndex: nil
+            ),
+            sourceRevision: 0,
+            volume: 1,
+            isMuted: false,
+            isSoloed: false
+        )
+        let longerTrack = ProjectPlaybackTrack(
+            id: stableUUID("00000000-0000-4000-a200-%012d", 2),
+            source: .timeline(
+                audioTimeline: longerTimeline,
+                zeroCrossingIndex: nil
+            ),
+            sourceRevision: 0,
+            volume: 1,
+            isMuted: true,
+            isSoloed: false
+        )
+        try playbackEngine.loadProjectTracks([shorterTrack])
+        try playbackEngine.seekExactly(toProgress: 0.8)
+        let beforeImportSnapshot = playbackEngine.snapshot()
+        let beforeImportTime = try requireValue(
+            beforeImportSnapshot.projectTime,
+            "mixed-rate project did not expose its pre-import project time"
+        )
+
+        try playbackEngine.updateProjectTracks([shorterTrack, longerTrack])
+        let loadedSnapshot = playbackEngine.snapshot()
+        try require(
+            abs((loadedSnapshot.duration ?? 0) - longerDuration) <= 1 / projectSampleRate,
+            "mixed-rate project duration did not preserve the longer track's seconds"
+        )
+        try require(
+            abs((loadedSnapshot.projectTime ?? 0) - beforeImportTime) <= 1 / projectSampleRate,
+            "adding a longer mixed-rate track changed the absolute playhead time"
+        )
+        try require(
+            abs(
+                Double(loadedSnapshot.progress) * longerDuration -
+                    beforeImportTime
+            ) <= 1 / projectSampleRate,
+            "mixed-rate project normalized progress no longer maps to the visual project time"
+        )
+        let corePointer = try requireValue(
+            outputDevice.corePointer,
+            "endpoint alignment output device did not receive core pointer"
+        )
+        try playbackEngine.seekExactly(
+            toProgress: Float((shorterDuration + 0.05) / longerDuration)
+        )
+        try playbackEngine.play()
+        let captured = renderCapturedAtHostTime(
+            corePointer: corePointer,
+            blockCount: 8,
+            frameCount: 256,
+            sampleRate: projectSampleRate,
+            firstHostTimestamp: CACurrentMediaTime()
+        )
+        let peak = max(
+            captured.left.map { Swift.abs($0) }.max() ?? 0,
+            captured.right.map { Swift.abs($0) }.max() ?? 0
+        )
+        try require(
+            peak <= 0.000_001,
+            "shorter audible track emitted audio after its visual endpoint (peak \(peak))"
+        )
+        playbackEngine.pause()
+
+        playbackEngine.updateProjectTrackMix([
+            ProjectPlaybackTrackMix(
+                id: shorterTrack.id,
+                volume: 1,
+                isMuted: true,
+                isSoloed: false
+            ),
+            ProjectPlaybackTrackMix(
+                id: longerTrack.id,
+                volume: 1,
+                isMuted: false,
+                isSoloed: true
+            ),
+        ])
+        try playbackEngine.seekExactly(toProgress: Float(1.7 / longerDuration))
+        try playbackEngine.play()
+        let longerTrackCapture = renderCapturedAtHostTime(
+            corePointer: corePointer,
+            blockCount: 8,
+            frameCount: 256,
+            sampleRate: projectSampleRate,
+            firstHostTimestamp: CACurrentMediaTime()
+        )
+        let longerTrackPeak = max(
+            longerTrackCapture.left.map { Swift.abs($0) }.max() ?? 0,
+            longerTrackCapture.right.map { Swift.abs($0) }.max() ?? 0
+        )
+        try require(
+            longerTrackPeak > 0.001,
+            "longer mixed-rate track ended before its visual endpoint (peak \(longerTrackPeak))"
+        )
         playbackEngine.pause()
         metrics.absorb(playbackEngine.realtimeSnapshotForSafetySmoke())
     }
@@ -737,6 +908,83 @@ enum AudioSafetySmokeHarness {
                 }
             }
         }
+    }
+
+    private nonisolated static func renderAtHostTime(
+        corePointer: OpaquePointer,
+        frameCount: Int,
+        hostTimestamp: TimeInterval
+    ) {
+        var leftOutput = [Float](repeating: 0, count: frameCount)
+        var rightOutput = [Float](repeating: 0, count: frameCount)
+        leftOutput.withUnsafeMutableBufferPointer { leftBuffer in
+            rightOutput.withUnsafeMutableBufferPointer { rightBuffer in
+                var outputs: [UnsafeMutablePointer<Float>?] = [
+                    leftBuffer.baseAddress,
+                    rightBuffer.baseAddress,
+                ]
+                outputs.withUnsafeMutableBufferPointer { outputBuffer in
+                    soundtime_audio_core_render_at_host_time(
+                        corePointer,
+                        outputBuffer.baseAddress,
+                        2,
+                        UInt32(frameCount),
+                        hostTimestamp
+                    )
+                }
+            }
+        }
+    }
+
+    private nonisolated static func renderCapturedAtHostTime(
+        corePointer: OpaquePointer,
+        blockCount: Int,
+        frameCount: Int,
+        sampleRate: Double,
+        firstHostTimestamp: TimeInterval
+    ) -> (left: [Float], right: [Float]) {
+        var leftOutput = [Float](repeating: 0, count: frameCount)
+        var rightOutput = [Float](repeating: 0, count: frameCount)
+        var capturedLeft: [Float] = []
+        var capturedRight: [Float] = []
+        capturedLeft.reserveCapacity(blockCount * frameCount)
+        capturedRight.reserveCapacity(blockCount * frameCount)
+        for blockIndex in 0..<blockCount {
+            leftOutput.withUnsafeMutableBufferPointer { leftBuffer in
+                rightOutput.withUnsafeMutableBufferPointer { rightBuffer in
+                    var outputs: [UnsafeMutablePointer<Float>?] = [
+                        leftBuffer.baseAddress,
+                        rightBuffer.baseAddress,
+                    ]
+                    outputs.withUnsafeMutableBufferPointer { outputBuffer in
+                        soundtime_audio_core_render_at_host_time(
+                            corePointer,
+                            outputBuffer.baseAddress,
+                            2,
+                            UInt32(frameCount),
+                            firstHostTimestamp + Double(blockIndex * frameCount) / sampleRate
+                        )
+                    }
+                    if let baseAddress = leftBuffer.baseAddress {
+                        capturedLeft.append(
+                            contentsOf: UnsafeBufferPointer(
+                                start: baseAddress,
+                                count: frameCount
+                            )
+                        )
+                    }
+                    if let baseAddress = rightBuffer.baseAddress {
+                        capturedRight.append(
+                            contentsOf: UnsafeBufferPointer(
+                                start: baseAddress,
+                                count: frameCount
+                            )
+                        )
+                    }
+                }
+            }
+        }
+        return (capturedLeft, capturedRight)
     }
 
     private nonisolated static func renderCaptured(
