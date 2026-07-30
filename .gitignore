@@ -10,6 +10,11 @@ dist/
 
 # Local development project.
 Three_tracks.soundtime
+chrono_trigger.soundtime
+
+# Local audio test assets.
+some_audio_files/
+some_audio_files.zip
 
 # Generated shippability fixtures. Rebuild locally with:
 # swift run Soundtime --build-shippability-fixtures
