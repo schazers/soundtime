@@ -235,11 +235,53 @@ enum TimelineUXSmokeHarness {
         try verifySelectionEdgeResizeSemantics()
         complete("selection edges resize around a fixed anchor without starting a new selection")
 
+        try verifyRegionCreationDragThreshold()
+        complete("new audio and loop regions require three points of horizontal drag")
+
+        try verifySecondaryClickDefersMenuUntilMouseUp()
+        complete("secondary click distinguishes context menu from timeline pan")
+
         try verifyLoopRangeMoveSemantics()
         complete("loop body movement preserves its width and clamps to timeline bounds")
 
+        try verifyLoopMoveGuidesRenderBothEndpoints(
+            renderer: renderer,
+            track: track,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        complete("loop body movement draws both full-height boundary guides")
+
+        try verifyLoopPlaybackBypassSemantics()
+        complete("explicit seek beyond loop bypasses the current loop cycle")
+
         try verifyLoopRangeViewportCornerSemantics()
         complete("loop region rounds only endpoints visible inside the viewport")
+
+        try verifyClippedLoopRangeCornersRenderSquare(
+            renderer: renderer,
+            track: track,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        complete("offscreen loop endpoints render square at viewport edges")
+
+        try verifyClippedRangeEndpointsSuppressEdgeEffects(
+            renderer: renderer,
+            track: track,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        complete("offscreen selection and loop endpoints suppress glass edge effects")
+
+        try verifyLiveLoopMoveUpdatesPlayheadProjection(
+            renderer: renderer,
+            track: track
+        )
+        complete("live loop movement replaces stale playhead loop boundaries")
 
         try verifyEdgeAutoPanCurve()
         complete("selection and loop edge autopan accelerates smoothly toward timeline boundaries")
@@ -1050,6 +1092,17 @@ enum TimelineUXSmokeHarness {
             label: "loop wrap"
         )
 
+        renderer.displayLoopPlaybackBypassed(true)
+        let bypassedProgress = try requireValue(
+            renderer.projectedPlayheadProgress(at: wrappedTimestamp),
+            "explicit seek beyond loop did not project a playhead"
+        )
+        try require(
+            abs(bypassedProgress - projectedProgress) < 0.000_001,
+            "explicit seek beyond loop projected \(bypassedProgress) instead of \(projectedProgress)"
+        )
+        renderer.displayLoopPlaybackBypassed(false)
+
         // Frame diagnostics intentionally publish over a short sample window.
         // Exercise enough wrapped playback frames to produce a representative
         // hot-path sample instead of relying on stats left by an earlier check.
@@ -1078,6 +1131,7 @@ enum TimelineUXSmokeHarness {
         renderer.displayPlaybackActive(false)
         renderer.displayLoopRange(.default)
         renderer.displayLoopRangeEnabled(true)
+        renderer.displayLoopPlaybackBypassed(false)
     }
 
     private static func verifyUltraZoomStillRenders(
@@ -1400,6 +1454,319 @@ enum TimelineUXSmokeHarness {
         )
     }
 
+    private static func verifyRegionCreationDragThreshold() throws {
+        let threshold = TimelineRegionCreationGesture.minimumHorizontalDragDistance
+
+        try require(
+            !TimelineRegionCreationGesture.hasCrossedDragThreshold(
+                anchorX: 100,
+                currentX: 100 + threshold - 0.01
+            ),
+            "a sub-threshold rightward gesture started a new region"
+        )
+        try require(
+            !TimelineRegionCreationGesture.hasCrossedDragThreshold(
+                anchorX: 100,
+                currentX: 100 - threshold + 0.01
+            ),
+            "a sub-threshold leftward gesture started a new region"
+        )
+        try require(
+            TimelineRegionCreationGesture.hasCrossedDragThreshold(
+                anchorX: 100,
+                currentX: 100 + threshold
+            ),
+            "a three-point rightward gesture did not start a new region"
+        )
+        try require(
+            TimelineRegionCreationGesture.hasCrossedDragThreshold(
+                anchorX: 100,
+                currentX: 100 - threshold
+            ),
+            "a three-point leftward gesture did not start a new region"
+        )
+    }
+
+    private static func verifySecondaryClickDefersMenuUntilMouseUp() throws {
+        let threshold = TimelineSecondaryButtonGesture.minimumPanDistance
+
+        try require(
+            !TimelineSecondaryButtonGesture.hasCrossedPanThreshold(
+                anchorX: 100,
+                currentX: 100 + threshold - 0.01
+            ),
+            "a stationary secondary click was claimed by timeline pan"
+        )
+        try require(
+            TimelineSecondaryButtonGesture.shouldPresentContextMenu(
+                wasEligibleAtMouseDown: true,
+                didPan: false
+            ),
+            "an eligible stationary secondary click did not present its menu"
+        )
+        try require(
+            TimelineSecondaryButtonGesture.hasCrossedPanThreshold(
+                anchorX: 100,
+                currentX: 100 - threshold
+            ),
+            "a secondary-button drag did not activate timeline pan"
+        )
+        try require(
+            !TimelineSecondaryButtonGesture.shouldPresentContextMenu(
+                wasEligibleAtMouseDown: true,
+                didPan: true
+            ),
+            "timeline pan still presented the selection context menu"
+        )
+        try require(
+            !TimelineSecondaryButtonGesture.shouldPresentContextMenu(
+                wasEligibleAtMouseDown: false,
+                didPan: false
+            ),
+            "a secondary click outside the selection presented its context menu"
+        )
+    }
+
+    private static func verifyLoopMoveGuidesRenderBothEndpoints(
+        renderer: TimelineRenderer,
+        track: TimelineRenderState.Track,
+        texture: MTLTexture,
+        viewportSize: CGSize,
+        backingScale: Float
+    ) throws {
+        let loopRange = TimelineLoopRange(startProgress: 0.24, endProgress: 0.71)
+        let timestamp = CACurrentMediaTime()
+
+        renderer.displayTracks([track], animateWaveformTransition: false)
+        renderer.displayTrackLayout(.default)
+        renderer.displayViewport(.full)
+        renderer.displayPlaybackActive(false)
+        renderer.displayPlayheadProgress(
+            0.04,
+            force: true,
+            anchorTimestamp: timestamp,
+            resetsTouchStart: true
+        )
+        renderer.displayLoopRange(loopRange)
+        renderer.displayHoverProgress(nil, isArmed: false)
+        renderer.publishInteractionLoopMoveGuides(false)
+        try waitForVisibleWaveformBuffers(
+            renderer: renderer,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale,
+            displayTimestamp: timestamp
+        )
+
+        let baseFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: timestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        renderer.publishInteractionLoopMoveGuides(true)
+        let guidedFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: timestamp + 1.0 / 144.0,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        renderer.publishInteractionLoopMoveGuides(false)
+
+        let width = guidedFrame.summary.width
+        let height = guidedFrame.summary.height
+        let layout = TimelineTrackLayout.default.resolved(
+            totalTrackCount: 1,
+            viewportHeight: Float(height)
+        )
+        let guideRows = min(Int(layout.rulerLaneHeight.rounded(.up)) + 2, height)..<height
+
+        func columns(around progress: Float) -> Range<Int> {
+            let x = Int((progress * Float(width)).rounded())
+            return max(x - 2, 0)..<min(x + 3, width)
+        }
+
+        let leftDifference = pixelDifferenceCount(
+            baseFrame.bytes,
+            guidedFrame.bytes,
+            width: width,
+            columns: columns(around: loopRange.startProgress),
+            rows: guideRows,
+            threshold: 2
+        )
+        let rightDifference = pixelDifferenceCount(
+            baseFrame.bytes,
+            guidedFrame.bytes,
+            width: width,
+            columns: columns(around: loopRange.endProgress),
+            rows: guideRows,
+            threshold: 2
+        )
+        let centerDifference = pixelDifferenceCount(
+            baseFrame.bytes,
+            guidedFrame.bytes,
+            width: width,
+            columns: columns(around: (loopRange.startProgress + loopRange.endProgress) * 0.5),
+            rows: guideRows,
+            threshold: 2
+        )
+
+        try require(
+            leftDifference > guideRows.count / 2,
+            "moving the full loop region did not draw its left boundary guide"
+        )
+        try require(
+            rightDifference > guideRows.count / 2,
+            "moving the full loop region did not draw its right boundary guide"
+        )
+        try require(
+            centerDifference < guideRows.count / 8,
+            "moving the full loop region incorrectly kept a cursor-centered guide"
+        )
+    }
+
+    private static func verifyLoopPlaybackBypassSemantics() throws {
+        let loopRange = TimelineLoopRange(startProgress: 0.20, endProgress: 0.60)
+
+        try require(
+            TimelineLoopPlaybackPolicy.bypassesLoopForExplicitSeek(
+                to: 0.78,
+                whilePlaying: true,
+                loopRange: loopRange,
+                isLoopEnabled: true
+            ),
+            "playing seek beyond the loop end did not bypass the current loop cycle"
+        )
+        try require(
+            !TimelineLoopPlaybackPolicy.bypassesLoopForExplicitSeek(
+                to: 0.50,
+                whilePlaying: true,
+                loopRange: loopRange,
+                isLoopEnabled: true
+            ),
+            "playing seek inside the loop incorrectly bypassed looping"
+        )
+        try require(
+            !TimelineLoopPlaybackPolicy.bypassesLoopForExplicitSeek(
+                to: 0.78,
+                whilePlaying: false,
+                loopRange: loopRange,
+                isLoopEnabled: true
+            ),
+            "paused seek beyond the loop end bypassed the next normal play"
+        )
+        try require(
+            !TimelineLoopPlaybackPolicy.shouldWrapPlayback(
+                at: 0.78,
+                loopRange: loopRange,
+                isLoopEnabled: true,
+                isBypassed: true
+            ),
+            "bypassed playback still wrapped at the loop boundary"
+        )
+        try require(
+            TimelineLoopPlaybackPolicy.shouldWrapPlayback(
+                at: 0.60,
+                loopRange: loopRange,
+                isLoopEnabled: true,
+                isBypassed: false
+            ),
+            "natural playback crossing did not wrap at the loop boundary"
+        )
+
+        let loopMovedAhead = TimelineLoopRange(startProgress: 0.62, endProgress: 0.82)
+        try require(
+            !TimelineLoopPlaybackPolicy.bypassesLoopAfterRangeChange(
+                playbackProgress: 0.48,
+                whilePlaying: true,
+                loopRange: loopMovedAhead,
+                isLoopEnabled: true
+            ),
+            "moving the loop ahead of playback incorrectly disabled the next loop"
+        )
+        try require(
+            TimelineLoopPlaybackPolicy.shouldWrapPlayback(
+                at: loopMovedAhead.endProgress,
+                loopRange: loopMovedAhead,
+                isLoopEnabled: true,
+                isBypassed: false
+            ),
+            "playback did not remain armed to wrap after reaching a loop moved ahead"
+        )
+
+        let loopMovedBehind = TimelineLoopRange(startProgress: 0.12, endProgress: 0.32)
+        try require(
+            TimelineLoopPlaybackPolicy.bypassesLoopAfterRangeChange(
+                playbackProgress: 0.48,
+                whilePlaying: true,
+                loopRange: loopMovedBehind,
+                isLoopEnabled: true
+            ),
+            "moving the loop behind playback did not bypass it for the current pass"
+        )
+        try require(
+            !TimelineLoopPlaybackPolicy.bypassesLoopAfterRangeChange(
+                playbackProgress: 0.48,
+                whilePlaying: false,
+                loopRange: loopMovedBehind,
+                isLoopEnabled: true
+            ),
+            "moving a loop while paused incorrectly bypassed the next playback pass"
+        )
+    }
+
+    private static func verifyLiveLoopMoveUpdatesPlayheadProjection(
+        renderer: TimelineRenderer,
+        track: TimelineRenderState.Track
+    ) throws {
+        let timestamp = CACurrentMediaTime()
+        let originalRange = TimelineLoopRange(startProgress: 0.20, endProgress: 0.40)
+        let movedRange = TimelineLoopRange(startProgress: 0.60, endProgress: 0.80)
+
+        renderer.displayTracks([track], animateWaveformTransition: false)
+        renderer.displayLoopRange(originalRange)
+        renderer.displayLoopRangeEnabled(true)
+        renderer.displayLoopPlaybackBypassed(false)
+        renderer.displayPlaybackActive(true)
+        renderer.displayPlayheadProgress(
+            0.50,
+            force: true,
+            anchorTimestamp: timestamp,
+            resetsTouchStart: true
+        )
+
+        let originalProjection = renderer.projectedPlayheadProgress(at: timestamp) ?? -1
+        try require(
+            abs(originalProjection - 0.30) < 0.000_1,
+            "test setup did not project through the original loop range"
+        )
+
+        renderer.publishInteractionLoopRange(movedRange)
+        let liveProjection = renderer.projectedPlayheadProgress(at: timestamp) ?? -1
+        try require(
+            abs(liveProjection - 0.50) < 0.000_1,
+            "playhead projection kept using the stale loop while its body moved"
+        )
+
+        renderer.displayLoopRange(movedRange)
+        let committedProjection = renderer.projectedPlayheadProgress(at: timestamp) ?? -1
+        try require(
+            abs(committedProjection - 0.50) < 0.000_1,
+            "committing a moved loop restored stale loop boundaries"
+        )
+
+        renderer.displayPlaybackActive(false)
+        renderer.displayLoopPlaybackBypassed(false)
+        renderer.displayLoopRangeEnabled(false)
+        renderer.displayLoopRange(.default)
+        renderer.publishInteractionLoopMoveGuides(false)
+        renderer.displayHighlightedLoopEndpoint(nil)
+        renderer.displayHighlightedSelectionEndpoint(nil)
+        renderer.displaySelection(nil, marksInteraction: false)
+    }
+
     private static func verifyEdgeAutoPanCurve() throws {
         let viewportWidth: CGFloat = 1_000
         let activationDistance: CGFloat = 84
@@ -1510,6 +1877,250 @@ enum TimelineUXSmokeHarness {
             ),
             "loop endpoints exactly on viewport boundaries were treated as clipped"
         )
+        try require(
+            TimelineLoopCornerVisibility.projected(
+                rawLeft: -120,
+                rawRight: 1_080,
+                viewportWidth: 960
+            ) == TimelineLoopCornerVisibility(
+                roundsLeftCorner: false,
+                roundsRightCorner: false
+            ),
+            "projected loop bounds did not suppress corners at both clipped viewport edges"
+        )
+    }
+
+    private static func verifyClippedLoopRangeCornersRenderSquare(
+        renderer: TimelineRenderer,
+        track: TimelineRenderState.Track,
+        texture: MTLTexture,
+        viewportSize: CGSize,
+        backingScale: Float
+    ) throws {
+        let timestamp = CACurrentMediaTime()
+        renderer.displayTracks([track], animateWaveformTransition: false)
+        renderer.displayTrackLayout(.default)
+        renderer.displayViewport(TimelineViewport(startProgress: 0.30, durationProgress: 0.30))
+        renderer.displayPlaybackActive(false)
+        renderer.displayPlayheadProgress(
+            0.45,
+            force: true,
+            anchorTimestamp: timestamp,
+            resetsTouchStart: true
+        )
+        renderer.displayLoopRange(.default)
+        let baseFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: timestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+
+        renderer.displayLoopRange(TimelineLoopRange(startProgress: 0.20, endProgress: 0.80))
+        renderer.displayLoopRangeEnabled(true)
+        let clippedFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: timestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+
+        let width = clippedFrame.summary.width
+        let height = clippedFrame.summary.height
+        let cornerRows = 3..<min(8, height)
+        let leftCornerDifference = pixelDifferenceCount(
+            baseFrame.bytes,
+            clippedFrame.bytes,
+            width: width,
+            columns: 0..<min(4, width),
+            rows: cornerRows,
+            threshold: 3
+        )
+        let rightCornerDifference = pixelDifferenceCount(
+            baseFrame.bytes,
+            clippedFrame.bytes,
+            width: width,
+            columns: max(width - 4, 0)..<width,
+            rows: cornerRows,
+            threshold: 3
+        )
+        try require(
+            leftCornerDifference >= 12,
+            "left-clipped loop endpoint still rendered a rounded viewport corner"
+        )
+        try require(
+            rightCornerDifference >= 12,
+            "right-clipped loop endpoint still rendered a rounded viewport corner"
+        )
+
+        renderer.displayLoopRange(.default)
+        renderer.displayViewport(.full)
+    }
+
+    private static func verifyClippedRangeEndpointsSuppressEdgeEffects(
+        renderer: TimelineRenderer,
+        track: TimelineRenderState.Track,
+        texture: MTLTexture,
+        viewportSize: CGSize,
+        backingScale: Float
+    ) throws {
+        let timestamp = CACurrentMediaTime()
+        let viewport = TimelineViewport(startProgress: 0.30, durationProgress: 0.30)
+        let selection = TimelineSelection(
+            startProgress: 0.20,
+            endProgress: 0.80,
+            trackID: track.id
+        )
+        renderer.displayTracks([track], animateWaveformTransition: false)
+        renderer.displayTrackLayout(.default)
+        renderer.displayViewport(viewport)
+        renderer.displayPlaybackActive(false)
+        renderer.displayPlayheadProgress(
+            0.45,
+            force: true,
+            anchorTimestamp: timestamp,
+            resetsTouchStart: true
+        )
+        renderer.displayLoopRange(.default)
+        renderer.displaySelection(nil, marksInteraction: false)
+        let noSelectionFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: timestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        renderer.displaySelection(selection, marksInteraction: false)
+        renderer.displayHighlightedSelectionEndpoint(nil)
+        let selectionBaseFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: timestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        let width = selectionBaseFrame.summary.width
+        let height = selectionBaseFrame.summary.height
+        let layout = TimelineTrackLayout.default.resolved(
+            totalTrackCount: 1,
+            viewportHeight: Float(height)
+        )
+        let topRow = Int(layout.rulerLaneHeight.rounded(.down))
+        let cornerRows = max(topRow + 2, 0)..<min(topRow + 7, height)
+        let bottomCornerRows = max(height - 7, 0)..<max(height - 2, 0)
+        let leftColumns = 0..<min(4, width)
+        let rightColumns = max(width - 4, 0)..<width
+        let leftCornerDifference =
+            pixelDifferenceCount(
+                noSelectionFrame.bytes,
+                selectionBaseFrame.bytes,
+                width: width,
+                columns: leftColumns,
+                rows: cornerRows,
+                threshold: 3
+            ) +
+            pixelDifferenceCount(
+                noSelectionFrame.bytes,
+                selectionBaseFrame.bytes,
+                width: width,
+                columns: leftColumns,
+                rows: bottomCornerRows,
+                threshold: 3
+            )
+        let rightCornerDifference =
+            pixelDifferenceCount(
+                noSelectionFrame.bytes,
+                selectionBaseFrame.bytes,
+                width: width,
+                columns: rightColumns,
+                rows: cornerRows,
+                threshold: 3
+            ) +
+            pixelDifferenceCount(
+                noSelectionFrame.bytes,
+                selectionBaseFrame.bytes,
+                width: width,
+                columns: rightColumns,
+                rows: bottomCornerRows,
+                threshold: 3
+            )
+        try require(
+            leftCornerDifference >= 24,
+            "left-clipped selection still rounded its viewport continuation"
+        )
+        try require(
+            rightCornerDifference >= 24,
+            "right-clipped selection still rounded its viewport continuation"
+        )
+
+        renderer.displayHighlightedSelectionEndpoint(.start)
+        let selectionStartHoverFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: timestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        renderer.displayHighlightedSelectionEndpoint(.end)
+        let selectionEndHoverFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: timestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        try require(
+            pixelDifferenceCount(selectionBaseFrame.bytes, selectionStartHoverFrame.bytes, threshold: 0) == 0,
+            "left-clipped selection endpoint still rendered a hover/glass edge"
+        )
+        try require(
+            pixelDifferenceCount(selectionBaseFrame.bytes, selectionEndHoverFrame.bytes, threshold: 0) == 0,
+            "right-clipped selection endpoint still rendered a hover/glass edge"
+        )
+
+        renderer.displayHighlightedSelectionEndpoint(nil)
+        renderer.displaySelection(nil, marksInteraction: false)
+        renderer.displayLoopRange(TimelineLoopRange(startProgress: 0.20, endProgress: 0.80))
+        renderer.displayLoopRangeEnabled(true)
+        renderer.displayHighlightedLoopEndpoint(nil)
+        let loopBaseFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: timestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+
+        renderer.displayHighlightedLoopEndpoint(.start)
+        let loopStartHoverFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: timestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        renderer.displayHighlightedLoopEndpoint(.end)
+        let loopEndHoverFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: timestamp,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        try require(
+            pixelDifferenceCount(loopBaseFrame.bytes, loopStartHoverFrame.bytes, threshold: 0) == 0,
+            "left-clipped loop endpoint still rendered a hover/glass edge"
+        )
+        try require(
+            pixelDifferenceCount(loopBaseFrame.bytes, loopEndHoverFrame.bytes, threshold: 0) == 0,
+            "right-clipped loop endpoint still rendered a hover/glass edge"
+        )
+
+        renderer.displayHighlightedLoopEndpoint(nil)
+        renderer.displayLoopRange(.default)
+        renderer.displayViewport(.full)
     }
 
     private static func verifySelectionEdgeHoverRendering(

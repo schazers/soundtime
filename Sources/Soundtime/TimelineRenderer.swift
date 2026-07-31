@@ -160,6 +160,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         var metrics: SIMD4<Float>
         var style: SIMD4<Float>
         var pulse: SIMD4<Float>
+        var endpointVisibility: SIMD4<Float>
         var baseColor: SIMD4<Float>
         var progressColor: SIMD4<Float>
         var fisheye: SIMD4<Float>
@@ -764,6 +765,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             let selectionDragSnapshot: TimelineSelectionDragSnapshot?
             let selectionDragWaveformContacts: [SelectionDragWaveformContact]
             let loopRange: TimelineLoopRange?
+            let showsLoopMoveGuides: Bool
         }
 
         private let lock = NSLock()
@@ -774,6 +776,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         private var hoverProgress: Float?
         private var isHoverArmed = false
         private var loopRange: TimelineLoopRange?
+        private var showsLoopMoveGuides = false
 
         func publishViewport(_ viewport: TimelineViewport) {
             lock.lock()
@@ -847,6 +850,22 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             self.loopRange = loopRange
         }
 
+        func publishLoopMoveGuides(_ isVisible: Bool) {
+            lock.lock()
+            defer {
+                lock.unlock()
+            }
+            showsLoopMoveGuides = isVisible
+        }
+
+        func presentedLoopRange(fallback: TimelineLoopRange) -> TimelineLoopRange {
+            lock.lock()
+            defer {
+                lock.unlock()
+            }
+            return loopRange ?? fallback
+        }
+
         func applying(to state: TimelineRenderState) -> TimelineRenderState {
             lock.lock()
             defer {
@@ -874,7 +893,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 renderState: applyingInteractionState(to: state),
                 selectionDragSnapshot: selectionDragSnapshot,
                 selectionDragWaveformContacts: selectionDragWaveformContacts,
-                loopRange: loopRange
+                loopRange: loopRange,
+                showsLoopMoveGuides: showsLoopMoveGuides
             )
         }
 
@@ -1195,6 +1215,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var clipBoundaryVertexScratch: [TimelineVertex] = []
     private var loopRange = TimelineLoopRange.default
     private var isLoopRangeEnabled = true
+    private var isLoopPlaybackBypassed = false
     private var isLoopRegionHighlighted = false
     private var loopRangeFlashStartTime: CFTimeInterval?
     private var highlightedLoopEndpoint: TimelineLoopEndpoint?
@@ -2391,6 +2412,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         interactionStateStore.publishLoopRange(loopRange)
     }
 
+    func publishInteractionLoopMoveGuides(_ isVisible: Bool) {
+        markWaveformHotInteraction()
+        interactionStateStore.publishLoopMoveGuides(isVisible)
+    }
+
     func displayLoopRangeEnabled(_ isEnabled: Bool) {
         guard isLoopRangeEnabled != isEnabled else {
             return
@@ -2398,6 +2424,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         markWaveformHotInteraction()
         isLoopRangeEnabled = isEnabled
+    }
+
+    func displayLoopPlaybackBypassed(_ isBypassed: Bool) {
+        guard isLoopPlaybackBypassed != isBypassed else {
+            return
+        }
+
+        isLoopPlaybackBypassed = isBypassed
     }
 
     func displayHighlightedLoopEndpoint(_ endpoint: TimelineLoopEndpoint?) {
@@ -2933,7 +2967,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let mipLevelSnapshot = waveformMipLevelSnapshot()
         let renderedPlayheadProgress = currentPlayheadProgress(
             renderState: renderState,
-            displayTimestamp: displayTimestamp
+            displayTimestamp: displayTimestamp,
+            loopRange: presentedLoopRange
         )
         updateTrackFisheyeAudibility(for: renderState, at: displayTimestamp)
         let waveformFisheye = waveformFisheyeParameters(
@@ -3150,7 +3185,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let hoverGuideVertices = makeHoverGuideVertices(
             drawableSize: viewportSize,
             backingScale: backingScale,
-            renderState: renderState
+            renderState: renderState,
+            loopMoveGuideRange: interactionFrame.showsLoopMoveGuides ? presentedLoopRange : nil
         )
         let playheadVertices = makePlayheadVertices(
             drawableSize: viewportSize,
@@ -5678,7 +5714,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             SIMD3<Float>(0.78, 0.79, 0.80)
         let flashedFillAlpha = min(fillAlpha + flashBoost * 0.10, 0.55)
         let flashedEdgeAlpha = min(edgeAlpha + flashBoost * 0.16, 0.96)
-        let cornerVisibility = loopRange.cornerVisibility(in: renderState.viewport)
+        let cornerVisibility = TimelineLoopCornerVisibility.projected(
+            rawLeft: rawLeft,
+            rawRight: rawRight,
+            viewportWidth: width
+        )
         let endpointHighlight: Float
         switch highlightedLoopEndpoint {
         case .start:
@@ -7280,6 +7320,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         guard visibleRight > visibleLeft else {
             return nil
         }
+        let endpointVisibility = TimelineRangeEndpointVisibility.projected(
+            rawLeft: left,
+            rawRight: right,
+            viewportWidth: 1
+        )
 
         let visibleWidthPixels = max((visibleRight - visibleLeft) * width, 1)
         let visibleHeightPixels = max((verticalRange.bottom - verticalRange.top) * height, 1)
@@ -7347,7 +7392,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 let freshness = 1 - smoothStep(fadeProgress)
                 dragStrength = selectionDragStrength(for: dragSnapshot.velocityPixelsPerSecond) * freshness
                 let edgeX = renderState.viewport.viewportProgress(forTimelineProgress: dragSnapshot.leadingProgress)
-                dragEdgeLocalX = min(max((edgeX - visibleLeft) / max(visibleRight - visibleLeft, 0.000_001), 0), 1)
+                if edgeX >= visibleLeft, edgeX <= visibleRight {
+                    dragEdgeLocalX = (edgeX - visibleLeft) / max(visibleRight - visibleLeft, 0.000_001)
+                }
                 dragDirection = dragSnapshot.direction == 0 ? 1 : dragSnapshot.direction
             }
         }
@@ -7387,6 +7434,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 Float(selectionCopyFlashDuration),
                 highlightedEndpoint,
                 abs(highlightedEndpoint)
+            ),
+            endpointVisibility: SIMD4<Float>(
+                endpointVisibility.showsLeftEndpoint ? 1 : 0,
+                endpointVisibility.showsRightEndpoint ? 1 : 0,
+                0,
+                0
             ),
             baseColor: baseColor,
             progressColor: progressColor,
@@ -10139,20 +10192,30 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     }
 
     func projectedPlayheadProgress(at displayTimestamp: CFTimeInterval) -> Float? {
-        projectedPlayheadProgress(at: displayTimestamp, renderState: renderStateStore.snapshot())
+        projectedPlayheadProgress(
+            at: displayTimestamp,
+            renderState: renderStateStore.snapshot(),
+            loopRange: interactionStateStore.presentedLoopRange(fallback: loopRange)
+        )
     }
 
     private func currentPlayheadProgress(
         renderState: TimelineRenderState,
-        displayTimestamp: CFTimeInterval
+        displayTimestamp: CFTimeInterval,
+        loopRange: TimelineLoopRange
     ) -> Float {
-        projectedPlayheadProgress(at: displayTimestamp, renderState: renderState) ??
+        projectedPlayheadProgress(
+            at: displayTimestamp,
+            renderState: renderState,
+            loopRange: loopRange
+        ) ??
             min(max(renderState.playheadProgress, 0), 1)
     }
 
     private func projectedPlayheadProgress(
         at displayTimestamp: CFTimeInterval,
-        renderState: TimelineRenderState
+        renderState: TimelineRenderState,
+        loopRange: TimelineLoopRange? = nil
     ) -> Float? {
         let clampedProgress = min(max(renderState.playheadProgress, 0), 1)
         guard
@@ -10166,12 +10229,18 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         let elapsedTime = displayTimestamp - renderState.playheadAnchorTimestamp
         let progress = clampedProgress + Float(elapsedTime / duration)
-        return loopConstrainedPlaybackProgress(progress)
+        return loopConstrainedPlaybackProgress(
+            progress,
+            loopRange: loopRange ?? self.loopRange
+        )
     }
 
-    private func loopConstrainedPlaybackProgress(_ progress: Float) -> Float {
+    private func loopConstrainedPlaybackProgress(
+        _ progress: Float,
+        loopRange: TimelineLoopRange
+    ) -> Float {
         let clampedProgress = min(max(progress, 0), 1)
-        guard isLoopRangeEnabled else {
+        guard isLoopRangeEnabled, !isLoopPlaybackBypassed else {
             return clampedProgress
         }
 
@@ -10330,12 +10399,22 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private func makeHoverGuideVertices(
         drawableSize: CGSize,
         backingScale: Float,
-        renderState: TimelineRenderState
+        renderState: TimelineRenderState,
+        loopMoveGuideRange: TimelineLoopRange? = nil
     ) -> [TimelineVertex] {
-        guard
-            let hoverProgress = renderState.hoverProgress,
-            renderState.hasWaveforms
-        else {
+        guard renderState.hasWaveforms else {
+            return []
+        }
+
+        var guideProgresses: [Float] = []
+        guideProgresses.reserveCapacity(2)
+        if let loopMoveGuideRange {
+            guideProgresses.append(loopMoveGuideRange.startProgress)
+            guideProgresses.append(loopMoveGuideRange.endProgress)
+        } else if let hoverProgress = renderState.hoverProgress {
+            guideProgresses.append(hoverProgress)
+        }
+        guard !guideProgresses.isEmpty else {
             return []
         }
 
@@ -10351,30 +10430,32 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         let viewport = renderState.viewport
-        let guideProgress = viewport.viewportProgress(forTimelineProgress: hoverProgress)
-        guard guideProgress >= 0, guideProgress <= 1 else {
-            return []
-        }
-
-        let guideX = pixelAligned(guideProgress * width, backingScale: backingScale)
         let guideWidth = pixelLength(backingScale: backingScale)
-        let left = max(guideX - guideWidth * 0.5, 0)
-        let right = min(left + guideWidth, width)
         let alpha: Float = renderState.isHoverGuideArmed ? 0.56 : 0.36
         let color = SIMD4<Float>(0.68, 0.70, 0.72, alpha)
         let size = SIMD2<Float>(width, height)
         var vertices: [TimelineVertex] = []
-        vertices.reserveCapacity(6)
+        vertices.reserveCapacity(guideProgresses.count * 6)
 
-        appendRectangle(
-            to: &vertices,
-            left: left,
-            right: right,
-            top: guideTop,
-            bottom: height,
-            color: color,
-            drawableSize: size
-        )
+        for progress in guideProgresses {
+            let guideProgress = viewport.viewportProgress(forTimelineProgress: progress)
+            guard guideProgress >= 0, guideProgress <= 1 else {
+                continue
+            }
+
+            let guideX = pixelAligned(guideProgress * width, backingScale: backingScale)
+            let left = max(guideX - guideWidth * 0.5, 0)
+            let right = min(left + guideWidth, width)
+            appendRectangle(
+                to: &vertices,
+                left: left,
+                right: right,
+                top: guideTop,
+                bottom: height,
+                color: color,
+                drawableSize: size
+            )
+        }
 
         return vertices
     }
@@ -12510,6 +12591,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float4 metrics;
         float4 style;
         float4 pulse;
+        float4 endpointVisibility;
         float4 baseColor;
         float4 progressColor;
         float4 fisheye;
@@ -12614,6 +12696,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float4 metrics;
         float4 style;
         float4 pulse;
+        float4 endpointVisibility;
         float4 baseColor;
         float4 progressColor;
     };
@@ -13149,6 +13232,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         out.metrics = uniform.metrics;
         out.style = uniform.style;
         out.pulse = uniform.pulse;
+        out.endpointVisibility = uniform.endpointVisibility;
         out.baseColor = uniform.baseColor;
         out.progressColor = uniform.progressColor;
         return out;
@@ -13162,6 +13246,34 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     static float box_signed_distance(float2 point, float2 center, float2 halfSize) {
         float2 q = abs(point - center) - halfSize;
         return length(max(q, float2(0.0))) + min(max(q.x, q.y), 0.0);
+    }
+
+    static float side_aware_rounded_rect_signed_distance(
+        float2 pixel,
+        float width,
+        float height,
+        float radius,
+        float2 endpointVisibility
+    ) {
+        float r = clamp(radius, 0.0, min(width, height) * 0.5);
+        if (r <= 0.5) {
+            return box_signed_distance(pixel, float2(width, height) * 0.5, float2(width, height) * 0.5);
+        }
+
+        if (endpointVisibility.x > 0.5 && pixel.x < r) {
+            float cornerY = pixel.y < height * 0.5 ? r : height - r;
+            if (pixel.y < r || pixel.y > height - r) {
+                return length(pixel - float2(r, cornerY)) - r;
+            }
+        }
+        if (endpointVisibility.y > 0.5 && pixel.x > width - r) {
+            float cornerY = pixel.y < height * 0.5 ? r : height - r;
+            if (pixel.y < r || pixel.y > height - r) {
+                return length(pixel - float2(width - r, cornerY)) - r;
+            }
+        }
+
+        return box_signed_distance(pixel, float2(width, height) * 0.5, float2(width, height) * 0.5);
     }
 
     static float top_rounded_tab_signed_distance(
@@ -13249,14 +13361,27 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float x = clamp(in.localPosition.x, 0.0, 1.0);
 
         float edgeDistance = abs(distance);
-        float rim = exp(-(edgeDistance * edgeDistance) / max(10.0, 8.0 + radiusPixels * 0.6));
-        float innerRim = exp(-pow(max(-distance, 0.0) / max(4.0, radiusPixels * 0.52), 2.0));
+        float leftEndpointVisible = step(0.5, in.cornerVisibility.x);
+        float rightEndpointVisible = step(0.5, in.cornerVisibility.y);
+        float clippedSideBlend = max(
+            (1.0 - leftEndpointVisible) * (1.0 - smoothstep(0.0, radiusPixels + 8.0, pixel.x)),
+            (1.0 - rightEndpointVisible) * (1.0 - smoothstep(0.0, radiusPixels + 8.0, widthPixels - pixel.x))
+        );
+        float horizontalEdgeDistance = min(pixel.y, heightPixels - pixel.y);
+        float visibleEdgeDistance = mix(edgeDistance, horizontalEdgeDistance, clippedSideBlend);
+        float visibleInnerDistance = mix(max(-distance, 0.0), horizontalEdgeDistance, clippedSideBlend);
+        float rim = exp(-(visibleEdgeDistance * visibleEdgeDistance) / max(10.0, 8.0 + radiusPixels * 0.6));
+        float innerRim = exp(-pow(visibleInnerDistance / max(4.0, radiusPixels * 0.52), 2.0));
         float topSheen = pow(max(1.0 - y, 0.0), 2.1);
         float bottomShade = pow(max(y, 0.0), 2.4);
-        float sideEdgeDistance = min(pixel.x, widthPixels - pixel.x);
-        float sideRim = exp(-pow(sideEdgeDistance / max(edgeWidthPixels * 3.4, 2.0), 2.0));
+        float leftSideRim = leftEndpointVisible *
+            exp(-pow(pixel.x / max(edgeWidthPixels * 3.4, 2.0), 2.0));
+        float rightSideRim = rightEndpointVisible *
+            exp(-pow((widthPixels - pixel.x) / max(edgeWidthPixels * 3.4, 2.0), 2.0));
+        float sideRim = max(leftSideRim, rightSideRim);
         float hoveredEdgeSide = clamp(in.edgeHighlight.x, -1.0, 1.0);
-        float hoveredEdgeAmount = clamp(in.edgeHighlight.y, 0.0, 1.0);
+        float hoveredEndpointVisible = hoveredEdgeSide < 0.0 ? leftEndpointVisible : rightEndpointVisible;
+        float hoveredEdgeAmount = clamp(in.edgeHighlight.y, 0.0, 1.0) * hoveredEndpointVisible;
         float hoveredEdgeDistance = hoveredEdgeSide < 0.0 ? pixel.x : widthPixels - pixel.x;
         float hoveredEdgeCore = exp(-pow(hoveredEdgeDistance / max(edgeWidthPixels * 1.35, 1.35), 2.0));
         float hoveredEdgeHalo = exp(-pow(hoveredEdgeDistance / max(edgeWidthPixels * 5.8, 5.8), 2.0));
@@ -13303,6 +13428,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float progressFraction,
         float4 style,
         float4 pulse,
+        float2 endpointVisibility,
         float4 baseColor,
         float4 progressFillColor
     ) {
@@ -13312,8 +13438,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float dragEdgeLocalX = style.x;
         float dragStrength = clamp(style.y, 0.0, 1.0);
         float edgeBandPixels = max(radiusPixels + 7.0, 20.0);
+        float leftEndpointVisible = step(0.5, endpointVisibility.x);
+        float rightEndpointVisible = step(0.5, endpointVisibility.y);
+        float leftInteriorDepth = leftEndpointVisible > 0.5 ? pixel.x : widthPixels + heightPixels;
+        float rightInteriorDepth = rightEndpointVisible > 0.5 ? widthPixels - pixel.x : widthPixels + heightPixels;
         float interiorDepth = min(
-            min(pixel.x, widthPixels - pixel.x),
+            min(leftInteriorDepth, rightInteriorDepth),
             min(pixel.y, heightPixels - pixel.y)
         );
         float transitionStart = max(edgeBandPixels - 8.0, 0.0);
@@ -13360,11 +13490,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             );
         }
 
-        float2 centered = pixel - float2(widthPixels, heightPixels) * 0.5;
-        float distance = rounded_rect_signed_distance(
-            centered,
-            max(float2(widthPixels, heightPixels) * 0.5, float2(radiusPixels + 0.5)),
-            radiusPixels
+        float distance = side_aware_rounded_rect_signed_distance(
+            pixel,
+            widthPixels,
+            heightPixels,
+            radiusPixels,
+            endpointVisibility
         );
         float aa = max(fwidth(distance), 0.85);
         float coverage = 1.0 - smoothstep(-aa, aa, distance);
@@ -13377,23 +13508,32 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float lowerAmount = max(localPosition.y, 0.0);
         float lowerShade = lowerAmount * lowerAmount * lowerAmount;
         float edgeDistance = abs(distance);
+        float clippedSideBlend = max(
+            (1.0 - leftEndpointVisible) * (1.0 - smoothstep(0.0, radiusPixels + 8.0, pixel.x)),
+            (1.0 - rightEndpointVisible) * (1.0 - smoothstep(0.0, radiusPixels + 8.0, widthPixels - pixel.x))
+        );
+        float horizontalEdgeDistance = min(pixel.y, heightPixels - pixel.y);
+        float visibleEdgeDistance = mix(edgeDistance, horizontalEdgeDistance, clippedSideBlend);
+        float visibleInnerDistance = mix(max(-distance, 0.0), horizontalEdgeDistance, clippedSideBlend);
+        float visibleOuterDistance = mix(max(distance, 0.0), horizontalEdgeDistance, clippedSideBlend);
         float rim = 1.0 - smoothstep(
             0.0,
             max(4.0, 4.0 + radiusPixels * 0.10),
-            edgeDistance
+            visibleEdgeDistance
         );
         float innerRim = 1.0 - smoothstep(
             0.0,
             max(6.0, radiusPixels * 0.55),
-            max(-distance, 0.0)
+            visibleInnerDistance
         );
         float outerRim = 1.0 - smoothstep(
             0.0,
             max(4.0, radiusPixels * 0.35),
-            max(distance, 0.0)
+            visibleOuterDistance
         );
         float hoveredEdgeSide = clamp(pulse.z, -1.0, 1.0);
-        float hoveredEdgeAmount = clamp(pulse.w, 0.0, 1.0);
+        float hoveredEndpointVisible = hoveredEdgeSide < 0.0 ? leftEndpointVisible : rightEndpointVisible;
+        float hoveredEdgeAmount = clamp(pulse.w, 0.0, 1.0) * hoveredEndpointVisible;
         float hoveredEdgeX = hoveredEdgeSide < 0.0 ? 0.0 : widthPixels;
         float hoveredEdgeDistance = abs(pixel.x - hoveredEdgeX);
         float hoveredEdgeCore = 1.0 - smoothstep(0.0, 1.6, hoveredEdgeDistance);
@@ -13491,6 +13631,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             in.metrics.w,
             in.style,
             in.pulse,
+            in.endpointVisibility.xy,
             in.baseColor,
             in.progressColor
         );
@@ -13670,6 +13811,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                             -1.0,
                             float4(1.0, edgeStrength, 1.0, effect.timing.z + effect.timing.y),
                             float4(0.0),
+                            float2(1.0),
                             float4(0.02, 0.82, 0.88, 0.18),
                             float4(0.28, 0.96, 1.0, 0.20)
                         )

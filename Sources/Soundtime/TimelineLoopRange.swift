@@ -5,9 +5,41 @@ enum TimelineLoopEndpoint: Sendable, Equatable {
     case end
 }
 
+struct TimelineRangeEndpointVisibility: Sendable, Equatable {
+    let showsLeftEndpoint: Bool
+    let showsRightEndpoint: Bool
+
+    static func projected(
+        rawLeft: Float,
+        rawRight: Float,
+        viewportWidth: Float
+    ) -> TimelineRangeEndpointVisibility {
+        TimelineRangeEndpointVisibility(
+            showsLeftEndpoint: rawLeft >= 0,
+            showsRightEndpoint: rawRight <= viewportWidth
+        )
+    }
+}
+
 struct TimelineLoopCornerVisibility: Sendable, Equatable {
     let roundsLeftCorner: Bool
     let roundsRightCorner: Bool
+
+    static func projected(
+        rawLeft: Float,
+        rawRight: Float,
+        viewportWidth: Float
+    ) -> TimelineLoopCornerVisibility {
+        let endpoints = TimelineRangeEndpointVisibility.projected(
+            rawLeft: rawLeft,
+            rawRight: rawRight,
+            viewportWidth: viewportWidth
+        )
+        return TimelineLoopCornerVisibility(
+            roundsLeftCorner: endpoints.showsLeftEndpoint,
+            roundsRightCorner: endpoints.showsRightEndpoint
+        )
+    }
 }
 
 struct TimelineLoopRange: Sendable, Equatable {
@@ -50,9 +82,71 @@ struct TimelineLoopRange: Sendable, Equatable {
     }
 
     func cornerVisibility(in viewport: TimelineViewport) -> TimelineLoopCornerVisibility {
-        TimelineLoopCornerVisibility(
-            roundsLeftCorner: startProgress >= viewport.startProgress,
-            roundsRightCorner: endProgress <= viewport.endProgress
+        let rawLeft = viewport.viewportProgress(forTimelineProgress: startProgress)
+        let rawRight = viewport.viewportProgress(forTimelineProgress: endProgress)
+        return TimelineLoopCornerVisibility.projected(
+            rawLeft: rawLeft,
+            rawRight: rawRight,
+            viewportWidth: 1
         )
+    }
+}
+
+enum TimelineLoopPlaybackPolicy {
+    private static let boundaryEpsilon: Float = 0.000_001
+
+    static func bypassesLoopForExplicitSeek(
+        to progress: Float,
+        whilePlaying: Bool,
+        loopRange: TimelineLoopRange,
+        isLoopEnabled: Bool
+    ) -> Bool {
+        guard
+            whilePlaying,
+            isLoopEnabled,
+            loopRange.durationProgress > 0.0001,
+            loopRange.durationProgress < 0.999
+        else {
+            return false
+        }
+
+        return progress > loopRange.endProgress + boundaryEpsilon
+    }
+
+    static func bypassesLoopAfterRangeChange(
+        playbackProgress: Float,
+        whilePlaying: Bool,
+        loopRange: TimelineLoopRange,
+        isLoopEnabled: Bool
+    ) -> Bool {
+        guard
+            whilePlaying,
+            isLoopEnabled,
+            loopRange.durationProgress > 0.0001,
+            loopRange.durationProgress < 0.999
+        else {
+            return false
+        }
+
+        return playbackProgress > loopRange.endProgress + boundaryEpsilon
+    }
+
+    static func shouldWrapPlayback(
+        at progress: Float,
+        loopRange: TimelineLoopRange,
+        isLoopEnabled: Bool,
+        isBypassed: Bool
+    ) -> Bool {
+        guard
+            isLoopEnabled,
+            !isBypassed,
+            loopRange.durationProgress > 0.0001,
+            loopRange.durationProgress < 0.999,
+            loopRange.endProgress > loopRange.startProgress
+        else {
+            return false
+        }
+
+        return progress >= loopRange.endProgress
     }
 }

@@ -2022,6 +2022,7 @@ final class WorkspaceView: NSView {
         return controller
     }
     private var timelineLoopIsEnabled = true
+    private var isTimelineLoopPlaybackBypassed = false
     private var playbackRefreshRate: TimeInterval {
         timelineLoopIsEnabled && timelineLoopRange.durationProgress < 0.999 ? 60 : 10
     }
@@ -5746,9 +5747,22 @@ final class WorkspaceView: NSView {
     }
 
     private func updateTimelineLoopRange(_ loopRange: TimelineLoopRange) {
+        let playbackProgress = projectedUnconstrainedVisualPlayheadProgress(
+            at: CACurrentMediaTime(),
+            duration: displayedDuration
+        )
+        let isPlaying = playbackController.isPlaying
         timelineLoopRange = loopRange
         previousLoopPlaybackProgress = nil
-        if playbackController.isPlaying {
+        setTimelineLoopPlaybackBypassed(
+            TimelineLoopPlaybackPolicy.bypassesLoopAfterRangeChange(
+                playbackProgress: playbackProgress,
+                whilePlaying: isPlaying,
+                loopRange: loopRange,
+                isLoopEnabled: timelineLoopIsEnabled
+            )
+        )
+        if isPlaying {
             startPlaybackTimer()
         }
     }
@@ -5756,6 +5770,7 @@ final class WorkspaceView: NSView {
     private func updateTimelineLoopRangeEnabled(_ isEnabled: Bool) {
         timelineLoopIsEnabled = isEnabled
         previousLoopPlaybackProgress = nil
+        setTimelineLoopPlaybackBypassed(false)
         timelineSurface.displayLoopRangeEnabled(isEnabled)
         if playbackController.isPlaying {
             startPlaybackTimer()
@@ -16681,8 +16696,10 @@ final class WorkspaceView: NSView {
                     timelineSurface.pausePresentationPlayheadProgress() :
                     nil
                 playbackController.pause(atProgress: max(pauseProgress ?? snapshot.progress, snapshot.progress))
+                setTimelineLoopPlaybackBypassed(false)
                 isPlaying = false
             } else {
+                setTimelineLoopPlaybackBypassed(false)
                 if let loopStartProgress = activeTimelineLoopStartProgress() {
                     try playbackController.seekExactly(toProgress: loopStartProgress)
                 }
@@ -16710,9 +16727,14 @@ final class WorkspaceView: NSView {
             return
         }
 
+        let previousLoopPlaybackBypass = isTimelineLoopPlaybackBypassed
         do {
             let wasPlaying = playbackController.isPlaying
             previousLoopPlaybackProgress = nil
+            updateTimelineLoopPlaybackBypassForExplicitSeek(
+                to: progress,
+                whilePlaying: wasPlaying
+            )
             try playbackController.seek(toProgress: progress)
             refreshPlaybackProgress(
                 syncPlayheadWhenPlaying: true,
@@ -16728,6 +16750,7 @@ final class WorkspaceView: NSView {
                 updateStatus("ready")
             }
         } catch {
+            setTimelineLoopPlaybackBypassed(previousLoopPlaybackBypass)
             stopPlaybackTimer()
             updateStatus("seek failed: \(error.localizedDescription)")
         }
@@ -16750,9 +16773,14 @@ final class WorkspaceView: NSView {
         let actualDelta = targetTime - currentTime
         let targetProgress = Float(targetTime / duration)
 
+        let previousLoopPlaybackBypass = isTimelineLoopPlaybackBypassed
         do {
             let wasPlaying = snapshot.isPlaying
             previousLoopPlaybackProgress = nil
+            updateTimelineLoopPlaybackBypassForExplicitSeek(
+                to: targetProgress,
+                whilePlaying: wasPlaying
+            )
             try playbackController.seekExactly(toProgress: targetProgress)
             refreshPlaybackProgress(
                 syncPlayheadWhenPlaying: true,
@@ -16774,6 +16802,7 @@ final class WorkspaceView: NSView {
                     "skipped back \(formatDuration(abs(actualDelta)))"
             )
         } catch {
+            setTimelineLoopPlaybackBypassed(previousLoopPlaybackBypass)
             stopPlaybackTimer()
             updateStatus("skip failed: \(error.localizedDescription)")
         }
@@ -16785,9 +16814,14 @@ final class WorkspaceView: NSView {
         }
         markTimelineHotInteraction(reason: "play-from-progress")
 
+        let previousLoopPlaybackBypass = isTimelineLoopPlaybackBypassed
         do {
             let wasPlaying = playbackController.isPlaying
             previousLoopPlaybackProgress = nil
+            updateTimelineLoopPlaybackBypassForExplicitSeek(
+                to: progress,
+                whilePlaying: true
+            )
             try playbackController.seek(toProgress: progress)
 
             if !playbackController.isPlaying {
@@ -16802,6 +16836,7 @@ final class WorkspaceView: NSView {
             startPlaybackTimer()
             updateStatus("playing")
         } catch {
+            setTimelineLoopPlaybackBypassed(previousLoopPlaybackBypass)
             stopPlaybackTimer()
             updateStatus("playback failed: \(error.localizedDescription)")
         }
@@ -17405,7 +17440,6 @@ final class WorkspaceView: NSView {
                     "renderedFrameCount": "\(exportResult.renderedFrameCount)",
                     "peakMagnitude": String(format: "%.3f", exportResult.renderStats.peakMagnitude),
                     "clippedSamples": "\(exportResult.renderStats.clippedSampleCount)",
-                    "report": exportResult.reportURL?.path ?? "",
                 ]
             )
         case let .failure(error as CancellationError):
@@ -20601,18 +20635,32 @@ final class WorkspaceView: NSView {
         at timestamp: TimeInterval,
         duration: TimeInterval
     ) -> Float {
+        loopConstrainedVisualProgress(
+            projectedUnconstrainedVisualPlayheadProgress(
+                at: timestamp,
+                duration: duration
+            )
+        )
+    }
+
+    private func projectedUnconstrainedVisualPlayheadProgress(
+        at timestamp: TimeInterval,
+        duration: TimeInterval
+    ) -> Float {
         guard visualPlaybackActive, duration.isFinite, duration > 0 else {
             return visualPlayheadProgress
         }
 
         let elapsedTime = timestamp - visualPlayheadAnchorTimestamp
-        let projectedProgress = visualPlayheadProgress + Float(elapsedTime / duration)
-        return loopConstrainedVisualProgress(projectedProgress)
+        return min(
+            max(visualPlayheadProgress + Float(elapsedTime / duration), 0),
+            1
+        )
     }
 
     private func loopConstrainedVisualProgress(_ progress: Float) -> Float {
         let clampedProgress = min(max(progress, 0), 1)
-        guard timelineLoopIsEnabled else {
+        guard timelineLoopIsEnabled, !isTimelineLoopPlaybackBypassed else {
             return clampedProgress
         }
 
@@ -20645,6 +20693,29 @@ final class WorkspaceView: NSView {
         }
 
         return timelineLoopRange.startProgress
+    }
+
+    private func updateTimelineLoopPlaybackBypassForExplicitSeek(
+        to progress: Float,
+        whilePlaying: Bool
+    ) {
+        setTimelineLoopPlaybackBypassed(
+            TimelineLoopPlaybackPolicy.bypassesLoopForExplicitSeek(
+                to: progress,
+                whilePlaying: whilePlaying,
+                loopRange: timelineLoopRange,
+                isLoopEnabled: timelineLoopIsEnabled
+            )
+        )
+    }
+
+    private func setTimelineLoopPlaybackBypassed(_ isBypassed: Bool) {
+        guard isTimelineLoopPlaybackBypassed != isBypassed else {
+            return
+        }
+
+        isTimelineLoopPlaybackBypassed = isBypassed
+        timelineSurface.displayLoopPlaybackBypassed(isBypassed)
     }
 
     private func displayPlaybackActiveIfNeeded(_ isPlaying: Bool, forceTimelineUpdate: Bool = false) {
@@ -20681,6 +20752,7 @@ final class WorkspaceView: NSView {
 
         if !snapshot.isPlaying {
             previousLoopPlaybackProgress = nil
+            setTimelineLoopPlaybackBypassed(false)
             stopPlaybackTimer()
             if snapshot.isAtEnd {
                 updateStatus("finished")
@@ -20694,9 +20766,12 @@ final class WorkspaceView: NSView {
     ) -> PlaybackSnapshot {
         guard
             snapshot.isPlaying,
-            timelineLoopIsEnabled,
-            timelineLoopRange.durationProgress > 0.0001,
-            timelineLoopRange.durationProgress < 0.999
+            TimelineLoopPlaybackPolicy.shouldWrapPlayback(
+                at: snapshot.progress,
+                loopRange: timelineLoopRange,
+                isLoopEnabled: timelineLoopIsEnabled,
+                isBypassed: isTimelineLoopPlaybackBypassed
+            )
         else {
             return snapshot
         }

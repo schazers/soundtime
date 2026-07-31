@@ -199,6 +199,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var edgeAutoPanLastTimestamp: CFTimeInterval?
     private var loopRange = TimelineLoopRange.default
     private var isLoopRangeEnabled = true
+    private var isLoopPlaybackBypassed = false
+    private var showsLoopMoveGuides = false
     private var isLoopRegionHovered = false
     private var hoverTrackingArea: NSTrackingArea?
     private var isInteractionSuppressed = false
@@ -210,9 +212,12 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var trackInsertionAnimationIndex: Int?
     private let trackInsertionAnimationDuration: CFTimeInterval = 0.22
     private var rightPanPreviousPoint: CGPoint?
+    private var rightPanInitialPoint: CGPoint?
     private var rightPanPreviousTime: TimeInterval?
     private var rightPanLastMovementTime: TimeInterval?
     private var rightPanVelocityProgressPerSecond: Float = 0
+    private var isRightPanGestureActive = false
+    private var isSelectionContextMenuArmed = false
     private var rightPanMomentumTimer: Timer?
     private var rightPanMomentumLastTime: TimeInterval?
     private var zoomMomentumAnchorProgress: Float?
@@ -374,9 +379,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             isDraggingTrim = false
             isDraggingLoop = false
             edgeAutoPanLastTimestamp = nil
-            rightPanPreviousPoint = nil
-            rightPanPreviousTime = nil
-            rightPanLastMovementTime = nil
+            resetRightPanGestureState()
             stopRightPanMomentum()
             stopZoomMomentum()
             displaySelection(nil)
@@ -470,9 +473,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             isDraggingTrim = false
             isDraggingLoop = false
             edgeAutoPanLastTimestamp = nil
-            rightPanPreviousPoint = nil
-            rightPanPreviousTime = nil
-            rightPanLastMovementTime = nil
+            resetRightPanGestureState()
             stopRightPanMomentum()
             stopZoomMomentum()
             displaySelection(nil)
@@ -855,9 +856,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             activeLoopMoveInitialRange = nil
             edgeAutoPanLastTimestamp = nil
             displayHoverProgress(nil)
+            displayLoopMoveGuides(false)
             displayHighlightedSelectionEndpoint(nil)
             displayHighlightedLoopEndpoint(nil)
             displayHighlightedLoopRegion(false)
+            resetRightPanGestureState()
             stopRightPanMomentum()
             stopZoomMomentum()
             scrollGestureMode = nil
@@ -1226,6 +1229,18 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         requestTimelineRender()
     }
 
+    func displayLoopPlaybackBypassed(_ isBypassed: Bool) {
+        guard isLoopPlaybackBypassed != isBypassed else {
+            return
+        }
+
+        isLoopPlaybackBypassed = isBypassed
+        updateTimelineRendererImmediately { renderer in
+            renderer.displayLoopPlaybackBypassed(isBypassed)
+        }
+        requestTimelineRender()
+    }
+
     func triggerLoopRangeFlash() {
         updateTimelineRendererImmediately { renderer in
             renderer.triggerLoopRangeFlash()
@@ -1287,6 +1302,19 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         let publishedProgress = isInteractionSuppressed ? nil : progress
         let publishedArmed = isInteractionSuppressed ? false : isArmed
         timelineRenderer?.publishInteractionHover(progress: publishedProgress, isArmed: publishedArmed)
+        requestRender(cadence: renderCadence)
+    }
+
+    private func displayLoopMoveGuides(
+        _ isVisible: Bool,
+        renderCadence: TimelineRenderCadence = .immediate
+    ) {
+        guard showsLoopMoveGuides != isVisible else {
+            return
+        }
+
+        showsLoopMoveGuides = isVisible
+        timelineRenderer?.publishInteractionLoopMoveGuides(isVisible)
         requestRender(cadence: renderCadence)
     }
 
@@ -1375,7 +1403,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         preferredFramesPerSecond = targetFramesPerSecond
 
         wantsLayer = true
-        layer?.cornerRadius = 8
+        layer?.cornerRadius = 0
         layer?.masksToBounds = true
         configureDropPreviewLayer()
         bootstrapWaveformView.translatesAutoresizingMaskIntoConstraints = false
@@ -1496,6 +1524,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         let currentTrackLayout = trackLayout
         let currentLoopRange = loopRange
         let currentLoopRangeEnabled = isLoopRangeEnabled
+        let currentLoopPlaybackBypassed = isLoopPlaybackBypassed
+        let currentShowsLoopMoveGuides = showsLoopMoveGuides
         let currentSelection = currentSelection
         let currentPlayheadProgress = pagingPlayheadProgress
         let playbackActive = isTimelinePlaybackActive
@@ -1509,6 +1539,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             renderer.displayTrackLayout(currentTrackLayout, marksInteraction: false)
             renderer.displayLoopRange(currentLoopRange)
             renderer.displayLoopRangeEnabled(currentLoopRangeEnabled)
+            renderer.displayLoopPlaybackBypassed(currentLoopPlaybackBypassed)
+            renderer.publishInteractionLoopMoveGuides(currentShowsLoopMoveGuides)
             renderer.displayTracks(
                 tracks,
                 animateWaveformTransition: false,
@@ -2169,7 +2201,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     private func loopConstrainedPagingProgress(_ progress: Float) -> Float {
         let clampedProgress = min(max(progress, 0), 1)
-        guard isLoopRangeEnabled else {
+        guard isLoopRangeEnabled, !isLoopPlaybackBypassed else {
             return clampedProgress
         }
 
@@ -3110,6 +3142,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onTimelineInteractionBegan?()
         clearLiveSelectionDragSnapshot()
         edgeAutoPanLastTimestamp = nil
+        displayLoopMoveGuides(false)
         let point = convert(event.locationInWindow, from: nil)
         let timelineProgress = progress(for: point)
         if let loopDragMode = loopDragMode(for: point) {
@@ -3265,7 +3298,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             if activeDragMode != .loopRegion {
                 displayHoverProgress(nil, renderCadence: .coalescedInteraction)
             }
-            if !isDraggingLoop, (activeDragMode == .loopRegion || didMovePastSelectionThreshold(to: point)) {
+            let crossedLoopDragThreshold = activeDragMode == .loopRegion ?
+                didMovePastRegionCreationThreshold(to: point) :
+                didMovePastSelectionThreshold(to: point)
+            if !isDraggingLoop, crossedLoopDragThreshold {
                 isDraggingLoop = true
                 if activeDragMode == .loopStart || activeDragMode == .loopEnd {
                     edgeAutoPanLastTimestamp = nil
@@ -3274,19 +3310,25 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                 if activeDragMode == .loopRegion || activeDragMode == .moveLoopRegion {
                     setLoopRangeEnabled(true, notifyChange: true)
                     displayHighlightedLoopRegion(true, renderCadence: .coalescedInteraction)
+                    displayLoopMoveGuides(
+                        activeDragMode == .moveLoopRegion,
+                        renderCadence: .coalescedInteraction
+                    )
                 }
             }
 
             if let activeDragMode {
                 let dragProgress = progress(for: loopDragProgressPoint(from: point), followsVisualFisheye: false)
                 if activeDragMode == .loopRegion {
-                    updateLoopRegionRange(
-                        from: Float(selectionAnchorProgress),
-                        to: dragProgress,
-                        renderCadence: .coalescedInteraction,
-                        invalidatesCursorRects: false
-                    )
-                    displayHoverProgress(dragProgress, isArmed: true, renderCadence: .coalescedInteraction)
+                    if isDraggingLoop {
+                        updateLoopRegionRange(
+                            from: Float(selectionAnchorProgress),
+                            to: dragProgress,
+                            renderCadence: .coalescedInteraction,
+                            invalidatesCursorRects: false
+                        )
+                        displayHoverProgress(dragProgress, isArmed: true, renderCadence: .coalescedInteraction)
+                    }
                 } else if
                     activeDragMode == .moveLoopRegion,
                     isDraggingLoop,
@@ -3300,11 +3342,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                         renderCadence: .coalescedInteraction,
                         invalidatesCursorRects: false
                     )
-                    displayHoverProgress(
-                        dragProgress,
-                        isArmed: true,
-                        renderCadence: .coalescedInteraction
-                    )
+                    displayHoverProgress(nil, renderCadence: .coalescedInteraction)
                 } else if isDraggingLoop {
                     updateLoopRange(
                         for: activeDragMode,
@@ -3380,7 +3418,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
-        if !isDraggingSelection, didMovePastSelectionThreshold(to: point) {
+        if !isDraggingSelection, didMovePastRegionCreationThreshold(to: point) {
             isDraggingSelection = true
             displayHoverProgress(nil, renderCadence: .coalescedInteraction)
         }
@@ -3553,6 +3591,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         isDraggingLoop = false
         activeLoopDragOffsetX = 0
         activeLoopMoveInitialRange = nil
+        displayLoopMoveGuides(false)
         edgeAutoPanLastTimestamp = nil
         flushPendingCursorRectInvalidationIfNeeded()
         if !updateLoopHover(for: event), !updateSelectionEdgeHover(for: event) {
@@ -3574,18 +3613,16 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         window?.makeFirstResponder(self)
         let point = convert(event.locationInWindow, from: nil)
-        if shouldShowSelectionContextMenu(at: point) {
-            showSelectionContextMenu(with: event)
-            return
-        }
-
         stopRightPanMomentum()
         stopZoomMomentum()
-        onTimelineInteractionBegan?()
-        rightPanPreviousPoint = currentDragPoint(for: event)
+        let dragPoint = currentDragPoint(for: event)
+        rightPanInitialPoint = dragPoint
+        rightPanPreviousPoint = dragPoint
         rightPanPreviousTime = event.timestamp
         rightPanLastMovementTime = nil
         rightPanVelocityProgressPerSecond = 0
+        isRightPanGestureActive = false
+        isSelectionContextMenuArmed = shouldShowSelectionContextMenu(at: point)
         selectionAnchorProgress = nil
         selectionAnchorPoint = nil
         selectionAnchorTrackID = nil
@@ -3595,6 +3632,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         isDraggingTrim = false
         isDraggingLoop = false
         displayHoverProgress(nil)
+        displayLoopMoveGuides(false)
     }
 
     private func shouldShowSelectionContextMenu(at point: CGPoint) -> Bool {
@@ -3620,7 +3658,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         return true
     }
 
-    private func showSelectionContextMenu(with event: NSEvent) {
+    private func showSelectionContextMenu(at point: CGPoint) {
         let menu = NSMenu(title: "Selected Region")
 
         let exportItem = NSMenuItem(
@@ -3644,7 +3682,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         deleteItem.target = self
         menu.addItem(deleteItem)
 
-        NSMenu.popUpContextMenu(menu, with: event, for: self)
+        menu.popUp(positioning: nil, at: point, in: self)
     }
 
     @objc private func exportSelectionFromContextMenu(_ sender: Any?) {
@@ -3659,6 +3697,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         PerformanceSampler.shared.recordTimelineInputEvent(kind: "right-mouse-dragged", at: event.timestamp)
         guard
             isSelectionEnabled,
+            let initialPoint = rightPanInitialPoint,
             let previousPoint = rightPanPreviousPoint,
             bounds.width > 0
         else {
@@ -3667,6 +3706,19 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         let point = currentDragPoint(for: event)
+        if !isRightPanGestureActive {
+            guard TimelineSecondaryButtonGesture.hasCrossedPanThreshold(
+                anchorX: initialPoint.x,
+                currentX: point.x
+            ) else {
+                return
+            }
+
+            isRightPanGestureActive = true
+            isSelectionContextMenuArmed = false
+            onTimelineInteractionBegan?()
+        }
+
         let horizontalDelta = previousPoint.x - point.x
         let progressDelta = Float(horizontalDelta / bounds.width) * viewport.durationProgress
         let elapsedTime: TimeInterval
@@ -3708,7 +3760,16 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
-        if let lastMovementTime = rightPanLastMovementTime {
+        let point = convert(event.locationInWindow, from: nil)
+        let didPan = isRightPanGestureActive
+        let shouldPresentContextMenu =
+            TimelineSecondaryButtonGesture.shouldPresentContextMenu(
+                wasEligibleAtMouseDown: isSelectionContextMenuArmed,
+                didPan: didPan
+            ) &&
+            shouldShowSelectionContextMenu(at: point)
+
+        if didPan, let lastMovementTime = rightPanLastMovementTime {
             let idleTime = max(event.timestamp - lastMovementTime, 0)
             let decayWindow = min(idleTime, rightPanMomentumReleaseWindow)
             let decay = Float(exp(-rightPanStationaryDecayRate * decayWindow))
@@ -3717,12 +3778,24 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             rightPanVelocityProgressPerSecond = 0
         }
 
+        resetRightPanGestureState()
+        flushPendingCursorRectInvalidationIfNeeded()
+        if didPan {
+            startRightPanMomentumIfNeeded()
+        }
+        updateHoverGuide(for: event)
+        if shouldPresentContextMenu {
+            showSelectionContextMenu(at: point)
+        }
+    }
+
+    private func resetRightPanGestureState() {
         rightPanPreviousPoint = nil
+        rightPanInitialPoint = nil
         rightPanPreviousTime = nil
         rightPanLastMovementTime = nil
-        flushPendingCursorRectInvalidationIfNeeded()
-        startRightPanMomentumIfNeeded()
-        updateHoverGuide(for: event)
+        isRightPanGestureActive = false
+        isSelectionContextMenuArmed = false
     }
 
     private func startRightPanMomentumIfNeeded() {
@@ -4936,6 +5009,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     ) {
         let nextRange = initialRange.moving(by: currentProgress - anchorProgress)
         guard nextRange != loopRange else {
+            if renderCadence == .immediate {
+                updateTimelineRendererImmediately { renderer in
+                    renderer.displayLoopRange(nextRange)
+                }
+            }
             return
         }
 
@@ -5484,6 +5562,17 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         return abs(point.x - selectionAnchorPoint.x) >= selectionDragThreshold ||
             abs(point.y - selectionAnchorPoint.y) >= selectionDragThreshold
+    }
+
+    private func didMovePastRegionCreationThreshold(to point: CGPoint) -> Bool {
+        guard let selectionAnchorPoint else {
+            return false
+        }
+
+        return TimelineRegionCreationGesture.hasCrossedDragThreshold(
+            anchorX: selectionAnchorPoint.x,
+            currentX: point.x
+        )
     }
 
     private func trackID(at point: CGPoint) -> UUID? {
