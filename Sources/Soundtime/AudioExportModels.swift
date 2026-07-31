@@ -290,7 +290,6 @@ struct AudioExportResult: Sendable {
     let renderedFrameCount: Int
     let renderStats: AudioExportRenderStats
     let validations: [AudioExportOutputValidator.Validation]
-    let reportURL: URL?
 }
 
 struct AudioExportRenderStats: Sendable, Codable, Equatable {
@@ -315,7 +314,6 @@ struct AudioExportCompletedWrite: Sendable {
     let outputURLs: [URL]
     let renderStats: AudioExportRenderStats
     let validations: [AudioExportOutputValidator.Validation]
-    let reportURL: URL?
 }
 
 protocol AudioExportSampleWriter: AnyObject {

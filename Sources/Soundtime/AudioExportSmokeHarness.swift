@@ -44,7 +44,12 @@ enum AudioExportSmokeHarness {
         try verifyMixBusDoesNotClampDuringSumming(root: root, sampleRate: sampleRate)
         try verifyCompressedMixdown(root: root, sampleRate: sampleRate, frameCount: frameCount, tracks: [trackA])
         try verifyLongFileBlockRender(root: root, sampleRate: sampleRate)
-        try verifyExportReport(root: root, sampleRate: sampleRate, frameCount: frameCount, tracks: [trackA, trackB])
+        try verifyExportDoesNotWriteSidecar(
+            root: root,
+            sampleRate: sampleRate,
+            frameCount: frameCount,
+            tracks: [trackA, trackB]
+        )
         try verifyAssetLeases(root: root, url: sourceAURL)
         try verifyWAVEncodingMatrix(root: root, sampleRate: sampleRate, track: trackA)
         try verifyAvailableCodecMatrix(root: root, sampleRate: sampleRate, track: trackA)
@@ -882,7 +887,7 @@ enum AudioExportSmokeHarness {
         try require(elapsed < 8, "long-file export was unexpectedly slow: \(elapsed)s")
     }
 
-    private static func verifyExportReport(
+    private static func verifyExportDoesNotWriteSidecar(
         root: URL,
         sampleRate: Double,
         frameCount: Int,
@@ -906,19 +911,17 @@ enum AudioExportSmokeHarness {
             leasedURLs: tracks.compactMap(\.sourceURL)
         )
 
-        let completed = try AudioExportService.exportSynchronouslyForTestingResult(
-            snapshot: snapshot,
-            writesReport: true
+        let completed = try AudioExportService.exportSynchronouslyForTestingResult(snapshot: snapshot)
+        let unexpectedJSONFiles = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: nil
+        )?
+            .compactMap { $0 as? URL }
+            .filter { $0.pathExtension.lowercased() == "json" } ?? []
+        try require(
+            unexpectedJSONFiles.isEmpty,
+            "export wrote unexpected JSON sidecars: \(unexpectedJSONFiles.map(\.lastPathComponent))"
         )
-        guard let reportURL = completed.reportURL else {
-            throw SmokeFailure("export report URL was not returned")
-        }
-        try require(FileManager.default.fileExists(atPath: reportURL.path), "export report was not written")
-        let reportText = try String(contentsOf: reportURL)
-        try require(reportText.contains("\"renderedFrameCount\""), "export report omitted rendered frame count")
-        try require(reportText.contains("\"compressedBitRate\""), "export report omitted compressed bit rate")
-        try require(reportText.contains("\"sourceFingerprints\""), "export report omitted source fingerprints")
-        try require(reportText.contains("\"applicationVersion\""), "export report omitted application version")
         try require(completed.renderStats.renderedFrameCount == frameCount, "export stats frame count mismatch")
     }
 

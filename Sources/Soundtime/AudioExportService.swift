@@ -63,21 +63,13 @@ final class AudioExportService: @unchecked Sendable {
                         outputURLs: []
                     ))
                 }
-                let reportURL = Self.writeReportIfPossible(
-                    snapshot: snapshot,
-                    outputURLs: completedWrite.outputURLs,
-                    startedAt: startedAt,
-                    renderStats: completedWrite.renderStats,
-                    validations: completedWrite.validations
-                )
                 let result = AudioExportResult(
                     request: snapshot.request,
                     outputURLs: completedWrite.outputURLs,
                     elapsedSeconds: Date().timeIntervalSince(startedAt),
                     renderedFrameCount: completedWrite.renderStats.renderedFrameCount,
                     renderStats: completedWrite.renderStats,
-                    validations: completedWrite.validations,
-                    reportURL: reportURL
+                    validations: completedWrite.validations
                 )
 
                 service.emit(AudioExportProgress(
@@ -216,8 +208,7 @@ final class AudioExportService: @unchecked Sendable {
                 return AudioExportCompletedWrite(
                     outputURLs: [outputURL],
                     renderStats: stats,
-                    validations: [validation],
-                    reportURL: nil
+                    validations: [validation]
                 )
             } catch {
                 transaction.cancel()
@@ -266,8 +257,7 @@ final class AudioExportService: @unchecked Sendable {
             return AudioExportCompletedWrite(
                 outputURLs: [outputURL],
                 renderStats: stats,
-                validations: [validation],
-                reportURL: nil
+                validations: [validation]
             )
         } catch {
             transaction.cancel()
@@ -388,8 +378,7 @@ final class AudioExportService: @unchecked Sendable {
             return AudioExportCompletedWrite(
                 outputURLs: committedURLs,
                 renderStats: combinedStats,
-                validations: validations,
-                reportURL: nil
+                validations: validations
             )
         } catch {
             transaction.cancel()
@@ -435,123 +424,12 @@ final class AudioExportService: @unchecked Sendable {
 
     static func exportSynchronouslyForTestingResult(
         snapshot: AudioExportSnapshot,
-        writesReport: Bool = false,
         progressHandler: AudioExportRenderer.ProgressHandler? = nil
     ) throws -> AudioExportCompletedWrite {
-        let startedAt = Date()
-        let completedWrite = try performExport(
+        try performExport(
             snapshot: snapshot,
             progressHandler: progressHandler
         )
-        guard writesReport else {
-            return completedWrite
-        }
-        let reportURL = writeReportIfPossible(
-            snapshot: snapshot,
-            outputURLs: completedWrite.outputURLs,
-            startedAt: startedAt,
-            renderStats: completedWrite.renderStats,
-            validations: completedWrite.validations
-        )
-        return AudioExportCompletedWrite(
-            outputURLs: completedWrite.outputURLs,
-            renderStats: completedWrite.renderStats,
-            validations: completedWrite.validations,
-            reportURL: reportURL
-        )
-    }
-
-    private static func writeReportIfPossible(
-        snapshot: AudioExportSnapshot,
-        outputURLs: [URL],
-        startedAt: Date,
-        renderStats: AudioExportRenderStats,
-        validations: [AudioExportOutputValidator.Validation]
-    ) -> URL? {
-        guard let reportURL = reportURL(for: snapshot.request, outputURLs: outputURLs) else {
-            return nil
-        }
-
-        let finishedAt = Date()
-        let bundle = Bundle.main
-        let report = AudioExportReport(
-            jobID: snapshot.request.id.uuidString,
-            applicationVersion: bundle.object(
-                forInfoDictionaryKey: "CFBundleShortVersionString"
-            ) as? String ?? "development",
-            applicationBuild: bundle.object(
-                forInfoDictionaryKey: "CFBundleVersion"
-            ) as? String ?? "development",
-            projectName: snapshot.request.projectName,
-            scope: snapshot.request.scope.displayName,
-            format: snapshot.request.format.displayName,
-            wavEncoding: snapshot.request.wavEncoding.displayName,
-            compressedBitRate: snapshot.request.compressedQuality.rawValue,
-            stemTrackInclusion: snapshot.request.stemOptions.trackInclusion.rawValue,
-            stemGainPosition: snapshot.request.stemOptions.gainPosition.rawValue,
-            createdAt: snapshot.request.createdAt,
-            startedAt: startedAt,
-            finishedAt: finishedAt,
-            elapsedSeconds: finishedAt.timeIntervalSince(startedAt),
-            sampleRate: snapshot.sampleRate,
-            channelCount: snapshot.channelCount,
-            exportFrameRangeLowerBound: snapshot.exportFrameRange.lowerBound,
-            exportFrameRangeUpperBound: snapshot.exportFrameRange.upperBound,
-            trackCount: snapshot.tracks.count,
-            sourceFingerprints: snapshot.tracks.compactMap(\.sourceFingerprint),
-            renderedFrameCount: renderStats.renderedFrameCount,
-            peakMagnitude: renderStats.peakMagnitude,
-            clippedSampleCount: renderStats.clippedSampleCount,
-            validations: validations,
-            outputPaths: outputURLs.map(\.path)
-        )
-
-        do {
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            let data = try encoder.encode(report)
-            try data.write(to: reportURL, options: .atomic)
-            SoundtimeDiagnostics.shared.record(
-                category: .system,
-                severity: .info,
-                name: "export-report-written",
-                message: "Export wrote a structured report.",
-                fields: [
-                    "jobID": snapshot.request.id.uuidString,
-                    "path": reportURL.path,
-                ]
-            )
-            return reportURL
-        } catch {
-            SoundtimeDiagnostics.shared.record(
-                category: .system,
-                severity: .warning,
-                name: "export-report-write-failed",
-                message: "Export completed, but the structured report could not be written.",
-                fields: [
-                    "jobID": snapshot.request.id.uuidString,
-                    "error": error.localizedDescription,
-                ]
-            )
-            return nil
-        }
-    }
-
-    private static func reportURL(for request: AudioExportRequest, outputURLs: [URL]) -> URL? {
-        guard let firstOutputURL = outputURLs.first else {
-            return nil
-        }
-
-        if request.scope.exportsStems {
-            return firstOutputURL
-                .deletingLastPathComponent()
-                .appendingPathComponent("soundtime-export-\(request.id.uuidString).json")
-        }
-
-        return firstOutputURL
-            .deletingPathExtension()
-            .appendingPathExtension("soundtime-export.json")
     }
 
     private static func sanitizedFilenameComponent(_ value: String) -> String {
@@ -568,32 +446,4 @@ final class AudioExportService: @unchecked Sendable {
         let sanitized = String(whitespaceCollapsed.prefix(120))
         return sanitized.isEmpty ? "Soundtime" : sanitized
     }
-}
-
-private struct AudioExportReport: Codable {
-    let jobID: String
-    let applicationVersion: String
-    let applicationBuild: String
-    let projectName: String
-    let scope: String
-    let format: String
-    let wavEncoding: String
-    let compressedBitRate: Int
-    let stemTrackInclusion: String
-    let stemGainPosition: String
-    let createdAt: Date
-    let startedAt: Date
-    let finishedAt: Date
-    let elapsedSeconds: TimeInterval
-    let sampleRate: Double
-    let channelCount: Int
-    let exportFrameRangeLowerBound: Int
-    let exportFrameRangeUpperBound: Int
-    let trackCount: Int
-    let sourceFingerprints: [AudioExportSourceFingerprint]
-    let renderedFrameCount: Int
-    let peakMagnitude: Float
-    let clippedSampleCount: Int
-    let validations: [AudioExportOutputValidator.Validation]
-    let outputPaths: [String]
 }
