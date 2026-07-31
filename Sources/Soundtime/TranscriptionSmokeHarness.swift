@@ -1642,19 +1642,22 @@ enum TranscriptionSmokeHarness {
         _ operation: @escaping @Sendable () async throws -> T
     ) throws -> T {
         let semaphore = DispatchSemaphore(value: 0)
-        var result: Result<T, Error>?
-        Task {
+        let resultBox = TranscriptionSmokeResultBox<T>()
+        Task.detached {
             let taskResult: Result<T, Error>
             do {
                 taskResult = .success(try await operation())
             } catch {
                 taskResult = .failure(error)
             }
-            result = taskResult
+            resultBox.store(taskResult)
             semaphore.signal()
         }
         semaphore.wait()
-        return try requireValue(result, "async transcription operation did not complete").get()
+        return try requireValue(
+            resultBox.value,
+            "async transcription operation did not complete"
+        ).get()
     }
 
     private static func require(_ condition: Bool, _ message: String) throws {
@@ -1668,5 +1671,22 @@ enum TranscriptionSmokeHarness {
             throw SmokeError.failed(message)
         }
         return value
+    }
+}
+
+private final class TranscriptionSmokeResultBox<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue: Result<Value, Error>?
+
+    var value: Result<Value, Error>? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedValue
+    }
+
+    func store(_ value: Result<Value, Error>) {
+        lock.lock()
+        storedValue = value
+        lock.unlock()
     }
 }

@@ -121,12 +121,9 @@ final class DenoiseReviewOverlayView: NSView {
     func hide(animated: Bool = true) {
         stopProgressTimer()
         previewPlayer.stop()
-        let completion = { [weak self] in
-            self?.isHidden = true
-            self?.alphaValue = 0
-        }
         guard animated else {
-            completion()
+            isHidden = true
+            alphaValue = 0
             return
         }
 
@@ -134,8 +131,11 @@ final class DenoiseReviewOverlayView: NSView {
             context.duration = 0.18
             context.timingFunction = CAMediaTimingFunction(name: .easeIn)
             animator().alphaValue = 0
-        } completionHandler: {
-            completion()
+        } completionHandler: { [weak self] in
+            MainActor.assumeIsolated {
+                self?.isHidden = true
+                self?.alphaValue = 0
+            }
         }
     }
 

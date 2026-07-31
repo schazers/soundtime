@@ -1,5 +1,22 @@
-import AVFoundation
+@preconcurrency import AVFoundation
 import Foundation
+
+private final class StreamingAudioConversionInputState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedError: Error?
+
+    var error: Error? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedError
+    }
+
+    func store(error: Error) {
+        lock.lock()
+        storedError = error
+        lock.unlock()
+    }
+}
 
 struct StreamingAudioProxyBuildResult: Sendable {
     let proxyURL: URL
@@ -167,6 +184,9 @@ enum StreamingAudioProxyBuilder {
         let maximumInputBufferBytes = Int(inputChunkFrames) *
             Int(sourceFormat.channelCount) *
             MemoryLayout<Float>.size
+        let maximumOutputBufferBytes = Int(outputCapacity) *
+            Int(outputFormat.channelCount) *
+            MemoryLayout<Float>.size
 
         while !reachedEnd {
             try Task.checkCancellation()
@@ -177,8 +197,9 @@ enum StreamingAudioProxyBuilder {
                 throw AudioAssetImporter.ImportError.unsupportedNativePCMLayout
             }
 
-            var conversionError: NSError?
-            let status = converter.convert(to: outputBuffer, error: &conversionError) {
+            let inputState = StreamingAudioConversionInputState()
+            var converterError: NSError?
+            let status = converter.convert(to: outputBuffer, error: &converterError) {
                 requestedFrames,
                 inputStatus in
                 if sourceFile.framePosition >= sourceFile.length {
@@ -201,20 +222,19 @@ enum StreamingAudioProxyBuilder {
                 do {
                     try sourceFile.read(into: inputBuffer, frameCount: frameCount)
                     inputStatus.pointee = inputBuffer.frameLength > 0 ? .haveData : .endOfStream
-                    localPeakWorkingSetBytes = max(
-                        localPeakWorkingSetBytes,
-                        estimatedBytes(inputBuffer) + estimatedBytes(outputBuffer)
-                    )
                     return inputBuffer.frameLength > 0 ? inputBuffer : nil
                 } catch {
-                    conversionError = error as NSError
+                    inputState.store(error: error)
                     inputStatus.pointee = .noDataNow
                     return nil
                 }
             }
 
-            if let conversionError {
-                throw conversionError
+            if let inputError = inputState.error {
+                throw inputError
+            }
+            if let converterError {
+                throw converterError
             }
             if outputBuffer.frameLength > 0 {
                 try outputFile.append(outputBuffer)
@@ -222,7 +242,7 @@ enum StreamingAudioProxyBuilder {
                 localPeakWorkingSetBytes = max(
                     localPeakWorkingSetBytes,
                     maximumInputBufferBytes +
-                        estimatedBytes(outputBuffer) +
+                        maximumOutputBufferBytes +
                         analyzer.estimatedWorkingSetBytes
                 )
                 publishProgress(
@@ -236,7 +256,7 @@ enum StreamingAudioProxyBuilder {
             case .endOfStream:
                 reachedEnd = true
             case .error:
-                throw conversionError ?? AudioAssetImporter.ImportError.unreadableNativeAudio(
+                throw converterError ?? AudioAssetImporter.ImportError.unreadableNativeAudio(
                     AudioAssetFormat.inferred(from: sourceFile.url)
                 )
             case .haveData, .inputRanDry:
