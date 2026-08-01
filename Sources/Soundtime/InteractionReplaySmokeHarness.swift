@@ -617,10 +617,37 @@ enum InteractionReplaySmokeHarness {
                 try waitForUndoState(workspace: workspace, context: context, iteration: index + 1)
                 results.append(workspace.interactionReplaySmokeUndoLastEdit())
                 runMainLoop(milliseconds: 12)
+                let afterUndo = workspace.userPerceivedTimingSmokeSnapshot()
+                guard
+                    afterUndo.selectedRangeStartProgress == nil,
+                    afterUndo.selectedRangeEndProgress == nil
+                else {
+                    throw SmokeError.failed(
+                        "paste undo left the pasted range selected on iteration \(index + 1)"
+                    )
+                }
                 results.append(workspace.interactionReplaySmokeRedoLastEdit())
                 runMainLoop(milliseconds: 12)
+                let afterRedo = workspace.userPerceivedTimingSmokeSnapshot()
+                guard
+                    afterRedo.selectedRangeStartProgress != nil,
+                    afterRedo.selectedRangeEndProgress != nil
+                else {
+                    throw SmokeError.failed(
+                        "paste redo did not restore the pasted range selection on iteration \(index + 1)"
+                    )
+                }
                 results.append(workspace.interactionReplaySmokeUndoLastEdit())
                 runMainLoop(milliseconds: 12)
+                let afterFinalUndo = workspace.userPerceivedTimingSmokeSnapshot()
+                guard
+                    afterFinalUndo.selectedRangeStartProgress == nil,
+                    afterFinalUndo.selectedRangeEndProgress == nil
+                else {
+                    throw SmokeError.failed(
+                        "second paste undo left the pasted range selected on iteration \(index + 1)"
+                    )
+                }
             }
             return (results, [])
         }

@@ -48,7 +48,14 @@ enum EditTransactionPlanner {
             guard !trackEdits.isEmpty else {
                 throw EditTransactionError.noAudioInRange
             }
-            playheadTime = range.start
+            if command.wasPlaying, command.kind != .clearGap {
+                playheadTime = playheadTimeAfterApplyingRippleRemoval(
+                    currentPlayheadTime: command.playheadTimeAtDispatch,
+                    range: range
+                )
+            } else {
+                playheadTime = range.start
+            }
             resultingSelection = nil
 
         case .paste:
@@ -88,6 +95,86 @@ enum EditTransactionPlanner {
             playheadTime: playheadTime,
             resultingSelection: resultingSelection
         )
+    }
+
+    static func resolvedPlayheadTime(
+        for plan: EditPlan,
+        resultingProjectDuration: TimeInterval,
+        livePlaybackTime: ProjectTime? = nil
+    ) -> ProjectTime {
+        let projectEnd = ProjectTime(seconds: max(resultingProjectDuration, 0))
+        let desiredTime: ProjectTime
+        if
+            plan.command.wasPlaying,
+            plan.command.kind == .rippleDelete || plan.command.kind == .cut,
+            let range = plan.command.range,
+            let livePlaybackTime
+        {
+            desiredTime = playheadTimeAfterApplyingRippleRemoval(
+                currentPlayheadTime: livePlaybackTime,
+                range: range
+            )
+        } else {
+            desiredTime = plan.playheadTime
+        }
+
+        guard desiredTime > projectEnd else {
+            return desiredTime
+        }
+
+        if
+            plan.command.wasPlaying,
+            plan.command.kind == .rippleDelete || plan.command.kind == .cut,
+            let range = plan.command.range
+        {
+            return min(range.start, projectEnd)
+        }
+        return projectEnd
+    }
+
+    static func resolvedHistoryPlayheadTime(
+        command: EditCommand,
+        direction: EditHistoryDirection,
+        historicalPlayheadTime: ProjectTime,
+        livePlayheadTime: ProjectTime,
+        isPlaying: Bool,
+        restoredProjectDuration: TimeInterval
+    ) -> ProjectTime {
+        var desiredTime = isPlaying ? livePlayheadTime : historicalPlayheadTime
+        if
+            isPlaying,
+            command.kind == .rippleDelete || command.kind == .cut,
+            let range = command.range
+        {
+            switch direction {
+            case .undo:
+                if livePlayheadTime >= range.start {
+                    desiredTime = livePlayheadTime + range.duration
+                }
+            case .redo:
+                desiredTime = playheadTimeAfterApplyingRippleRemoval(
+                    currentPlayheadTime: livePlayheadTime,
+                    range: range
+                )
+            }
+        }
+        return min(
+            desiredTime,
+            ProjectTime(seconds: max(restoredProjectDuration, 0))
+        )
+    }
+
+    static func playheadTimeAfterApplyingRippleRemoval(
+        currentPlayheadTime: ProjectTime,
+        range: ProjectEditRange
+    ) -> ProjectTime {
+        if currentPlayheadTime < range.start {
+            return currentPlayheadTime
+        }
+        if currentPlayheadTime >= range.end {
+            return currentPlayheadTime - range.duration
+        }
+        return range.start
     }
 
     private static func descriptorCatalog(

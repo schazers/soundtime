@@ -127,6 +127,11 @@ enum EditCommandKind: String, Codable, Sendable {
     case paste
 }
 
+enum EditHistoryDirection: Sendable {
+    case undo
+    case redo
+}
+
 enum EditCommandScope: String, Codable, Sendable {
     case track
     case selected
@@ -145,6 +150,7 @@ struct EditCommand: Sendable {
     let insertionTime: ProjectTime?
     let clipboardID: UUID?
     let wasPlaying: Bool
+    let playheadTimeAtDispatch: ProjectTime
     let dispatchedAt: TimeInterval
 
     init(
@@ -158,6 +164,7 @@ struct EditCommand: Sendable {
         insertionTime: ProjectTime? = nil,
         clipboardID: UUID? = nil,
         wasPlaying: Bool,
+        playheadTimeAtDispatch: ProjectTime,
         dispatchedAt: TimeInterval = ProcessInfo.processInfo.systemUptime
     ) {
         self.transactionID = transactionID
@@ -170,6 +177,7 @@ struct EditCommand: Sendable {
         self.insertionTime = insertionTime
         self.clipboardID = clipboardID
         self.wasPlaying = wasPlaying
+        self.playheadTimeAtDispatch = playheadTimeAtDispatch
         self.dispatchedAt = dispatchedAt
     }
 }

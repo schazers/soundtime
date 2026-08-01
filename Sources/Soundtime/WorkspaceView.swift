@@ -990,7 +990,8 @@ final class WorkspaceView: NSView {
             anchorTrackID: anchorTrackID,
             targetTrackIDs: targetTrackIDs,
             range: range,
-            wasPlaying: playbackController.isPlaying
+            wasPlaying: playbackController.isPlaying,
+            playheadTimeAtDispatch: currentProjectPlayheadTime()
         )
     }
 
@@ -1007,7 +1008,8 @@ final class WorkspaceView: NSView {
             targetTrackIDs: [trackID],
             insertionTime: insertionTime,
             clipboardID: clipboardID,
-            wasPlaying: playbackController.isPlaying
+            wasPlaying: playbackController.isPlaying,
+            playheadTimeAtDispatch: currentProjectPlayheadTime()
         )
     }
 
@@ -1274,7 +1276,7 @@ final class WorkspaceView: NSView {
         let before = captureProjectEditTransactionState(
             trackIDs: targetTrackIDs,
             trackIndexesByID: targetTrackIndexes,
-            playheadTime: plan.playheadTime
+            playheadTime: plan.command.playheadTimeAtDispatch
         )
         let capturedAt = CACurrentMediaTime()
 
@@ -1321,26 +1323,36 @@ final class WorkspaceView: NSView {
             projectTracks.reduce(TimeInterval(0)) { duration, track in
                 max(duration, trackDuration(for: track))
             },
-            plan.playheadTime.seconds,
             0.000_001
+        )
+        // Read the realtime clock only after the edited playback graph is ready
+        // to publish. Mapping an earlier key-down timestamp would replay the
+        // preparation interval whenever a running ripple edit rewinds time.
+        let transportBeforePublish = playbackController.snapshot()
+        let livePlayheadBeforePublish = ProjectTime(
+            seconds: transportBeforePublish.projectTime ?? currentProjectPlayheadTime().seconds
+        )
+        let postEditPlayheadTime = EditTransactionPlanner.resolvedPlayheadTime(
+            for: plan,
+            resultingProjectDuration: nextDuration,
+            livePlaybackTime: transportBeforePublish.isPlaying ? livePlayheadBeforePublish : nil
         )
         reloadPlaybackFromProjectTracks(
             preserveProgress: false,
-            targetProgress: Float(min(max(plan.playheadTime.seconds / nextDuration, 0), 1)),
-            resumeIfPlaying: plan.command.wasPlaying,
+            targetProgress: Float(min(max(postEditPlayheadTime.seconds / nextDuration, 0), 1)),
+            resumeIfPlaying: transportBeforePublish.isPlaying,
             playbackTracksOverride: nextPlaybackTracks,
             publishesVisualState: false
         )
         publishedPlaybackEditRevision = plan.nextRevision.rawValue
         // A transition continues to draw the pre-edit timeline until its visual
         // handoff. Publishing playback's post-edit normalized progress here
-        // shifts the playhead even though its project time did not change.
-        // The caller has already snapped the old presentation to the edit
-        // boundary; keep that exact visual until the handoff publishes both
-        // the new timeline duration and its matching playhead progress.
+        // would shift the playhead against the old timeline duration. Keep the
+        // current presentation until the handoff can publish the new duration
+        // and its matching live or paused playhead time together.
         if !keepsTransitionVisual {
             snapPlayheadVisuals(
-                toTimelineTime: plan.playheadTime.seconds,
+                toTimelineTime: postEditPlayheadTime.seconds,
                 isPlaying: playbackController.isPlaying,
                 synchronizesRenderer: true
             )
@@ -1351,7 +1363,7 @@ final class WorkspaceView: NSView {
         let after = captureProjectEditTransactionState(
             trackIDs: targetTrackIDs,
             trackIndexesByID: targetTrackIndexes,
-            playheadTime: plan.playheadTime,
+            playheadTime: postEditPlayheadTime,
             projectDuration: nextDuration,
             renderTracks: nextRenderTracks,
             playbackTracks: nextPlaybackTracks
@@ -5768,11 +5780,18 @@ final class WorkspaceView: NSView {
     }
 
     private func updateTimelineLoopRangeEnabled(_ isEnabled: Bool) {
+        let playbackSnapshot = playbackController.snapshot()
         timelineLoopIsEnabled = isEnabled
         previousLoopPlaybackProgress = nil
-        setTimelineLoopPlaybackBypassed(false)
+        setTimelineLoopPlaybackBypassed(
+            isEnabled && TimelineLoopPlaybackPolicy.bypassesLoopWhenEnabledDuringPlayback(
+                playbackProgress: playbackSnapshot.progress,
+                whilePlaying: playbackSnapshot.isPlaying,
+                loopRange: timelineLoopRange
+            )
+        )
         timelineSurface.displayLoopRangeEnabled(isEnabled)
-        if playbackController.isPlaying {
+        if playbackSnapshot.isPlaying {
             startPlaybackTimer()
         }
     }
@@ -8609,7 +8628,8 @@ final class WorkspaceView: NSView {
         targetProgress: Float? = nil,
         resumeIfPlaying: Bool? = nil,
         playbackTracksOverride: [ProjectPlaybackTrack]? = nil,
-        publishesVisualState: Bool = true
+        publishesVisualState: Bool = true,
+        preservesRunningTransportContinuity: Bool = false
     ) {
         scheduledPlaybackReloadWorkItem?.cancel()
         scheduledPlaybackReloadWorkItem = nil
@@ -8637,12 +8657,17 @@ final class WorkspaceView: NSView {
                 try playbackController.loadProjectTracks(playbackTracks)
             }
             if preserveProgress || targetProgress != nil {
-                let updatedSnapshot = playbackController.snapshot()
-                let restoredProgress = targetProgress ??
-                    updatedSnapshot.progressPreservingProjectTime(
-                        from: previousSnapshot
-                    )
-                try playbackController.seekExactly(toProgress: restoredProgress)
+                let keptRunningTransport = preservesRunningTransportContinuity &&
+                    previousSnapshot.isPlaying &&
+                    playbackController.isPlaying
+                if !keptRunningTransport {
+                    let updatedSnapshot = playbackController.snapshot()
+                    let restoredProgress = targetProgress ??
+                        updatedSnapshot.progressPreservingProjectTime(
+                            from: previousSnapshot
+                        )
+                    try playbackController.seekExactly(toProgress: restoredProgress)
+                }
                 if shouldResume && !playbackController.isPlaying {
                     try playbackController.play()
                 }
@@ -9144,10 +9169,11 @@ final class WorkspaceView: NSView {
         )
 
         let pasteGeneration = beginDeleteAnimationCriticalSection()
-        selectedTimelineRange = visualSelection
         // Let the paste-effect shader draw the growing selected region. Publishing
         // the normal full-width selection here makes paste look like it snapped
-        // into place before the animation has a chance to run.
+        // into place before the animation has a chance to run. Keep the preview
+        // out of canonical workspace state as well: the edit transaction must
+        // capture the real pre-paste selection for undo.
         timelineSurface.displaySelection(nil)
         timelineSurface.displayGainPreview(selection: nil, gain: 1)
         timelineSurface.triggerPasteEffect(selection: visualSelection, waveformOverview: waveformOverview)
@@ -9645,7 +9671,8 @@ final class WorkspaceView: NSView {
                     )
                     self.scheduleTransactionVisualHandoff(
                         generation: pasteVisual.generation,
-                        state: transaction.after
+                        state: transaction.after,
+                        preservesLivePlayhead: command.wasPlaying
                     )
                     self.updateEffectCommandState()
                     self.updateStatus("pasted \(self.formatDuration(clipboardBuffer.duration))")
@@ -13218,7 +13245,8 @@ final class WorkspaceView: NSView {
             let committedAt = CACurrentMediaTime()
             scheduleTransactionVisualHandoff(
                 generation: pasteVisual.generation,
-                state: transaction.after
+                state: transaction.after,
+                preservesLivePlayhead: command.wasPlaying
             )
             updateEffectCommandState()
             updateStatus("pasted \(formatDuration(insertedDuration))")
@@ -13414,11 +13442,13 @@ final class WorkspaceView: NSView {
                 guard let range = command.range else {
                     throw EditTransactionError.missingRange
                 }
-                snapPlayheadVisuals(
-                    toTimelineTime: range.start.seconds,
-                    isPlaying: command.wasPlaying,
-                    synchronizesRenderer: true
-                )
+                if !command.wasPlaying {
+                    snapPlayheadVisuals(
+                        toTimelineTime: range.start.seconds,
+                        isPlaying: false,
+                        synchronizesRenderer: true
+                    )
+                }
                 deleteVisualGeneration = beginDeleteAnimationCriticalSection()
             }
             let plan = try EditTransactionPlanner.plan(
@@ -13516,7 +13546,8 @@ final class WorkspaceView: NSView {
             updateEffectCommandState()
             scheduleTransactionVisualHandoff(
                 generation: generation,
-                state: transaction.after
+                state: transaction.after,
+                preservesLivePlayhead: command.wasPlaying
             )
             updateStatus(
                 transactionStatus(
@@ -13572,7 +13603,8 @@ final class WorkspaceView: NSView {
 
     private func scheduleTransactionVisualHandoff(
         generation: Int,
-        state: ProjectEditTransactionState
+        state: ProjectEditTransactionState,
+        preservesLivePlayhead: Bool
     ) {
         let workItem = DispatchWorkItem { [weak self] in
             guard let self, self.deleteAnimationGeneration == generation else {
@@ -13590,13 +13622,17 @@ final class WorkspaceView: NSView {
                 renderTracks,
                 animateWaveformTransition: false,
                 allowImmediateWaveformPrewarm: false,
-                allowImmediateInteractiveWaveformPrewarm: false
+                allowImmediateInteractiveWaveformPrewarm: false,
+                viewportTransition: .animatedEditReframe
             )
             self.publishSelectedTracksToTimeline()
             self.selectedTimelineRange = state.selectedTimelineRange
             self.timelineSurface.displaySelection(state.selectedTimelineRange)
+            let handoffPlayheadTime = preservesLivePlayhead ?
+                self.currentProjectPlayheadTime().seconds :
+                state.playheadTime.seconds
             self.snapPlayheadVisuals(
-                toTimelineTime: state.playheadTime.seconds,
+                toTimelineTime: handoffPlayheadTime,
                 isPlaying: self.playbackController.isPlaying,
                 synchronizesRenderer: true
             )
@@ -16299,9 +16335,10 @@ final class WorkspaceView: NSView {
             do {
                 try restoreProjectEditTransactionState(
                     record.before,
-                    transactionID: record.command.transactionID,
-                    commandKind: record.command.kind,
-                    operation: "undo"
+                    command: record.command,
+                    direction: .undo,
+                    operation: "undo",
+                    clearsSelection: record.command.kind == .paste
                 )
                 editRedoStack.append(.transaction(record))
             } catch {
@@ -16335,8 +16372,8 @@ final class WorkspaceView: NSView {
             do {
                 try restoreProjectEditTransactionState(
                     record.after,
-                    transactionID: record.command.transactionID,
-                    commandKind: record.command.kind,
+                    command: record.command,
+                    direction: .redo,
                     operation: "redo"
                 )
                 editUndoStack.append(.transaction(record))
@@ -16349,9 +16386,10 @@ final class WorkspaceView: NSView {
 
     private func restoreProjectEditTransactionState(
         _ state: ProjectEditTransactionState,
-        transactionID: EditTransactionID,
-        commandKind: EditCommandKind,
-        operation: String
+        command: EditCommand,
+        direction: EditHistoryDirection,
+        operation: String,
+        clearsSelection: Bool = false
     ) throws {
         let startedAt = CACurrentMediaTime()
         let restoredTrackIDs = Set(state.tracksByID.keys)
@@ -16406,7 +16444,7 @@ final class WorkspaceView: NSView {
             selectedTrackIDs.insert(selectedTrackID)
         }
         trackSelectionAnchorID = selectedTrackID
-        selectedTimelineRange = state.selectedTimelineRange
+        selectedTimelineRange = clearsSelection ? nil : state.selectedTimelineRange
         audioClipboard = state.clipboard
         syncActiveTrackFields()
         displayedSampleRate = state.displayedSampleRate
@@ -16426,26 +16464,55 @@ final class WorkspaceView: NSView {
             renderTracks,
             animateWaveformTransition: false,
             allowImmediateWaveformPrewarm: false,
-            allowImmediateInteractiveWaveformPrewarm: false
+            allowImmediateInteractiveWaveformPrewarm: false,
+            viewportTransition: .animatedEditReframe
         )
         publishSelectedTracksToTimeline()
         publishedTimelineEditRevision = nextRevision.rawValue
         let timelinePublishedAt = CACurrentMediaTime()
 
-        let duration = max(state.projectDuration, state.playheadTime.seconds, 0.000_001)
+        let duration = max(state.projectDuration, 0.000_001)
+        // History restoration can spend several milliseconds rebuilding its
+        // projections. Sample the running transport at the publication boundary
+        // so undo/redo remaps the audio that is actually about to play.
+        let transportBeforePublish = playbackController.snapshot()
+        let wasPlaying = transportBeforePublish.isPlaying
+        let livePlayheadTime = ProjectTime(
+            seconds: transportBeforePublish.projectTime ?? currentProjectPlayheadTime().seconds
+        )
+        let restoredPlayheadTime = EditTransactionPlanner.resolvedHistoryPlayheadTime(
+            command: command,
+            direction: direction,
+            historicalPlayheadTime: state.playheadTime,
+            livePlayheadTime: livePlayheadTime,
+            isPlaying: wasPlaying,
+            restoredProjectDuration: duration
+        )
+        let remapsRunningPlayhead = wasPlaying && restoredPlayheadTime != livePlayheadTime
         reloadPlaybackFromProjectTracks(
             preserveProgress: false,
-            targetProgress: Float(min(max(state.playheadTime.seconds / duration, 0), 1)),
+            targetProgress: Float(
+                min(max(restoredPlayheadTime.seconds / duration, 0), 1)
+            ),
+            resumeIfPlaying: wasPlaying,
             playbackTracksOverride: ProjectPlaybackProjection.applyingMixes(
                 mixes,
                 to: state.playbackTracks
             ),
-            publishesVisualState: false
+            publishesVisualState: false,
+            preservesRunningTransportContinuity: wasPlaying && !remapsRunningPlayhead
         )
         publishedPlaybackEditRevision = nextRevision.rawValue
+        let playbackAfterRestore = playbackController.snapshot()
+        let displayedPlayheadTime: TimeInterval
+        if wasPlaying {
+            displayedPlayheadTime = playbackAfterRestore.projectTime ?? restoredPlayheadTime.seconds
+        } else {
+            displayedPlayheadTime = restoredPlayheadTime.seconds
+        }
         snapPlayheadVisuals(
-            toTimelineTime: state.playheadTime.seconds,
-            isPlaying: playbackController.isPlaying,
+            toTimelineTime: displayedPlayheadTime,
+            isPlaying: playbackAfterRestore.isPlaying,
             synchronizesRenderer: true
         )
         updateTransportControlState(isPlaying: playbackController.isPlaying)
@@ -16479,8 +16546,8 @@ final class WorkspaceView: NSView {
             name: "edit-transaction-\(operation)",
             message: "Published an edit transaction history state.",
             fields: [
-                "transactionID": transactionID.description,
-                "kind": commandKind.rawValue,
+                "transactionID": command.transactionID.description,
+                "kind": command.kind.rawValue,
                 "sourceRevision": state.revision.description,
                 "publishedRevision": nextRevision.description,
                 "trackCount": "\(restoredTrackIDs.count)",
@@ -16565,7 +16632,8 @@ final class WorkspaceView: NSView {
             restoredRenderTracks,
             animateWaveformTransition: false,
             allowImmediateWaveformPrewarm: false,
-            allowImmediateInteractiveWaveformPrewarm: false
+            allowImmediateInteractiveWaveformPrewarm: false,
+            viewportTransition: .animatedEditReframe
         )
         publishSelectedTracksToTimeline()
         if preservesTrackTopology {

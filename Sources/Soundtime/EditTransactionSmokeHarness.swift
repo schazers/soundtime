@@ -25,6 +25,12 @@ enum EditTransactionSmokeHarness {
         try verifyUnequalDurationScopePlanning()
         checks.append("multi-track scope planning intersects unequal track durations")
 
+        try verifyPlaybackAwareDeletePlayheadPlanning()
+        checks.append("playing deletes remap the playhead to preserve source continuity")
+
+        try verifyPlaybackAwareHistoryRestorePlanning()
+        checks.append("undo and redo preserve live transport time while playback is running")
+
         try verifyExactMemoryTimelineMutations()
         checks.append("memory timelines delete, clear, copy, and paste exact frame ranges")
 
@@ -141,7 +147,8 @@ enum EditTransactionSmokeHarness {
                     anchorTrackID: firstID,
                     targetTrackIDs: [firstID],
                     range: range,
-                    wasPlaying: false
+                    wasPlaying: false,
+                    playheadTimeAtDispatch: .zero
                 ),
                 currentRevision: .initial.advanced(),
                 tracks: tracks
@@ -156,7 +163,8 @@ enum EditTransactionSmokeHarness {
                     anchorTrackID: firstID,
                     targetTrackIDs: [firstID, fixedUUID(99)],
                     range: range,
-                    wasPlaying: false
+                    wasPlaying: false,
+                    playheadTimeAtDispatch: .zero
                 ),
                 currentRevision: .initial,
                 tracks: tracks
@@ -171,7 +179,8 @@ enum EditTransactionSmokeHarness {
                     anchorTrackID: firstID,
                     targetTrackIDs: [firstID, secondID],
                     range: range,
-                    wasPlaying: false
+                    wasPlaying: false,
+                    playheadTimeAtDispatch: .zero
                 ),
                 currentRevision: .initial,
                 tracks: tracks
@@ -186,7 +195,8 @@ enum EditTransactionSmokeHarness {
                     anchorTrackID: firstID,
                     targetTrackIDs: [firstID],
                     range: range,
-                    wasPlaying: false
+                    wasPlaying: false,
+                    playheadTimeAtDispatch: .zero
                 ),
                 currentRevision: .initial,
                 tracks: [tracks[0], tracks[0]]
@@ -219,7 +229,8 @@ enum EditTransactionSmokeHarness {
                 anchorTrackID: ids[0],
                 targetTrackIDs: ids.reversed(),
                 range: range,
-                wasPlaying: true
+                wasPlaying: true,
+                playheadTimeAtDispatch: ProjectTime(seconds: 4)
             ),
             currentRevision: .initial,
             tracks: descriptors
@@ -229,7 +240,169 @@ enum EditTransactionSmokeHarness {
             plan.command.targetTrackIDs == ids.sorted { $0.uuidString < $1.uuidString },
             "captured scope IDs were not stable"
         )
-        try require(plan.playheadTime == range.start, "delete playhead did not target the range start")
+        try require(
+            plan.playheadTime == ProjectTime(seconds: 3),
+            "playing delete did not preserve source continuity after the removed range"
+        )
+    }
+
+    private static func verifyPlaybackAwareDeletePlayheadPlanning() throws {
+        let trackID = fixedUUID(201)
+        let range = try requireValue(
+            ProjectEditRange(
+                start: ProjectTime(seconds: 2),
+                end: ProjectTime(seconds: 4)
+            ),
+            "playback-aware delete range was empty"
+        )
+        let descriptor = EditTrackDescriptor(
+            trackID: trackID,
+            sampleRate: 48_000,
+            frameCount: 480_000,
+            isEditable: true
+        )
+
+        let pausedPlan = try EditTransactionPlanner.plan(
+            command: EditCommand(
+                baseRevision: .initial,
+                kind: .rippleDelete,
+                scope: .track,
+                anchorTrackID: trackID,
+                targetTrackIDs: [trackID],
+                range: range,
+                wasPlaying: false,
+                playheadTimeAtDispatch: ProjectTime(seconds: 7)
+            ),
+            currentRevision: .initial,
+            tracks: [descriptor]
+        )
+        try require(
+            pausedPlan.playheadTime == range.start,
+            "paused delete did not move the playhead to the deleted range start"
+        )
+
+        let playingPlan = try EditTransactionPlanner.plan(
+            command: EditCommand(
+                baseRevision: .initial,
+                kind: .rippleDelete,
+                scope: .track,
+                anchorTrackID: trackID,
+                targetTrackIDs: [trackID],
+                range: range,
+                wasPlaying: true,
+                playheadTimeAtDispatch: ProjectTime(seconds: 7)
+            ),
+            currentRevision: .initial,
+            tracks: [descriptor]
+        )
+        try require(
+            playingPlan.playheadTime == ProjectTime(seconds: 5),
+            "playing delete did not move left by the removed duration"
+        )
+        try require(
+            EditTransactionPlanner.resolvedPlayheadTime(
+                for: playingPlan,
+                resultingProjectDuration: 8
+            ) == ProjectTime(seconds: 5),
+            "playing delete did not retain its source-continuity target"
+        )
+        try require(
+            EditTransactionPlanner.resolvedPlayheadTime(
+                for: playingPlan,
+                resultingProjectDuration: 8,
+                livePlaybackTime: ProjectTime(seconds: 8)
+            ) == ProjectTime(seconds: 6),
+            "playing delete used the stale dispatch time instead of the live publish time"
+        )
+        try require(
+            EditTransactionPlanner.resolvedPlayheadTime(
+                for: playingPlan,
+                resultingProjectDuration: 2
+            ) == range.start,
+            "playing delete did not fall back when the shortened project removed the playhead"
+        )
+    }
+
+    private static func verifyPlaybackAwareHistoryRestorePlanning() throws {
+        let historicalTime = ProjectTime(seconds: 2)
+        let liveTime = ProjectTime(seconds: 7)
+        let trackID = fixedUUID(202)
+        let range = try requireValue(
+            ProjectEditRange(
+                start: ProjectTime(seconds: 2),
+                end: ProjectTime(seconds: 4)
+            ),
+            "history continuity range was empty"
+        )
+        let command = EditCommand(
+            baseRevision: .initial,
+            kind: .rippleDelete,
+            scope: .track,
+            anchorTrackID: trackID,
+            targetTrackIDs: [trackID],
+            range: range,
+            wasPlaying: true,
+            playheadTimeAtDispatch: liveTime
+        )
+
+        try require(
+            EditTransactionPlanner.resolvedHistoryPlayheadTime(
+                command: command,
+                direction: .undo,
+                historicalPlayheadTime: historicalTime,
+                livePlayheadTime: liveTime,
+                isPlaying: true,
+                restoredProjectDuration: 10
+            ) == ProjectTime(seconds: 9),
+            "playing undo did not move right to preserve source continuity"
+        )
+        try require(
+            EditTransactionPlanner.resolvedHistoryPlayheadTime(
+                command: command,
+                direction: .undo,
+                historicalPlayheadTime: historicalTime,
+                livePlayheadTime: liveTime,
+                isPlaying: false,
+                restoredProjectDuration: 10
+            ) == historicalTime,
+            "paused undo did not restore the transaction's historical playhead"
+        )
+        try require(
+            EditTransactionPlanner.resolvedHistoryPlayheadTime(
+                command: command,
+                direction: .undo,
+                historicalPlayheadTime: historicalTime,
+                livePlayheadTime: liveTime,
+                isPlaying: true,
+                restoredProjectDuration: 8
+            ) == ProjectTime(seconds: 8),
+            "playing undo did not clamp a live playhead beyond the restored project end"
+        )
+        try require(
+            EditTransactionPlanner.resolvedHistoryPlayheadTime(
+                command: command,
+                direction: .redo,
+                historicalPlayheadTime: historicalTime,
+                livePlayheadTime: liveTime,
+                isPlaying: true,
+                restoredProjectDuration: 10
+            ) == ProjectTime(seconds: 5),
+            "playing redo did not move left to preserve source continuity"
+        )
+        try require(
+            EditTransactionPlanner.playheadTimeAfterApplyingRippleRemoval(
+                currentPlayheadTime: ProjectTime(seconds: 1),
+                range: range
+            ) == ProjectTime(seconds: 1),
+            "ripple removal moved playback before the edited range"
+        )
+        try require(
+            EditTransactionPlanner.playheadTimeAfterApplyingRippleRemoval(
+                currentPlayheadTime: ProjectTime(seconds: 3),
+                range: range
+            ) == range.start,
+            "ripple removal did not fall back for playback inside removed audio"
+        )
     }
 
     private static func verifyExactMemoryTimelineMutations() throws {

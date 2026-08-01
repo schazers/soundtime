@@ -50,6 +50,11 @@ enum RealtimeGraphPublishSmokeHarness {
             sourceFrameCount: sourceFrameCount,
             renderBlockFrameCount: renderBlockFrameCount
         )
+        try runPlayingRippleDeleteContinuitySmoke(
+            sampleRate: sampleRate,
+            sourceFrameCount: sourceFrameCount,
+            renderBlockFrameCount: renderBlockFrameCount
+        )
         let fileBackedPublishSummary = try runFileBackedEditPublishSmoke(
             sampleRate: sampleRate,
             sourceFrameCount: sourceFrameCount,
@@ -480,6 +485,129 @@ enum RealtimeGraphPublishSmokeHarness {
             expectedFrame: Int((Double(sourceFrameCount) * 0.75).rounded(.down)),
             isPlaying: false,
             label: "pending paused seek"
+        )
+    }
+
+    private static func runPlayingRippleDeleteContinuitySmoke(
+        sampleRate: Double,
+        sourceFrameCount: Int,
+        renderBlockFrameCount: Int
+    ) throws {
+        let outputDevice = RealtimeGraphPublishSmokeOutputDevice()
+        guard let playbackEngine = RealtimeCorePlaybackEngine(outputDevice: outputDevice) else {
+            throw SmokeError.failed("could not create ripple-delete continuity playback engine")
+        }
+
+        let sourceBuffer = syntheticAudioBuffer(frameCount: sourceFrameCount, sampleRate: sampleRate)
+        let trackID = UUID(uuidString: "00000000-0000-4000-c000-000000000001") ?? UUID()
+        var timeline = AudioEditTimeline(sourceBuffer: sourceBuffer)
+        let originalTrack = ProjectPlaybackTrack(
+            id: trackID,
+            source: .timeline(audioTimeline: timeline, zeroCrossingIndex: nil),
+            sourceRevision: 0,
+            volume: 1,
+            isMuted: false,
+            isSoloed: false
+        )
+        try playbackEngine.loadProjectTracks([originalTrack])
+        guard let corePointer = outputDevice.corePointer else {
+            throw SmokeError.failed("ripple-delete continuity output device was not configured")
+        }
+
+        try playbackEngine.seekExactly(toProgress: 0.375)
+        try playbackEngine.play()
+        render(
+            corePointer: corePointer,
+            blockCount: 8,
+            frameCount: renderBlockFrameCount,
+            sampleRate: sampleRate
+        )
+
+        let beforeEdit = playbackEngine.snapshot()
+        let deleteStartFrame = Int(sampleRate * 0.5)
+        let deleteEndFrame = Int(sampleRate * 1.0)
+        let removedFrameCount = timeline.delete(frameRange: deleteStartFrame..<deleteEndFrame)
+        try require(removedFrameCount > 0, "ripple-delete continuity edit removed no frames")
+        try require(
+            beforeEdit.frameIndex >= deleteEndFrame,
+            "ripple-delete continuity playhead did not begin to the right of the edit"
+        )
+
+        let editedTrack = ProjectPlaybackTrack(
+            id: trackID,
+            source: .timeline(audioTimeline: timeline, zeroCrossingIndex: nil),
+            sourceRevision: 1,
+            volume: 1,
+            isMuted: false,
+            isSoloed: false
+        )
+        try playbackEngine.updateProjectTracks([editedTrack])
+        let mappedFrame = beforeEdit.frameIndex - removedFrameCount
+        try playbackEngine.seekExactly(
+            toProgress: Float(Double(mappedFrame) / Double(timeline.frameCount))
+        )
+        let pendingEdit = playbackEngine.snapshot()
+        let expectedSourceStartFrame = pendingEdit.frameIndex + removedFrameCount
+        let captured = renderCaptured(
+            corePointer: corePointer,
+            blockCount: 1,
+            frameCount: renderBlockFrameCount,
+            sampleRate: sampleRate
+        )
+
+        let comparableFrameCount = min(
+            renderBlockFrameCount,
+            sourceBuffer.frameCount - expectedSourceStartFrame
+        )
+        try require(comparableFrameCount > 0, "ripple-delete continuity had no comparable output")
+        var maxError: Float = 0
+        for offset in 0..<comparableFrameCount {
+            maxError = max(
+                maxError,
+                abs(captured.left[offset] - sourceBuffer.samplesByChannel[0][expectedSourceStartFrame + offset]),
+                abs(captured.right[offset] - sourceBuffer.samplesByChannel[1][expectedSourceStartFrame + offset])
+            )
+        }
+        try require(
+            maxError <= 0.000_1,
+            String(
+                format: "playing ripple delete did not preserve source continuity: max error %.8f",
+                maxError
+            )
+        )
+
+        let beforeUndo = playbackEngine.snapshot()
+        try playbackEngine.updateProjectTracks([originalTrack])
+        let restoredFrame = beforeUndo.frameIndex + removedFrameCount
+        try playbackEngine.seekExactly(
+            toProgress: Float(Double(restoredFrame) / Double(sourceBuffer.frameCount))
+        )
+        let pendingUndo = playbackEngine.snapshot()
+        let undoCapture = renderCaptured(
+            corePointer: corePointer,
+            blockCount: 1,
+            frameCount: renderBlockFrameCount,
+            sampleRate: sampleRate
+        )
+        let undoComparableFrameCount = min(
+            renderBlockFrameCount,
+            sourceBuffer.frameCount - pendingUndo.frameIndex
+        )
+        try require(undoComparableFrameCount > 0, "ripple-delete undo had no comparable output")
+        var undoMaxError: Float = 0
+        for offset in 0..<undoComparableFrameCount {
+            undoMaxError = max(
+                undoMaxError,
+                abs(undoCapture.left[offset] - sourceBuffer.samplesByChannel[0][pendingUndo.frameIndex + offset]),
+                abs(undoCapture.right[offset] - sourceBuffer.samplesByChannel[1][pendingUndo.frameIndex + offset])
+            )
+        }
+        try require(
+            undoMaxError <= 0.000_1,
+            String(
+                format: "playing ripple-delete undo did not preserve source continuity: max error %.8f",
+                undoMaxError
+            )
         )
     }
 
