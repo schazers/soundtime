@@ -1,4 +1,5 @@
 import AVFoundation
+import Accelerate
 import Foundation
 
 final class StreamingWAVFileWriter {
@@ -7,6 +8,8 @@ final class StreamingWAVFileWriter {
     private let blockAlign: Int
     private var dataByteCount: UInt64 = 0
     private var isFinished = false
+    private var interleavedSamples: [Int16] = []
+    private var convertedChannel: [Float] = []
 
     init(url: URL, sampleRate: Double, channelCount: Int) throws {
         guard
@@ -58,17 +61,65 @@ final class StreamingWAVFileWriter {
         }
 
         let frameCount = Int(buffer.frameLength)
+        guard frameCount > 0 else {
+            return
+        }
         let appendedByteCount = UInt64(frameCount * blockAlign)
         guard dataByteCount + appendedByteCount <= UInt64(UInt32.max) else {
             throw WAVFileWriter.WriteError.fileTooLarge
         }
 
-        var data = Data()
-        data.reserveCapacity(Int(appendedByteCount))
-        for frame in 0..<frameCount {
-            for channel in 0..<channelCount {
-                data.appendInt16LE(Self.quantize(channels[channel][frame]))
+        let interleavedSampleCount = frameCount * channelCount
+        if interleavedSamples.count < interleavedSampleCount {
+            interleavedSamples = [Int16](repeating: 0, count: interleavedSampleCount)
+        }
+        if convertedChannel.count < frameCount {
+            convertedChannel = [Float](repeating: 0, count: frameCount)
+        }
+        var lowerBound: Float = -1
+        var upperBound: Float = 1
+        var scale: Float = Float(Int16.max)
+        try interleavedSamples.withUnsafeMutableBufferPointer { destination in
+            guard let destinationBaseAddress = destination.baseAddress else {
+                throw WAVFileWriter.WriteError.couldNotCreateFile
             }
+            for channel in 0..<channelCount {
+                convertedChannel.withUnsafeMutableBufferPointer { converted in
+                    guard let convertedBaseAddress = converted.baseAddress else {
+                        return
+                    }
+                    vDSP_vclip(
+                        channels[channel],
+                        1,
+                        &lowerBound,
+                        &upperBound,
+                        convertedBaseAddress,
+                        1,
+                        vDSP_Length(frameCount)
+                    )
+                    vDSP_vsmul(
+                        convertedBaseAddress,
+                        1,
+                        &scale,
+                        convertedBaseAddress,
+                        1,
+                        vDSP_Length(frameCount)
+                    )
+                    vDSP_vfix16(
+                        convertedBaseAddress,
+                        1,
+                        destinationBaseAddress.advanced(by: channel),
+                        vDSP_Stride(channelCount),
+                        vDSP_Length(frameCount)
+                    )
+                }
+            }
+        }
+        let data = interleavedSamples.withUnsafeBytes { bytes in
+            Data(
+                bytes: bytes.baseAddress!,
+                count: Int(appendedByteCount)
+            )
         }
         try fileHandle.write(contentsOf: data)
         dataByteCount += appendedByteCount
@@ -114,11 +165,6 @@ final class StreamingWAVFileWriter {
         return data
     }
 
-    private static func quantize(_ sample: Float) -> Int16 {
-        let clipped = min(max(sample, -1), 1)
-        let scaled = clipped < 0 ? clipped * 32_768 : clipped * 32_767
-        return Int16(min(max(Int(scaled.rounded()), Int(Int16.min)), Int(Int16.max)))
-    }
 }
 
 private extension Data {
@@ -132,8 +178,4 @@ private extension Data {
         return Swift.withUnsafeBytes(of: &value) { Data($0) }
     }
 
-    mutating func appendInt16LE(_ value: Int16) {
-        var value = value.littleEndian
-        Swift.withUnsafeBytes(of: &value) { append(contentsOf: $0) }
-    }
 }

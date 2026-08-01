@@ -48,8 +48,8 @@ struct AudioImportProgress: Sendable {
 }
 
 struct AudioImportFingerprint: Hashable, Codable, Sendable {
-    static let cacheFormatVersion = 2
-    static let decoderIdentifier = "avfoundation-streaming-v1"
+    static let cacheFormatVersion = 3
+    static let decoderIdentifier = "avfoundation-streaming-v2"
 
     let fileSize: Int64
     let modificationTime: TimeInterval
@@ -237,6 +237,8 @@ struct AudioImportSessionSnapshot: Sendable {
 enum AudioImportPerformanceContract {
     static let admittedMilliseconds = 50.0
     static let cachedPreviewMilliseconds = 100.0
+    static let firstProgressiveWaveformMilliseconds = 250.0
+    static let coldScreenDetailMilliseconds = 2_000.0
     static let playbackReadyMilliseconds = 500.0
     static let maximumWorkingSetBytes = 32 * 1_024 * 1_024
 }

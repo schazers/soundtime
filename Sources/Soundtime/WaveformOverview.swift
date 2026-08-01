@@ -96,6 +96,28 @@ struct WaveformBinAccumulator {
         sampleCount += 1
     }
 
+    mutating func addSamples(
+        minimum: Float,
+        maximum: Float,
+        squareSum: Float,
+        count: Int
+    ) {
+        guard count > 0 else {
+            return
+        }
+        minimumSample = min(minimumSample, min(max(minimum, -1), 1))
+        maximumSample = max(maximumSample, min(max(maximum, -1), 1))
+        rmsSquareSum += max(squareSum, 0)
+
+        // Progressive import prioritizes exact envelope/RMS values. The richer
+        // spectral tint is rebuilt later from the editable WAV proxy.
+        let weight = Float(count)
+        lowEnergySum += 0.34 * weight
+        midEnergySum += 0.33 * weight
+        highEnergySum += 0.33 * weight
+        sampleCount += weight
+    }
+
     mutating func addBin(_ bin: WaveformOverview.Bin) {
         minimumSample = min(minimumSample, bin.minimumSample)
         maximumSample = max(maximumSample, bin.maximumSample)

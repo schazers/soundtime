@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import Accelerate
 import Foundation
 
 private final class StreamingAudioConversionInputState: @unchecked Sendable {
@@ -28,7 +29,13 @@ struct StreamingAudioProxyBuildResult: Sendable {
 
 enum StreamingAudioProxyBuilder {
     private static let inputChunkFrames: AVAudioFrameCount = 16_384
-    private static let waveformBinCount = 16_384
+    // Build screen-detail waveform data during the one sequential decode that
+    // also writes the editable proxy. This avoids a later whole-file pass.
+    // This is already substantially denser than a full-screen timeline. A
+    // 131K launch/zoom level is refined later from the editable WAV proxy so it
+    // cannot delay the first complete cold-import waveform.
+    static let waveformBinCount = 32_768
+    static let progressWaveformBinCount = 8_192
 
     static func build(
         sourceURL: URL,
@@ -116,7 +123,8 @@ enum StreamingAudioProxyBuilder {
             stage: .editableReady,
             completedFrames: Int64(fileInfo.frameCount),
             totalFrames: Int64(fileInfo.frameCount),
-            message: "Editable audio ready"
+            message: "Editable audio ready",
+            previewOverview: analysis.overview
         ))
         return StreamingAudioProxyBuildResult(
             proxyURL: destinationURL,
@@ -282,7 +290,7 @@ enum StreamingAudioProxyBuilder {
             return
         }
         let previewOverview = publisher.shouldPublishWaveformPreview() ?
-            analyzer.makePreview(maximumBinCount: 512) :
+            analyzer.makePreview(maximumBinCount: progressWaveformBinCount) :
             nil
         progress?(AudioImportProgress(
             stage: .proxying,
@@ -303,6 +311,7 @@ enum StreamingAudioProxyBuilder {
 private struct StreamingProgressPublisher {
     private static let minimumIntervalNanoseconds: UInt64 = 50_000_000
     private static let minimumFractionDelta = 0.005
+    private static let waveformIntervalNanoseconds: UInt64 = 100_000_000
 
     private var lastPublishNanoseconds: UInt64 = 0
     private var lastFraction = 0.0
@@ -331,7 +340,7 @@ private struct StreamingProgressPublisher {
         let now = DispatchTime.now().uptimeNanoseconds
         guard
             lastWaveformPublishNanoseconds == 0 ||
-            now &- lastWaveformPublishNanoseconds >= 250_000_000
+            now &- lastWaveformPublishNanoseconds >= Self.waveformIntervalNanoseconds
         else {
             return false
         }
@@ -348,41 +357,40 @@ private struct StreamingAnalyzer {
 
     let expectedFrameCount: Int64
     let sampleRate: Double
-    private static let maximumStoredZeroCrossings = 262_144
     private var accumulators: [WaveformBinAccumulator]
-    private var crossings: [Int] = [0]
-    private var zeroCrossingsOverflowed = false
-    private var previousMixedSample: Float?
+    private var previewAccumulators: [WaveformBinAccumulator]
     private(set) var consumedFrameCount: Int64 = 0
 
     var estimatedWorkingSetBytes: Int {
         accumulators.capacity * MemoryLayout<WaveformBinAccumulator>.stride +
-            crossings.capacity * MemoryLayout<Int>.stride
+            previewAccumulators.capacity * MemoryLayout<WaveformBinAccumulator>.stride
     }
 
     func makePreview(maximumBinCount: Int) -> WaveformOverview {
-        let outputCount = min(max(maximumBinCount, 1), accumulators.count)
+        let sourceAccumulators = maximumBinCount <= previewAccumulators.count ?
+            previewAccumulators : accumulators
+        let outputCount = min(max(maximumBinCount, 1), sourceAccumulators.count)
         let duration = sampleRate > 0 ?
             Double(expectedFrameCount) / sampleRate :
             0
-        guard outputCount < accumulators.count else {
+        guard outputCount < sourceAccumulators.count else {
             return WaveformOverview(
                 duration: duration,
-                bins: accumulators.map { $0.makeBin() }
+                bins: sourceAccumulators.map { $0.makeBin() }
             )
         }
 
         var bins: [WaveformOverview.Bin] = []
         bins.reserveCapacity(outputCount)
         for outputIndex in 0..<outputCount {
-            let start = outputIndex * accumulators.count / outputCount
+            let start = outputIndex * sourceAccumulators.count / outputCount
             let end = max(
-                (outputIndex + 1) * accumulators.count / outputCount,
+                (outputIndex + 1) * sourceAccumulators.count / outputCount,
                 start + 1
             )
             var accumulator = WaveformBinAccumulator()
-            for sourceIndex in start..<min(end, accumulators.count) {
-                accumulator.addBin(accumulators[sourceIndex].makeBin())
+            for sourceIndex in start..<min(end, sourceAccumulators.count) {
+                accumulator.addBin(sourceAccumulators[sourceIndex].makeBin())
             }
             bins.append(accumulator.makeBin())
         }
@@ -393,6 +401,10 @@ private struct StreamingAnalyzer {
         self.expectedFrameCount = max(expectedFrameCount, 1)
         self.sampleRate = sampleRate
         accumulators = Array(repeating: WaveformBinAccumulator(), count: max(binCount, 1))
+        previewAccumulators = Array(
+            repeating: WaveformBinAccumulator(),
+            count: min(max(StreamingAudioProxyBuilder.progressWaveformBinCount, 1), max(binCount, 1))
+        )
     }
 
     mutating func consume(_ buffer: AVAudioPCMBuffer) {
@@ -406,46 +418,71 @@ private struct StreamingAnalyzer {
 
         let frameLength = Int(buffer.frameLength)
         let channelCount = Int(buffer.format.channelCount)
-        for localFrame in 0..<frameLength {
-            let absoluteFrame = consumedFrameCount + Int64(localFrame)
-            let binIndex = min(
-                max(Int(absoluteFrame * Int64(accumulators.count) / expectedFrameCount), 0),
-                accumulators.count - 1
+        var localStart = 0
+        while localStart < frameLength {
+            let absoluteStart = consumedFrameCount + Int64(localStart)
+            let finalBinIndex = binIndex(
+                for: absoluteStart,
+                binCount: accumulators.count
             )
-            var mixedSample: Float = 0
+            let previewBinIndex = binIndex(
+                for: absoluteStart,
+                binCount: previewAccumulators.count
+            )
+            let absoluteEnd = min(
+                consumedFrameCount + Int64(frameLength),
+                nextBinBoundary(after: absoluteStart, binCount: accumulators.count),
+                nextBinBoundary(after: absoluteStart, binCount: previewAccumulators.count)
+            )
+            let localEnd = min(
+                max(Int(absoluteEnd - consumedFrameCount), localStart + 1),
+                frameLength
+            )
+            let count = localEnd - localStart
+
             for channel in 0..<channelCount {
-                let sample = channelData[channel][localFrame]
-                accumulators[binIndex].addSample(sample)
-                mixedSample += sample
+                let samples = channelData[channel].advanced(by: localStart)
+                var minimum: Float = 0
+                var maximum: Float = 0
+                var squareSum: Float = 0
+                vDSP_minv(samples, 1, &minimum, vDSP_Length(count))
+                vDSP_maxv(samples, 1, &maximum, vDSP_Length(count))
+                vDSP_svesq(samples, 1, &squareSum, vDSP_Length(count))
+                accumulators[finalBinIndex].addSamples(
+                    minimum: minimum,
+                    maximum: maximum,
+                    squareSum: squareSum,
+                    count: count
+                )
+                previewAccumulators[previewBinIndex].addSamples(
+                    minimum: minimum,
+                    maximum: maximum,
+                    squareSum: squareSum,
+                    count: count
+                )
             }
-            mixedSample /= Float(channelCount)
-            if
-                !zeroCrossingsOverflowed,
-                let previousMixedSample,
-                let crossing = AudioZeroCrossingIndex.crossingFrame(
-                    previousSample: previousMixedSample,
-                    sample: mixedSample,
-                    previousFrame: Int(absoluteFrame) - 1,
-                    frame: Int(absoluteFrame)
-                ),
-                crossings.last != crossing
-            {
-                crossings.append(crossing)
-                if crossings.count > Self.maximumStoredZeroCrossings {
-                    crossings.removeAll(keepingCapacity: false)
-                    zeroCrossingsOverflowed = true
-                }
-            }
-            previousMixedSample = mixedSample
+            localStart = localEnd
         }
         consumedFrameCount += Int64(frameLength)
     }
 
+    private func binIndex(for frame: Int64, binCount: Int) -> Int {
+        min(
+            max(Int(frame * Int64(binCount) / expectedFrameCount), 0),
+            binCount - 1
+        )
+    }
+
+    private func nextBinBoundary(after frame: Int64, binCount: Int) -> Int64 {
+        let index = binIndex(for: frame, binCount: binCount)
+        return max(
+            Int64(index + 1) * expectedFrameCount / Int64(binCount),
+            frame + 1
+        )
+    }
+
     mutating func finish(actualFrameCount: Int64) -> Result {
         let actualFrameCount = max(actualFrameCount, 0)
-        if !zeroCrossingsOverflowed, crossings.last != Int(actualFrameCount) {
-            crossings.append(Int(actualFrameCount))
-        }
         let duration = sampleRate > 0 ? Double(actualFrameCount) / sampleRate : 0
         return Result(
             overview: WaveformOverview(
@@ -454,7 +491,7 @@ private struct StreamingAnalyzer {
             ),
             zeroCrossingIndex: AudioZeroCrossingIndex(
                 frameCount: Int(actualFrameCount),
-                crossings: zeroCrossingsOverflowed ? [] : crossings
+                crossings: []
             )
         )
     }
