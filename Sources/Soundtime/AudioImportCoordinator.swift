@@ -23,6 +23,8 @@ actor AudioImportCoordinator {
         var progress: Double
         var message: String
         var task: Task<AudioAssetProxyResult, Error>?
+        var latestProgress: AudioImportProgress?
+        var progressObservers: [UUID: @Sendable (AudioImportProgress) -> Void]
     }
 
     private var sessions: [UUID: Session] = [:]
@@ -63,7 +65,9 @@ actor AudioImportCoordinator {
             stage: admission.initialStage,
             progress: cachedImport == nil ? 0 : 1,
             message: cachedImport == nil ? "Audio admitted" : "Cached editable audio ready",
-            task: nil
+            task: nil,
+            latestProgress: nil,
+            progressObservers: [:]
         )
         return admission
     }
@@ -72,16 +76,21 @@ actor AudioImportCoordinator {
         admission: AudioImportAdmission,
         progress uiProgress: (@Sendable (AudioImportProgress) -> Void)? = nil
     ) -> Task<AudioAssetProxyResult, Error> {
+        if let uiProgress {
+            sessions[admission.sessionID]?.progressObservers[UUID()] = uiProgress
+            if let latestProgress = sessions[admission.sessionID]?.latestProgress {
+                uiProgress(latestProgress)
+            }
+        }
         if let existing = sessions[admission.sessionID]?.task {
             return existing
         }
 
         let sessionID = admission.sessionID
-        let task = Task.detached(priority: .utility) {
+        let task = Task.detached(priority: .userInitiated) {
             try await AudioAssetImporter.importEditableAsset(
                 admission: admission
             ) { progress in
-                uiProgress?(progress)
                 Task {
                     await AudioImportCoordinator.shared.record(
                         progress,
@@ -156,7 +165,11 @@ actor AudioImportCoordinator {
         session.stage = progress.stage
         session.progress = progress.fraction
         session.message = progress.message
+        session.latestProgress = progress
         sessions[sessionID] = session
+        for observer in session.progressObservers.values {
+            observer(progress)
+        }
     }
 
     private func complete(
@@ -166,13 +179,17 @@ actor AudioImportCoordinator {
         guard var session = sessions[sessionID], session.stage != .canceled else {
             return
         }
-        session.task = nil
         switch result {
         case .success:
+            // Retain the completed task until the session is forgotten. A drag
+            // prewarm can finish before drop; the dropped track must reuse that
+            // exact result instead of launching a second decode.
             session.stage = .complete
             session.progress = 1
             session.message = "Import complete"
         case let .failure(error):
+            // Failures remain retryable for callers that keep the session alive.
+            session.task = nil
             if error is CancellationError {
                 session.stage = .canceled
                 session.message = "Import canceled"

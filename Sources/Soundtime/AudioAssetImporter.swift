@@ -320,18 +320,7 @@ enum AudioAssetImporter {
             )
         }
 
-        let assetInfo = try inspectSynchronously(url: url)
-        let waveformOverview = try buildNativeSparsePreview(
-            url: url,
-            assetInfo: assetInfo,
-            targetBinCount: targetBinCount,
-            samplesPerBin: samplesPerBin
-        )
-        return AudioAssetPreviewResult(
-            assetInfo: assetInfo,
-            waveformOverview: waveformOverview,
-            zeroCrossingProbe: nil
-        )
+        throw ImportError.unsupportedPreviewFormat(format)
     }
 
     static func loadPreviewOverview(
@@ -655,90 +644,6 @@ enum AudioAssetImporter {
             throw importError
         } catch {
             throw ImportError.unreadableNativeAudio(format)
-        }
-    }
-
-    private static func buildNativeSparsePreview(
-        url: URL,
-        assetInfo: AudioAssetInfo,
-        targetBinCount: Int,
-        samplesPerBin: Int
-    ) throws -> WaveformOverview {
-        guard canImport(url) else {
-            throw ImportError.unsupportedPreviewFormat(assetInfo.format)
-        }
-
-        do {
-            let file = try AVAudioFile(
-                forReading: url,
-                commonFormat: .pcmFormatFloat32,
-                interleaved: false
-            )
-            let processingFormat = file.processingFormat
-            let sampleRate = processingFormat.sampleRate
-            guard sampleRate.isFinite, sampleRate > 0 else {
-                throw ImportError.invalidSampleRate
-            }
-            guard file.length > 0, file.length <= AVAudioFramePosition(Int.max) else {
-                return WaveformOverview(duration: assetInfo.duration ?? 0, bins: [])
-            }
-
-            let frameCount = Int(file.length)
-            let binCount = min(max(targetBinCount, 1), frameCount)
-            let previewWindowFrameCount = max(samplesPerBin, 16)
-            var bins: [WaveformOverview.Bin] = []
-            bins.reserveCapacity(binCount)
-
-            for binIndex in 0..<binCount {
-                if binIndex.isMultiple(of: 256) {
-                    try Task.checkCancellation()
-                }
-
-                let startFrame = binIndex * frameCount / binCount
-                let endFrame = max((binIndex + 1) * frameCount / binCount, startFrame + 1)
-                let frameSpan = endFrame - startFrame
-                let framesToRead = min(previewWindowFrameCount, frameSpan)
-                let readStartFrame: Int
-                if frameSpan <= framesToRead {
-                    readStartFrame = startFrame
-                } else {
-                    readStartFrame = startFrame + max((frameSpan - framesToRead) / 2, 0)
-                }
-
-                file.framePosition = AVAudioFramePosition(readStartFrame)
-                guard
-                    let buffer = AVAudioPCMBuffer(
-                        pcmFormat: processingFormat,
-                        frameCapacity: AVAudioFrameCount(framesToRead)
-                    )
-                else {
-                    throw ImportError.unsupportedNativePCMLayout
-                }
-                try file.read(
-                    into: buffer,
-                    frameCount: AVAudioFrameCount(min(framesToRead, frameCount - readStartFrame))
-                )
-
-                var accumulator = WaveformBinAccumulator()
-                if let floatChannelData = buffer.floatChannelData {
-                    let channelCount = Int(processingFormat.channelCount)
-                    let readFrameCount = Int(buffer.frameLength)
-                    for channelIndex in 0..<channelCount {
-                        let channelPointer = floatChannelData[channelIndex]
-                        for frameIndex in 0..<readFrameCount {
-                            accumulator.addSample(channelPointer[frameIndex])
-                        }
-                    }
-                }
-                bins.append(accumulator.makeBin())
-            }
-
-            let duration = assetInfo.duration ?? (Double(frameCount) / sampleRate)
-            return WaveformOverview(duration: duration, bins: bins)
-        } catch let importError as ImportError {
-            throw importError
-        } catch {
-            throw ImportError.unreadableNativeAudio(assetInfo.format)
         }
     }
 

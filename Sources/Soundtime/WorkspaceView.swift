@@ -387,17 +387,8 @@ final class WorkspaceView: NSView {
     private struct AudioImportPrewarm {
         let url: URL
         let admissionTask: Task<AudioImportAdmission, Error>?
-        let previewTask: Task<AudioAssetPreviewResult, Error>
-    }
-
-    private struct AudioImportPreviewOperation {
-        let token: UUID
-        let task: Task<Void, Never>
-    }
-
-    private enum NativeAudioPreview {
-        static let targetBinCount = 512
-        static let samplesPerBin = 32
+        let previewTask: Task<AudioAssetPreviewResult, Error>?
+        let preparationTask: Task<AudioAssetProxyResult, Error>?
     }
 
     private enum LaunchWaveformCache {
@@ -1853,7 +1844,6 @@ final class WorkspaceView: NSView {
     private var activeImportID = UUID()
     private var activeImportOperationIDs: Set<UUID> = []
     private var audioImportPrewarm: AudioImportPrewarm?
-    private var audioImportPreviewOperations: [UUID: AudioImportPreviewOperation] = [:]
     private var selectedAudioFile: AudioFileMetadata?
     private var decodedAudioBuffer: DecodedAudioBuffer?
     private var audioTimeline: AudioEditTimeline?
@@ -3928,12 +3918,9 @@ final class WorkspaceView: NSView {
         activeImportID = UUID()
         activeImportOperationIDs.removeAll()
         audioImportPrewarm?.admissionTask?.cancel()
-        audioImportPrewarm?.previewTask.cancel()
+        audioImportPrewarm?.previewTask?.cancel()
+        audioImportPrewarm?.preparationTask?.cancel()
         audioImportPrewarm = nil
-        for operation in audioImportPreviewOperations.values {
-            operation.task.cancel()
-        }
-        audioImportPreviewOperations.removeAll()
         let importSessionIDs = projectTracks.compactMap(\.importSessionID)
         if !importSessionIDs.isEmpty {
             Task {
@@ -5700,7 +5687,6 @@ final class WorkspaceView: NSView {
         else {
             return
         }
-        cancelAudioImportPreview(for: trackID)
         Task {
             await AudioImportCoordinator.shared.cancel(sessionID: sessionID)
             await AudioImportCoordinator.shared.forget(sessionID: sessionID)
@@ -6653,24 +6639,37 @@ final class WorkspaceView: NSView {
             try Task.checkCancellation()
             return try await AudioImportCoordinator.shared.admit(sourceURL: normalizedURL)
         }
-        let previewLevel = isWAV ?
-            WAVImportPreviewPolicy.immediate :
-            .init(
-                targetBinCount: NativeAudioPreview.targetBinCount,
-                samplesPerBin: NativeAudioPreview.samplesPerBin
-            )
-        let previewTask = Task.detached(priority: .userInitiated) {
+        // Compressed formats are decoded once after drop. Their sequential proxy
+        // pass publishes progressive waveform data, so prewarming a second
+        // random-seek decoder would only compete with the authoritative work.
+        let previewTask: Task<AudioAssetPreviewResult, Error>? = isWAV ? Task.detached(
+            priority: .userInitiated
+        ) {
             try Task.checkCancellation()
             return try await AudioImportPipeline.loadPreview(
                 at: normalizedURL,
-                targetBinCount: previewLevel.targetBinCount,
-                samplesPerBin: previewLevel.samplesPerBin
+                targetBinCount: WAVImportPreviewPolicy.immediate.targetBinCount,
+                samplesPerBin: WAVImportPreviewPolicy.immediate.samplesPerBin
             )
+        } : nil
+        let preparationTask: Task<AudioAssetProxyResult, Error>? = isWAV ? nil : Task.detached(
+            priority: .userInitiated
+        ) {
+            guard let admissionTask else {
+                throw CancellationError()
+            }
+            let admission = try await admissionTask.value
+            try Task.checkCancellation()
+            let task = await AudioImportCoordinator.shared.startPreparingEditableAsset(
+                admission: admission
+            )
+            return try await task.value
         }
         audioImportPrewarm = AudioImportPrewarm(
             url: normalizedURL,
             admissionTask: admissionTask,
-            previewTask: previewTask
+            previewTask: previewTask,
+            preparationTask: preparationTask
         )
         SoundtimeDiagnostics.shared.record(
             category: .audio,
@@ -6695,7 +6694,8 @@ final class WorkspaceView: NSView {
 
         audioImportPrewarm = nil
         prewarm.admissionTask?.cancel()
-        prewarm.previewTask.cancel()
+        prewarm.previewTask?.cancel()
+        prewarm.preparationTask?.cancel()
         Task {
             if let admissionTask = prewarm.admissionTask,
                let admission = try? await admissionTask.value
@@ -6794,6 +6794,7 @@ final class WorkspaceView: NSView {
                 return
             }
             var pendingTrackIdentity: (trackID: UUID, importID: UUID)?
+            var admittedSessionID: UUID?
             defer {
                 self.activeImportOperationIDs.remove(importOperationID)
             }
@@ -6806,23 +6807,14 @@ final class WorkspaceView: NSView {
                         sourceURL: normalizedURL
                     )
                 }
+                admittedSessionID = admission.sessionID
 
                 let importIdentity = self.addPendingAudioAssetTrack(
                     admission: admission,
                     displayName: importName
                 )
                 pendingTrackIdentity = importIdentity
-                if admission.cachedImport == nil {
-                    self.startPendingAudioAssetPreview(
-                        trackID: importIdentity.trackID,
-                        importID: importIdentity.importID,
-                        url: normalizedURL,
-                        displayName: importName,
-                        prewarmedTask: prewarm?.previewTask
-                    )
-                } else {
-                    prewarm?.previewTask.cancel()
-                }
+                prewarm?.previewTask?.cancel()
                 let preparationTask = await AudioImportCoordinator.shared.startPreparingEditableAsset(
                     admission: admission
                 ) { [weak self] progress in
@@ -6840,6 +6832,10 @@ final class WorkspaceView: NSView {
                     trackID: importIdentity.trackID,
                     importID: importIdentity.importID
                 ) else {
+                    await AudioImportCoordinator.shared.forget(
+                        sessionID: admission.sessionID
+                    )
+                    admittedSessionID = nil
                     return
                 }
 
@@ -6872,9 +6868,23 @@ final class WorkspaceView: NSView {
                     ]
                 )
                 PerformanceDashboardWindowController.refreshIfVisible()
+                await AudioImportCoordinator.shared.forget(
+                    sessionID: admission.sessionID
+                )
+                admittedSessionID = nil
             } catch is CancellationError {
+                if let admittedSessionID {
+                    await AudioImportCoordinator.shared.forget(
+                        sessionID: admittedSessionID
+                    )
+                }
                 return
             } catch {
+                if let admittedSessionID {
+                    await AudioImportCoordinator.shared.forget(
+                        sessionID: admittedSessionID
+                    )
+                }
                 if
                     let pendingTrackIdentity,
                     let trackIndex = self.projectTracks.firstIndex(where: {
@@ -7034,6 +7044,7 @@ final class WorkspaceView: NSView {
                 projectTracks[trackIndex].importPreviewIsProgressive
             )
         {
+            let isFirstWaveform = projectTracks[trackIndex].sourceWaveformOverview == nil
             projectTracks[trackIndex].importPreviewIsProgressive = true
             projectTracks[trackIndex].sourceWaveformOverview = previewOverview
             projectTracks[trackIndex].waveformOverview =
@@ -7047,6 +7058,30 @@ final class WorkspaceView: NSView {
                 allowImmediateInteractiveWaveformPrewarm: false,
                 updatesRendererImmediately: true
             )
+            if isFirstWaveform {
+                SoundtimeDiagnostics.shared.record(
+                    category: .waveform,
+                    severity: .info,
+                    name: "native-audio-first-waveform-published",
+                    message: "Published the first waveform from the unified sequential import decode.",
+                    fields: [
+                        "trackID": trackID.uuidString,
+                        "bins": "\(previewOverview.bins.count)",
+                        "progress": String(format: "%.4f", progress.fraction),
+                    ]
+                )
+            } else if progress.stage == .editableReady {
+                SoundtimeDiagnostics.shared.record(
+                    category: .waveform,
+                    severity: .info,
+                    name: "native-audio-screen-detail-waveform-published",
+                    message: "Published the completed high-detail waveform before cache commit.",
+                    fields: [
+                        "trackID": trackID.uuidString,
+                        "bins": "\(previewOverview.bins.count)",
+                    ]
+                )
+            }
         }
         if let controlView = trackControlViewsByID[trackID] {
             controlView.configure(
@@ -7062,118 +7097,6 @@ final class WorkspaceView: NSView {
         updateStatus("\(projectTracks[trackIndex].name) \(progress.message.lowercased())")
     }
 
-    private func startPendingAudioAssetPreview(
-        trackID: UUID,
-        importID: UUID,
-        url: URL,
-        displayName: String,
-        prewarmedTask: Task<AudioAssetPreviewResult, Error>? = nil
-    ) {
-        cancelAudioImportPreview(for: trackID)
-        let token = UUID()
-        let task = Task { @MainActor [weak self, trackID, importID, url, displayName, prewarmedTask] in
-            defer {
-                self?.finishAudioImportPreview(for: trackID, token: token)
-            }
-            do {
-                let preview: AudioAssetPreviewResult
-                if let prewarmedTask {
-                    preview = try await withTaskCancellationHandler {
-                        try await prewarmedTask.value
-                    } onCancel: {
-                        prewarmedTask.cancel()
-                    }
-                } else {
-                    preview = try await AudioImportPipeline.loadPreview(
-                        at: url,
-                        targetBinCount: NativeAudioPreview.targetBinCount,
-                        samplesPerBin: NativeAudioPreview.samplesPerBin
-                    )
-                }
-                guard let self, self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
-                    return
-                }
-
-                self.applyPendingAudioAssetPreview(
-                    trackID: trackID,
-                    importID: importID,
-                    preview: preview,
-                    displayName: displayName
-                )
-            } catch {
-                guard let self, self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
-                    return
-                }
-
-                SoundtimeDiagnostics.shared.record(
-                    category: .waveform,
-                    severity: .warning,
-                    name: "native-audio-preview-failed",
-                    message: "Could not build a quick waveform preview for a non-WAV import.",
-                    fields: [
-                        "file": url.lastPathComponent,
-                        "format": AudioAssetFormat.inferred(from: url).displayName,
-                        "error": error.localizedDescription,
-                    ]
-                )
-                PerformanceDashboardWindowController.refreshIfVisible()
-            }
-        }
-        audioImportPreviewOperations[trackID] = AudioImportPreviewOperation(
-            token: token,
-            task: task
-        )
-    }
-
-    private func cancelAudioImportPreview(for trackID: UUID) {
-        audioImportPreviewOperations.removeValue(forKey: trackID)?.task.cancel()
-    }
-
-    private func finishAudioImportPreview(for trackID: UUID, token: UUID) {
-        guard audioImportPreviewOperations[trackID]?.token == token else {
-            return
-        }
-        audioImportPreviewOperations.removeValue(forKey: trackID)
-    }
-
-    private func applyPendingAudioAssetPreview(
-        trackID: UUID,
-        importID: UUID,
-        preview: AudioAssetPreviewResult,
-        displayName: String
-    ) {
-        guard let trackIndex = projectTracks.firstIndex(where: {
-            $0.id == trackID && $0.importID == importID
-        }) else {
-            return
-        }
-
-        projectTracks[trackIndex].name = displayName
-        projectTracks[trackIndex].durationHint = preview.waveformOverview.duration
-        projectTracks[trackIndex].importPreviewIsProgressive = false
-        projectTracks[trackIndex].sourceWaveformOverview = preview.waveformOverview
-        projectTracks[trackIndex].waveformOverview = preview.waveformOverview
-        activeTrackID = trackID
-        refreshProjectTimelineDisplay(rebuildControls: false)
-        updateProjectDisplayTiming(sampleRateHint: preview.assetInfo.sampleRate)
-        updateTimeReadout()
-        syncActiveTrackFields()
-        updateStatus("\(displayName) preview ready - converting to editable audio")
-
-        SoundtimeDiagnostics.shared.record(
-            category: .waveform,
-            severity: .info,
-            name: "native-audio-preview-ready",
-            message: "Built a quick waveform preview for a non-WAV import before proxy conversion completed.",
-            fields: [
-                "file": preview.assetInfo.url.lastPathComponent,
-                "format": preview.assetInfo.format.displayName,
-                "bins": "\(preview.waveformOverview.bins.count)",
-            ]
-        )
-        PerformanceDashboardWindowController.refreshIfVisible()
-    }
-
     private func finishPendingAudioAssetImport(
         trackID: UUID,
         importID: UUID,
@@ -7185,8 +7108,6 @@ final class WorkspaceView: NSView {
         }) else {
             return
         }
-        cancelAudioImportPreview(for: trackID)
-
         let proxyURL = proxyResult.proxyURL.standardizedFileURL
         wavFileInfoCache[proxyURL] = proxyResult.proxyFileInfo
         invalidWAVFileInfoCache.remove(proxyURL)
@@ -7236,7 +7157,13 @@ final class WorkspaceView: NSView {
 
         activeTrackID = trackID
         window?.title = projectWindowTitle()
-        refreshProjectTimelineDisplay()
+        refreshProjectTimelineDisplay(
+            rebuildControls: false,
+            animateWaveformTransition: false,
+            allowImmediateWaveformPrewarm: true,
+            allowImmediateInteractiveWaveformPrewarm: false,
+            updatesRendererImmediately: true
+        )
         updateProjectDisplayTiming(sampleRateHint: proxyResult.proxyFileInfo.sampleRate)
         updateTimeReadout()
         syncActiveTrackFields()
@@ -7276,13 +7203,16 @@ final class WorkspaceView: NSView {
             guard let self else {
                 return
             }
+            var admittedSessionID: UUID?
             do {
                 let admission = try await AudioImportCoordinator.shared.admit(
                     sourceURL: sourceURL,
                     assetID: assetID
                 )
+                admittedSessionID = admission.sessionID
                 guard let currentIndex = self.projectTracks.firstIndex(where: { $0.id == trackID }) else {
                     await AudioImportCoordinator.shared.forget(sessionID: admission.sessionID)
+                    admittedSessionID = nil
                     return
                 }
                 self.projectTracks[currentIndex].importID = assetID
@@ -7314,6 +7244,10 @@ final class WorkspaceView: NSView {
                 }
                 let result = try await task.value
                 guard self.isTrackImportCurrent(trackID: trackID, importID: assetID) else {
+                    await AudioImportCoordinator.shared.forget(
+                        sessionID: admission.sessionID
+                    )
+                    admittedSessionID = nil
                     return
                 }
                 self.finishPendingAudioAssetImport(
@@ -7322,9 +7256,23 @@ final class WorkspaceView: NSView {
                     proxyResult: result,
                     displayName: displayName
                 )
+                await AudioImportCoordinator.shared.forget(
+                    sessionID: admission.sessionID
+                )
+                admittedSessionID = nil
             } catch is CancellationError {
+                if let admittedSessionID {
+                    await AudioImportCoordinator.shared.forget(
+                        sessionID: admittedSessionID
+                    )
+                }
                 return
             } catch {
+                if let admittedSessionID {
+                    await AudioImportCoordinator.shared.forget(
+                        sessionID: admittedSessionID
+                    )
+                }
                 guard let currentIndex = self.projectTracks.firstIndex(where: { $0.id == trackID }) else {
                     return
                 }
@@ -7582,8 +7530,8 @@ final class WorkspaceView: NSView {
                 var latestFileInfo = fileInfo
                 if latestPreviewBinCount < min(initialPreviewLevel.targetBinCount, fileInfo?.frameCount ?? Int.max) {
                     let previewResult: AudioAssetPreviewResult
-                    if let prewarm {
-                        previewResult = try await prewarm.previewTask.value
+                    if let previewTask = prewarm?.previewTask {
+                        previewResult = try await previewTask.value
                     } else {
                         previewResult = try await Task.detached(priority: .userInitiated) {
                             try await AudioImportPipeline.loadPreview(
@@ -7635,7 +7583,7 @@ final class WorkspaceView: NSView {
                         self.projectTracks[trackIndex].zeroCrossingProbe = zeroCrossingProbe
                     }
                 } else {
-                    prewarm?.previewTask.cancel()
+                    prewarm?.previewTask?.cancel()
                     if let admissionTask = prewarm?.admissionTask,
                        let admission = try? await admissionTask.value
                     {
@@ -8251,7 +8199,6 @@ final class WorkspaceView: NSView {
             stopRecording()
         }
 
-        cancelAudioImportPreview(for: trackID)
         if
             let sessionID = projectTracks.first(where: { $0.id == trackID })?.importSessionID
         {
