@@ -27,7 +27,9 @@ enum AudioAssetImporterSmokeHarness {
         }
 
         try verifyCommonFormatRecognition()
+        try verifyWAVImmediatePreviewContract()
         try verifyWAVFacadeRoundTrip(rootDirectory: rootDirectory)
+        let longWAVMetrics = try verifyFourMinuteWAVPreviewPerformance(rootDirectory: rootDirectory)
         let nativeMetrics = try verifyNativeEditableProxyImport(rootDirectory: rootDirectory)
         try verifyCanceledTransactionCleanup(rootDirectory: rootDirectory)
         try verifyCorruptCacheQuarantine(rootDirectory: rootDirectory)
@@ -37,7 +39,9 @@ enum AudioAssetImporterSmokeHarness {
 
         let checks = [
             "common audio format recognition",
+            "dropped WAV immediate-preview work stays bounded",
             "wav importer facade preview/decode round trip",
+            "four-minute WAV first preview and bounded refinement",
             "native audio streaming proxy and cache reuse",
             "stable logical identity and edit remap across proxy promotion",
             "transaction cancellation removes staged artifacts",
@@ -66,11 +70,26 @@ enum AudioAssetImporterSmokeHarness {
                 ),
                 "peakWorkingSetBytes": "\(nativeMetrics.peakWorkingSetBytes)",
                 "cacheHit": "true",
+                "fourMinuteWAVFirstPreviewMilliseconds": String(
+                    format: "%.3f",
+                    longWAVMetrics.firstPreviewMilliseconds
+                ),
+                "fourMinuteWAVRefinementMilliseconds": String(
+                    format: "%.3f",
+                    longWAVMetrics.refinementMilliseconds
+                ),
             ],
             arguments: arguments
         ) {
             print("Soundtime audio asset importer smoke report: \(reportURL.path)")
         }
+        print(
+            String(
+                format: "Four-minute WAV preview: %.1f ms first visible, %.1f ms bounded refinement",
+                longWAVMetrics.firstPreviewMilliseconds,
+                longWAVMetrics.refinementMilliseconds
+            )
+        )
         print("Soundtime audio asset importer smoke passed")
     }
 
@@ -146,6 +165,178 @@ enum AudioAssetImporterSmokeHarness {
         let unknownURL = URL(fileURLWithPath: "/tmp/not-audio.xyz")
         try require(AudioAssetFormat.inferred(from: unknownURL) == .unknown, "unknown format inference failed")
         try require(!AudioAssetImporter.canImport(unknownURL), "unknown format should not be importable")
+    }
+
+    private static func verifyWAVImmediatePreviewContract() throws {
+        let levels = WAVImportPreviewPolicy.allLevels
+        try require(levels.first == WAVImportPreviewPolicy.immediate, "immediate WAV preview is not first")
+        try require(levels.count <= 3, "WAV import performs too many whole-file preview passes")
+        try require(
+            zip(levels, levels.dropFirst()).allSatisfy { $0.targetBinCount < $1.targetBinCount },
+            "WAV preview levels are not strictly increasing"
+        )
+        try require(
+            WAVImportPreviewPolicy.immediate.targetBinCount >= 4_096,
+            "immediate WAV preview is too coarse for a normal timeline viewport"
+        )
+        try require(
+            levels.last?.targetBinCount == 131_072,
+            "WAV import should stop whole-file refinement at the launch-detail cache level"
+        )
+
+        let fourMinuteFrames = 4 * 60 * 44_100
+        let sampledFrames = WAVImportPreviewPolicy.estimatedSampledFrameCount(
+            sourceFrameCount: fourMinuteFrames
+        )
+        try require(
+            sampledFrames <= 5_200_000,
+            "four-minute WAV preview policy samples too much audio: \(sampledFrames) frames"
+        )
+    }
+
+    private struct LongWAVPreviewMetrics {
+        let firstPreviewMilliseconds: Double
+        let refinementMilliseconds: Double
+    }
+
+    private static func verifyFourMinuteWAVPreviewPerformance(
+        rootDirectory: URL
+    ) throws -> LongWAVPreviewMetrics {
+        let wavURL = rootDirectory.appendingPathComponent("FourMinuteColdImport.wav")
+        try writeRepeatedPCM16WAV(
+            to: wavURL,
+            sampleRate: 44_100,
+            channelCount: 1,
+            duration: 4 * 60
+        )
+
+        let firstStartedAt = DispatchTime.now().uptimeNanoseconds
+        let firstResult = try awaitValue {
+            try await AudioImportPipeline.loadPreview(
+                at: wavURL,
+                targetBinCount: WAVImportPreviewPolicy.immediate.targetBinCount,
+                samplesPerBin: WAVImportPreviewPolicy.immediate.samplesPerBin
+            )
+        }
+        let firstPreviewMilliseconds = elapsedMilliseconds(since: firstStartedAt)
+        guard let fileInfo = firstResult.assetInfo.wavFileInfo else {
+            throw SmokeError.failed("four-minute WAV first preview omitted file information")
+        }
+        let firstOverview = firstResult.waveformOverview
+        try require(
+            firstOverview.bins.count == WAVImportPreviewPolicy.immediate.targetBinCount,
+            "four-minute WAV first preview had the wrong bin count"
+        )
+        try require(
+            firstResult.zeroCrossingProbe == nil,
+            "four-minute WAV first preview performed deferred zero-crossing setup"
+        )
+        try require(
+            abs(firstOverview.duration - fileInfo.duration) <= 1 / fileInfo.sampleRate,
+            "four-minute WAV first preview did not cover the canonical file duration"
+        )
+        try require(
+            firstPreviewMilliseconds < 2_000,
+            "four-minute WAV first preview exceeded 2 seconds: \(firstPreviewMilliseconds) ms"
+        )
+
+        let refinementStartedAt = DispatchTime.now().uptimeNanoseconds
+        var previousBinCount = firstOverview.bins.count
+        for level in WAVImportPreviewPolicy.refinements {
+            let (_, overview) = try WAVAudioDecoder.buildSparsePreview(
+                url: wavURL,
+                targetBinCount: level.targetBinCount,
+                samplesPerBin: level.samplesPerBin
+            )
+            try require(
+                overview.bins.count > previousBinCount,
+                "four-minute WAV refinement did not increase detail"
+            )
+            previousBinCount = overview.bins.count
+        }
+        let refinementMilliseconds = elapsedMilliseconds(since: refinementStartedAt)
+        try require(
+            refinementMilliseconds < 20_000,
+            "four-minute WAV bounded refinement exceeded 20 seconds: \(refinementMilliseconds) ms"
+        )
+
+        return LongWAVPreviewMetrics(
+            firstPreviewMilliseconds: firstPreviewMilliseconds,
+            refinementMilliseconds: refinementMilliseconds
+        )
+    }
+
+    private static func writeRepeatedPCM16WAV(
+        to url: URL,
+        sampleRate: Int,
+        channelCount: Int,
+        duration: TimeInterval
+    ) throws {
+        let frameCount = Int((duration * Double(sampleRate)).rounded())
+        let bytesPerFrame = channelCount * MemoryLayout<Int16>.size
+        let dataByteCount = frameCount * bytesPerFrame
+        guard dataByteCount <= Int(UInt32.max) - 36 else {
+            throw SmokeError.failed("long WAV fixture exceeded RIFF size limits")
+        }
+
+        var header = Data()
+        appendASCII("RIFF", to: &header)
+        appendUInt32LE(UInt32(36 + dataByteCount), to: &header)
+        appendASCII("WAVEfmt ", to: &header)
+        appendUInt32LE(16, to: &header)
+        appendUInt16LE(1, to: &header)
+        appendUInt16LE(UInt16(channelCount), to: &header)
+        appendUInt32LE(UInt32(sampleRate), to: &header)
+        appendUInt32LE(UInt32(sampleRate * bytesPerFrame), to: &header)
+        appendUInt16LE(UInt16(bytesPerFrame), to: &header)
+        appendUInt16LE(16, to: &header)
+        appendASCII("data", to: &header)
+        appendUInt32LE(UInt32(dataByteCount), to: &header)
+
+        FileManager.default.createFile(atPath: url.path, contents: header)
+        let handle = try FileHandle(forWritingTo: url)
+        defer {
+            try? handle.close()
+        }
+        try handle.seekToEnd()
+
+        let chunkFrameCount = 8_192
+        var chunk = Data(capacity: chunkFrameCount * bytesPerFrame)
+        for frame in 0..<chunkFrameCount {
+            let phase = Double(frame) / Double(sampleRate)
+            let sample = Int16((sin(phase * .pi * 2 * 220) * 12_000).rounded())
+            for _ in 0..<channelCount {
+                appendUInt16LE(UInt16(bitPattern: sample), to: &chunk)
+            }
+        }
+
+        var remainingFrames = frameCount
+        while remainingFrames > 0 {
+            let framesToWrite = min(remainingFrames, chunkFrameCount)
+            let byteCount = framesToWrite * bytesPerFrame
+            try handle.write(contentsOf: chunk.prefix(byteCount))
+            remainingFrames -= framesToWrite
+        }
+    }
+
+    private static func appendASCII(_ value: String, to data: inout Data) {
+        data.append(contentsOf: value.utf8)
+    }
+
+    private static func appendUInt16LE(_ value: UInt16, to data: inout Data) {
+        data.append(UInt8(value & 0xFF))
+        data.append(UInt8((value >> 8) & 0xFF))
+    }
+
+    private static func appendUInt32LE(_ value: UInt32, to data: inout Data) {
+        data.append(UInt8(value & 0xFF))
+        data.append(UInt8((value >> 8) & 0xFF))
+        data.append(UInt8((value >> 16) & 0xFF))
+        data.append(UInt8((value >> 24) & 0xFF))
+    }
+
+    private static func elapsedMilliseconds(since startedAt: UInt64) -> Double {
+        Double(DispatchTime.now().uptimeNanoseconds &- startedAt) / 1_000_000
     }
 
     private static func verifyWAVFacadeRoundTrip(rootDirectory: URL) throws {

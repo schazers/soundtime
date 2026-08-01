@@ -239,47 +239,51 @@ enum WAVAudioDecoder {
         let binCount = min(max(targetBinCount, 1), fileInfo.frameCount)
         let minimumSamplesPerPreviewBin = 16
         let sampledFrameCount = max(samplesPerBin, minimumSamplesPerPreviewBin)
+        let bytesPerSample = bytesPerSample(for: fileInfo)
         var bins: [WaveformOverview.Bin] = []
         bins.reserveCapacity(binCount)
 
-        for binIndex in 0..<binCount {
-            if binIndex.isMultiple(of: 256) {
-                try ImportWorkBudget.shared.waitIfPlaybackActive()
-            }
-
-            let startFrame = binIndex * fileInfo.frameCount / binCount
-            let endFrame = max((binIndex + 1) * fileInfo.frameCount / binCount, startFrame + 1)
-            let frameSpan = endFrame - startFrame
-            let shouldScanEntireBin = frameSpan <= sampledFrameCount * 4
-            let binSampleCount = shouldScanEntireBin ? frameSpan : min(sampledFrameCount, frameSpan)
-            var accumulator = WaveformBinAccumulator()
-
-            for sampleIndex in 0..<binSampleCount {
-                let frameOffset: Int
-                if shouldScanEntireBin {
-                    frameOffset = sampleIndex
-                } else if binSampleCount == 1 {
-                    frameOffset = frameSpan / 2
-                } else {
-                    frameOffset = sampleIndex * (frameSpan - 1) / (binSampleCount - 1)
+        try data.withUnsafeBytes { bytes in
+            for binIndex in 0..<binCount {
+                if binIndex.isMultiple(of: 256) {
+                    try Task.checkCancellation()
+                    try ImportWorkBudget.shared.waitIfPlaybackActive()
                 }
 
-                let frameIndex = startFrame + frameOffset
-                let frameByteOffset = fileInfo.dataRange.lowerBound + frameIndex * fileInfo.blockAlign
+                let startFrame = binIndex * fileInfo.frameCount / binCount
+                let endFrame = max((binIndex + 1) * fileInfo.frameCount / binCount, startFrame + 1)
+                let frameSpan = endFrame - startFrame
+                let shouldScanEntireBin = frameSpan <= sampledFrameCount * 4
+                let binSampleCount = shouldScanEntireBin ? frameSpan : min(sampledFrameCount, frameSpan)
+                var accumulator = WaveformBinAccumulator()
 
-                for channelIndex in 0..<fileInfo.channelCount {
-                    let sampleOffset = frameByteOffset + channelIndex * bytesPerSample(for: fileInfo)
-                    let sample = try decodeSample(
-                        in: data,
-                        at: sampleOffset,
-                        formatTag: fileInfo.formatTag,
-                        bitsPerSample: fileInfo.bitsPerSample
-                    )
-                    accumulator.addSample(sample)
+                for sampleIndex in 0..<binSampleCount {
+                    let frameOffset: Int
+                    if shouldScanEntireBin {
+                        frameOffset = sampleIndex
+                    } else if binSampleCount == 1 {
+                        frameOffset = frameSpan / 2
+                    } else {
+                        frameOffset = sampleIndex * (frameSpan - 1) / (binSampleCount - 1)
+                    }
+
+                    let frameIndex = startFrame + frameOffset
+                    let frameByteOffset = fileInfo.dataRange.lowerBound + frameIndex * fileInfo.blockAlign
+
+                    for channelIndex in 0..<fileInfo.channelCount {
+                        let sampleOffset = frameByteOffset + channelIndex * bytesPerSample
+                        let sample = try decodeSample(
+                            in: bytes,
+                            at: sampleOffset,
+                            formatTag: fileInfo.formatTag,
+                            bitsPerSample: fileInfo.bitsPerSample
+                        )
+                        accumulator.addSample(sample)
+                    }
                 }
-            }
 
-            bins.append(accumulator.makeBin())
+                bins.append(accumulator.makeBin())
+            }
         }
 
         return WaveformOverview(duration: fileInfo.duration, bins: bins)

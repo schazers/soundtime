@@ -386,7 +386,7 @@ final class WorkspaceView: NSView {
 
     private struct AudioImportPrewarm {
         let url: URL
-        let admissionTask: Task<AudioImportAdmission, Error>
+        let admissionTask: Task<AudioImportAdmission, Error>?
         let previewTask: Task<AudioAssetPreviewResult, Error>
     }
 
@@ -2053,25 +2053,9 @@ final class WorkspaceView: NSView {
     private let visualAudioSyncResponseDuration: TimeInterval = 0.12
     private let visualAudioSyncMinimumCorrectionInterval: TimeInterval = 0.1
     private let transportArrowSkipDuration: TimeInterval = 5
-    private let wavPreviewLevels = [
-        WAVPreviewLevel(targetBinCount: 16_384, samplesPerBin: 64),
-        WAVPreviewLevel(targetBinCount: 24_576, samplesPerBin: 64),
-        WAVPreviewLevel(targetBinCount: 32_768, samplesPerBin: 56),
-        WAVPreviewLevel(targetBinCount: 49_152, samplesPerBin: 48),
-        WAVPreviewLevel(targetBinCount: 65_536, samplesPerBin: 44),
-        WAVPreviewLevel(targetBinCount: 98_304, samplesPerBin: 36),
-        WAVPreviewLevel(targetBinCount: 131_072, samplesPerBin: 32),
-        WAVPreviewLevel(targetBinCount: 196_608, samplesPerBin: 28),
-        WAVPreviewLevel(targetBinCount: 262_144, samplesPerBin: 24),
-        WAVPreviewLevel(targetBinCount: 393_216, samplesPerBin: 18),
-        WAVPreviewLevel(targetBinCount: 524_288, samplesPerBin: 16),
-        WAVPreviewLevel(targetBinCount: 786_432, samplesPerBin: 10),
-        WAVPreviewLevel(targetBinCount: 1_048_576, samplesPerBin: 8),
-        WAVPreviewLevel(targetBinCount: 1_572_864, samplesPerBin: 3),
-        WAVPreviewLevel(targetBinCount: 2_097_152, samplesPerBin: 3),
-        WAVPreviewLevel(targetBinCount: 3_145_728, samplesPerBin: 2),
-        WAVPreviewLevel(targetBinCount: 4_194_304, samplesPerBin: 2),
-    ]
+    private let wavPreviewLevels = WAVImportPreviewPolicy.allLevels.map {
+        WAVPreviewLevel(targetBinCount: $0.targetBinCount, samplesPerBin: $0.samplesPerBin)
+    }
     private let optimisticEditPreviewBinLimit = 262_144
     private let optimisticEditPreviewSamplesPerBin = 2
 
@@ -3943,7 +3927,7 @@ final class WorkspaceView: NSView {
 
         activeImportID = UUID()
         activeImportOperationIDs.removeAll()
-        audioImportPrewarm?.admissionTask.cancel()
+        audioImportPrewarm?.admissionTask?.cancel()
         audioImportPrewarm?.previewTask.cancel()
         audioImportPrewarm = nil
         for operation in audioImportPreviewOperations.values {
@@ -6635,7 +6619,10 @@ final class WorkspaceView: NSView {
 
     private func loadDroppedAudioFile(at url: URL) {
         if WAVAudioDecoder.canDecode(url) {
-            addDroppedWAVTrack(at: url)
+            addDroppedWAVTrack(
+                at: url,
+                prewarm: consumeAudioImportPrewarm(for: url)
+            )
             return
         }
 
@@ -6651,7 +6638,7 @@ final class WorkspaceView: NSView {
 
     private func beginAudioImportPrewarm(for url: URL) {
         let normalizedURL = url.standardizedFileURL
-        guard AudioAssetImporter.canImport(normalizedURL), !WAVAudioDecoder.canDecode(normalizedURL) else {
+        guard AudioAssetImporter.canImport(normalizedURL) else {
             return
         }
         if audioImportPrewarm?.url == normalizedURL {
@@ -6659,16 +6646,25 @@ final class WorkspaceView: NSView {
         }
 
         cancelAudioImportPrewarm()
-        let admissionTask = Task(priority: .userInitiated) {
+        let isWAV = WAVAudioDecoder.canDecode(normalizedURL)
+        let admissionTask: Task<AudioImportAdmission, Error>? = isWAV ? nil : Task.detached(
+            priority: .userInitiated
+        ) {
             try Task.checkCancellation()
             return try await AudioImportCoordinator.shared.admit(sourceURL: normalizedURL)
         }
-        let previewTask = Task(priority: .userInitiated) {
+        let previewLevel = isWAV ?
+            WAVImportPreviewPolicy.immediate :
+            .init(
+                targetBinCount: NativeAudioPreview.targetBinCount,
+                samplesPerBin: NativeAudioPreview.samplesPerBin
+            )
+        let previewTask = Task.detached(priority: .userInitiated) {
             try Task.checkCancellation()
             return try await AudioImportPipeline.loadPreview(
                 at: normalizedURL,
-                targetBinCount: NativeAudioPreview.targetBinCount,
-                samplesPerBin: NativeAudioPreview.samplesPerBin
+                targetBinCount: previewLevel.targetBinCount,
+                samplesPerBin: previewLevel.samplesPerBin
             )
         }
         audioImportPrewarm = AudioImportPrewarm(
@@ -6698,10 +6694,12 @@ final class WorkspaceView: NSView {
         }
 
         audioImportPrewarm = nil
-        prewarm.admissionTask.cancel()
+        prewarm.admissionTask?.cancel()
         prewarm.previewTask.cancel()
         Task {
-            if let admission = try? await prewarm.admissionTask.value {
+            if let admissionTask = prewarm.admissionTask,
+               let admission = try? await admissionTask.value
+            {
                 await AudioImportCoordinator.shared.forget(sessionID: admission.sessionID)
             }
         }
@@ -6801,8 +6799,8 @@ final class WorkspaceView: NSView {
             }
             do {
                 let admission: AudioImportAdmission
-                if let prewarm {
-                    admission = try await prewarm.admissionTask.value
+                if let admissionTask = prewarm?.admissionTask {
+                    admission = try await admissionTask.value
                 } else {
                     admission = try await AudioImportCoordinator.shared.admit(
                         sourceURL: normalizedURL
@@ -7351,8 +7349,10 @@ final class WorkspaceView: NSView {
         at url: URL,
         settings: SoundtimeProject.Track? = nil,
         displayName: String? = nil,
-        ownsSourceFile: Bool = false
+        ownsSourceFile: Bool = false,
+        prewarm: AudioImportPrewarm? = nil
     ) {
+        let importStartedAt = DispatchTime.now().uptimeNanoseconds
         let trackID = settings?.id ?? UUID()
         let importID = UUID()
         let trackName = settings?.name ?? displayName ?? url.deletingPathExtension().lastPathComponent
@@ -7391,7 +7391,10 @@ final class WorkspaceView: NSView {
                 ownsEditableFile: settings?.ownsSourceFile ?? ownsSourceFile
             )
         }
-        let shouldCheckLaunchCacheSynchronously = settings == nil || launchPreview == nil
+        // Project restore may synchronously use its bounded launch cache before
+        // first paint. A newly dropped file must publish its lane first and do
+        // every cache lookup off the main thread.
+        let shouldCheckLaunchCacheSynchronously = settings != nil && launchPreview == nil
         let cachedLaunchEntry = shouldCheckLaunchCacheSynchronously ? fileInfo.flatMap { fileInfo in
             cachedWaveformOverviewForLaunch(
                 at: url,
@@ -7460,6 +7463,14 @@ final class WorkspaceView: NSView {
         )
 
         projectTracks.append(track)
+        recordDroppedWAVImportMilestone(
+            name: "wav-import-track-published",
+            message: "Published the dropped WAV track lane.",
+            startedAt: importStartedAt,
+            trackID: trackID,
+            sourceURL: url,
+            binCount: launchDisplayOverview?.bins.count
+        )
         if let editableSource, let canonicalFileTimeline {
             projectEditGraph.upsert(
                 source: editableSource,
@@ -7479,6 +7490,14 @@ final class WorkspaceView: NSView {
         }
         if !isLoadingProject {
             reloadPlaybackFromProjectTracks(preserveProgress: true)
+            recordDroppedWAVImportMilestone(
+                name: "wav-import-playback-ready",
+                message: "Published file-backed playback for a dropped WAV.",
+                startedAt: importStartedAt,
+                trackID: trackID,
+                sourceURL: url,
+                binCount: launchDisplayOverview?.bins.count
+            )
         }
         let launchPreviewReason: String
         if launchPreview != nil {
@@ -7549,7 +7568,7 @@ final class WorkspaceView: NSView {
         }
 
         let wavPreviewLevels = wavPreviewLevels
-        Task { [weak self, trackID, importID, url, fileInfo, wavPreviewLevels, launchPreviewBinCount] in
+        Task { [weak self, trackID, importID, url, fileInfo, wavPreviewLevels, launchPreviewBinCount, prewarm] in
             do {
                 guard let initialPreviewLevel = wavPreviewLevels.first else {
                     return
@@ -7561,6 +7580,70 @@ final class WorkspaceView: NSView {
 
                 var latestPreviewBinCount = launchPreviewBinCount
                 var latestFileInfo = fileInfo
+                if latestPreviewBinCount < min(initialPreviewLevel.targetBinCount, fileInfo?.frameCount ?? Int.max) {
+                    let previewResult: AudioAssetPreviewResult
+                    if let prewarm {
+                        previewResult = try await prewarm.previewTask.value
+                    } else {
+                        previewResult = try await Task.detached(priority: .userInitiated) {
+                            try await AudioImportPipeline.loadPreview(
+                                at: url,
+                                targetBinCount: initialPreviewLevel.targetBinCount,
+                                samplesPerBin: initialPreviewLevel.samplesPerBin
+                            )
+                        }.value
+                    }
+
+                    guard
+                        self.isTrackImportCurrent(trackID: trackID, importID: importID),
+                        let previewResult = previewResult.wavPreviewResult
+                    else {
+                        return
+                    }
+
+                    self.applyDroppedWAVInitialPreview(
+                        trackID: trackID,
+                        previewResult: previewResult
+                    )
+                    self.cacheWaveformOverview(
+                        previewResult.waveformOverview,
+                        targetBinCount: initialPreviewLevel.targetBinCount,
+                        samplesPerBin: initialPreviewLevel.samplesPerBin,
+                        fileInfo: previewResult.fileInfo
+                    )
+                    latestPreviewBinCount = previewResult.waveformOverview.bins.count
+                    latestFileInfo = previewResult.fileInfo
+                    self.recordDroppedWAVImportMilestone(
+                        name: "wav-import-first-waveform-published",
+                        message: "Published the first interactive waveform for a dropped WAV.",
+                        startedAt: importStartedAt,
+                        trackID: trackID,
+                        sourceURL: url,
+                        binCount: latestPreviewBinCount
+                    )
+
+                    let zeroCrossingProbe = try? await Task.detached(priority: .utility) {
+                        try WAVAudioDecoder.makeZeroCrossingProbe(
+                            url: url,
+                            fileInfo: previewResult.fileInfo
+                        )
+                    }.value
+                    if
+                        self.isTrackImportCurrent(trackID: trackID, importID: importID),
+                        let trackIndex = self.projectTracks.firstIndex(where: { $0.id == trackID })
+                    {
+                        self.projectTracks[trackIndex].zeroCrossingProbe = zeroCrossingProbe
+                    }
+                } else {
+                    prewarm?.previewTask.cancel()
+                    if let admissionTask = prewarm?.admissionTask,
+                       let admission = try? await admissionTask.value
+                    {
+                        await AudioImportCoordinator.shared.forget(sessionID: admission.sessionID)
+                    }
+                    self.updateStatus(WAVImportPreviewPolicy.readyStatus)
+                }
+
                 if let fileInfo {
                     let fastCachedEntry = await self.cachedWaveformOverview(
                         at: url,
@@ -7613,100 +7696,6 @@ final class WorkspaceView: NSView {
                         )
                     }
 
-                    let fastTargetBinCount = min(
-                        LaunchWaveformCache.firstRefinementBinCount,
-                        latestFileInfo?.frameCount ?? fileInfo.frameCount
-                    )
-                    if latestPreviewBinCount < fastTargetBinCount {
-                        self.recordWaveformCacheDecision(
-                            name: "fast-preview-rebuild",
-                            message: "Building fast launch-detail waveform preview in the background.",
-                            tier: "backgroundRebuild",
-                            result: "build",
-                            trackID: trackID,
-                            trackName: trackName,
-                            sourceURL: url,
-                            targetBinCount: LaunchWaveformCache.firstRefinementBinCount,
-                            samplesPerBin: LaunchWaveformCache.firstRefinementSamplesPerBin,
-                            reason: "fast-cache-missing-or-too-coarse"
-                        )
-                        let (fileInfo, waveformOverview) = try await AudioImportPipeline.loadWAVPreviewOverview(
-                            at: url,
-                            targetBinCount: LaunchWaveformCache.firstRefinementBinCount,
-                            samplesPerBin: LaunchWaveformCache.firstRefinementSamplesPerBin
-                        )
-
-                        guard self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
-                            return
-                        }
-
-                        latestPreviewBinCount = waveformOverview.bins.count
-                        latestFileInfo = fileInfo
-                        let editedDisplayOverview = await self.cachedEditedDisplayOverviewForTrack(
-                            trackID: trackID,
-                            sourceURL: url,
-                            fileInfo: fileInfo
-                        )
-                        self.applyTrackPreviewRefinement(
-                            trackID: trackID,
-                            fileInfo: fileInfo,
-                            waveformOverview: waveformOverview,
-                            displayOverviewOverride: editedDisplayOverview
-                        )
-                        self.cacheWaveformOverview(
-                            waveformOverview,
-                            targetBinCount: LaunchWaveformCache.firstRefinementBinCount,
-                            samplesPerBin: LaunchWaveformCache.firstRefinementSamplesPerBin,
-                            fileInfo: fileInfo
-                        )
-                    }
-
-                    let cachedEntry = await self.cachedWaveformOverview(at: url, fileInfo: fileInfo)
-                    if
-                        let cachedEntry,
-                        self.isTrackImportCurrent(trackID: trackID, importID: importID),
-                        cachedEntry.overview.bins.count > latestPreviewBinCount
-                    {
-                        self.recordWaveformCacheDecision(
-                            name: "raw-overview-cache-hit",
-                            message: "Loaded largest raw waveform overview from disk cache.",
-                            tier: "rawOverviewDiskCache",
-                            result: "hit",
-                            trackID: trackID,
-                            trackName: trackName,
-                            sourceURL: url,
-                            binCount: cachedEntry.overview.bins.count,
-                            targetBinCount: cachedEntry.level.targetBinCount,
-                            samplesPerBin: cachedEntry.level.samplesPerBin
-                        )
-                        latestPreviewBinCount = cachedEntry.overview.bins.count
-                        latestFileInfo = cachedEntry.fileInfo
-                        let editedDisplayOverview = await self.cachedEditedDisplayOverviewForTrack(
-                            trackID: trackID,
-                            sourceURL: url,
-                            fileInfo: cachedEntry.fileInfo
-                        )
-                        self.applyTrackPreviewRefinement(
-                            trackID: trackID,
-                            fileInfo: cachedEntry.fileInfo,
-                            waveformOverview: cachedEntry.overview,
-                            displayOverviewOverride: editedDisplayOverview
-                        )
-                    } else if self.isTrackImportCurrent(trackID: trackID, importID: importID) {
-                        self.recordWaveformCacheDecision(
-                            name: "raw-overview-cache-miss",
-                            message: "Largest raw waveform overview disk cache was unavailable or not finer than the current preview.",
-                            tier: "rawOverviewDiskCache",
-                            result: cachedEntry == nil ? "miss" : "skipped",
-                            trackID: trackID,
-                            trackName: trackName,
-                            sourceURL: url,
-                            binCount: cachedEntry?.overview.bins.count,
-                            targetBinCount: cachedEntry?.level.targetBinCount,
-                            samplesPerBin: cachedEntry?.level.samplesPerBin,
-                            reason: cachedEntry == nil ? "not-found" : "not-finer-than-current-preview"
-                        )
-                    }
                 } else {
                     self.recordWaveformCacheDecision(
                         name: "raw-overview-cache-miss",
@@ -7718,49 +7707,6 @@ final class WorkspaceView: NSView {
                         sourceURL: url,
                         reason: "file-inspection-failed"
                     )
-                }
-
-                if latestPreviewBinCount < min(initialPreviewLevel.targetBinCount, latestFileInfo?.frameCount ?? Int.max) {
-                    self.recordWaveformCacheDecision(
-                        name: "preview-rebuild",
-                        message: "Building initial waveform preview in the background.",
-                        tier: "backgroundRebuild",
-                        result: "build",
-                        trackID: trackID,
-                        trackName: trackName,
-                        sourceURL: url,
-                        targetBinCount: initialPreviewLevel.targetBinCount,
-                        samplesPerBin: initialPreviewLevel.samplesPerBin,
-                        reason: "cache-missing-or-too-coarse"
-                    )
-                    let previewResult = try await AudioImportPipeline.loadWAVPreview(
-                        at: url,
-                        targetBinCount: initialPreviewLevel.targetBinCount,
-                        samplesPerBin: initialPreviewLevel.samplesPerBin
-                    )
-
-                    guard self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
-                        return
-                    }
-
-                    let editedDisplayOverview = await self.cachedEditedDisplayOverviewForTrack(
-                        trackID: trackID,
-                        sourceURL: url,
-                        fileInfo: previewResult.fileInfo
-                    )
-                    self.applyTrackPreview(
-                        trackID: trackID,
-                        previewResult: previewResult,
-                        displayOverviewOverride: editedDisplayOverview
-                    )
-                    self.cacheWaveformOverview(
-                        previewResult.waveformOverview,
-                        targetBinCount: initialPreviewLevel.targetBinCount,
-                        samplesPerBin: initialPreviewLevel.samplesPerBin,
-                        fileInfo: previewResult.fileInfo
-                    )
-                    latestPreviewBinCount = previewResult.waveformOverview.bins.count
-                    latestFileInfo = previewResult.fileInfo
                 }
 
                 for previewLevel in wavPreviewLevels.dropFirst() {
@@ -7825,59 +7771,23 @@ final class WorkspaceView: NSView {
                     }
                 }
 
-                do {
-                    guard await self.waitForImportWorkBudget(
-                        trackID: trackID,
-                        importID: importID,
-                        idleSettleDuration: 0.65
-                    ) else {
-                        return
-                    }
-
-                    self.recordWaveformCacheDecision(
-                        name: "full-waveform-decode",
-                        message: "Building full-resolution waveform overview from decoded WAV audio.",
-                        tier: "backgroundRebuild",
-                        result: "build",
-                        trackID: trackID,
-                        trackName: trackName,
-                        sourceURL: url,
-                        reason: "final-decode"
-                    )
-                    let (decodedAudioBuffer, waveformOverview, zeroCrossingIndex) =
-                        try await AudioImportPipeline.loadDecodedWAV(at: url)
-
-                    guard self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
-                        return
-                    }
-                    guard await self.waitForImportWorkBudget(trackID: trackID, importID: importID) else {
-                        return
-                    }
-
-                    self.applyTrackDecodedWAV(
-                        trackID: trackID,
-                        decodedAudioBuffer: decodedAudioBuffer,
-                        waveformOverview: waveformOverview,
-                        zeroCrossingIndex: zeroCrossingIndex
-                    )
-                    if let latestFileInfo {
-                        self.cacheWaveformOverview(
-                            waveformOverview,
-                            targetBinCount: waveformOverview.bins.count,
-                            samplesPerBin: 1,
-                            fileInfo: latestFileInfo
-                        )
-                    }
-                } catch {
-                    guard self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
-                        return
-                    }
-
-                    self.updateStatus("track decode failed: \(error.localizedDescription)")
-                }
+                self.recordDroppedWAVImportMilestone(
+                    name: "wav-import-background-refinement-complete",
+                    message: "Completed bounded background waveform refinement for a dropped WAV.",
+                    startedAt: importStartedAt,
+                    trackID: trackID,
+                    sourceURL: url,
+                    binCount: latestPreviewBinCount
+                )
             } catch {
                 guard let self, self.isTrackImportCurrent(trackID: trackID, importID: importID) else {
                     return
+                }
+
+                if let admissionTask = prewarm?.admissionTask,
+                   let admission = try? await admissionTask.value
+                {
+                    await AudioImportCoordinator.shared.forget(sessionID: admission.sessionID)
                 }
 
                 self.removeProjectTrack(trackID)
@@ -7888,6 +7798,35 @@ final class WorkspaceView: NSView {
 
     private func isTrackImportCurrent(trackID: UUID, importID: UUID) -> Bool {
         projectTracks.contains { $0.id == trackID && $0.importID == importID }
+    }
+
+    private func recordDroppedWAVImportMilestone(
+        name: String,
+        message: String,
+        startedAt: UInt64,
+        trackID: UUID,
+        sourceURL: URL,
+        binCount: Int?
+    ) {
+        var fields = [
+            "elapsedMs": String(
+                format: "%.3f",
+                Double(DispatchTime.now().uptimeNanoseconds &- startedAt) / 1_000_000
+            ),
+            "file": sourceURL.lastPathComponent,
+            "trackID": trackID.uuidString,
+        ]
+        if let binCount {
+            fields["bins"] = "\(binCount)"
+        }
+        SoundtimeDiagnostics.shared.record(
+            category: .waveform,
+            severity: .info,
+            name: name,
+            message: message,
+            fields: fields
+        )
+        PerformanceDashboardWindowController.refreshIfVisible()
     }
 
     private func waitForImportWorkBudget(
@@ -8367,6 +8306,35 @@ final class WorkspaceView: NSView {
         syncActiveTrackFields()
         reloadPlaybackFromProjectTracks(preserveProgress: true)
         updateStatus("preview ready - resolving waveform")
+        scheduleLaunchSnapshotSaveIfNeeded(reason: "preview-ready", delay: 0.35)
+    }
+
+    private func applyDroppedWAVInitialPreview(
+        trackID: UUID,
+        previewResult: WAVPreviewImportResult
+    ) {
+        guard let trackIndex = projectTracks.firstIndex(where: { $0.id == trackID }) else {
+            return
+        }
+
+        let fileTimeline = projectTracks[trackIndex].fileTimeline
+        projectTracks[trackIndex].name = previewResult.metadata.displayName
+        projectTracks[trackIndex].durationHint = fileTimeline?.duration ?? previewResult.fileInfo.duration
+        projectTracks[trackIndex].sourceWaveformOverview = previewResult.waveformOverview
+        projectTracks[trackIndex].waveformOverview = fileTimeline?.waveformOverview(
+            from: previewResult.waveformOverview
+        ) ?? previewResult.waveformOverview
+        window?.title = projectWindowTitle()
+        refreshProjectTimelineDisplay(
+            rebuildControls: false,
+            animateWaveformTransition: false,
+            allowImmediateWaveformPrewarm: true,
+            allowImmediateInteractiveWaveformPrewarm: false,
+            updatesRendererImmediately: true
+        )
+        updateProjectDisplayTiming(sampleRateHint: previewResult.fileInfo.sampleRate)
+        updateTimeReadout()
+        updateStatus(WAVImportPreviewPolicy.readyStatus)
         scheduleLaunchSnapshotSaveIfNeeded(reason: "preview-ready", delay: 0.35)
     }
 

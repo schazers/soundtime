@@ -583,6 +583,50 @@ enum TimelineUXSmokeHarness {
             secondLaneWaveformPixels < firstLaneWaveformPixels / 4 + 500,
             "resident waveform leaked into pending import lane: \(secondLaneWaveformPixels) vs \(firstLaneWaveformPixels)"
         )
+
+        guard let importedOverview = residentTrack.waveformOverview else {
+            throw SmokeError.checkFailed("pending import fixture had no waveform to publish")
+        }
+        let resolvedImportedTrack = TimelineRenderState.Track(
+            id: pendingTrack.id,
+            waveformVersion: 1,
+            waveformOverview: importedOverview,
+            durationHint: importedOverview.duration,
+            volume: 1,
+            isMuted: false,
+            isSoloed: false,
+            clipRanges: [TimelineRenderState.ClipRange(startProgress: 0, endProgress: 1)]
+        )
+        renderer.displayTracks(
+            [residentTrack, resolvedImportedTrack],
+            animateWaveformTransition: false,
+            allowImmediateWaveformPrewarm: true,
+            allowImmediateInteractiveWaveformPrewarm: false
+        )
+        try require(
+            renderer.prepareFirstPaintWaveformShaderBuffers(
+                drawableSize: viewportSize,
+                backingScale: backingScale
+            ),
+            "freshly imported waveform did not become resident for its first paint"
+        )
+        let resolvedFrame = try renderCurrentTimeline(
+            renderer: renderer,
+            displayTimestamp: timestamp + 0.02,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+        let resolvedSecondLaneWaveformPixels = nonBackgroundPixelCount(
+            inRows: secondRows,
+            bytes: resolvedFrame.bytes,
+            width: resolvedFrame.summary.width,
+            backgroundLuminanceThreshold: 110
+        )
+        try require(
+            resolvedSecondLaneWaveformPixels > 1_500,
+            "freshly imported waveform stayed blank after first-preview publication"
+        )
     }
 
     private static func verifyInitialWaveformPublishSurvivesHover(

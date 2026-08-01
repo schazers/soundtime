@@ -295,32 +295,42 @@ enum AudioAssetImporter {
         samplesPerBin: Int = 8
     ) async throws -> AudioAssetPreviewResult {
         try Task.checkCancellation()
-        let assetInfo = try inspectSynchronously(url: url)
-        let waveformOverview: WaveformOverview
-        let zeroCrossingProbe: WAVZeroCrossingProbe?
-        if assetInfo.format.isWAVFastPath, let fileInfo = assetInfo.wavFileInfo {
-            (_, waveformOverview) = try WAVAudioDecoder.buildSparsePreview(
+        let format = AudioAssetFormat.inferred(from: url)
+        if format.isWAVFastPath, WAVAudioDecoder.canDecode(url) {
+            let (fileInfo, waveformOverview) = try WAVAudioDecoder.buildSparsePreview(
                 url: url,
                 targetBinCount: targetBinCount,
                 samplesPerBin: samplesPerBin
             )
-            zeroCrossingProbe = try? WAVAudioDecoder.makeZeroCrossingProbe(
+            let assetInfo = AudioAssetInfo(
                 url: url,
-                fileInfo: fileInfo
+                format: .wav,
+                metadata: AudioFileMetadata(
+                    url: url,
+                    displayName: url.deletingPathExtension().lastPathComponent,
+                    duration: fileInfo.duration,
+                    fileSize: nil
+                ),
+                wavFileInfo: fileInfo
             )
-        } else {
-            waveformOverview = try buildNativeSparsePreview(
-                url: url,
+            return AudioAssetPreviewResult(
                 assetInfo: assetInfo,
-                targetBinCount: targetBinCount,
-                samplesPerBin: samplesPerBin
+                waveformOverview: waveformOverview,
+                zeroCrossingProbe: nil
             )
-            zeroCrossingProbe = nil
         }
+
+        let assetInfo = try inspectSynchronously(url: url)
+        let waveformOverview = try buildNativeSparsePreview(
+            url: url,
+            assetInfo: assetInfo,
+            targetBinCount: targetBinCount,
+            samplesPerBin: samplesPerBin
+        )
         return AudioAssetPreviewResult(
             assetInfo: assetInfo,
             waveformOverview: waveformOverview,
-            zeroCrossingProbe: zeroCrossingProbe
+            zeroCrossingProbe: nil
         )
     }
 
