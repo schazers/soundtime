@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import AppKit
 @preconcurrency import Metal
 import QuartzCore
 
@@ -393,9 +394,11 @@ enum TimelineUXSmokeHarness {
         complete("render-loop hot frames publish without CPU waveform fallback")
 
         try MainActor.assumeIsolated {
+            try verifyTimelineStartClickSeeksDuringPlayback(track: track)
             try verifyMainFPSGraphPixels()
             try verifyPerformanceDashboardGraphPixels()
         }
+        complete("timeline start click seeks during playback")
         try verifyFrameHealthMetricSemantics()
         complete("main FPS graph draws visible cyan/red pixels")
         complete("performance monitor FPS/CPU graphs draw visible pixels")
@@ -3334,6 +3337,63 @@ enum TimelineUXSmokeHarness {
         let pannedViewport = viewport.panned(byProgress: 0.10)
         let progressAfterPan = pannedViewport.timelineProgress(forViewportProgress: clickedViewportProgress)
         try require(abs(progressAfterPan - 0.60) < 0.000_001, "panned hit test mapped to \(progressAfterPan), expected 0.60")
+    }
+
+    @MainActor
+    private static func verifyTimelineStartClickSeeksDuringPlayback(
+        track: TimelineRenderState.Track
+    ) throws {
+        let timelineView = TimelineView()
+        timelineView.frame = NSRect(x: 0, y: 0, width: 960, height: 360)
+        timelineView.displayTracks(
+            [track],
+            animateWaveformTransition: false,
+            allowImmediateWaveformPrewarm: false,
+            allowImmediateInteractiveWaveformPrewarm: false
+        )
+        timelineView.displayPlaybackActive(true)
+
+        var requestedProgresses: [Float] = []
+        timelineView.onSeekRequested = { requestedProgresses.append($0) }
+        let clickPoint = NSPoint(x: 1, y: 120)
+        guard
+            let mouseDown = NSEvent.mouseEvent(
+                with: .leftMouseDown,
+                location: clickPoint,
+                modifierFlags: [],
+                timestamp: 1,
+                windowNumber: 0,
+                context: nil,
+                eventNumber: 1,
+                clickCount: 1,
+                pressure: 1
+            ),
+            let mouseUp = NSEvent.mouseEvent(
+                with: .leftMouseUp,
+                location: clickPoint,
+                modifierFlags: [],
+                timestamp: 1.01,
+                windowNumber: 0,
+                context: nil,
+                eventNumber: 2,
+                clickCount: 1,
+                pressure: 0
+            )
+        else {
+            throw SmokeError.checkFailed("could not create timeline start click events")
+        }
+
+        timelineView.mouseDown(with: mouseDown)
+        timelineView.mouseUp(with: mouseUp)
+        let requestedProgress = try requireValue(
+            requestedProgresses.last,
+            "timeline start click was intercepted instead of seeking"
+        )
+        let maximumExpectedProgress = Float(clickPoint.x / timelineView.bounds.width) + 0.000_001
+        try require(
+            requestedProgress <= maximumExpectedProgress,
+            "timeline start click sought to \(requestedProgress), expected no later than \(maximumExpectedProgress)"
+        )
     }
 
     private static func verifyDeleteSelectionDeletesExactFrameRange() throws {
