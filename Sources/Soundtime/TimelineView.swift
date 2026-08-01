@@ -177,6 +177,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         qos: .userInteractive
     )
     private var viewport = TimelineViewport.full
+    private var settledViewport = TimelineViewport.full
+    private var activeCameraTransition: TimelineCameraTransition?
     private var pendingRestoredViewport: TimelineViewport?
     private var trackLayout = TimelineTrackLayout.default
     private var lastPublishedTrackLayout: ResolvedTimelineTrackLayout?
@@ -258,7 +260,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private let selectionDragVelocityFallTimeConstant: CFTimeInterval = 0.18
     private let selectionDragVelocityMaximumSampleInterval: CFTimeInterval = 1.0 / 30.0
     private let trimHandleHitWidth: CGFloat = 18
-    private let selectionEdgeHitWidth: CGFloat = 14
+    private let selectionEdgeHitWidth: CGFloat = 24
+    private let retainedSelectionEdgeHitWidth: CGFloat = 32
     private let loopFlagWidth: CGFloat = 18
     private let loopFlagHeight: CGFloat = 18
     private let loopRegionEdgeHitWidth: CGFloat = 14
@@ -393,10 +396,17 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         animateWaveformTransition: Bool = true,
         allowImmediateWaveformPrewarm: Bool = true,
         allowImmediateInteractiveWaveformPrewarm: Bool = true,
-        updatesRendererImmediately: Bool = false
+        updatesRendererImmediately: Bool = false,
+        viewportTransition: TimelineViewportTransitionPolicy = .immediate
     ) {
         let previousTimelineDuration = timelineDuration
         let previousViewport = viewport
+        let previousSettledViewport = settledViewport
+        let sourceCamera = TimelineCameraWindow(
+            viewport: previousViewport,
+            projectDuration: previousTimelineDuration
+        )
+        activeCameraTransition = nil
         currentTrackIDs = tracks.map(\.id)
         currentRenderTracks = tracks
         let nextTimelineDuration = Self.timelineDuration(for: tracks)
@@ -410,11 +420,21 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             nextTimelineDuration > 0,
             previousTimelineDuration != nextTimelineDuration
         {
-            let preservedViewport = previousViewport.preservingAbsoluteTimes(
-                previousDuration: previousTimelineDuration,
-                nextDuration: nextTimelineDuration
-            )
-            setViewport(preservedViewport, kicksImmediateRender: false, marksInteraction: false)
+            let targetViewport = previousSettledViewport.isFull ?
+                TimelineViewport.full :
+                previousSettledViewport.preservingAbsoluteTimes(
+                    previousDuration: previousTimelineDuration,
+                    nextDuration: nextTimelineDuration
+                )
+            if viewportTransition == .animatedEditReframe {
+                beginCameraTransition(
+                    from: sourceCamera,
+                    to: targetViewport,
+                    projectDuration: nextTimelineDuration
+                )
+            } else {
+                setViewport(targetViewport, kicksImmediateRender: false, marksInteraction: false)
+            }
         }
         if let pendingRestoredViewport, isSelectionEnabled {
             self.pendingRestoredViewport = nil
@@ -514,7 +534,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     var currentViewport: TimelineViewport {
-        viewport
+        settledViewport
     }
 
     var currentTimelineDuration: TimeInterval {
@@ -1291,6 +1311,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         updateTimelineRendererImmediately { renderer in
             renderer.displayHighlightedLoopRegion(isHighlighted)
         }
+        startTransientRenderPulse(duration: TimelineLoopRegionStyleAnimation.renderPulseDuration)
         requestRender(cadence: renderCadence)
     }
 
@@ -1448,7 +1469,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         let trackingArea = NSTrackingArea(
             rect: bounds,
-            options: [.activeInKeyWindow, .inVisibleRect, .mouseEnteredAndExited, .mouseMoved],
+            options: [.activeInKeyWindow, .inVisibleRect, .mouseEnteredAndExited, .mouseMoved, .cursorUpdate],
             owner: self,
             userInfo: nil
         )
@@ -1827,6 +1848,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             !isProcessingSelectionAnimationActive,
             !hasActiveTransientRenderPulse(),
             !hasActiveSelectionDragRenderPulse(),
+            activeCameraTransition == nil,
             !isEdgeAutoPanDragActive,
             !isHotPathContractSmokeFrameStatsActive
         else {
@@ -1878,6 +1900,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         timelineDisplayLink = nil
         transientRenderEndTime = nil
         selectionDragRenderEndTime = nil
+        activeCameraTransition = nil
         edgeAutoPanLastTimestamp = nil
         isProcessingSelectionAnimationActive = false
         needsTimelineRender = false
@@ -1891,11 +1914,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         publishPerformanceRenderDemand()
         let sampledAt = CACurrentMediaTime()
         let didAutoPan = stepEdgeAutoPan(sampledAt: sampledAt)
+        let didAdvanceCamera = stepCameraTransition(sampledAt: sampledAt)
         let shouldRender = needsTimelineRender ||
             isTimelinePlaybackActive ||
             isProcessingSelectionAnimationActive ||
             hasActiveTransientRenderPulse() ||
             hasActiveSelectionDragRenderPulse() ||
+            activeCameraTransition != nil ||
+            didAdvanceCamera ||
             didAutoPan ||
             isHotPathContractSmokeFrameStatsActive
 
@@ -2034,7 +2060,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return .interaction
         }
 
-        if isProcessingSelectionAnimationActive || hasActiveTransientRenderPulse() {
+        if isProcessingSelectionAnimationActive ||
+            activeCameraTransition != nil ||
+            hasActiveTransientRenderPulse()
+        {
             return .animation
         }
 
@@ -2535,6 +2564,30 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         addSelectionEdgeCursorRects()
     }
 
+    override func cursorUpdate(with event: NSEvent) {
+        guard
+            !isInteractionSuppressed,
+            isSelectionEnabled,
+            activeDragMode == nil
+        else {
+            super.cursorUpdate(with: event)
+            return
+        }
+
+        let point = convert(event.locationInWindow, from: nil)
+        if let endpointHit = selectionEndpointHit(at: point) {
+            displayHighlightedSelectionEndpoint(
+                endpointHit.endpoint,
+                renderCadence: .coalescedInteraction
+            )
+            NSCursor.resizeLeftRight.set()
+            return
+        }
+
+        displayHighlightedSelectionEndpoint(nil, renderCadence: .coalescedInteraction)
+        super.cursorUpdate(with: event)
+    }
+
     private func addTranscriptCursorRects() {
         guard isTranscriptLayerVisible else {
             return
@@ -2580,7 +2633,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         guard
             let selection = currentSelection,
             selection.durationProgress > 0,
-            let verticalRect = selectionVerticalHitRect(for: selection)
+            let geometry = selectionEndpointGeometry(
+                for: selection,
+                at: CACurrentMediaTime()
+            )
         else {
             return
         }
@@ -2588,8 +2644,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         for endpoint in [TimelineSelectionEndpoint.start, .end] {
             guard let rect = selectionEdgeHitRect(
                 for: endpoint,
-                selection: selection,
-                verticalRect: verticalRect
+                geometry: geometry
             ) else {
                 continue
             }
@@ -2992,7 +3047,6 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
-        displayHoverProgress(nil, renderCadence: .coalescedInteraction)
         let hasGesturePhase = !event.phase.isEmpty || !event.momentumPhase.isEmpty
         let isGestureEnding =
             event.phase.contains(.ended) ||
@@ -3040,6 +3094,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        displayHoverProgress(nil, renderCadence: .coalescedInteraction)
         stopZoomMomentum()
         guard horizontalDelta != 0, bounds.width > 0 else {
             return
@@ -3065,7 +3120,6 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
-        displayHoverProgress(nil, renderCadence: .coalescedInteraction)
         stopRightPanMomentum()
         let hasGesturePhase = !event.phase.isEmpty || !event.momentumPhase.isEmpty
         let isGestureEnding =
@@ -4071,13 +4125,37 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         renderCadence: TimelineRenderCadence = .immediate,
         marksInteraction: Bool = true
     ) {
+        activeCameraTransition = nil
+        settledViewport = nextViewport
+        applyViewport(
+            nextViewport,
+            kicksImmediateRender: kicksImmediateRender,
+            transcriptCadence: transcriptCadence,
+            invalidatesCursorRects: invalidatesCursorRects,
+            renderCadence: renderCadence,
+            marksInteraction: marksInteraction,
+            notifiesChange: true
+        )
+    }
+
+    private func applyViewport(
+        _ nextViewport: TimelineViewport,
+        kicksImmediateRender: Bool,
+        transcriptCadence: TimelineRenderCadence,
+        invalidatesCursorRects: Bool,
+        renderCadence: TimelineRenderCadence,
+        marksInteraction: Bool,
+        notifiesChange: Bool
+    ) {
         guard viewport != nextViewport else {
             return
         }
 
         viewport = nextViewport
         updateBootstrapWaveformView()
-        onViewportChanged?(nextViewport)
+        if notifiesChange {
+            onViewportChanged?(nextViewport)
+        }
         if marksInteraction {
             timelineRenderer?.publishInteractionViewport(nextViewport)
         }
@@ -4101,6 +4179,80 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             }
             requestRender(cadence: renderCadence)
         }
+    }
+
+    private func beginCameraTransition(
+        from sourceCamera: TimelineCameraWindow,
+        to targetViewport: TimelineViewport,
+        projectDuration: TimeInterval
+    ) {
+        let targetCamera = TimelineCameraWindow(
+            viewport: targetViewport,
+            projectDuration: projectDuration
+        )
+        let transition = TimelineCameraTransition(
+            source: sourceCamera,
+            target: targetCamera,
+            startTimestamp: CACurrentMediaTime(),
+            tuning: .editReframe
+        )
+        settledViewport = targetViewport
+        guard transition.isMeaningful(viewportWidth: bounds.width) else {
+            applyViewport(
+                targetViewport,
+                kicksImmediateRender: false,
+                transcriptCadence: .immediate,
+                invalidatesCursorRects: true,
+                renderCadence: .immediate,
+                marksInteraction: false,
+                notifiesChange: true
+            )
+            return
+        }
+
+        activeCameraTransition = transition
+        let sourceViewport = TimelineViewport.presentationViewport(
+            for: sourceCamera,
+            projectDuration: projectDuration
+        )
+        applyViewport(
+            sourceViewport,
+            kicksImmediateRender: true,
+            transcriptCadence: .coalescedInteraction,
+            invalidatesCursorRects: false,
+            renderCadence: .coalescedInteraction,
+            marksInteraction: true,
+            notifiesChange: false
+        )
+        requestTimelineRender()
+    }
+
+    @discardableResult
+    private func stepCameraTransition(sampledAt: CFTimeInterval) -> Bool {
+        guard let transition = activeCameraTransition else {
+            return false
+        }
+
+        let isComplete = transition.isComplete(at: sampledAt)
+        let nextViewport = isComplete ? settledViewport : TimelineViewport.presentationViewport(
+            for: transition.camera(at: sampledAt),
+            projectDuration: timelineDuration
+        )
+        applyViewport(
+            nextViewport,
+            kicksImmediateRender: true,
+            transcriptCadence: .coalescedInteraction,
+            invalidatesCursorRects: false,
+            renderCadence: .coalescedInteraction,
+            marksInteraction: true,
+            notifiesChange: false
+        )
+        if isComplete {
+            activeCameraTransition = nil
+            onViewportChanged?(settledViewport)
+            invalidateTimelineCursorRects()
+        }
+        return true
     }
 
     private func zoomToSelection() {
@@ -4896,8 +5048,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         isLoopRangeEnabled = isEnabled
         updateTimelineRendererImmediately { renderer in
-            renderer.displayLoopRangeEnabled(isEnabled)
+            renderer.displayLoopRangeEnabled(isEnabled, animated: true)
         }
+        startTransientRenderPulse(duration: TimelineLoopRegionStyleAnimation.renderPulseDuration)
         if notifyChange {
             onLoopRangeEnabledChanged?(isEnabled)
         }
@@ -5122,59 +5275,103 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         guard
             let selection = currentSelection,
             selection.durationProgress > 0,
-            let verticalRect = selectionVerticalHitRect(for: selection),
-            verticalRect.contains(point),
-            let startX = selectionHandleX(
-                forTimelineProgress: selection.startProgressFloat,
-                trackID: selection.trackID
+            let geometry = selectionEndpointGeometry(
+                for: selection,
+                at: CACurrentMediaTime()
             ),
-            let endX = selectionHandleX(
-                forTimelineProgress: selection.endProgressFloat,
-                trackID: selection.trackID
-            )
+            geometry.verticalRect.contains(point)
         else {
             return nil
         }
 
+        let endpoint = TimelineSelectionResizeInteraction.endpoint(
+            at: point,
+            startX: geometry.startX,
+            endX: geometry.endX,
+            verticalRect: geometry.verticalRect,
+            viewportWidth: bounds.width,
+            hitWidth: selectionEdgeHitWidth
+        ) ?? retainedSelectionEndpoint(at: point, geometry: geometry)
         guard
-            let endpoint = TimelineSelectionResizeInteraction.endpoint(
-                at: point,
-                startX: startX,
-                endX: endX,
-                verticalRect: verticalRect,
-                viewportWidth: bounds.width,
-                hitWidth: selectionEdgeHitWidth
-            )
+            let endpoint,
+            let handleX = geometry.handleX(for: endpoint)
         else {
             return nil
         }
 
         return (
             endpoint: endpoint,
-            handleX: endpoint == .start ? min(startX, endX) : max(startX, endX)
+            handleX: handleX
         )
+    }
+
+    private struct SelectionEndpointGeometry {
+        let startX: CGFloat?
+        let endX: CGFloat?
+        let verticalRect: NSRect
+
+        func handleX(for endpoint: TimelineSelectionEndpoint) -> CGFloat? {
+            endpoint == .start ? startX : endX
+        }
+    }
+
+    private func selectionEndpointGeometry(
+        for selection: TimelineSelection,
+        at timestamp: CFTimeInterval
+    ) -> SelectionEndpointGeometry? {
+        guard
+            let verticalRect = selectionVerticalHitRect(for: selection)
+        else {
+            return nil
+        }
+
+        let startX = selectionHandleX(
+            forTimelineProgress: selection.startProgressFloat,
+            trackID: selection.trackID,
+            timestamp: timestamp
+        )
+        let endX = selectionHandleX(
+            forTimelineProgress: selection.endProgressFloat,
+            trackID: selection.trackID,
+            timestamp: timestamp
+        )
+        guard startX != nil || endX != nil else {
+            return nil
+        }
+
+        return SelectionEndpointGeometry(
+            startX: startX,
+            endX: endX,
+            verticalRect: verticalRect
+        )
+    }
+
+    private func retainedSelectionEndpoint(
+        at point: CGPoint,
+        geometry: SelectionEndpointGeometry
+    ) -> TimelineSelectionEndpoint? {
+        guard let hoveredSelectionEndpoint else {
+            return nil
+        }
+
+        guard let handleX = geometry.handleX(for: hoveredSelectionEndpoint) else {
+            return nil
+        }
+        let maximumDistance = retainedSelectionEdgeHitWidth * 0.5
+        return abs(point.x - handleX) <= maximumDistance ? hoveredSelectionEndpoint : nil
     }
 
     private func selectionEdgeHitRect(
         for endpoint: TimelineSelectionEndpoint,
-        selection: TimelineSelection,
-        verticalRect: NSRect
+        geometry: SelectionEndpointGeometry
     ) -> NSRect? {
-        let progress = endpoint == .start ? selection.startProgressFloat : selection.endProgressFloat
-        guard
-            let handleX = selectionHandleX(
-                forTimelineProgress: progress,
-                trackID: selection.trackID
-            ),
-            handleX >= 0,
-            handleX <= bounds.width
-        else {
+        guard let handleX = geometry.handleX(for: endpoint) else {
             return nil
         }
 
         return TimelineSelectionResizeInteraction.hitRect(
             endpointX: handleX,
-            verticalRect: verticalRect,
+            verticalRect: geometry.verticalRect,
             viewportWidth: bounds.width,
             hitWidth: selectionEdgeHitWidth
         )
@@ -5211,7 +5408,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     private func selectionHandleX(
         forTimelineProgress progress: Float,
-        trackID: UUID?
+        trackID: UUID?,
+        timestamp: CFTimeInterval
     ) -> CGFloat? {
         guard bounds.width > 0 else {
             return nil
@@ -5225,7 +5423,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             viewportProgress = timelineRenderer.visualViewportProgress(
                 forTimelineProgress: progress,
                 trackID: trackID,
-                timestamp: CACurrentMediaTime()
+                timestamp: timestamp
             )
         } else {
             viewportProgress = viewport.viewportProgress(forTimelineProgress: progress)

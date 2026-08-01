@@ -32,16 +32,24 @@ enum TimelineSelectionResizeInteraction {
 
     static func endpoint(
         at point: CGPoint,
-        startX: CGFloat,
-        endX: CGFloat,
+        startX: CGFloat?,
+        endX: CGFloat?,
         verticalRect: CGRect,
         viewportWidth: CGFloat,
         hitWidth: CGFloat
     ) -> TimelineSelectionEndpoint? {
-        let candidates: [(endpoint: TimelineSelectionEndpoint, x: CGFloat)] = [
-            (.start, min(startX, endX)),
-            (.end, max(startX, endX)),
-        ]
+        let candidates: [(endpoint: TimelineSelectionEndpoint, x: CGFloat?)]
+        if let startX, let endX {
+            candidates = [
+                (.start, min(startX, endX)),
+                (.end, max(startX, endX)),
+            ]
+        } else {
+            candidates = [
+                (.start, startX),
+                (.end, endX),
+            ]
+        }
 
         return candidates
             .compactMap { candidate -> (
@@ -49,8 +57,9 @@ enum TimelineSelectionResizeInteraction {
                 distance: CGFloat
             )? in
                 guard
+                    let endpointX = candidate.x,
                     let rect = hitRect(
-                        endpointX: candidate.x,
+                        endpointX: endpointX,
                         verticalRect: verticalRect,
                         viewportWidth: viewportWidth,
                         hitWidth: hitWidth
@@ -62,7 +71,7 @@ enum TimelineSelectionResizeInteraction {
 
                 return (
                     endpoint: candidate.endpoint,
-                    distance: abs(point.x - candidate.x)
+                    distance: abs(point.x - endpointX)
                 )
             }
             .min { $0.distance < $1.distance }?

@@ -1217,6 +1217,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var isLoopRangeEnabled = true
     private var isLoopPlaybackBypassed = false
     private var isLoopRegionHighlighted = false
+    private var loopRangeEnabledPresentation: Float = 1
+    private var loopRangeEnabledTransition: TimelineLoopRegionStyleTransition?
+    private var loopRegionHoverPresentation: Float = 0
+    private var loopRegionHoverTransition: TimelineLoopRegionStyleTransition?
     private var loopRangeFlashStartTime: CFTimeInterval?
     private var highlightedLoopEndpoint: TimelineLoopEndpoint?
     private var gridCache: GridCache?
@@ -1303,7 +1307,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let playheadTouchLightAheadDuration: TimeInterval = 0.08
     private var playheadTouchTrailDuration: TimeInterval = 0.56
     private var playheadTouchTrailFalloffSteepness: Float = 1.30
-    private var waveformBaseGray: Float = 0.92
+    private var waveformBaseGray: Float = 0.97
+    private let mutedWaveformBaseGray: Float = 0.626
+    private let selectedWaveformGrayLift: Float = 0.02
+    private let selectedWaveformOverlayOpacity: Float = 0.46
     private let waveformTransitionDuration: CFTimeInterval = 0.2
     private let playheadTouchDecayDuration: CFTimeInterval = 0.046
     private let playheadTouchPauseFadeDuration: CFTimeInterval = 0.20
@@ -2417,12 +2424,28 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         interactionStateStore.publishLoopMoveGuides(isVisible)
     }
 
-    func displayLoopRangeEnabled(_ isEnabled: Bool) {
+    func displayLoopRangeEnabled(
+        _ isEnabled: Bool,
+        animated: Bool = false,
+        at timestamp: CFTimeInterval = CACurrentMediaTime()
+    ) {
         guard isLoopRangeEnabled != isEnabled else {
             return
         }
 
         markWaveformHotInteraction()
+        let target: Float = isEnabled ? 1 : 0
+        if animated {
+            let source = currentLoopRangeEnabledPresentation(at: timestamp)
+            loopRangeEnabledTransition = TimelineLoopRegionStyleTransition(
+                source: source,
+                target: target,
+                startTimestamp: timestamp
+            )
+        } else {
+            loopRangeEnabledPresentation = target
+            loopRangeEnabledTransition = nil
+        }
         isLoopRangeEnabled = isEnabled
     }
 
@@ -2450,11 +2473,20 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         highlightedSelectionEndpoint = endpoint
     }
 
-    func displayHighlightedLoopRegion(_ isHighlighted: Bool) {
+    func displayHighlightedLoopRegion(
+        _ isHighlighted: Bool,
+        at timestamp: CFTimeInterval = CACurrentMediaTime()
+    ) {
         guard isLoopRegionHighlighted != isHighlighted else {
             return
         }
 
+        let source = currentLoopRegionHoverPresentation(at: timestamp)
+        loopRegionHoverTransition = TimelineLoopRegionStyleTransition(
+            source: source,
+            target: isHighlighted ? 1 : 0,
+            startTimestamp: timestamp
+        )
         isLoopRegionHighlighted = isHighlighted
     }
 
@@ -3478,7 +3510,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             let amplitudeHeight = laneFrame.height * 0.39 * min(max(track.volume, 0), 1.8)
             let isAudible = isTrackAudible(track, anySolo: anySolo)
             let trackAlpha = (isAudible ? Float(1) : Float(0.26)) * min(max(opacity, 0), 1)
-            let gray = waveformBaseGray * (isAudible ? 1.0 : 0.68)
+            let gray = isAudible ? waveformBaseGray : mutedWaveformBaseGray
             let trackTouch = isAudible ?
                 touchParameters.touch :
                 SIMD4<Float>(
@@ -3523,6 +3555,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                     by: trackFisheyeEnergy(for: track.id, at: displayTimestamp)
                 ) :
                 .zero
+            let highlightedSegments = selectedWaveformSegments(
+                for: track,
+                trackDurationProgress: trackDurationProgress,
+                selection: renderState.selection
+            )
             let promotionLayers = promotedWaveformShaderLayers(
                 track: track,
                 candidate: shaderDrawable,
@@ -3603,6 +3640,39 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                         appendWaveformShaderBatchUniform(segmentUniform, buffer: layer.drawable.buffer)
                     }
                 }
+
+                for highlightedSegment in highlightedSegments {
+                    let highlightedUniform = makeWaveformShaderUniform(
+                        laneTop: laneTop,
+                        laneBottom: laneBottom,
+                        centerY: centerY,
+                        amplitudeHeight: amplitudeHeight,
+                        binCount: layer.drawable.mipLevel.binCount,
+                        binOffset: layer.drawable.binOffset,
+                        trackDurationProgress: trackDurationProgress,
+                        baseGray: min(gray + selectedWaveformGrayLift, 0.99),
+                        alpha: layerAlpha * selectedWaveformOverlayOpacity,
+                        style: style,
+                        drawableSize: drawableSize,
+                        backingScale: backingScale,
+                        fisheye: trackFisheye,
+                        touch: trackTouch,
+                        touch2: touchParameters.touch2,
+                        touch3: touchParameters.touch3,
+                        selectionDrag: trackSelectionDragTuning,
+                        selectionDrag2: trackSelectionDragVisuals,
+                        selectionDragContacts: selectionDragContacts,
+                        deletionWarp: waveformDeletionWarp(
+                            for: track,
+                            effects: deletionWarpEffects,
+                            displayTimestamp: displayTimestamp
+                        ),
+                        segment: highlightedSegment,
+                        trackID: track.id,
+                        renderState: renderState
+                    )
+                    appendWaveformShaderBatchUniform(highlightedUniform, buffer: layer.drawable.buffer)
+                }
             }
         }
 
@@ -3618,6 +3688,58 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         waveformShaderBatchScratch.removeAll(keepingCapacity: true)
+    }
+
+    private func selectedWaveformSegments(
+        for track: TimelineRenderState.Track,
+        trackDurationProgress: Float,
+        selection: TimelineSelection?
+    ) -> [TimelineRenderState.Track.WaveformSegment] {
+        guard
+            let selection,
+            selection.durationProgress > 0,
+            selection.trackID == nil || selection.trackID == track.id,
+            trackDurationProgress > 0
+        else {
+            return []
+        }
+
+        let selectedStart = max(selection.startProgressFloat, 0)
+        let selectedEnd = min(selection.endProgressFloat, trackDurationProgress)
+        guard selectedEnd > selectedStart else {
+            return []
+        }
+
+        let sourceSegments = track.waveformSegments.isEmpty ? [
+            TimelineRenderState.Track.WaveformSegment(
+                outputStartProgress: 0,
+                outputEndProgress: 1,
+                sourceStartProgress: 0,
+                sourceEndProgress: 1
+            ),
+        ] : track.waveformSegments
+
+        return sourceSegments.compactMap { segment in
+            let outputStart = segment.outputStartProgress * trackDurationProgress
+            let outputEnd = segment.outputEndProgress * trackDurationProgress
+            let intersectionStart = max(outputStart, selectedStart)
+            let intersectionEnd = min(outputEnd, selectedEnd)
+            let outputWidth = outputEnd - outputStart
+            guard intersectionEnd > intersectionStart, outputWidth > 0 else {
+                return nil
+            }
+
+            let startFraction = min(max((intersectionStart - outputStart) / outputWidth, 0), 1)
+            let endFraction = min(max((intersectionEnd - outputStart) / outputWidth, 0), 1)
+            return TimelineRenderState.Track.WaveformSegment(
+                outputStartProgress: intersectionStart / trackDurationProgress,
+                outputEndProgress: intersectionEnd / trackDurationProgress,
+                sourceStartProgress: mix(segment.sourceStartProgress, segment.sourceEndProgress, startFraction),
+                sourceEndProgress: mix(segment.sourceStartProgress, segment.sourceEndProgress, endFraction),
+                gainStart: mix(segment.gainStart, segment.gainEnd, startFraction),
+                gainEnd: mix(segment.gainStart, segment.gainEnd, endFraction)
+            )
+        }
     }
 
     private func appendWaveformShaderBatchUniform(
@@ -5695,23 +5817,41 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let top = max(pixelLength(2, backingScale: backingScale), 1)
         let bottom = max(rulerHeight, top + 1)
         let radius = min(max((bottom - top) * 0.34, 4), 8)
-        let hoverBoost: Float = isLoopRegionHighlighted ? 1 : 0
+        let enabledAmount = currentLoopRangeEnabledPresentation(at: displayTimestamp)
+        let hoverBoost = currentLoopRegionHoverPresentation(at: displayTimestamp)
         let flashBoost = currentLoopRangeFlashBoost(displayTimestamp: displayTimestamp)
-        let activeAlpha: Float = isLoopRangeEnabled ? 0.30 : 0.15
+        let activeAlpha = mix(0.15, 0.30, enabledAmount)
         let fillAlpha = activeAlpha + hoverBoost * 0.08
-        let edgeAlpha = (isLoopRangeEnabled ? 0.72 : 0.36) + hoverBoost * 0.12
-        let fillRGB = isLoopRangeEnabled ?
-            mix(SIMD3<Float>(0.10, 0.78, 0.86), SIMD3<Float>(0.92, 1.0, 1.0), flashBoost * 0.38) :
-            SIMD3<Float>(0.46 + hoverBoost * 0.06, 0.47 + hoverBoost * 0.06, 0.48 + hoverBoost * 0.06)
-        let topRGB = isLoopRangeEnabled ?
-            mix(SIMD3<Float>(0.92, 1.0, 1.0), SIMD3<Float>(1.0, 1.0, 1.0), flashBoost * 0.55) :
-            SIMD3<Float>(0.82, 0.83, 0.84)
-        let bottomRGB = isLoopRangeEnabled ?
-            mix(SIMD3<Float>(0.00, 0.20, 0.23), SIMD3<Float>(0.58, 0.68, 0.70), flashBoost * 0.42) :
-            SIMD3<Float>(0.16, 0.16, 0.17)
-        let edgeRGB = isLoopRangeEnabled ?
-            mix(SIMD3<Float>(0.86, 0.98, 1.0), SIMD3<Float>(1.0, 1.0, 1.0), flashBoost * 0.65) :
-            SIMD3<Float>(0.78, 0.79, 0.80)
+        let edgeAlpha = mix(0.36, 0.72, enabledAmount) + hoverBoost * 0.12
+        let inactiveFillRGB = SIMD3<Float>(
+            0.46 + hoverBoost * 0.06,
+            0.47 + hoverBoost * 0.06,
+            0.48 + hoverBoost * 0.06
+        )
+        let activeFillRGB = mix(
+            SIMD3<Float>(0.10, 0.78, 0.86),
+            SIMD3<Float>(0.92, 1.0, 1.0),
+            flashBoost * 0.38
+        )
+        let fillRGB = mix(inactiveFillRGB, activeFillRGB, enabledAmount)
+        let activeTopRGB = mix(
+            SIMD3<Float>(0.92, 1.0, 1.0),
+            SIMD3<Float>(1.0, 1.0, 1.0),
+            flashBoost * 0.55
+        )
+        let topRGB = mix(SIMD3<Float>(0.82, 0.83, 0.84), activeTopRGB, enabledAmount)
+        let activeBottomRGB = mix(
+            SIMD3<Float>(0.00, 0.20, 0.23),
+            SIMD3<Float>(0.58, 0.68, 0.70),
+            flashBoost * 0.42
+        )
+        let bottomRGB = mix(SIMD3<Float>(0.16, 0.16, 0.17), activeBottomRGB, enabledAmount)
+        let activeEdgeRGB = mix(
+            SIMD3<Float>(0.86, 0.98, 1.0),
+            SIMD3<Float>(1.0, 1.0, 1.0),
+            flashBoost * 0.65
+        )
+        let edgeRGB = mix(SIMD3<Float>(0.78, 0.79, 0.80), activeEdgeRGB, enabledAmount)
         let flashedFillAlpha = min(fillAlpha + flashBoost * 0.10, 0.55)
         let flashedEdgeAlpha = min(edgeAlpha + flashBoost * 0.16, 0.96)
         let cornerVisibility = TimelineLoopCornerVisibility.projected(
@@ -5743,7 +5883,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 max(lineWidth, 1)
             ),
             style: SIMD4<Float>(
-                isLoopRangeEnabled ? 1 : 0,
+                enabledAmount,
                 hoverBoost,
                 flashBoost,
                 Float(displayTimestamp.truncatingRemainder(dividingBy: 8192))
@@ -5765,16 +5905,46 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 topRGB.x,
                 topRGB.y,
                 topRGB.z,
-                isLoopRangeEnabled ? 0.13 + hoverBoost * 0.05 + flashBoost * 0.08 : 0.07 + hoverBoost * 0.03
+                mix(
+                    0.07 + hoverBoost * 0.03,
+                    0.13 + hoverBoost * 0.05 + flashBoost * 0.08,
+                    enabledAmount
+                )
             ),
             bottomColor: SIMD4<Float>(
                 bottomRGB.x,
                 bottomRGB.y,
                 bottomRGB.z,
-                isLoopRangeEnabled ? 0.18 + flashBoost * 0.06 : 0.10
+                mix(0.10, 0.18 + flashBoost * 0.06, enabledAmount)
             ),
             edgeColor: SIMD4<Float>(edgeRGB.x, edgeRGB.y, edgeRGB.z, flashedEdgeAlpha)
         )
+    }
+
+    private func currentLoopRangeEnabledPresentation(at timestamp: CFTimeInterval) -> Float {
+        guard let transition = loopRangeEnabledTransition else {
+            return loopRangeEnabledPresentation
+        }
+
+        loopRangeEnabledPresentation = transition.value(at: timestamp)
+        if transition.isComplete(at: timestamp) {
+            loopRangeEnabledPresentation = transition.target
+            loopRangeEnabledTransition = nil
+        }
+        return loopRangeEnabledPresentation
+    }
+
+    private func currentLoopRegionHoverPresentation(at timestamp: CFTimeInterval) -> Float {
+        guard let transition = loopRegionHoverTransition else {
+            return loopRegionHoverPresentation
+        }
+
+        loopRegionHoverPresentation = transition.value(at: timestamp)
+        if transition.isComplete(at: timestamp) {
+            loopRegionHoverPresentation = transition.target
+            loopRegionHoverTransition = nil
+        }
+        return loopRegionHoverPresentation
     }
 
     private func currentLoopRangeFlashBoost(displayTimestamp: CFTimeInterval) -> Float {
@@ -8440,7 +8610,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
         let isAudible = track.map { isTrackAudible($0, anySolo: anySolo) } ?? true
         let volumeScale = min(max(track?.volume ?? 1, 0), 1.8)
-        let baseGray = waveformBaseGray * (isAudible ? 1.0 : 0.68)
+        let baseGray = isAudible ? waveformBaseGray : mutedWaveformBaseGray
         let alpha = isAudible ? Float(1) : Float(0.26)
         let overlayLeftX = min(max(leftX, 0), width)
         let overlayRightX = min(max(rightX, overlayLeftX), width)
@@ -9057,7 +9227,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             let minimumVisualHeight = laneFrame.height * 0.006
             let isAudible = isTrackAudible(track, anySolo: anySolo)
             let alpha: Float = isAudible ? 1.0 : 0.26
-            let gray = waveformBaseGray * (isAudible ? 1.0 : 0.68)
+            let gray = isAudible ? waveformBaseGray : mutedWaveformBaseGray
             let startIndex = max(Int(floor(renderState.viewport.startProgress / trackDurationProgress * Float(binCount))) - 1, 0)
             let endIndex = min(Int(ceil(renderState.viewport.endProgress / trackDurationProgress * Float(binCount))) + 1, binCount)
             guard startIndex < endIndex else {
@@ -13536,10 +13706,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float hoveredEdgeAmount = clamp(pulse.w, 0.0, 1.0) * hoveredEndpointVisible;
         float hoveredEdgeX = hoveredEdgeSide < 0.0 ? 0.0 : widthPixels;
         float hoveredEdgeDistance = abs(pixel.x - hoveredEdgeX);
-        float hoveredEdgeCore = 1.0 - smoothstep(0.0, 1.6, hoveredEdgeDistance);
-        float hoveredEdgeHalo = 1.0 - smoothstep(0.0, 8.0, hoveredEdgeDistance);
+        float hoveredEdgeCore = 1.0 - smoothstep(0.0, 3.0, hoveredEdgeDistance);
+        float hoveredEdgeHalo = 1.0 - smoothstep(0.0, 13.0, hoveredEdgeDistance);
         float hoveredEdgeGlow = hoveredEdgeAmount *
-            (hoveredEdgeCore * 0.72 + hoveredEdgeHalo * 0.28) *
+            (hoveredEdgeCore * 0.82 + hoveredEdgeHalo * 0.38) *
             (0.42 + rim * 0.58);
 
         float dragDirection = style.z >= 0.0 ? 1.0 : -1.0;
@@ -13572,7 +13742,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             topSheen * 0.26 +
             rim * 0.42 +
             dragEdge * 0.22 +
-            hoveredEdgeGlow * 0.34
+            hoveredEdgeGlow * 0.52
         );
         float3 glassTint = base.rgb;
         glassTint = mix(glassTint, float3(0.78, 1.0, 1.0), 0.20 * topSheen + 0.12 * rim + 0.18 * dragEdge);
@@ -13588,7 +13758,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 innerRim * 0.045 +
                 outerRim * 0.05 +
                 dragEdge * 0.12 +
-                hoveredEdgeGlow * 0.24
+                hoveredEdgeGlow * 0.40
             )
         );
         color = source_over(color, rimColor);

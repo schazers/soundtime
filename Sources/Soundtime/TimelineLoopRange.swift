@@ -5,6 +5,50 @@ enum TimelineLoopEndpoint: Sendable, Equatable {
     case end
 }
 
+enum TimelineLoopRegionStyleAnimation {
+    static let duration: CFTimeInterval = 0.060
+    static let renderPulseDuration: CFTimeInterval = duration + (1.0 / 60.0)
+}
+
+struct TimelineLoopRegionStyleTransition: Sendable, Equatable {
+    let source: Float
+    let target: Float
+    let startTimestamp: CFTimeInterval
+    let duration: CFTimeInterval
+
+    init(
+        source: Float,
+        target: Float,
+        startTimestamp: CFTimeInterval,
+        duration: CFTimeInterval = TimelineLoopRegionStyleAnimation.duration
+    ) {
+        self.source = min(max(source, 0), 1)
+        self.target = min(max(target, 0), 1)
+        self.startTimestamp = startTimestamp
+        self.duration = max(duration, 0)
+    }
+
+    func value(at timestamp: CFTimeInterval) -> Float {
+        guard duration > 0 else {
+            return target
+        }
+        if timestamp <= startTimestamp {
+            return source
+        }
+        if timestamp >= startTimestamp + duration {
+            return target
+        }
+
+        let linearProgress = Float((timestamp - startTimestamp) / duration)
+        let progress = linearProgress * linearProgress * (3 - 2 * linearProgress)
+        return source + (target - source) * progress
+    }
+
+    func isComplete(at timestamp: CFTimeInterval) -> Bool {
+        timestamp >= startTimestamp + duration
+    }
+}
+
 struct TimelineRangeEndpointVisibility: Sendable, Equatable {
     let showsLeftEndpoint: Bool
     let showsRightEndpoint: Bool
@@ -129,6 +173,19 @@ enum TimelineLoopPlaybackPolicy {
         }
 
         return playbackProgress > loopRange.endProgress + boundaryEpsilon
+    }
+
+    static func bypassesLoopWhenEnabledDuringPlayback(
+        playbackProgress: Float,
+        whilePlaying: Bool,
+        loopRange: TimelineLoopRange
+    ) -> Bool {
+        bypassesLoopAfterRangeChange(
+            playbackProgress: playbackProgress,
+            whilePlaying: whilePlaying,
+            loopRange: loopRange,
+            isLoopEnabled: true
+        )
     }
 
     static func shouldWrapPlayback(

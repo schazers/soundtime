@@ -259,6 +259,9 @@ enum TimelineUXSmokeHarness {
         try verifyLoopRangeViewportCornerSemantics()
         complete("loop region rounds only endpoints visible inside the viewport")
 
+        try verifyLoopRegionStyleTransition()
+        complete("loop hover and enabled styling transitions continuously")
+
         try verifyClippedLoopRangeCornersRenderSquare(
             renderer: renderer,
             track: track,
@@ -372,6 +375,9 @@ enum TimelineUXSmokeHarness {
 
         try verifyViewportPreservesAbsoluteTimeAfterDelete()
         complete("delete refresh preserves visible time window")
+
+        try verifyEditCameraTransition()
+        complete("edit camera reframing is continuous and lands exactly")
 
         try verifyDeleteSelectionDeletesExactFrameRange()
         complete("delete selection removes exact selected frame range")
@@ -1326,7 +1332,7 @@ enum TimelineUXSmokeHarness {
                 nearX: 247,
                 startX: 250,
                 endX: 650,
-                hitWidth: 14
+                hitWidth: 24
             ) == .start,
             "selection start edge was not hit within its resize target"
         )
@@ -1335,16 +1341,34 @@ enum TimelineUXSmokeHarness {
                 nearX: 656,
                 startX: 250,
                 endX: 650,
-                hitWidth: 14
+                hitWidth: 24
             ) == .end,
             "selection end edge was not hit within its resize target"
+        )
+        try require(
+            TimelineSelectionResizeInteraction.endpoint(
+                nearX: 661,
+                startX: 250,
+                endX: 650,
+                hitWidth: 24
+            ) == .end,
+            "selection edge did not retain the production resize acquisition width"
+        )
+        try require(
+            TimelineSelectionResizeInteraction.endpoint(
+                nearX: 663,
+                startX: 250,
+                endX: 650,
+                hitWidth: 24
+            ) == nil,
+            "selection resize acquisition extended beyond its bounded edge target"
         )
         try require(
             TimelineSelectionResizeInteraction.endpoint(
                 nearX: 450,
                 startX: 250,
                 endX: 650,
-                hitWidth: 14
+                hitWidth: 24
             ) == nil,
             "selection center incorrectly behaved like a resize edge"
         )
@@ -1357,7 +1381,7 @@ enum TimelineUXSmokeHarness {
                 endX: 650,
                 verticalRect: verticalRect,
                 viewportWidth: 1_000,
-                hitWidth: 14
+                hitWidth: 24
             ) == .start,
             "selection resize cursor target and mouse-down target disagreed at the left viewport edge"
         )
@@ -1368,9 +1392,42 @@ enum TimelineUXSmokeHarness {
                 endX: 1_000,
                 verticalRect: verticalRect,
                 viewportWidth: 1_000,
-                hitWidth: 14
+                hitWidth: 24
             ) == .end,
             "selection resize cursor target and mouse-down target disagreed at the right viewport edge"
+        )
+        try require(
+            TimelineSelectionResizeInteraction.endpoint(
+                at: CGPoint(x: 250, y: 100),
+                startX: 250,
+                endX: nil,
+                verticalRect: verticalRect,
+                viewportWidth: 1_000,
+                hitWidth: 24
+            ) == .start,
+            "an offscreen selection end disabled the visible start resize target"
+        )
+        try require(
+            TimelineSelectionResizeInteraction.endpoint(
+                at: CGPoint(x: 650, y: 100),
+                startX: nil,
+                endX: 650,
+                verticalRect: verticalRect,
+                viewportWidth: 1_000,
+                hitWidth: 24
+            ) == .end,
+            "an offscreen selection start disabled the visible end resize target"
+        )
+        try require(
+            TimelineSelectionResizeInteraction.endpoint(
+                at: CGPoint(x: 500, y: 100),
+                startX: nil,
+                endX: nil,
+                verticalRect: verticalRect,
+                viewportWidth: 1_000,
+                hitWidth: 24
+            ) == nil,
+            "a fully offscreen selection exposed a phantom resize target"
         )
         try require(
             TimelineSelectionResizeInteraction.endpoint(
@@ -1379,7 +1436,7 @@ enum TimelineUXSmokeHarness {
                 endX: 650,
                 verticalRect: verticalRect,
                 viewportWidth: 1_000,
-                hitWidth: 14
+                hitWidth: 24
             ) == nil,
             "selection resize endpoint accepted a point outside the selected track lane"
         )
@@ -1714,6 +1771,71 @@ enum TimelineUXSmokeHarness {
                 isLoopEnabled: true
             ),
             "moving a loop while paused incorrectly bypassed the next playback pass"
+        )
+
+        try require(
+            TimelineLoopPlaybackPolicy.bypassesLoopWhenEnabledDuringPlayback(
+                playbackProgress: 0.78,
+                whilePlaying: true,
+                loopRange: loopRange
+            ),
+            "enabling a loop behind an active playhead did not preserve the current playback pass"
+        )
+        try require(
+            !TimelineLoopPlaybackPolicy.bypassesLoopWhenEnabledDuringPlayback(
+                playbackProgress: 0.50,
+                whilePlaying: true,
+                loopRange: loopRange
+            ),
+            "enabling a loop around an active playhead incorrectly bypassed its upcoming boundary"
+        )
+        try require(
+            !TimelineLoopPlaybackPolicy.bypassesLoopWhenEnabledDuringPlayback(
+                playbackProgress: 0.78,
+                whilePlaying: false,
+                loopRange: loopRange
+            ),
+            "enabling a loop while paused incorrectly bypassed start-from-loop playback"
+        )
+    }
+
+    private static func verifyLoopRegionStyleTransition() throws {
+        let startTimestamp: CFTimeInterval = 4
+        let duration = TimelineLoopRegionStyleAnimation.duration
+        let hoverOn = TimelineLoopRegionStyleTransition(
+            source: 0,
+            target: 1,
+            startTimestamp: startTimestamp
+        )
+
+        try require(
+            abs(duration - 0.060) < 0.000_001,
+            "loop style transition duration drifted from the 60 ms interaction target"
+        )
+        try require(hoverOn.value(at: startTimestamp) == 0, "loop hover transition did not start at its source")
+        let halfwayTimestamp = startTimestamp + duration * 0.5
+        let halfwayValue = hoverOn.value(at: halfwayTimestamp)
+        try require(
+            halfwayValue > 0 && halfwayValue < 1,
+            "loop hover transition snapped instead of producing an intermediate style"
+        )
+        try require(
+            hoverOn.value(at: startTimestamp + duration) == 1,
+            "loop hover transition did not land exactly on its target"
+        )
+
+        let hoverOff = TimelineLoopRegionStyleTransition(
+            source: halfwayValue,
+            target: 0,
+            startTimestamp: halfwayTimestamp
+        )
+        try require(
+            abs(hoverOff.value(at: halfwayTimestamp) - halfwayValue) < 0.000_001,
+            "reversing a loop style transition introduced a visual discontinuity"
+        )
+        try require(
+            hoverOff.value(at: halfwayTimestamp + duration) == 0,
+            "reversed loop style transition did not finish at its inactive state"
         )
     }
 
@@ -3292,6 +3414,87 @@ enum TimelineUXSmokeHarness {
         )
         try require(clamped.endProgress <= 1.000_001, "preserved near-end viewport exceeded timeline bounds")
         try require(clamped.durationProgress <= 1, "preserved near-end viewport duration exceeded full timeline")
+    }
+
+    private static func verifyEditCameraTransition() throws {
+        let beforeDuration = 120.0
+        let afterDuration = 82.0
+        let source = TimelineCameraWindow(
+            viewport: .full,
+            projectDuration: beforeDuration
+        )
+        let targetViewport = TimelineViewport.full
+        let target = TimelineCameraWindow(
+            viewport: targetViewport,
+            projectDuration: afterDuration
+        )
+        let tuning = TimelineCameraTransition.Tuning(
+            duration: 0.18,
+            minimumTranslationPixels: 2,
+            minimumZoomRatioDelta: 0.005
+        )
+        let transition = TimelineCameraTransition(
+            source: source,
+            target: target,
+            startTimestamp: 10,
+            tuning: tuning
+        )
+
+        try require(
+            transition.isMeaningful(viewportWidth: 1_440),
+            "large edit camera reframe was incorrectly treated as imperceptible"
+        )
+        let first = transition.camera(at: 10)
+        let middle = transition.camera(at: 10.09)
+        let final = transition.camera(at: 10.18)
+        try require(first == source, "camera transition did not begin at the exact source camera")
+        try require(final == target, "camera transition did not finish at the exact target camera")
+        try require(
+            middle.visibleDuration < source.visibleDuration &&
+                middle.visibleDuration > target.visibleDuration,
+            "camera field of view did not move monotonically between edit endpoints"
+        )
+        try require(
+            middle.centerTime < source.centerTime && middle.centerTime > target.centerTime,
+            "camera center did not move monotonically between edit endpoints"
+        )
+
+        let sourcePresentationViewport = TimelineViewport.presentationViewport(
+            for: source,
+            projectDuration: afterDuration
+        )
+        try require(
+            abs(Double(sourcePresentationViewport.durationProgress) * afterDuration - beforeDuration) < 0.000_1,
+            "first edit camera frame did not preserve the old absolute field of view"
+        )
+        try require(
+            sourcePresentationViewport.durationProgress > 1,
+            "shrinking a fit timeline did not retain temporary presentation overscan"
+        )
+
+        let zoomedViewport = TimelineViewport(startProgress: 0.20, durationProgress: 0.30)
+        let zoomedSource = TimelineCameraWindow(
+            viewport: zoomedViewport,
+            projectDuration: beforeDuration
+        )
+        let preserved = zoomedViewport.preservingAbsoluteTimes(
+            previousDuration: beforeDuration,
+            nextDuration: afterDuration
+        )
+        let zoomedTarget = TimelineCameraWindow(
+            viewport: preserved,
+            projectDuration: afterDuration
+        )
+        let fixedCameraTransition = TimelineCameraTransition(
+            source: zoomedSource,
+            target: zoomedTarget,
+            startTimestamp: 20,
+            tuning: tuning
+        )
+        try require(
+            !fixedCameraTransition.isMeaningful(viewportWidth: 1_440),
+            "an edit moved a zoomed camera whose absolute time window was still valid"
+        )
     }
 
     private static func verifyRenderLoopStatsStayAlive(
