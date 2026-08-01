@@ -5,6 +5,64 @@ private final class AudioAssetImporterSmokeResultBox<T: Sendable>: @unchecked Se
     var result: Result<T, Error>?
 }
 
+private final class AudioImportProgressProbe: @unchecked Sendable {
+    struct Snapshot: Sendable {
+        let firstWaveformMilliseconds: Double?
+        let firstWaveformBinCount: Int?
+        let firstWaveformHadSignal: Bool
+        let waveformPublicationCount: Int
+        let screenDetailMilliseconds: Double?
+        let maximumWaveformBinCount: Int
+    }
+
+    private let lock = NSLock()
+    private let startedAtNanoseconds = DispatchTime.now().uptimeNanoseconds
+    private var firstWaveformMilliseconds: Double?
+    private var firstWaveformBinCount: Int?
+    private var firstWaveformHadSignal = false
+    private var waveformPublicationCount = 0
+    private var screenDetailMilliseconds: Double?
+    private var maximumWaveformBinCount = 0
+
+    func record(_ progress: AudioImportProgress) {
+        guard let overview = progress.previewOverview, !overview.bins.isEmpty else {
+            return
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        waveformPublicationCount += 1
+        maximumWaveformBinCount = max(maximumWaveformBinCount, overview.bins.count)
+        if
+            screenDetailMilliseconds == nil,
+            overview.bins.count >= StreamingAudioProxyBuilder.waveformBinCount
+        {
+            screenDetailMilliseconds = Double(
+                DispatchTime.now().uptimeNanoseconds &- startedAtNanoseconds
+            ) / 1_000_000
+        }
+        if firstWaveformMilliseconds == nil {
+            firstWaveformMilliseconds = Double(
+                DispatchTime.now().uptimeNanoseconds &- startedAtNanoseconds
+            ) / 1_000_000
+            firstWaveformBinCount = overview.bins.count
+            firstWaveformHadSignal = overview.bins.contains { $0.peakMagnitude > 0 }
+        }
+    }
+
+    func snapshot() -> Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return Snapshot(
+            firstWaveformMilliseconds: firstWaveformMilliseconds,
+            firstWaveformBinCount: firstWaveformBinCount,
+            firstWaveformHadSignal: firstWaveformHadSignal,
+            waveformPublicationCount: waveformPublicationCount,
+            screenDetailMilliseconds: screenDetailMilliseconds,
+            maximumWaveformBinCount: maximumWaveformBinCount
+        )
+    }
+}
+
 enum AudioAssetImporterSmokeHarness {
     private enum SmokeError: Error, CustomStringConvertible {
         case failed(String)
@@ -31,6 +89,7 @@ enum AudioAssetImporterSmokeHarness {
         try verifyWAVFacadeRoundTrip(rootDirectory: rootDirectory)
         let longWAVMetrics = try verifyFourMinuteWAVPreviewPerformance(rootDirectory: rootDirectory)
         let nativeMetrics = try verifyNativeEditableProxyImport(rootDirectory: rootDirectory)
+        let compressedMetrics = try verifyCompressedProgressiveImport(rootDirectory: rootDirectory)
         try verifyCanceledTransactionCleanup(rootDirectory: rootDirectory)
         try verifyCorruptCacheQuarantine(rootDirectory: rootDirectory)
         try verifyFingerprintInvalidation(rootDirectory: rootDirectory)
@@ -43,6 +102,8 @@ enum AudioAssetImporterSmokeHarness {
             "wav importer facade preview/decode round trip",
             "four-minute WAV first preview and bounded refinement",
             "native audio streaming proxy and cache reuse",
+            "compressed audio publishes progressive waveform from its proxy decode",
+            "compressed audio final waveform has screen-detail resolution",
             "stable logical identity and edit remap across proxy promotion",
             "transaction cancellation removes staged artifacts",
             "corrupt cache is quarantined and regenerated",
@@ -69,6 +130,19 @@ enum AudioAssetImporterSmokeHarness {
                     nativeMetrics.cachedPreparationMilliseconds
                 ),
                 "peakWorkingSetBytes": "\(nativeMetrics.peakWorkingSetBytes)",
+                "compressedFirstWaveformMilliseconds": String(
+                    format: "%.3f",
+                    compressedMetrics.firstWaveformMilliseconds
+                ),
+                "compressedPreparationMilliseconds": String(
+                    format: "%.3f",
+                    compressedMetrics.preparationMilliseconds
+                ),
+                "compressedScreenDetailMilliseconds": String(
+                    format: "%.3f",
+                    compressedMetrics.screenDetailMilliseconds
+                ),
+                "compressedFinalWaveformBins": "\(compressedMetrics.finalWaveformBinCount)",
                 "cacheHit": "true",
                 "fourMinuteWAVFirstPreviewMilliseconds": String(
                     format: "%.3f",
@@ -88,6 +162,13 @@ enum AudioAssetImporterSmokeHarness {
                 format: "Four-minute WAV preview: %.1f ms first visible, %.1f ms bounded refinement",
                 longWAVMetrics.firstPreviewMilliseconds,
                 longWAVMetrics.refinementMilliseconds
+            )
+        )
+        print(
+            String(
+                format: "Compressed preview: %.1f ms first visible, %.1f ms complete screen detail",
+                compressedMetrics.firstWaveformMilliseconds,
+                compressedMetrics.screenDetailMilliseconds
             )
         )
         print("Soundtime audio asset importer smoke passed")
@@ -377,6 +458,148 @@ enum AudioAssetImporterSmokeHarness {
         let peakWorkingSetBytes: Int
     }
 
+    private struct CompressedImportMetrics {
+        let firstWaveformMilliseconds: Double
+        let screenDetailMilliseconds: Double
+        let preparationMilliseconds: Double
+        let finalWaveformBinCount: Int
+    }
+
+    private struct CompressedPreparationPair: Sendable {
+        let first: AudioAssetProxyResult
+        let replayed: AudioAssetProxyResult
+    }
+
+    private static func verifyCompressedProgressiveImport(
+        rootDirectory: URL
+    ) throws -> CompressedImportMetrics {
+        let externalBenchmarkPath = ProcessInfo.processInfo.environment[
+            "SOUNDTIME_IMPORT_BENCHMARK_FILE"
+        ]
+        let sourceURL: URL
+        if let externalBenchmarkPath, !externalBenchmarkPath.isEmpty {
+            sourceURL = URL(fileURLWithPath: externalBenchmarkPath).standardizedFileURL
+            try require(
+                FileManager.default.fileExists(atPath: sourceURL.path),
+                "compressed import benchmark file does not exist"
+            )
+        } else {
+            sourceURL = rootDirectory.appendingPathComponent("ProgressiveImport.m4a")
+            let sourceBuffer = makeSyntheticBuffer(
+                url: sourceURL,
+                sampleRate: 48_000,
+                frameCount: 480_000
+            )
+            try CompressedAudioFileWriter.write(sourceBuffer, to: sourceURL)
+        }
+
+        let probe = AudioImportProgressProbe()
+        let lateObserverProbe = AudioImportProgressProbe()
+        let completed = try awaitValue {
+            let coordinator = AudioImportCoordinator.shared
+            let admission = try await coordinator.admit(sourceURL: sourceURL)
+            let task = await coordinator.startPreparingEditableAsset(
+                admission: admission,
+                progress: { progress in probe.record(progress) }
+            )
+            try await Task.sleep(for: .milliseconds(50))
+            _ = await coordinator.startPreparingEditableAsset(
+                admission: admission,
+                progress: { progress in lateObserverProbe.record(progress) }
+            )
+            do {
+                let result = try await task.value
+                let replayedTask = await coordinator.startPreparingEditableAsset(
+                    admission: admission
+                )
+                let replayed = try await replayedTask.value
+                await coordinator.forget(sessionID: admission.sessionID)
+                return CompressedPreparationPair(first: result, replayed: replayed)
+            } catch {
+                await coordinator.forget(sessionID: admission.sessionID)
+                throw error
+            }
+        }
+        let result = completed.first
+        defer {
+            AudioImportCacheStore.shared.removeCache(for: result.fingerprint)
+        }
+
+        let progress = probe.snapshot()
+        let lateProgress = lateObserverProbe.snapshot()
+        guard let firstWaveformMilliseconds = progress.firstWaveformMilliseconds else {
+            throw SmokeError.failed("compressed import never published a progressive waveform")
+        }
+        try require(
+            firstWaveformMilliseconds <= AudioImportPerformanceContract.firstProgressiveWaveformMilliseconds,
+            String(
+                format: "compressed first waveform took %.1f ms (budget %.1f ms)",
+                firstWaveformMilliseconds,
+                AudioImportPerformanceContract.firstProgressiveWaveformMilliseconds
+            )
+        )
+        try require(
+            progress.firstWaveformBinCount == StreamingAudioProxyBuilder.progressWaveformBinCount,
+            "compressed progressive waveform did not use the screen-detail bin budget"
+        )
+        try require(
+            progress.firstWaveformHadSignal,
+            "compressed progressive waveform did not contain decoded signal"
+        )
+        try require(
+            progress.waveformPublicationCount >= 1,
+            "compressed import did not publish waveform progress"
+        )
+        try require(
+            lateProgress.waveformPublicationCount >= 1,
+            "drag prewarm did not replay progressive waveform state to the dropped track"
+        )
+        guard let screenDetailMilliseconds = progress.screenDetailMilliseconds else {
+            throw SmokeError.failed("compressed import never published its full screen-detail waveform")
+        }
+        try require(
+            screenDetailMilliseconds <= AudioImportPerformanceContract.coldScreenDetailMilliseconds,
+            String(
+                format: "compressed screen-detail waveform took %.1f ms (budget %.1f ms)",
+                screenDetailMilliseconds,
+                AudioImportPerformanceContract.coldScreenDetailMilliseconds
+            )
+        )
+        try require(
+            progress.maximumWaveformBinCount == StreamingAudioProxyBuilder.waveformBinCount,
+            "compressed progress never promoted to its final waveform resolution"
+        )
+        try require(
+            result.waveformOverview.bins.count == min(
+                result.proxyFileInfo.frameCount,
+                StreamingAudioProxyBuilder.waveformBinCount
+            ),
+            "compressed final waveform did not retain screen-detail resolution"
+        )
+        try require(
+            abs(result.waveformOverview.duration - result.proxyFileInfo.duration) <=
+                (2 / result.proxyFileInfo.sampleRate),
+            "compressed waveform duration diverged from its editable proxy"
+        )
+        try require(
+            result.peakWorkingSetBytes <= AudioImportPerformanceContract.maximumWorkingSetBytes,
+            "compressed progressive import exceeded its working-set contract"
+        )
+        try require(
+            completed.replayed.proxyURL == result.proxyURL &&
+                completed.replayed.preparationMilliseconds == result.preparationMilliseconds &&
+                completed.replayed.cacheHit == result.cacheHit,
+            "completed drag prewarm was decoded again instead of being reused on drop"
+        )
+
+        return CompressedImportMetrics(
+            firstWaveformMilliseconds: firstWaveformMilliseconds,
+            screenDetailMilliseconds: screenDetailMilliseconds,
+            preparationMilliseconds: result.preparationMilliseconds,
+            finalWaveformBinCount: result.waveformOverview.bins.count
+        )
+    }
+
     private static func verifyNativeEditableProxyImport(
         rootDirectory: URL
     ) throws -> NativeImportMetrics {
@@ -390,18 +613,6 @@ enum AudioAssetImporterSmokeHarness {
         try require(info.sampleRate == sourceBuffer.sampleRate, "native importer sample rate mismatch")
         try require(info.channelCount == sourceBuffer.channelCount, "native importer channel count mismatch")
         try require(info.requiresEditableProxy, "native importer should require an editable proxy")
-
-        let preview = try awaitValue {
-            try await AudioAssetImporter.loadPreview(
-                at: aiffURL,
-                targetBinCount: 512,
-                samplesPerBin: 64
-            )
-        }
-        try require(preview.assetInfo.format == .aiff, "native preview did not report AIFF format")
-        try require(preview.wavPreviewResult == nil, "native preview should not bridge to WAV preview result")
-        try require(preview.waveformOverview.bins.count == 512, "native preview bin count mismatch")
-        try require(!preview.waveformOverview.bins.allSatisfy { $0.peakMagnitude == 0 }, "native preview was silent")
 
         let decoded = try awaitValue {
             try await AudioAssetImporter.loadDecodedAsset(at: aiffURL)
@@ -446,8 +657,8 @@ enum AudioAssetImporterSmokeHarness {
             "native import exceeded its bounded working-set contract"
         )
         try require(
-            !proxyResult.zeroCrossingIndex.isEmpty,
-            "first native import did not retain its bounded zero-crossing index"
+            proxyResult.zeroCrossingIndex.frameCount == proxyResult.proxyFileInfo.frameCount,
+            "native import zero-crossing capability did not preserve the proxy frame domain"
         )
 
         var originalTimeline = AudioFileEditTimeline(
