@@ -178,6 +178,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         var edgeColor: SIMD4<Float>
     }
 
+    private struct ScrollbarUniform {
+        var horizontalTrack: SIMD4<Float>
+        var horizontalHandle: SIMD4<Float>
+        var verticalTrack: SIMD4<Float>
+        var verticalHandle: SIMD4<Float>
+        var metrics: SIMD4<Float>
+        var style: SIMD4<Float>
+    }
+
     private struct WaveformShaderBin {
         var minimumSample: Float
         var maximumSample: Float
@@ -1157,6 +1166,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private let additivePipelineState: MTLRenderPipelineState
     private let selectionOverlayPipelineState: MTLRenderPipelineState
     private let loopRegionPipelineState: MTLRenderPipelineState
+    private let scrollbarPipelineState: MTLRenderPipelineState
     private let selectionDragEffectPipelineState: MTLRenderPipelineState
     private let deletionEffectPipelineState: MTLRenderPipelineState
     private let dynamicVertexBufferRing: DynamicVertexBufferRing
@@ -1223,6 +1233,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var loopRegionHoverTransition: TimelineLoopRegionStyleTransition?
     private var loopRangeFlashStartTime: CFTimeInterval?
     private var highlightedLoopEndpoint: TimelineLoopEndpoint?
+    private var areEmbeddedScrollbarsVisible = true
+    private var scrollbarHighlightedAxis = 0
+    private var scrollbarHighlightAmount: Float = 0
     private var gridCache: GridCache?
     private var waveformTransitionStartTime: CFTimeInterval?
     private var previousRenderedPlayheadX: Float?
@@ -1453,6 +1466,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             let selectionOverlayFragmentFunction = library.makeFunction(name: "selection_overlay_fragment"),
             let loopRegionVertexFunction = library.makeFunction(name: "loop_region_vertex"),
             let loopRegionFragmentFunction = library.makeFunction(name: "loop_region_fragment"),
+            let scrollbarVertexFunction = library.makeFunction(name: "scrollbar_vertex"),
+            let scrollbarFragmentFunction = library.makeFunction(name: "scrollbar_fragment"),
             let selectionDragEffectVertexFunction = library.makeFunction(name: "selection_drag_effect_vertex"),
             let selectionDragEffectFragmentFunction = library.makeFunction(name: "selection_drag_effect_fragment"),
             let deletionEffectVertexFunction = library.makeFunction(name: "deletion_effect_vertex"),
@@ -1527,6 +1542,17 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         loopRegionDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
         loopRegionDescriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
         loopRegionDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        let scrollbarDescriptor = MTLRenderPipelineDescriptor()
+        scrollbarDescriptor.vertexFunction = scrollbarVertexFunction
+        scrollbarDescriptor.fragmentFunction = scrollbarFragmentFunction
+        scrollbarDescriptor.colorAttachments[0].pixelFormat = pixelFormat
+        scrollbarDescriptor.colorAttachments[0].isBlendingEnabled = true
+        scrollbarDescriptor.colorAttachments[0].rgbBlendOperation = .add
+        scrollbarDescriptor.colorAttachments[0].alphaBlendOperation = .add
+        scrollbarDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        scrollbarDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+        scrollbarDescriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        scrollbarDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
         let selectionDragEffectDescriptor = MTLRenderPipelineDescriptor()
         selectionDragEffectDescriptor.vertexFunction = selectionDragEffectVertexFunction
         selectionDragEffectDescriptor.fragmentFunction = selectionDragEffectFragmentFunction
@@ -1572,6 +1598,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         additivePipelineState = try device.makeRenderPipelineState(descriptor: additiveDescriptor)
         selectionOverlayPipelineState = try device.makeRenderPipelineState(descriptor: selectionOverlayDescriptor)
         loopRegionPipelineState = try device.makeRenderPipelineState(descriptor: loopRegionDescriptor)
+        scrollbarPipelineState = try device.makeRenderPipelineState(descriptor: scrollbarDescriptor)
         selectionDragEffectPipelineState = try device.makeRenderPipelineState(descriptor: selectionDragEffectDescriptor)
         deletionEffectPipelineState = try device.makeRenderPipelineState(descriptor: deletionEffectDescriptor)
         targetPresentationCalibrationIntervals.reserveCapacity(8)
@@ -2225,16 +2252,21 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return
         }
 
+        let previousLayout = renderState.trackLayout
+        let onlyReordersTrackPositions =
+            previousLayout.withTrackPositions(nil) == trackLayout.withTrackPositions(nil)
         if marksInteraction {
             markWaveformHotInteraction()
         }
         gridCache = nil
         renderState = renderState.withTrackLayout(trackLayout)
-        prewarmCurrentInteractiveWaveformShaderBuffers(
-            drawableSize: lastRenderViewportSize,
-            backingScale: lastRenderBackingScale,
-            allowsSynchronousUpload: !marksInteraction
-        )
+        if !onlyReordersTrackPositions {
+            prewarmCurrentInteractiveWaveformShaderBuffers(
+                drawableSize: lastRenderViewportSize,
+                backingScale: lastRenderBackingScale,
+                allowsSynchronousUpload: !marksInteraction
+            )
+        }
     }
 
     func displayHoverProgress(_ progress: Float?, isArmed: Bool = false) {
@@ -2463,6 +2495,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         highlightedLoopEndpoint = endpoint
+    }
+
+    func displayScrollbarHighlight(axis: Int, amount: Float) {
+        scrollbarHighlightedAxis = min(max(axis, 0), 2)
+        scrollbarHighlightAmount = min(max(amount, 0), 1)
+    }
+
+    func displayEmbeddedScrollbarsVisible(_ isVisible: Bool) {
+        areEmbeddedScrollbarsVisible = isVisible
     }
 
     func displayHighlightedSelectionEndpoint(_ endpoint: TimelineSelectionEndpoint?) {
@@ -3174,6 +3215,10 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             (usesPreviousWaveformShader || previousWaveformVertices != nil)
         let rulerLaneVertices = makeRulerLaneVertices(
             drawableSize: viewportSize,
+            renderState: renderState
+        )
+        let rulerSeparatorVertices = makeRulerSeparatorVertices(
+            drawableSize: viewportSize,
             backingScale: backingScale,
             renderState: renderState
         )
@@ -3183,6 +3228,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             renderState: renderState,
             loopRange: presentedLoopRange,
             displayTimestamp: displayTimestamp
+        )
+        let scrollbarUniform = makeScrollbarUniform(
+            drawableSize: viewportSize,
+            backingScale: backingScale,
+            renderState: renderState
         )
         let trimPreviewVertices = makeTrimPreviewVertices(
             drawableSize: viewportSize,
@@ -3246,6 +3296,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         )
         drawLoopRange(uniform: loopRangeUniform, encoder: encoder)
         encoder.setRenderPipelineState(pipelineState)
+        draw(vertices: rulerSeparatorVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: selectedTrackVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: processingTrackVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: candidateRegionVertices, primitiveType: .triangle, encoder: encoder)
@@ -3346,6 +3397,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         draw(vertices: trimPreviewVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: hoverGuideVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: playheadVertices, primitiveType: .triangle, encoder: encoder)
+        drawScrollbars(uniform: scrollbarUniform, encoder: encoder)
         recordWaveformPerformanceContract(
             hotPathReason: waveformHotPathReason,
             displayTimestamp: displayTimestamp
@@ -3462,7 +3514,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         var visiblePromotedTrackIDs = Set<UUID>()
         waveformShaderBatchScratch.removeAll(keepingCapacity: true)
 
-        for trackIndex in trackLayout.visibleRange(overscan: 1) {
+        for trackIndex in trackLayout.visibleTrackIndices(overscan: 1) {
             guard tracks.indices.contains(trackIndex) else {
                 continue
             }
@@ -4072,7 +4124,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
         var checkedRenderableTrack = false
         var drawableTrackCount = 0
-        for trackIndex in trackLayout.visibleRange(overscan: 1) {
+        for trackIndex in trackLayout.visibleTrackIndices(overscan: 1) {
             guard tracks.indices.contains(trackIndex) else {
                 continue
             }
@@ -5477,7 +5529,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
-        let visibleRange = trackLayout.visibleRange(
+        let visibleRange = trackLayout.visibleTrackIndices(
             overscan: overscan >= 0 ? overscan : waveformShaderPrewarmTrackOverscan
         )
         let maximumCount = maximumCount > 0 ? maximumCount : maximumViewportPrewarmTrackCount
@@ -5728,6 +5780,37 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
     private func makeRulerLaneVertices(
         drawableSize: CGSize,
+        renderState: TimelineRenderState
+    ) -> [TimelineVertex] {
+        let width = Float(drawableSize.width)
+        let height = Float(drawableSize.height)
+        guard width > 0, height > 0 else {
+            return []
+        }
+
+        let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
+        let rulerHeight = min(max(trackLayout.rulerLaneHeight, 0), height)
+        guard rulerHeight > 0 else {
+            return []
+        }
+
+        let size = SIMD2<Float>(width, height)
+        var vertices: [TimelineVertex] = []
+        vertices.reserveCapacity(6)
+        appendRectangle(
+            to: &vertices,
+            left: 0,
+            right: width,
+            top: 0,
+            bottom: rulerHeight,
+            color: SIMD4<Float>(0.055, 0.058, 0.060, 0.96),
+            drawableSize: size
+        )
+        return vertices
+    }
+
+    private func makeRulerSeparatorVertices(
+        drawableSize: CGSize,
         backingScale: Float,
         renderState: TimelineRenderState
     ) -> [TimelineVertex] {
@@ -5745,18 +5828,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         let size = SIMD2<Float>(width, height)
         let lineWidth = pixelLength(backingScale: backingScale)
-        var vertices: [TimelineVertex] = []
-        vertices.reserveCapacity(12)
-        appendRectangle(
-            to: &vertices,
-            left: 0,
-            right: width,
-            top: 0,
-            bottom: rulerHeight,
-            color: SIMD4<Float>(0.055, 0.058, 0.060, 0.96),
-            drawableSize: size
-        )
         let separatorY = pixelAligned(rulerHeight, backingScale: backingScale)
+        var vertices: [TimelineVertex] = []
+        vertices.reserveCapacity(6)
         appendRectangle(
             to: &vertices,
             left: 0,
@@ -6070,7 +6144,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         frameStatsShaderBufferUploadCount += completedWork.uploadSummary.uploadedCount
         frameStatsShaderBufferUploadByteCount += completedWork.uploadSummary.uploadedBytes
 
-        for trackIndex in trackLayout.visibleRange(overscan: 1) {
+        for trackIndex in trackLayout.visibleTrackIndices(overscan: 1) {
             guard
                 renderState.tracks.indices.contains(trackIndex),
                 let source = renderState.tracks[trackIndex].waveformTileSource
@@ -6691,7 +6765,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
 
         let tracks = renderState.tracks
         let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
-        for trackIndex in trackLayout.visibleRange(overscan: 1) {
+        for trackIndex in trackLayout.visibleTrackIndices(overscan: 1) {
             guard tracks.indices.contains(trackIndex) else {
                 continue
             }
@@ -7663,6 +7737,64 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
     }
 
+    private func makeScrollbarUniform(
+        drawableSize: CGSize,
+        backingScale: Float,
+        renderState: TimelineRenderState
+    ) -> ScrollbarUniform? {
+        guard areEmbeddedScrollbarsVisible else {
+            return nil
+        }
+        let width = max(Float(drawableSize.width), 1)
+        let height = max(Float(drawableSize.height), 1)
+        let resolvedLayout = renderState.trackLayout.resolved(
+            totalTrackCount: renderState.tracks.count,
+            viewportHeight: height
+        )
+        let geometry = TimelineScrollbarGeometry.resolve(
+            bounds: CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)),
+            viewport: renderState.viewport,
+            trackLayout: resolvedLayout
+        )
+
+        func normalizedRect(_ rect: CGRect) -> SIMD4<Float> {
+            SIMD4<Float>(
+                Float(rect.minX) / width,
+                Float(rect.maxX) / width,
+                (height - Float(rect.maxY)) / height,
+                (height - Float(rect.minY)) / height
+            )
+        }
+
+        return ScrollbarUniform(
+            horizontalTrack: normalizedRect(geometry.horizontalTrack),
+            horizontalHandle: normalizedRect(geometry.horizontalHandle),
+            verticalTrack: normalizedRect(geometry.verticalTrack),
+            verticalHandle: normalizedRect(geometry.verticalHandle),
+            metrics: SIMD4<Float>(width, height, max(backingScale, 1), 0),
+            style: SIMD4<Float>(
+                Float(scrollbarHighlightedAxis),
+                scrollbarHighlightAmount,
+                geometry.isHorizontalScrollable ? 1 : 0,
+                geometry.isVerticalScrollable ? 1 : 0
+            )
+        )
+    }
+
+    private func drawScrollbars(
+        uniform: ScrollbarUniform?,
+        encoder: MTLRenderCommandEncoder
+    ) {
+        guard var uniform, uniform.style.z > 0 || uniform.style.w > 0 else {
+            return
+        }
+        encoder.setRenderPipelineState(scrollbarPipelineState)
+        encoder.setVertexBuffer(waveformQuadVertexBuffer, offset: 0, index: 0)
+        encoder.setVertexBytes(&uniform, length: MemoryLayout<ScrollbarUniform>.stride, index: 1)
+        encoder.setFragmentBytes(&uniform, length: MemoryLayout<ScrollbarUniform>.stride, index: 1)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+    }
+
     private func drawSelectionDragEffect(
         uniform: SelectionDragEffectUniform?,
         encoder: MTLRenderCommandEncoder
@@ -7767,7 +7899,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
-        for trackIndex in trackLayout.visibleRange(overscan: 0) {
+        for trackIndex in trackLayout.visibleTrackIndices(overscan: 0) {
             guard let laneFrame = trackLayout.laneFrame(forTrackIndex: trackIndex), laneFrame.isVisible else {
                 continue
             }
@@ -8498,7 +8630,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         drawableSize: CGSize
     ) -> (top: Float, bottom: Float)? {
         let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
-        let visibleRange = trackLayout.visibleRange(overscan: 0)
+        let visibleRange = trackLayout.visibleTrackIndices(overscan: 0)
         guard !visibleRange.isEmpty else {
             return nil
         }
@@ -9015,7 +9147,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let width = Float(drawableSize.width)
         let pixelWidth = width > 0 ? max(pixelLength(backingScale: backingScale) / width, 0.0012) : 0.0012
         let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
-        let visibleRange = trackLayout.visibleRange(overscan: 1)
+        let visibleRange = trackLayout.visibleTrackIndices(overscan: 1)
         clipBoundaryVertexScratch.reserveCapacity(visibleRange.count * 24)
 
         for trackIndex in visibleRange {
@@ -9188,7 +9320,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
         var vertices: [TimelineVertex] = []
 
-        for trackIndex in trackLayout.visibleRange(overscan: 1) {
+        for trackIndex in trackLayout.visibleTrackIndices(overscan: 1) {
             guard tracks.indices.contains(trackIndex) else {
                 continue
             }
@@ -9287,7 +9419,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let tracks = renderState.tracks
         let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
         var hasher = Hasher()
-        for trackIndex in trackLayout.visibleRange(overscan: 1) {
+        for trackIndex in trackLayout.visibleTrackIndices(overscan: 1) {
             guard tracks.indices.contains(trackIndex) else {
                 continue
             }
@@ -12779,6 +12911,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float4 edgeColor;
     };
 
+    struct ScrollbarUniform {
+        float4 horizontalTrack;
+        float4 horizontalHandle;
+        float4 verticalTrack;
+        float4 verticalHandle;
+        float4 metrics;
+        float4 style;
+    };
+
     struct TimelineRulerUniform {
         float4 viewport;
         float4 metrics;
@@ -12882,6 +13023,11 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float4 topColor;
         float4 bottomColor;
         float4 edgeColor;
+    };
+
+    struct ScrollbarRasterizedVertex {
+        float4 position [[position]];
+        float2 normalizedPosition;
     };
 
     float fisheye_focus_weight(float normalizedDistance) {
@@ -13411,6 +13557,81 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     static float rounded_rect_signed_distance(float2 point, float2 halfSize, float radius) {
         float2 q = abs(point) - halfSize + radius;
         return length(max(q, float2(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+    }
+
+    static float scrollbar_coverage(float2 pixel, float4 rect, float2 viewportPixels) {
+        float2 minimum = rect.xz * viewportPixels;
+        float2 maximum = rect.yw * viewportPixels;
+        float2 size = max(maximum - minimum, float2(1.0));
+        float2 center = (minimum + maximum) * 0.5;
+        float radius = min(size.x, size.y) * 0.5;
+        float distance = rounded_rect_signed_distance(pixel - center, size * 0.5, radius);
+        float aa = max(fwidth(distance), 0.75);
+        return 1.0 - smoothstep(-aa, aa, distance);
+    }
+
+    static float scrollbar_sheen(float2 pixel, float4 rect, float2 viewportPixels) {
+        float2 minimum = rect.xz * viewportPixels;
+        float2 maximum = rect.yw * viewportPixels;
+        float2 size = max(maximum - minimum, float2(1.0));
+        float2 local = clamp((pixel - minimum) / size, 0.0, 1.0);
+        return pow(max(1.0 - local.y, 0.0), 2.2) * 0.32 +
+            exp(-pow((local.y - 0.35) / 0.2, 2.0)) * 0.12;
+    }
+
+    vertex ScrollbarRasterizedVertex scrollbar_vertex(
+        uint vertexID [[vertex_id]],
+        constant WaveformShaderQuadVertex *vertices [[buffer(0)]],
+        constant ScrollbarUniform &uniform [[buffer(1)]]
+    ) {
+        float2 normalizedPosition = vertices[vertexID].position.xy;
+        ScrollbarRasterizedVertex out;
+        out.position = float4(
+            normalizedPosition.x * 2.0 - 1.0,
+            1.0 - normalizedPosition.y * 2.0,
+            0.0,
+            1.0
+        );
+        out.normalizedPosition = normalizedPosition;
+        return out;
+    }
+
+    fragment float4 scrollbar_fragment(
+        ScrollbarRasterizedVertex in [[stage_in]],
+        constant ScrollbarUniform &uniform [[buffer(1)]]
+    ) {
+        float2 viewportPixels = max(uniform.metrics.xy, float2(1.0));
+        float2 pixel = in.normalizedPosition * viewportPixels;
+        float showHorizontal = clamp(uniform.style.z, 0.0, 1.0);
+        float showVertical = clamp(uniform.style.w, 0.0, 1.0);
+        float highlight = clamp(uniform.style.y, 0.0, 1.0);
+        float horizontalHighlight = highlight * (uniform.style.x > 0.5 && uniform.style.x < 1.5 ? 1.0 : 0.0);
+        float verticalHighlight = highlight * (uniform.style.x > 1.5 ? 1.0 : 0.0);
+
+        float horizontalRail = scrollbar_coverage(pixel, uniform.horizontalTrack, viewportPixels) * showHorizontal;
+        float verticalRail = scrollbar_coverage(pixel, uniform.verticalTrack, viewportPixels) * showVertical;
+        float horizontalHandle = scrollbar_coverage(pixel, uniform.horizontalHandle, viewportPixels) * showHorizontal;
+        float verticalHandle = scrollbar_coverage(pixel, uniform.verticalHandle, viewportPixels) * showVertical;
+        float railCoverage = max(horizontalRail, verticalRail);
+        float handleCoverage = max(horizontalHandle, verticalHandle);
+        if (max(railCoverage, handleCoverage) <= 0.0001) {
+            return float4(0.0);
+        }
+
+        float activeHighlight = max(horizontalHandle * horizontalHighlight, verticalHandle * verticalHighlight);
+        float3 neutral = float3(0.58, 0.62, 0.64);
+        float3 teal = float3(0.06, 0.78, 0.88);
+        float3 handleColor = mix(neutral, teal, activeHighlight);
+        float sheen = max(
+            scrollbar_sheen(pixel, uniform.horizontalHandle, viewportPixels) * horizontalHandle,
+            scrollbar_sheen(pixel, uniform.verticalHandle, viewportPixels) * verticalHandle
+        );
+        handleColor += sheen * mix(float3(0.45), float3(0.55, 0.95, 1.0), activeHighlight);
+        float railAlpha = railCoverage * 0.16;
+        float handleAlpha = handleCoverage * mix(0.58, 0.88, activeHighlight);
+        float alpha = max(railAlpha, handleAlpha);
+        float3 color = mix(float3(0.22, 0.24, 0.25), handleColor, min(handleCoverage, 1.0));
+        return float4(color, alpha);
     }
 
     static float box_signed_distance(float2 point, float2 center, float2 halfSize) {

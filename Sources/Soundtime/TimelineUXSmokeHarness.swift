@@ -233,6 +233,12 @@ enum TimelineUXSmokeHarness {
         try verifyTrackLayoutGeometry()
         complete("track layout geometry keeps lanes aligned and hit-testable")
 
+        try verifyTrackNavigationGeometry()
+        complete("track reorder, scrolling, and zoom geometry remain synchronized")
+
+        try verifyTwoDimensionalTrackpadNavigation()
+        complete("trackpad navigation composes horizontal and vertical panning")
+
         try verifySelectionEdgeResizeSemantics()
         complete("selection edges resize around a fixed anchor without starting a new selection")
 
@@ -1317,6 +1323,108 @@ enum TimelineUXSmokeHarness {
             }
             try require(laneFrame.bottom > laneFrame.top, "lane \(trackIndex) had inverted geometry")
         }
+    }
+
+    private static func verifyTrackNavigationGeometry() throws {
+        let zoomedLayout = TimelineTrackLayout.default
+            .withPreferredTrackHeight(240)
+            .resolved(totalTrackCount: 8, viewportHeight: 480)
+        try require(
+            abs(zoomedLayout.trackHeight - 240) < 0.000_1,
+            "vertical zoom did not preserve its requested fixed track height"
+        )
+        try require(zoomedLayout.isScrollable, "vertically zoomed tracks should be scrollable")
+
+        let viewport = TimelineViewport(startProgress: 0.35, durationProgress: 0.25)
+        let geometry = TimelineScrollbarGeometry.resolve(
+            bounds: CGRect(x: 0, y: 0, width: 1_000, height: 480),
+            viewport: viewport,
+            trackLayout: zoomedLayout
+        )
+        try require(
+            abs(geometry.horizontalHandle.width / geometry.horizontalTrack.width - 0.25) < 0.01,
+            "horizontal scrollbar handle did not represent the visible duration"
+        )
+        try require(
+            geometry.horizontalHandle.minX > geometry.horizontalTrack.minX,
+            "horizontal scrollbar handle did not represent the panned viewport"
+        )
+        try require(
+            geometry.verticalHandle.height < geometry.verticalTrack.height,
+            "vertical scrollbar handle did not represent hidden tracks"
+        )
+        try require(
+            geometry.axis(at: CGPoint(x: geometry.horizontalHandle.midX, y: geometry.horizontalHandle.midY)) == .horizontal,
+            "horizontal scrollbar handle was not hit-testable"
+        )
+        try require(
+            geometry.axis(at: CGPoint(x: geometry.verticalHandle.midX, y: geometry.verticalHandle.midY)) == .vertical,
+            "vertical scrollbar handle was not hit-testable"
+        )
+        try require(geometry.isHorizontalScrollable, "zoomed viewport did not expose horizontal scrolling")
+        try require(geometry.isVerticalScrollable, "zoomed track layout did not expose vertical scrolling")
+
+        let unscrollableGeometry = TimelineScrollbarGeometry.resolve(
+            bounds: CGRect(x: 0, y: 0, width: 1_000, height: 480),
+            viewport: .full,
+            trackLayout: TimelineTrackLayout.default.resolved(totalTrackCount: 2, viewportHeight: 480)
+        )
+        try require(!unscrollableGeometry.isHorizontalScrollable, "full viewport exposed a horizontal scrollbar")
+        try require(!unscrollableGeometry.isVerticalScrollable, "fitted tracks exposed a vertical scrollbar")
+        try require(
+            unscrollableGeometry.axis(at: CGPoint(
+                x: unscrollableGeometry.horizontalHandle.midX,
+                y: unscrollableGeometry.horizontalHandle.midY
+            )) == nil,
+            "hidden horizontal scrollbar intercepted timeline input"
+        )
+        try require(
+            unscrollableGeometry.axis(at: CGPoint(
+                x: unscrollableGeometry.verticalHandle.midX,
+                y: unscrollableGeometry.verticalHandle.midY
+            )) == nil,
+            "hidden vertical scrollbar intercepted timeline input"
+        )
+
+        let positions = TimelineTrackReorderGeometry.trackPositions(
+            count: 5,
+            draggedIndex: 1,
+            targetIndex: 4,
+            draggedPosition: 3.6
+        )
+        try require(positions == [0, 3.6, 1, 2, 3], "downward track reorder positions were incorrect")
+        let target = TimelineTrackReorderGeometry.targetIndex(
+            yFromTop: zoomedLayout.rulerLaneHeight + zoomedLayout.trackHeight * 3.55,
+            layout: zoomedLayout
+        )
+        try require(target == 3, "track reorder target did not follow the pointer lane")
+    }
+
+    private static func verifyTwoDimensionalTrackpadNavigation() throws {
+        let viewport = TimelineViewport(startProgress: 0.35, durationProgress: 0.25)
+        let horizontalDelta = TimelineNavigationPanGeometry.horizontalProgressDelta(
+            scrollingDeltaX: 120,
+            viewportWidth: 1_000,
+            viewportDurationProgress: viewport.durationProgress
+        )
+        let verticalDelta = TimelineNavigationPanGeometry.verticalTrackDelta(scrollingDeltaY: -48)
+        let pannedViewport = viewport.panned(byProgress: horizontalDelta)
+        let pannedLayout = TimelineTrackLayout.default
+            .withPreferredTrackHeight(220)
+            .scrolled(by: verticalDelta, totalTrackCount: 8, viewportHeight: 480)
+
+        try require(
+            abs(horizontalDelta + 0.03) < 0.000_1,
+            "horizontal trackpad motion did not scale through the visible viewport"
+        )
+        try require(
+            abs(pannedViewport.startProgress - 0.32) < 0.000_1,
+            "horizontal trackpad motion did not pan timeline time"
+        )
+        try require(
+            abs(pannedLayout.scrollOffset - 48) < 0.000_1,
+            "vertical trackpad motion did not scroll track lanes"
+        )
     }
 
     private static func verifyScrolledTrackLanesRender(

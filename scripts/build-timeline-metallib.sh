@@ -74,5 +74,6 @@ build_library() {
 build_library "$ROOT/Sources/Soundtime/FrameRateHistoryView.swift" "FrameRateHistoryShaders"
 build_library "$ROOT/Sources/Soundtime/LoudnessMeterView.swift" "LoudnessMeterShaders"
 build_library "$ROOT/Sources/Soundtime/TransportControlPanelView.swift" "TransportControlShaders"
+build_library "$ROOT/Sources/Soundtime/TimelineNavigationScrollbarView.swift" "TimelineNavigationScrollbarShaders"
 
 echo "Built $LIBRARY_OUTPUT"

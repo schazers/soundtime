@@ -103,6 +103,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onViewportChanged: ((TimelineViewport) -> Void)?
     var onTimelineInteractionBegan: (() -> Void)?
     var onTrackLaneLayoutChanged: ((ResolvedTimelineTrackLayout) -> Void)?
+    var onTrackReorderCommitted: ((UUID, Int) -> Void)?
     var onLoopRangeChanged: ((TimelineLoopRange) -> Void)?
     var onLoopRangeEnabledChanged: ((Bool) -> Void)?
     var onPlaybackVisualProgressChanged: ((Float) -> Void)?
@@ -134,6 +135,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         case loopEnd
         case loopRegion
         case moveLoopRegion
+        case horizontalScrollbar
+        case verticalScrollbar
     }
 
     private enum ScrollGestureMode {
@@ -186,6 +189,26 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var hoveredLoopEndpoint: TimelineLoopEndpoint?
     private var activeLoopDragOffsetX: CGFloat = 0
     private var activeLoopMoveInitialRange: TimelineLoopRange?
+    private var activeScrollbarAxis: TimelineScrollbarAxis?
+    private var activeScrollbarDragOffset: CGFloat = 0
+    private var hoveredScrollbarAxis: TimelineScrollbarAxis?
+    private var scrollbarPresentationAxis: TimelineScrollbarAxis?
+    private var scrollbarHoverPresentation: Float = 0
+    private var scrollbarHoverTarget: Float = 0
+    private var scrollbarHoverTransitionStartTime = CACurrentMediaTime()
+    private var scrollbarHoverTransitionSource: Float = 0
+    private let scrollbarHoverTransitionDuration: CFTimeInterval = 0.06
+    private var areEmbeddedScrollbarsEnabled = true
+    private var trackReorderTrackID: UUID?
+    private var trackReorderDraggedIndex: Int?
+    private var trackReorderTargetIndex: Int?
+    private var trackReorderPointerYFromTop: Float?
+    private var trackReorderSourcePositions: [Float]?
+    private var trackReorderTargetPositions: [Float]?
+    private var trackReorderAnimationStartTime = CACurrentMediaTime()
+    private let trackReorderAnimationDuration: CFTimeInterval = 0.14
+    private var trackReorderLastTickTime = CACurrentMediaTime()
+    private var isZoomControlInteractionActive = false
     private var edgeAutoPanLastTimestamp: CFTimeInterval?
     private var loopRange = TimelineLoopRange.default
     private var isLoopRangeEnabled = true
@@ -271,7 +294,6 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private let selectionDragEffectRenderPulseDuration: CFTimeInterval = 0.72
     private let deletionEffectRenderPulseDuration: CFTimeInterval = 0.18
     private let targetFramesPerSecond = 144
-    private let scrollZoomSensitivity: Float = 0.01
     private let supportedAudioExtensions = AudioAssetImporter.supportedAudioFileExtensions
     private var selectionDragWaveformTuning = SelectionDragWaveformTuning.defaultValue
 
@@ -1512,6 +1534,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         let currentLoopRange = loopRange
         let currentLoopRangeEnabled = isLoopRangeEnabled
         let currentLoopPlaybackBypassed = isLoopPlaybackBypassed
+        let currentEmbeddedScrollbarsEnabled = areEmbeddedScrollbarsEnabled
         let currentShowsLoopMoveGuides = showsLoopMoveGuides
         let currentSelection = currentSelection
         let currentPlayheadProgress = pagingPlayheadProgress
@@ -1527,6 +1550,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             renderer.displayLoopRange(currentLoopRange)
             renderer.displayLoopRangeEnabled(currentLoopRangeEnabled)
             renderer.displayLoopPlaybackBypassed(currentLoopPlaybackBypassed)
+            renderer.displayEmbeddedScrollbarsVisible(currentEmbeddedScrollbarsEnabled)
             renderer.publishInteractionLoopMoveGuides(currentShowsLoopMoveGuides)
             renderer.displayTracks(
                 tracks,
@@ -1816,6 +1840,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             !hasActiveSelectionDragRenderPulse(),
             activeCameraTransition == nil,
             !isEdgeAutoPanDragActive,
+            trackReorderTrackID == nil,
+            !isScrollbarHoverAnimating,
             !isHotPathContractSmokeFrameStatsActive
         else {
             return
@@ -1834,6 +1860,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             activeTranscriptDrag != nil ||
             isDraggingSelection ||
             isDraggingLoop ||
+            trackReorderTrackID != nil ||
+            isZoomControlInteractionActive ||
             scrollGestureMode != nil ||
             rightPanPreviousPoint != nil
     }
@@ -1880,6 +1908,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         let sampledAt = CACurrentMediaTime()
         let didAutoPan = stepEdgeAutoPan(sampledAt: sampledAt)
         let didAdvanceCamera = stepCameraTransition(sampledAt: sampledAt)
+        let didAdvanceTrackReorder = stepTrackReorder(sampledAt: sampledAt)
+        let didAdvanceScrollbarHover = stepScrollbarHover(sampledAt: sampledAt)
         let shouldRender = needsTimelineRender ||
             isTimelinePlaybackActive ||
             isProcessingSelectionAnimationActive ||
@@ -1888,6 +1918,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             activeCameraTransition != nil ||
             didAdvanceCamera ||
             didAutoPan ||
+            didAdvanceTrackReorder ||
+            didAdvanceScrollbarHover ||
             isHotPathContractSmokeFrameStatsActive
 
         guard shouldRender else {
@@ -1920,6 +1952,64 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             finishBootstrapWaveformHandoffAfterSubmittedFrame()
         }
         stopTimelineDisplayLinkIfIdle()
+    }
+
+    private func stepTrackReorder(sampledAt timestamp: CFTimeInterval) -> Bool {
+        guard trackReorderTrackID != nil, let pointerY = trackReorderPointerYFromTop else {
+            return false
+        }
+        let previousTick = trackReorderLastTickTime
+        trackReorderLastTickTime = timestamp
+        let elapsed = min(max(timestamp - previousTick, 1.0 / 240.0), 1.0 / 20.0)
+        let edgeZone: Float = 42
+        let height = Float(max(bounds.height, 1))
+        let topDistance = pointerY - trackLayout.rulerLaneHeight
+        let bottomDistance = height - pointerY
+        let direction: Float
+        let proximity: Float
+        if topDistance < edgeZone {
+            direction = -1
+            proximity = min(max(1 - topDistance / edgeZone, 0), 1)
+        } else if bottomDistance < edgeZone {
+            direction = 1
+            proximity = min(max(1 - bottomDistance / edgeZone, 0), 1)
+        } else {
+            direction = 0
+            proximity = 0
+        }
+        if direction != 0 {
+            let speed = 760 * proximity * proximity
+            scrollTracks(byPixels: direction * speed * Float(elapsed))
+            updateTrackReorder(yFromTop: pointerY)
+        }
+        return publishTrackReorderPresentation(at: timestamp)
+    }
+
+    private var isScrollbarHoverAnimating: Bool {
+        abs(scrollbarHoverPresentation - scrollbarHoverTarget) > 0.001
+    }
+
+    private func stepScrollbarHover(sampledAt timestamp: CFTimeInterval) -> Bool {
+        guard isScrollbarHoverAnimating else {
+            return false
+        }
+        let raw = Float(min(max(
+            (timestamp - scrollbarHoverTransitionStartTime) / scrollbarHoverTransitionDuration,
+            0
+        ), 1))
+        let eased = easeInOutCubic(raw)
+        scrollbarHoverPresentation = scrollbarHoverTransitionSource +
+            (scrollbarHoverTarget - scrollbarHoverTransitionSource) * eased
+        if raw >= 1 {
+            scrollbarHoverPresentation = scrollbarHoverTarget
+            if scrollbarHoverTarget == 0, activeScrollbarAxis == nil {
+                publishScrollbarPresentation()
+                scrollbarPresentationAxis = nil
+                return true
+            }
+        }
+        publishScrollbarPresentation()
+        return true
     }
 
     private func submitTimelineRender(frame: TimelineDisplayLinkFrame) -> Bool {
@@ -2088,6 +2178,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return isDraggingSelection
         case .loopStart, .loopEnd:
             return isDraggingLoop
+        case .horizontalScrollbar, .verticalScrollbar:
+            return false
         case
             .selection,
             .loopRegion,
@@ -2151,6 +2243,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             )
         case .loopStart, .loopEnd:
             updateLoopEndpointDrag(to: point)
+        case .horizontalScrollbar, .verticalScrollbar:
+            break
         case
             .selection,
             .loopRegion,
@@ -2515,6 +2609,15 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         addTranscriptCursorRects()
         addLoopHandleCursorRects()
         addSelectionEdgeCursorRects()
+        if areEmbeddedScrollbarsEnabled {
+            let scrollbarGeometry = currentScrollbarGeometry()
+            if scrollbarGeometry.isHorizontalScrollable {
+                addCursorRect(scrollbarGeometry.horizontalHandle.insetBy(dx: -4, dy: -4), cursor: .openHand)
+            }
+            if scrollbarGeometry.isVerticalScrollable {
+                addCursorRect(scrollbarGeometry.verticalHandle.insetBy(dx: -4, dy: -4), cursor: .openHand)
+            }
+        }
     }
 
     override func cursorUpdate(with event: NSEvent) {
@@ -2964,6 +3067,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         PerformanceSampler.shared.recordTimelineInputEvent(kind: "mouse-moved", at: event.timestamp)
+        if areEmbeddedScrollbarsEnabled, updateScrollbarHover(for: event) {
+            return
+        }
         if updateLoopHover(for: event) {
             return
         }
@@ -2986,6 +3092,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         displayHighlightedSelectionEndpoint(nil)
         displayHighlightedLoopEndpoint(nil)
         displayHighlightedLoopRegion(false)
+        setHoveredScrollbarAxis(nil)
         updateTranscriptHover(nil)
     }
 
@@ -3016,49 +3123,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         let horizontalDelta = event.scrollingDeltaX
         let verticalDelta = event.scrollingDeltaY
         guard horizontalDelta != 0 || verticalDelta != 0 else {
-            if isGestureEnding, scrollGestureMode == .zoom, event.momentumPhase.isEmpty {
-                startZoomMomentumIfNeeded()
-            }
             return
         }
-        let proposedGestureMode: ScrollGestureMode =
-            abs(verticalDelta) >= abs(horizontalDelta) && verticalDelta != 0 ?
-            .zoom :
-            .pan
-        let gestureMode = scrollGestureMode ?? proposedGestureMode
-        scrollGestureMode = gestureMode
-
-        if gestureMode == .zoom {
-            stopRightPanMomentum()
-            guard verticalDelta != 0 else {
-                return
-            }
-            let anchorProgress = progress(for: convert(event.locationInWindow, from: nil))
-            let logScaleDelta = Float(verticalDelta) * scrollZoomSensitivity
-            applyZoomMomentumInput(
-                logScaleDelta: logScaleDelta,
-                anchorProgress: anchorProgress,
-                timestamp: event.timestamp,
-                recordsVelocity: event.momentumPhase.isEmpty
-            )
-            if !hasGesturePhase {
-                startZoomMomentumIfNeeded()
-            }
-            return
-        }
-
+        scrollGestureMode = .pan
         displayHoverProgress(nil, renderCadence: .coalescedInteraction)
-        stopZoomMomentum()
-        guard horizontalDelta != 0, bounds.width > 0 else {
-            return
-        }
-
-        let progressDelta = Float(-horizontalDelta / bounds.width) * viewport.durationProgress
-        setViewport(
-            viewport.panned(byProgress: progressDelta),
-            transcriptCadence: .coalescedInteraction,
-            invalidatesCursorRects: false,
-            renderCadence: .coalescedInteraction
+        stopRightPanMomentum()
+        applyTwoDimensionalPan(
+            horizontalDeltaPixels: horizontalDelta,
+            verticalDeltaPixels: verticalDelta
         )
     }
 
@@ -3087,12 +3159,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             }
         }
 
-        if scrollGestureMode == nil {
-            scrollGestureMode = .zoom
-        }
-        guard scrollGestureMode == .zoom else {
-            return
-        }
+        scrollGestureMode = .zoom
 
         let anchorProgress = progress(for: convert(event.locationInWindow, from: nil))
         let zoomFactor = max(1 + Float(event.magnification), 0.1)
@@ -3152,6 +3219,20 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         displayLoopMoveGuides(false)
         let point = convert(event.locationInWindow, from: nil)
         let timelineProgress = progress(for: point)
+        if areEmbeddedScrollbarsEnabled, let scrollbarAxis = currentScrollbarGeometry().axis(at: point) {
+            let geometry = currentScrollbarGeometry()
+            activeScrollbarAxis = scrollbarAxis
+            activeDragMode = scrollbarAxis == .horizontal ? .horizontalScrollbar : .verticalScrollbar
+            let handle = scrollbarAxis == .horizontal ? geometry.horizontalHandle : geometry.verticalHandle
+            activeScrollbarDragOffset = scrollbarAxis == .horizontal ?
+                point.x - handle.minX : point.y - handle.minY
+            selectionAnchorProgress = Double(timelineProgress)
+            selectionAnchorPoint = point
+            selectionAnchorTrackID = nil
+            setHoveredScrollbarAxis(scrollbarAxis)
+            NSCursor.closedHand.set()
+            return
+        }
         if let loopDragMode = loopDragMode(for: point) {
             displayHoverProgress(nil)
             if let endpoint = loopEndpoint(for: loopDragMode) {
@@ -3259,6 +3340,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         let point = currentDragPoint(for: event)
+        if activeDragMode == .horizontalScrollbar || activeDragMode == .verticalScrollbar {
+            updateScrollbarDrag(to: point)
+            NSCursor.closedHand.set()
+            return
+        }
         if
             activeDragMode == .loopStart ||
                 activeDragMode == .loopEnd ||
@@ -3410,7 +3496,18 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         let point = currentDragPoint(for: event)
         let timelineProgress = progress(for: point)
-        if
+        if activeDragMode == .horizontalScrollbar || activeDragMode == .verticalScrollbar {
+            updateScrollbarDrag(to: point)
+            activeScrollbarAxis = nil
+            activeScrollbarDragOffset = 0
+            if let axis = currentScrollbarGeometry().axis(at: point) {
+                setHoveredScrollbarAxis(axis)
+                NSCursor.openHand.set()
+            } else {
+                setHoveredScrollbarAxis(nil)
+                NSCursor.arrow.set()
+            }
+        } else if
             activeDragMode == .loopStart ||
                 activeDragMode == .loopEnd ||
                 activeDragMode == .loopRegion ||
@@ -4000,7 +4097,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         invalidatesCursorRects: Bool,
         renderCadence: TimelineRenderCadence,
         marksInteraction: Bool,
-        notifiesChange: Bool
+        notifiesChange: Bool,
+        updatesTranscript: Bool = true
     ) {
         guard viewport != nextViewport else {
             return
@@ -4014,10 +4112,12 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         if marksInteraction {
             timelineRenderer?.publishInteractionViewport(nextViewport)
         }
-        if transcriptCadence != .immediate {
-            transcriptViewportRelayoutAllowedUntil = CACurrentMediaTime() + 0.18
+        if updatesTranscript {
+            if transcriptCadence != .immediate {
+                transcriptViewportRelayoutAllowedUntil = CACurrentMediaTime() + 0.18
+            }
+            updateTranscriptOverlay(cadence: transcriptCadence)
         }
-        updateTranscriptOverlay(cadence: transcriptCadence)
         if invalidatesCursorRects {
             invalidateTimelineCursorRects()
         }
@@ -4157,7 +4257,400 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
         updateTrackLayoutForCurrentBounds(requestRender: false)
         updateTranscriptOverlay()
+        publishScrollbarPresentation()
         requestTimelineRender()
+    }
+
+    private func applyTwoDimensionalPan(
+        horizontalDeltaPixels: CGFloat,
+        verticalDeltaPixels: CGFloat
+    ) {
+        var didChangeViewport = false
+        var didChangeTrackLayout = false
+
+        let horizontalProgressDelta = TimelineNavigationPanGeometry.horizontalProgressDelta(
+            scrollingDeltaX: horizontalDeltaPixels,
+            viewportWidth: bounds.width,
+            viewportDurationProgress: viewport.durationProgress
+        )
+        if horizontalProgressDelta != 0 {
+            let nextViewport = viewport.panned(byProgress: horizontalProgressDelta)
+            if nextViewport != viewport {
+                applyViewport(
+                    nextViewport,
+                    kicksImmediateRender: false,
+                    transcriptCadence: .coalescedInteraction,
+                    invalidatesCursorRects: false,
+                    renderCadence: .none,
+                    marksInteraction: true,
+                    notifiesChange: true,
+                    updatesTranscript: false
+                )
+                didChangeViewport = true
+            }
+        }
+
+        let verticalTrackDelta = TimelineNavigationPanGeometry.verticalTrackDelta(
+            scrollingDeltaY: verticalDeltaPixels
+        )
+        if verticalTrackDelta != 0 {
+            let nextTrackLayout = trackLayout.scrolled(
+                by: verticalTrackDelta,
+                totalTrackCount: currentTrackIDs.count,
+                viewportHeight: Float(max(bounds.height, 1))
+            )
+            if nextTrackLayout != trackLayout {
+                publishTrackLayout(
+                    nextTrackLayout,
+                    requestRender: false,
+                    updatesTranscript: false
+                )
+                didChangeTrackLayout = true
+            }
+        }
+
+        guard didChangeViewport || didChangeTrackLayout else {
+            return
+        }
+        transcriptViewportRelayoutAllowedUntil = CACurrentMediaTime() + 0.18
+        updateTranscriptOverlay(cadence: .coalescedInteraction)
+        if areEmbeddedScrollbarsEnabled {
+            publishScrollbarPresentation()
+        }
+        requestCoalescedInteractionRender()
+    }
+
+    private func currentScrollbarGeometry() -> TimelineScrollbarGeometry {
+        TimelineScrollbarGeometry.resolve(
+            bounds: bounds,
+            viewport: viewport,
+            trackLayout: resolvedTrackLayoutForCurrentBounds()
+        )
+    }
+
+    private func updateScrollbarHover(for event: NSEvent) -> Bool {
+        let point = convert(event.locationInWindow, from: nil)
+        guard let axis = currentScrollbarGeometry().axis(at: point) else {
+            setHoveredScrollbarAxis(nil)
+            return false
+        }
+        displayHoverProgress(nil, renderCadence: .coalescedInteraction)
+        displayHighlightedSelectionEndpoint(nil, renderCadence: .coalescedInteraction)
+        displayHighlightedLoopEndpoint(nil, renderCadence: .coalescedInteraction)
+        displayHighlightedLoopRegion(false, renderCadence: .coalescedInteraction)
+        setHoveredScrollbarAxis(axis)
+        NSCursor.openHand.set()
+        return true
+    }
+
+    private func setHoveredScrollbarAxis(_ axis: TimelineScrollbarAxis?) {
+        guard hoveredScrollbarAxis != axis else {
+            return
+        }
+        scrollbarHoverPresentation = currentScrollbarHoverPresentation(at: CACurrentMediaTime())
+        scrollbarHoverTransitionSource = scrollbarHoverPresentation
+        hoveredScrollbarAxis = axis
+        if let axis {
+            scrollbarPresentationAxis = axis
+        }
+        scrollbarHoverTarget = axis == nil ? 0 : 1
+        scrollbarHoverTransitionStartTime = CACurrentMediaTime()
+        publishScrollbarPresentation()
+        startTimelineDisplayLink()
+    }
+
+    private func currentScrollbarHoverPresentation(at timestamp: CFTimeInterval) -> Float {
+        guard isScrollbarHoverAnimating else {
+            return scrollbarHoverTarget
+        }
+        let raw = Float(min(max(
+            (timestamp - scrollbarHoverTransitionStartTime) / scrollbarHoverTransitionDuration,
+            0
+        ), 1))
+        let eased = easeInOutCubic(raw)
+        return scrollbarHoverTransitionSource +
+            (scrollbarHoverTarget - scrollbarHoverTransitionSource) * eased
+    }
+
+    private func publishScrollbarPresentation() {
+        let axisValue: Int
+        switch activeScrollbarAxis ?? hoveredScrollbarAxis ?? scrollbarPresentationAxis {
+        case .horizontal:
+            axisValue = 1
+        case .vertical:
+            axisValue = 2
+        case nil:
+            axisValue = 0
+        }
+        let amount = activeScrollbarAxis == nil ? scrollbarHoverPresentation : 1
+        updateTimelineRendererImmediately { renderer in
+            renderer.displayScrollbarHighlight(axis: axisValue, amount: amount)
+        }
+        requestTimelineRender()
+    }
+
+    private func updateScrollbarDrag(to point: CGPoint) {
+        let geometry = currentScrollbarGeometry()
+        if activeDragMode == .horizontalScrollbar {
+            let travel = max(geometry.horizontalTrack.width - geometry.horizontalHandle.width, 0)
+            guard travel > 0 else {
+                return
+            }
+            let handleOrigin = min(max(
+                point.x - activeScrollbarDragOffset,
+                geometry.horizontalTrack.minX
+            ), geometry.horizontalTrack.maxX - geometry.horizontalHandle.width)
+            let fraction = Float((handleOrigin - geometry.horizontalTrack.minX) / travel)
+            let nextStart = fraction * max(1 - viewport.durationProgress, 0)
+            setViewport(
+                TimelineViewport(startProgress: nextStart, durationProgress: viewport.durationProgress),
+                transcriptCadence: .coalescedInteraction,
+                invalidatesCursorRects: false,
+                renderCadence: .coalescedInteraction
+            )
+        } else if activeDragMode == .verticalScrollbar {
+            let resolved = resolvedTrackLayoutForCurrentBounds()
+            let travel = max(geometry.verticalTrack.height - geometry.verticalHandle.height, 0)
+            guard travel > 0, resolved.maximumScrollOffset > 0 else {
+                return
+            }
+            let handleOrigin = min(max(
+                point.y - activeScrollbarDragOffset,
+                geometry.verticalTrack.minY
+            ), geometry.verticalTrack.maxY - geometry.verticalHandle.height)
+            let fraction = Float(
+                (geometry.verticalTrack.maxY - geometry.verticalHandle.height - handleOrigin) / travel
+            )
+            let nextLayout = trackLayout.withScrollOffset(
+                fraction * resolved.maximumScrollOffset,
+                totalTrackCount: currentTrackIDs.count,
+                viewportHeight: Float(max(bounds.height, 1))
+            )
+            publishTrackLayout(nextLayout, requestRender: true)
+            publishScrollbarPresentation()
+        }
+    }
+
+    var horizontalZoomNormalizedValue: Float {
+        let minimumDuration: Float = 0.001
+        let duration = min(max(viewport.durationProgress, minimumDuration), 1)
+        return min(max(log(duration) / log(minimumDuration), 0), 1)
+    }
+
+    var verticalZoomNormalizedValue: Float {
+        let range: ClosedRange<Float> = 48...320
+        let height = resolvedTrackLayoutForCurrentBounds().trackHeight
+        return min(max((height - range.lowerBound) / (range.upperBound - range.lowerBound), 0), 1)
+    }
+
+    var horizontalScrollNormalizedValue: Float {
+        let travel = max(1 - viewport.durationProgress, 0)
+        guard travel > 0.000_001 else {
+            return 0
+        }
+        return min(max(viewport.startProgress / travel, 0), 1)
+    }
+
+    var horizontalVisibleFraction: Float {
+        min(max(viewport.durationProgress, 0), 1)
+    }
+
+    var verticalScrollNormalizedValue: Float {
+        let resolved = resolvedTrackLayoutForCurrentBounds()
+        guard resolved.maximumScrollOffset > 0 else {
+            return 0
+        }
+        return min(max(resolved.scrollOffset / resolved.maximumScrollOffset, 0), 1)
+    }
+
+    var verticalVisibleFraction: Float {
+        let resolved = resolvedTrackLayoutForCurrentBounds()
+        return min(max(resolved.trackViewportHeight / max(resolved.contentHeight, 1), 0), 1)
+    }
+
+    func setEmbeddedScrollbarsEnabled(_ isEnabled: Bool) {
+        guard areEmbeddedScrollbarsEnabled != isEnabled else {
+            return
+        }
+        areEmbeddedScrollbarsEnabled = isEnabled
+        if !isEnabled {
+            setHoveredScrollbarAxis(nil)
+        }
+        updateTimelineRendererImmediately { renderer in
+            renderer.displayEmbeddedScrollbarsVisible(isEnabled)
+        }
+        invalidateTimelineCursorRects()
+        requestTimelineRender()
+    }
+
+    func setHorizontalScrollNormalized(_ value: Float) {
+        let travel = max(1 - viewport.durationProgress, 0)
+        let start = min(max(value, 0), 1) * travel
+        setViewport(
+            TimelineViewport(startProgress: start, durationProgress: viewport.durationProgress),
+            transcriptCadence: .coalescedInteraction,
+            invalidatesCursorRects: false,
+            renderCadence: .coalescedInteraction
+        )
+    }
+
+    func setVerticalScrollNormalized(_ value: Float) {
+        let resolved = resolvedTrackLayoutForCurrentBounds()
+        guard resolved.maximumScrollOffset > 0 else {
+            return
+        }
+        let nextLayout = trackLayout.withScrollOffset(
+            min(max(value, 0), 1) * resolved.maximumScrollOffset,
+            totalTrackCount: currentTrackIDs.count,
+            viewportHeight: Float(max(bounds.height, 1))
+        )
+        publishTrackLayout(nextLayout, requestRender: true)
+    }
+
+    func finishNavigationScrollbarInteraction() {
+        performTranscriptOverlayUpdate(forceLayoutRebuild: true)
+        invalidateTimelineCursorRects()
+        requestTimelineRender()
+    }
+
+    func setHorizontalZoomNormalized(_ value: Float) {
+        isZoomControlInteractionActive = true
+        let clamped = min(max(value, 0), 1)
+        let minimumDuration: Float = 0.001
+        let nextDuration = pow(minimumDuration, clamped)
+        let center = viewport.startProgress + viewport.durationProgress * 0.5
+        setViewport(TimelineViewport(
+            startProgress: center - nextDuration * 0.5,
+            durationProgress: nextDuration
+        ), transcriptCadence: .coalescedInteraction, invalidatesCursorRects: false)
+    }
+
+    func setVerticalZoomNormalized(_ value: Float) {
+        isZoomControlInteractionActive = true
+        let clamped = min(max(value, 0), 1)
+        let range: ClosedRange<Float> = 48...320
+        let height = range.lowerBound + (range.upperBound - range.lowerBound) * clamped
+        publishTrackLayout(trackLayout.withPreferredTrackHeight(height), requestRender: true)
+        publishScrollbarPresentation()
+    }
+
+    func finishZoomControlInteraction() {
+        guard isZoomControlInteractionActive else {
+            return
+        }
+        isZoomControlInteractionActive = false
+        performTranscriptOverlayUpdate(forceLayoutRebuild: true)
+        invalidateTimelineCursorRects()
+        requestTimelineRender()
+    }
+
+    func beginTrackReorder(trackID: UUID, yFromTop: Float) {
+        guard let draggedIndex = currentTrackIDs.firstIndex(of: trackID) else {
+            return
+        }
+        stopTrackInsertionAnimation(clearsLayout: true)
+        trackReorderTrackID = trackID
+        trackReorderDraggedIndex = draggedIndex
+        trackReorderTargetIndex = draggedIndex
+        trackReorderPointerYFromTop = yFromTop
+        let base = trackLayout.trackPositions ?? (0..<currentTrackIDs.count).map(Float.init)
+        trackReorderSourcePositions = base
+        trackReorderTargetPositions = base
+        trackReorderAnimationStartTime = CACurrentMediaTime()
+        trackReorderLastTickTime = trackReorderAnimationStartTime
+        startTimelineDisplayLink()
+        updateTrackReorder(yFromTop: yFromTop)
+    }
+
+    func updateTrackReorder(yFromTop: Float) {
+        guard
+            let draggedIndex = trackReorderDraggedIndex,
+            currentTrackIDs.indices.contains(draggedIndex)
+        else {
+            return
+        }
+        let resolved = resolvedTrackLayoutForCurrentBounds()
+        guard let targetIndex = TimelineTrackReorderGeometry.targetIndex(
+            yFromTop: yFromTop,
+            layout: resolved
+        ) else {
+            return
+        }
+        trackReorderPointerYFromTop = yFromTop
+        let draggedPosition = (yFromTop - resolved.rulerLaneHeight + resolved.scrollOffset) /
+            max(resolved.trackHeight, 1) - 0.5
+        let nextTargets = TimelineTrackReorderGeometry.trackPositions(
+            count: currentTrackIDs.count,
+            draggedIndex: draggedIndex,
+            targetIndex: targetIndex,
+            draggedPosition: draggedPosition
+        )
+        if targetIndex != trackReorderTargetIndex {
+            trackReorderSourcePositions = currentTrackReorderPresentation(at: CACurrentMediaTime())
+            trackReorderAnimationStartTime = CACurrentMediaTime()
+            trackReorderTargetIndex = targetIndex
+        }
+        trackReorderTargetPositions = nextTargets
+        publishTrackReorderPresentation(at: CACurrentMediaTime())
+        startTimelineDisplayLink()
+    }
+
+    func endTrackReorder(cancelled: Bool) {
+        guard let trackID = trackReorderTrackID else {
+            return
+        }
+        let targetIndex = trackReorderTargetIndex
+        if !cancelled, let targetIndex {
+            onTrackReorderCommitted?(trackID, targetIndex)
+        }
+        trackReorderTrackID = nil
+        trackReorderDraggedIndex = nil
+        trackReorderTargetIndex = nil
+        trackReorderPointerYFromTop = nil
+        trackReorderSourcePositions = nil
+        trackReorderTargetPositions = nil
+        publishTrackLayout(trackLayout.withTrackPositions(nil), requestRender: true)
+    }
+
+    private func currentTrackReorderPresentation(at timestamp: CFTimeInterval) -> [Float] {
+        guard
+            let source = trackReorderSourcePositions,
+            let target = trackReorderTargetPositions,
+            source.count == target.count
+        else {
+            return trackLayout.trackPositions ?? (0..<currentTrackIDs.count).map(Float.init)
+        }
+        let raw = Float(min(max(
+            (timestamp - trackReorderAnimationStartTime) / trackReorderAnimationDuration,
+            0
+        ), 1))
+        let eased = easeInOutCubic(raw)
+        var presentation = zip(source, target).map { pair in
+            pair.0 + (pair.1 - pair.0) * eased
+        }
+        if
+            let draggedIndex = trackReorderDraggedIndex,
+            let pointerY = trackReorderPointerYFromTop,
+            presentation.indices.contains(draggedIndex)
+        {
+            let resolved = resolvedTrackLayoutForCurrentBounds()
+            presentation[draggedIndex] = min(max(
+                (pointerY - resolved.rulerLaneHeight + resolved.scrollOffset) /
+                    max(resolved.trackHeight, 1) - 0.5,
+                0
+            ), Float(max(currentTrackIDs.count - 1, 0)))
+        }
+        return presentation
+    }
+
+    @discardableResult
+    private func publishTrackReorderPresentation(at timestamp: CFTimeInterval) -> Bool {
+        guard trackReorderTrackID != nil else {
+            return false
+        }
+        let positions = currentTrackReorderPresentation(at: timestamp)
+        publishTrackLayout(trackLayout.withTrackPositions(positions), requestRender: true)
+        return true
     }
 
     private func resolvedTrackLayoutForCurrentBounds() -> ResolvedTimelineTrackLayout {
@@ -4202,7 +4695,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
     }
 
-    private func publishTrackLayout(_ nextTrackLayout: TimelineTrackLayout, requestRender: Bool) {
+    private func publishTrackLayout(
+        _ nextTrackLayout: TimelineTrackLayout,
+        requestRender: Bool,
+        updatesTranscript: Bool = true
+    ) {
         let clampedLayout = nextTrackLayout.clamped(
             totalTrackCount: currentTrackIDs.count,
             viewportHeight: Float(max(bounds.height, 1))
@@ -4214,8 +4711,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             lastPublishedTrackLayout = resolvedLayout
             onTrackLaneLayoutChanged?(resolvedLayout)
         }
-        if transcriptDisplayMode != .hidden {
-            updateTranscriptOverlay()
+        if updatesTranscript, transcriptDisplayMode != .hidden {
+            updateTranscriptOverlay(
+                cadence: trackReorderTrackID == nil ? .immediate : .coalescedInteraction
+            )
         }
         updateTimelineRendererImmediately { renderer in
             renderer.displayTrackLayout(clampedLayout, marksInteraction: requestRender)
@@ -4406,6 +4905,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             activeTranscriptDrag != nil ||
             isDraggingSelection ||
             isDraggingLoop ||
+            trackReorderTrackID != nil ||
+            isZoomControlInteractionActive ||
             hasActiveTransientRenderPulse() ||
             hasActiveSelectionDragRenderPulse()
     }
@@ -4947,7 +5448,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         case
             .selection,
             .resizeSelectionStart,
-            .resizeSelectionEnd:
+            .resizeSelectionEnd,
+            .horizontalScrollbar,
+            .verticalScrollbar:
             return
         }
 
@@ -5075,7 +5578,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             .resizeSelectionStart,
             .resizeSelectionEnd,
             .loopRegion,
-            .moveLoopRegion:
+            .moveLoopRegion,
+            .horizontalScrollbar,
+            .verticalScrollbar:
             return nil
         }
     }

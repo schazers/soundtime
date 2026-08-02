@@ -1998,6 +1998,7 @@ final class WorkspaceView: NSView {
     private var recordingTrackID: UUID?
     private var recordingTakeWriter: StreamingWAVTakeWriter?
     private var recordingStartUndoSnapshot: ProjectTrackUndoSnapshot?
+    private var trackReorderUndoSnapshot: ProjectTrackUndoSnapshot?
     private var recordingStartUndoStackCount: Int?
     private var recordingSampleRate: Double = 0
     private var recordingAccumulator: LiveRecordingWaveformAccumulator?
@@ -2209,6 +2210,9 @@ final class WorkspaceView: NSView {
         return view
     }()
     private let timelineSurface = TimelineView()
+    private let timelineZoomControls = TimelineZoomControlsView()
+    private let horizontalTimelineScrollbar = TimelineNavigationScrollbarView(axis: .horizontal)
+    private let verticalTimelineScrollbar = TimelineNavigationScrollbarView(axis: .vertical)
     private let addTrackButton = AddTrackButton()
     private var exportProgressOverlayStorage: ExportProgressOverlayView?
     private var exportProgressOverlay: ExportProgressOverlayView {
@@ -2587,6 +2591,7 @@ final class WorkspaceView: NSView {
         SoundtimeMainThreadStallMonitor.shared.start()
 
         timelineSurface.translatesAutoresizingMaskIntoConstraints = false
+        timelineSurface.setEmbeddedScrollbarsEnabled(false)
         frameRateHistoryView.translatesAutoresizingMaskIntoConstraints = false
         cpuUsageHistoryView.translatesAutoresizingMaskIntoConstraints = false
         performanceDashboardButton.translatesAutoresizingMaskIntoConstraints = false
@@ -2807,6 +2812,9 @@ final class WorkspaceView: NSView {
         timelineSurface.onTrackLaneLayoutChanged = { [weak self] layout in
             self?.updateTrackLaneLayout(layout)
         }
+        timelineSurface.onTrackReorderCommitted = { [weak self] trackID, targetIndex in
+            self?.commitTrackReorder(trackID: trackID, targetIndex: targetIndex)
+        }
         timelineSurface.onLoopRangeChanged = { [weak self] loopRange in
             self?.updateTimelineLoopRange(loopRange)
         }
@@ -2821,6 +2829,31 @@ final class WorkspaceView: NSView {
         }
         trackControlsStack.onVerticalScroll = { [weak self] deltaPixels in
             self?.timelineSurface.scrollTracks(byPixels: deltaPixels)
+        }
+        timelineZoomControls.onHorizontalZoomChanged = { [weak self] value in
+            self?.markTimelineHotInteraction(reason: "horizontal-zoom-control")
+            self?.timelineSurface.setHorizontalZoomNormalized(value)
+        }
+        timelineZoomControls.onVerticalZoomChanged = { [weak self] value in
+            self?.markTimelineHotInteraction(reason: "vertical-zoom-control")
+            self?.timelineSurface.setVerticalZoomNormalized(value)
+        }
+        timelineZoomControls.onZoomEditingEnded = { [weak self] in
+            self?.timelineSurface.finishZoomControlInteraction()
+        }
+        horizontalTimelineScrollbar.onValueChanged = { [weak self] value in
+            self?.markTimelineHotInteraction(reason: "horizontal-scrollbar")
+            self?.timelineSurface.setHorizontalScrollNormalized(value)
+        }
+        horizontalTimelineScrollbar.onEditingEnded = { [weak self] in
+            self?.timelineSurface.finishNavigationScrollbarInteraction()
+        }
+        verticalTimelineScrollbar.onValueChanged = { [weak self] value in
+            self?.markTimelineHotInteraction(reason: "vertical-scrollbar")
+            self?.timelineSurface.setVerticalScrollNormalized(value)
+        }
+        verticalTimelineScrollbar.onEditingEnded = { [weak self] in
+            self?.timelineSurface.finishNavigationScrollbarInteraction()
         }
         volumeControl.onVolumeChanged = { [weak self] volume in
             self?.playbackController.setPerceptualVolume(volume)
@@ -2885,6 +2918,9 @@ final class WorkspaceView: NSView {
         addSubview(trackControlsStack)
         addSubview(addTrackButton)
         addSubview(timelineSurface)
+        addSubview(timelineZoomControls)
+        addSubview(horizontalTimelineScrollbar)
+        addSubview(verticalTimelineScrollbar)
         addSubview(agentCommandBar)
 
         let fisheyeTrailingConstraint = fisheyeControlsStack.trailingAnchor.constraint(
@@ -2912,6 +2948,11 @@ final class WorkspaceView: NSView {
         loudnessMeterWidthConstraint.priority = .defaultLow
         let agentCommandBarWidthConstraint = agentCommandBar.widthAnchor.constraint(equalToConstant: 620)
         agentCommandBarWidthConstraint.priority = .defaultHigh
+        let timelineZoomControlsLeadingConstraint = timelineZoomControls.leadingAnchor.constraint(
+            greaterThanOrEqualTo: editScopeStack.trailingAnchor,
+            constant: 16
+        )
+        timelineZoomControlsLeadingConstraint.priority = .defaultHigh
         let trackControlsBelowDebugConstraint = trackControlsStack.topAnchor.constraint(
             equalTo: fisheyeControlsStack.bottomAnchor,
             constant: 14
@@ -2987,7 +3028,7 @@ final class WorkspaceView: NSView {
 
             trackControlsBelowDebugConstraint,
             trackControlsStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 22),
-            trackControlsStack.bottomAnchor.constraint(equalTo: agentCommandBar.topAnchor, constant: -22),
+            trackControlsStack.bottomAnchor.constraint(equalTo: timelineSurface.bottomAnchor),
             trackControlsStack.widthAnchor.constraint(equalToConstant: 158),
 
             addTrackButton.leadingAnchor.constraint(equalTo: trackControlsStack.leadingAnchor),
@@ -2997,8 +3038,24 @@ final class WorkspaceView: NSView {
 
             timelineSurface.topAnchor.constraint(equalTo: trackControlsStack.topAnchor),
             timelineSurface.leadingAnchor.constraint(equalTo: trackControlsStack.trailingAnchor, constant: 10),
-            timelineSurface.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -22),
-            timelineSurface.bottomAnchor.constraint(equalTo: trackControlsStack.bottomAnchor),
+            timelineSurface.trailingAnchor.constraint(equalTo: verticalTimelineScrollbar.leadingAnchor, constant: -6),
+            timelineSurface.bottomAnchor.constraint(equalTo: horizontalTimelineScrollbar.topAnchor, constant: -6),
+
+            verticalTimelineScrollbar.topAnchor.constraint(equalTo: timelineSurface.topAnchor),
+            verticalTimelineScrollbar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            verticalTimelineScrollbar.bottomAnchor.constraint(equalTo: timelineSurface.bottomAnchor),
+            verticalTimelineScrollbar.widthAnchor.constraint(equalToConstant: 16),
+
+            horizontalTimelineScrollbar.leadingAnchor.constraint(equalTo: timelineSurface.leadingAnchor),
+            horizontalTimelineScrollbar.trailingAnchor.constraint(equalTo: timelineSurface.trailingAnchor),
+            horizontalTimelineScrollbar.bottomAnchor.constraint(equalTo: agentCommandBar.topAnchor, constant: -8),
+            horizontalTimelineScrollbar.heightAnchor.constraint(equalToConstant: 16),
+
+            timelineZoomControls.trailingAnchor.constraint(equalTo: timelineSurface.trailingAnchor),
+            timelineZoomControls.bottomAnchor.constraint(equalTo: timelineSurface.topAnchor, constant: -8),
+            timelineZoomControlsLeadingConstraint,
+            timelineZoomControls.widthAnchor.constraint(equalToConstant: 252),
+            timelineZoomControls.heightAnchor.constraint(equalToConstant: 28),
 
             agentCommandBar.centerXAnchor.constraint(equalTo: centerXAnchor),
             agentCommandBar.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -22),
@@ -3015,6 +3072,7 @@ final class WorkspaceView: NSView {
         transportControlPanel.displayOutputActivity(levels: .silence)
         transportControlPanel.isPlaying = false
         transportControlPanel.isTransportEnabled = false
+        updateTimelineNavigationScrollbars()
         startLoudnessMeterTimer()
         startPerformanceMeterTimer()
     }
@@ -3023,6 +3081,7 @@ final class WorkspaceView: NSView {
         super.layout()
         updateResponsiveChromeVisibilityIfNeeded()
         layoutTrackControlViews()
+        updateTimelineNavigationScrollbars()
     }
 
     override func viewDidMoveToWindow() {
@@ -5582,10 +5641,9 @@ final class WorkspaceView: NSView {
 
     private func refreshTrackControls() {
         rebuildTrackIndexCache()
-        let visibleRange = currentTrackLaneLayout.visibleRange(overscan: 1)
-        let visibleLowerBound = min(max(visibleRange.lowerBound, 0), projectTracks.count)
-        let visibleUpperBound = min(max(visibleRange.upperBound, visibleLowerBound), projectTracks.count)
-        let visibleTracks = projectTracks[visibleLowerBound..<visibleUpperBound]
+        let visibleTracks = currentTrackLaneLayout.visibleTrackIndices(overscan: 1).compactMap { index in
+            projectTracks.indices.contains(index) ? projectTracks[index] : nil
+        }
         let visibleTrackIDs = Set(visibleTracks.map(\.id))
         for (trackID, controlView) in trackControlViewsByID where !visibleTrackIDs.contains(trackID) {
             controlView.removeFromSuperview()
@@ -5596,6 +5654,9 @@ final class WorkspaceView: NSView {
             controlView.onVolumeChanged = nil
             controlView.onVolumeEditingEnded = nil
             controlView.onCancelImport = nil
+            controlView.onReorderBegan = nil
+            controlView.onReorderChanged = nil
+            controlView.onReorderEnded = nil
             trackControlReusePool.append(controlView)
             trackControlViewsByID[trackID] = nil
         }
@@ -5644,6 +5705,15 @@ final class WorkspaceView: NSView {
             }
             controlView.onCancelImport = { [weak self, trackID = track.id] in
                 self?.cancelAudioImport(for: trackID)
+            }
+            controlView.onReorderBegan = { [weak self, weak controlView, trackID = track.id] windowPoint in
+                self?.beginTrackReorder(trackID: trackID, controlView: controlView, windowPoint: windowPoint)
+            }
+            controlView.onReorderChanged = { [weak self] windowPoint in
+                self?.updateTrackReorder(windowPoint: windowPoint)
+            }
+            controlView.onReorderEnded = { [weak self, weak controlView] windowPoint, cancelled in
+                self?.endTrackReorder(controlView: controlView, windowPoint: windowPoint, cancelled: cancelled)
             }
         }
 
@@ -5708,14 +5778,21 @@ final class WorkspaceView: NSView {
         let previousLayout = currentTrackLaneLayout
         guard currentTrackLaneLayout != layout else {
             layoutTrackControlViews()
+            updateTimelineNavigationScrollbars()
             return
         }
 
         currentTrackLaneLayout = layout
-        if
-            previousLayout.totalTrackCount == layout.totalTrackCount,
-            trackControlViewsByID.count == projectTracks.count
-        {
+        timelineZoomControls.display(
+            horizontal: timelineSurface.horizontalZoomNormalizedValue,
+            vertical: timelineSurface.verticalZoomNormalizedValue
+        )
+        updateTimelineNavigationScrollbars()
+        let expectedVisibleTrackIDs = Set(layout.visibleTrackIndices(overscan: 1).compactMap { index in
+            projectTracks.indices.contains(index) ? projectTracks[index].id : nil
+        })
+        if previousLayout.totalTrackCount == layout.totalTrackCount,
+           Set(trackControlViewsByID.keys) == expectedVisibleTrackIDs {
             layoutTrackControlViews()
         } else {
             refreshTrackControls()
@@ -5789,6 +5866,87 @@ final class WorkspaceView: NSView {
                 height: height
             )
         }
+    }
+
+    private func trackReorderYFromTop(windowPoint: CGPoint) -> Float {
+        let localPoint = trackControlsStack.convert(windowPoint, from: nil)
+        return Float(trackControlsStack.bounds.maxY - localPoint.y)
+    }
+
+    private func beginTrackReorder(
+        trackID: UUID,
+        controlView: TrackControlView?,
+        windowPoint: CGPoint
+    ) {
+        guard projectTracks.contains(where: { $0.id == trackID }) else {
+            return
+        }
+        trackReorderUndoSnapshot = captureProjectTrackUndoSnapshot(restoreProgress: nil)
+        if let controlView {
+            trackControlsStack.addSubview(controlView, positioned: .above, relativeTo: nil)
+        }
+        timelineSurface.beginTrackReorder(
+            trackID: trackID,
+            yFromTop: trackReorderYFromTop(windowPoint: windowPoint)
+        )
+    }
+
+    private func updateTrackReorder(windowPoint: CGPoint) {
+        timelineSurface.updateTrackReorder(
+            yFromTop: trackReorderYFromTop(windowPoint: windowPoint)
+        )
+    }
+
+    private func endTrackReorder(
+        controlView: TrackControlView?,
+        windowPoint: CGPoint,
+        cancelled: Bool
+    ) {
+        if !cancelled {
+            updateTrackReorder(windowPoint: windowPoint)
+        }
+        timelineSurface.endTrackReorder(cancelled: cancelled)
+        controlView?.isBeingReordered = false
+        trackReorderUndoSnapshot = nil
+        refreshTrackControls()
+    }
+
+    private func commitTrackReorder(trackID: UUID, targetIndex: Int) {
+        guard
+            let sourceIndex = projectTracks.firstIndex(where: { $0.id == trackID }),
+            !projectTracks.isEmpty
+        else {
+            return
+        }
+        let clampedTarget = min(max(targetIndex, 0), projectTracks.count - 1)
+        guard sourceIndex != clampedTarget else {
+            return
+        }
+
+        if let trackReorderUndoSnapshot {
+            editUndoStack.append(.projectTracks(trackReorderUndoSnapshot))
+        }
+        let movedTrack = projectTracks.remove(at: sourceIndex)
+        projectTracks.insert(movedTrack, at: clampedTarget)
+        rebuildTrackIndexCache()
+
+        let renderTracksByID = Dictionary(
+            uniqueKeysWithValues: publishedTimelineRenderTracks.map { ($0.id, $0) }
+        )
+        publishedTimelineRenderTracks = projectTracks.compactMap { renderTracksByID[$0.id] }
+        timelineSurface.displayTracks(
+            publishedTimelineRenderTracks,
+            animateWaveformTransition: false,
+            allowImmediateWaveformPrewarm: false,
+            allowImmediateInteractiveWaveformPrewarm: false
+        )
+
+        let playbackTracksByID = Dictionary(
+            uniqueKeysWithValues: publishedProjectPlaybackTracks.map { ($0.id, $0) }
+        )
+        publishedProjectPlaybackTracks = projectTracks.compactMap { playbackTracksByID[$0.id] }
+        updateLoadedProjectSummary()
+        scheduleAutosaveIfNeeded()
     }
 
     private func addEmptyTrack() {
@@ -17441,6 +17599,11 @@ final class WorkspaceView: NSView {
     }
 
     private func timelineViewportDidChange(_ viewport: TimelineViewport) {
+        timelineZoomControls.display(
+            horizontal: timelineSurface.horizontalZoomNormalizedValue,
+            vertical: timelineSurface.verticalZoomNormalizedValue
+        )
+        updateTimelineNavigationScrollbars()
         guard
             !isAutosaveSuppressed,
             !isLoadingProject,
@@ -17452,6 +17615,17 @@ final class WorkspaceView: NSView {
 
         latestTimelineViewportForPersistence = projectViewport
         scheduleTimelineViewportPersistence()
+    }
+
+    private func updateTimelineNavigationScrollbars() {
+        horizontalTimelineScrollbar.display(
+            value: timelineSurface.horizontalScrollNormalizedValue,
+            visibleFraction: timelineSurface.horizontalVisibleFraction
+        )
+        verticalTimelineScrollbar.display(
+            value: timelineSurface.verticalScrollNormalizedValue,
+            visibleFraction: timelineSurface.verticalVisibleFraction
+        )
     }
 
     private func markTimelineHotInteraction(reason: String) {
