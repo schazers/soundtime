@@ -41,7 +41,7 @@ final class TimelineBootstrapWaveformView: NSView {
         let columnWidth = max(1 / max(scale, 1), 0.5)
 
         NSGraphicsContext.current?.shouldAntialias = false
-        for trackIndex in resolvedLayout.visibleRange(overscan: 0) {
+        for trackIndex in resolvedLayout.visibleTrackIndices(overscan: 0) {
             guard
                 let lane = resolvedLayout.laneFrame(forTrackIndex: trackIndex),
                 lane.isVisible

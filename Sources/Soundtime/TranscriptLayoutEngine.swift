@@ -115,7 +115,7 @@ enum TranscriptLayoutEngine {
             totalTrackCount: input.tracks.count,
             viewportHeight: Float(max(input.bounds.height, 1))
         )
-        let visibleTrackRange = resolvedLayout.visibleRange(overscan: 0)
+        let visibleTrackRange = resolvedLayout.visibleTrackIndices(overscan: 0)
         guard !visibleTrackRange.isEmpty else {
             return TranscriptTimelineLayout(backgrounds: [], runs: [])
         }

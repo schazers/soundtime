@@ -8,6 +8,9 @@ final class TrackControlView: NSView {
     var onVolumeEditingEnded: (() -> Void)?
     var onTrackSelected: ((NSEvent.ModifierFlags) -> Void)?
     var onCancelImport: (() -> Void)?
+    var onReorderBegan: ((CGPoint) -> Void)?
+    var onReorderChanged: ((CGPoint) -> Void)?
+    var onReorderEnded: ((CGPoint, Bool) -> Void)?
 
     private let panelView = NSView()
     private let selectedAccentView = NSView()
@@ -21,6 +24,10 @@ final class TrackControlView: NSView {
     private let buttonStack = NSStackView()
     private var trackingArea: NSTrackingArea?
     private var canCancelImport = false
+    private var reorderMouseDownPoint: CGPoint?
+    private var latestReorderWindowPoint: CGPoint?
+    private var hasStartedReorder = false
+    private let reorderDragThreshold: CGFloat = 3
 
     private var isHovered = false {
         didSet {
@@ -30,6 +37,15 @@ final class TrackControlView: NSView {
 
     var isTrackSelected = false {
         didSet {
+            updateAppearance()
+        }
+    }
+
+    var isBeingReordered = false {
+        didSet {
+            guard oldValue != isBeingReordered else {
+                return
+            }
             updateAppearance()
         }
     }
@@ -75,6 +91,11 @@ final class TrackControlView: NSView {
         false
     }
 
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: isBeingReordered ? .closedHand : .openHand)
+    }
+
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let trackingArea {
@@ -104,20 +125,65 @@ final class TrackControlView: NSView {
             return nil
         }
 
-        if hitView === titleLabel ||
-            hitView === buttonStack ||
-            hitView === contentStack ||
-            hitView === panelView
-        {
-            return self
+        let interactiveControls: [NSView] = [volumeSlider, muteButton, soloButton, recordButton]
+        if interactiveControls.contains(where: { control in
+            hitView === control || hitView.isDescendant(of: control)
+        }) {
+            return hitView
         }
 
-        return hitView
+        return self
     }
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         onTrackSelected?(event.modifierFlags)
+        reorderMouseDownPoint = event.locationInWindow
+        latestReorderWindowPoint = event.locationInWindow
+        hasStartedReorder = false
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let reorderMouseDownPoint else {
+            return
+        }
+        let point = event.locationInWindow
+        latestReorderWindowPoint = point
+        if !hasStartedReorder {
+            let distance = hypot(point.x - reorderMouseDownPoint.x, point.y - reorderMouseDownPoint.y)
+            guard distance >= reorderDragThreshold else {
+                return
+            }
+            hasStartedReorder = true
+            isBeingReordered = true
+            NSCursor.closedHand.set()
+            onReorderBegan?(reorderMouseDownPoint)
+        }
+        onReorderChanged?(point)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if hasStartedReorder {
+            onReorderEnded?(event.locationInWindow, false)
+        }
+        resetReorderInteraction()
+        NSCursor.openHand.set()
+    }
+
+    override func cancelOperation(_ sender: Any?) {
+        if hasStartedReorder, let latestReorderWindowPoint {
+            onReorderEnded?(latestReorderWindowPoint, true)
+        }
+        resetReorderInteraction()
+        NSCursor.openHand.set()
+    }
+
+    private func resetReorderInteraction() {
+        reorderMouseDownPoint = nil
+        latestReorderWindowPoint = nil
+        hasStartedReorder = false
+        isBeingReordered = false
+        window?.invalidateCursorRects(for: self)
     }
 
     override func menu(for event: NSEvent) -> NSMenu? {
@@ -262,7 +328,9 @@ final class TrackControlView: NSView {
 
     private func updateAppearance() {
         let baseWhite: CGFloat
-        if isTrackSelected {
+        if isBeingReordered {
+            baseWhite = 0.20
+        } else if isTrackSelected {
             baseWhite = isHovered ? 0.19 : 0.17
         } else {
             baseWhite = isHovered ? 0.105 : 0.075
@@ -273,6 +341,11 @@ final class TrackControlView: NSView {
             alpha: 1
         ).cgColor
         panelView.layer?.borderWidth = 1
+        layer?.masksToBounds = !isBeingReordered
+        layer?.shadowColor = NSColor.systemTeal.cgColor
+        layer?.shadowOpacity = isBeingReordered ? 0.28 : 0
+        layer?.shadowRadius = isBeingReordered ? 14 : 0
+        layer?.shadowOffset = .zero
         selectedAccentView.isHidden = !isTrackSelected
     }
 }

@@ -8,20 +8,26 @@ struct TimelineTrackLayout: Sendable, Equatable {
 
     var scrollOffset: Float
     var preferredTrackHeight: Float
+    var automaticallyFitsTrackHeight: Bool
     var rulerLaneHeight: Float
     var insertionTrackIndex: Int?
     var insertionProgress: Float
+    var trackPositions: [Float]?
 
     init(
         scrollOffset: Float = 0,
         preferredTrackHeight: Float = Self.defaultPreferredTrackHeight,
+        automaticallyFitsTrackHeight: Bool = true,
         rulerLaneHeight: Float = Self.defaultRulerLaneHeight,
         insertionTrackIndex: Int? = nil,
-        insertionProgress: Float = 1
+        insertionProgress: Float = 1,
+        trackPositions: [Float]? = nil
     ) {
         self.scrollOffset = max(scrollOffset, 0)
         self.preferredTrackHeight = max(preferredTrackHeight, 1)
+        self.automaticallyFitsTrackHeight = automaticallyFitsTrackHeight
         self.rulerLaneHeight = max(rulerLaneHeight, 0)
+        self.trackPositions = trackPositions
         if let insertionTrackIndex, insertionProgress < 0.999 {
             self.insertionTrackIndex = max(insertionTrackIndex, 0)
             self.insertionProgress = min(max(insertionProgress, 0), 1)
@@ -36,10 +42,12 @@ struct TimelineTrackLayout: Sendable, Equatable {
             totalTrackCount: totalTrackCount,
             viewportHeight: viewportHeight,
             preferredTrackHeight: preferredTrackHeight,
+            automaticallyFitsTrackHeight: automaticallyFitsTrackHeight,
             requestedScrollOffset: scrollOffset,
             rulerLaneHeight: rulerLaneHeight,
             insertionTrackIndex: insertionTrackIndex,
-            insertionProgress: insertionProgress
+            insertionProgress: insertionProgress,
+            trackPositions: trackPositions
         )
     }
 
@@ -48,9 +56,11 @@ struct TimelineTrackLayout: Sendable, Equatable {
         return TimelineTrackLayout(
             scrollOffset: resolvedLayout.scrollOffset,
             preferredTrackHeight: preferredTrackHeight,
+            automaticallyFitsTrackHeight: automaticallyFitsTrackHeight,
             rulerLaneHeight: rulerLaneHeight,
             insertionTrackIndex: insertionTrackIndex,
-            insertionProgress: insertionProgress
+            insertionProgress: insertionProgress,
+            trackPositions: trackPositions
         )
     }
 
@@ -63,9 +73,52 @@ struct TimelineTrackLayout: Sendable, Equatable {
         return TimelineTrackLayout(
             scrollOffset: min(max(resolvedLayout.scrollOffset + deltaPixels, 0), resolvedLayout.maximumScrollOffset),
             preferredTrackHeight: preferredTrackHeight,
+            automaticallyFitsTrackHeight: automaticallyFitsTrackHeight,
             rulerLaneHeight: rulerLaneHeight,
             insertionTrackIndex: insertionTrackIndex,
-            insertionProgress: insertionProgress
+            insertionProgress: insertionProgress,
+            trackPositions: trackPositions
+        )
+    }
+
+    func withScrollOffset(
+        _ scrollOffset: Float,
+        totalTrackCount: Int,
+        viewportHeight: Float
+    ) -> TimelineTrackLayout {
+        let resolvedLayout = resolved(totalTrackCount: totalTrackCount, viewportHeight: viewportHeight)
+        return TimelineTrackLayout(
+            scrollOffset: min(max(scrollOffset, 0), resolvedLayout.maximumScrollOffset),
+            preferredTrackHeight: preferredTrackHeight,
+            automaticallyFitsTrackHeight: automaticallyFitsTrackHeight,
+            rulerLaneHeight: rulerLaneHeight,
+            insertionTrackIndex: insertionTrackIndex,
+            insertionProgress: insertionProgress,
+            trackPositions: trackPositions
+        )
+    }
+
+    func withPreferredTrackHeight(_ preferredTrackHeight: Float) -> TimelineTrackLayout {
+        TimelineTrackLayout(
+            scrollOffset: scrollOffset,
+            preferredTrackHeight: preferredTrackHeight,
+            automaticallyFitsTrackHeight: false,
+            rulerLaneHeight: rulerLaneHeight,
+            insertionTrackIndex: insertionTrackIndex,
+            insertionProgress: insertionProgress,
+            trackPositions: trackPositions
+        )
+    }
+
+    func withTrackPositions(_ trackPositions: [Float]?) -> TimelineTrackLayout {
+        TimelineTrackLayout(
+            scrollOffset: scrollOffset,
+            preferredTrackHeight: preferredTrackHeight,
+            automaticallyFitsTrackHeight: automaticallyFitsTrackHeight,
+            rulerLaneHeight: rulerLaneHeight,
+            insertionTrackIndex: insertionTrackIndex,
+            insertionProgress: insertionProgress,
+            trackPositions: trackPositions
         )
     }
 
@@ -73,9 +126,11 @@ struct TimelineTrackLayout: Sendable, Equatable {
         TimelineTrackLayout(
             scrollOffset: scrollOffset,
             preferredTrackHeight: preferredTrackHeight,
+            automaticallyFitsTrackHeight: automaticallyFitsTrackHeight,
             rulerLaneHeight: rulerLaneHeight,
             insertionTrackIndex: trackIndex,
-            insertionProgress: progress
+            insertionProgress: progress,
+            trackPositions: trackPositions
         )
     }
 
@@ -83,7 +138,9 @@ struct TimelineTrackLayout: Sendable, Equatable {
         TimelineTrackLayout(
             scrollOffset: scrollOffset,
             preferredTrackHeight: preferredTrackHeight,
-            rulerLaneHeight: rulerLaneHeight
+            automaticallyFitsTrackHeight: automaticallyFitsTrackHeight,
+            rulerLaneHeight: rulerLaneHeight,
+            trackPositions: trackPositions
         )
     }
 }
@@ -99,15 +156,18 @@ struct ResolvedTimelineTrackLayout: Sendable, Equatable {
     let insertionTrackIndex: Int?
     let insertionProgress: Float
     let insertedTrackHeight: Float
+    let trackPositions: [Float]?
 
     init(
         totalTrackCount: Int,
         viewportHeight: Float,
         preferredTrackHeight: Float,
+        automaticallyFitsTrackHeight: Bool = true,
         requestedScrollOffset: Float,
         rulerLaneHeight: Float = TimelineTrackLayout.defaultRulerLaneHeight,
         insertionTrackIndex: Int? = nil,
-        insertionProgress: Float = 1
+        insertionProgress: Float = 1,
+        trackPositions: [Float]? = nil
     ) {
         let safeTrackCount = max(totalTrackCount, 0)
         let safeViewportHeight = max(viewportHeight, 1)
@@ -134,12 +194,14 @@ struct ResolvedTimelineTrackLayout: Sendable, Equatable {
             let previousTrackHeight = Self.resolvedTrackHeight(
                 totalTrackCount: previousTrackCount,
                 trackViewportHeight: safeTrackViewportHeight,
-                preferredTrackHeight: safePreferredTrackHeight
+                preferredTrackHeight: safePreferredTrackHeight,
+                automaticallyFitsTrackHeight: automaticallyFitsTrackHeight
             )
             let finalTrackHeight = Self.resolvedTrackHeight(
                 totalTrackCount: safeTrackCount,
                 trackViewportHeight: safeTrackViewportHeight,
-                preferredTrackHeight: safePreferredTrackHeight
+                preferredTrackHeight: safePreferredTrackHeight,
+                automaticallyFitsTrackHeight: automaticallyFitsTrackHeight
             )
             resolvedTrackHeight = previousTrackHeight + (finalTrackHeight - previousTrackHeight) *
                 clampedInsertionProgress
@@ -149,7 +211,8 @@ struct ResolvedTimelineTrackLayout: Sendable, Equatable {
             resolvedTrackHeight = Self.resolvedTrackHeight(
                 totalTrackCount: safeTrackCount,
                 trackViewportHeight: safeTrackViewportHeight,
-                preferredTrackHeight: safePreferredTrackHeight
+                preferredTrackHeight: safePreferredTrackHeight,
+                automaticallyFitsTrackHeight: automaticallyFitsTrackHeight
             )
             resolvedInsertedTrackHeight = resolvedTrackHeight
             resolvedContentHeight = resolvedTrackHeight * Float(max(safeTrackCount, 1))
@@ -166,12 +229,14 @@ struct ResolvedTimelineTrackLayout: Sendable, Equatable {
         self.insertionTrackIndex = clampedInsertionTrackIndex
         self.insertionProgress = clampedInsertionTrackIndex == nil ? 1 : clampedInsertionProgress
         self.insertedTrackHeight = resolvedInsertedTrackHeight
+        self.trackPositions = trackPositions?.count == safeTrackCount ? trackPositions : nil
     }
 
     private static func resolvedTrackHeight(
         totalTrackCount: Int,
         trackViewportHeight: Float,
-        preferredTrackHeight: Float
+        preferredTrackHeight: Float,
+        automaticallyFitsTrackHeight: Bool
     ) -> Float {
         let safeTrackCount = max(totalTrackCount, 0)
         let fillTrackHeight = safeTrackCount > 0 ?
@@ -179,10 +244,12 @@ struct ResolvedTimelineTrackLayout: Sendable, Equatable {
             trackViewportHeight
         if safeTrackCount == 0 {
             return trackViewportHeight
-        } else if safeTrackCount <= TimelineTrackLayout.maximumAutoFitTrackCount {
+        } else if automaticallyFitsTrackHeight && safeTrackCount <= TimelineTrackLayout.maximumAutoFitTrackCount {
             return fillTrackHeight
-        } else {
+        } else if automaticallyFitsTrackHeight {
             return max(preferredTrackHeight, fillTrackHeight)
+        } else {
+            return preferredTrackHeight
         }
     }
 
@@ -199,7 +266,7 @@ struct ResolvedTimelineTrackLayout: Sendable, Equatable {
             return 0..<0
         }
 
-        if insertionTrackIndex != nil {
+        if insertionTrackIndex != nil || trackPositions != nil {
             var lowerBound: Int?
             var upperBound = 0
             for trackIndex in 0..<totalTrackCount {
@@ -225,6 +292,24 @@ struct ResolvedTimelineTrackLayout: Sendable, Equatable {
         return lowerBound..<max(lowerBound, upperBound)
     }
 
+    func visibleTrackIndices(overscan: Int = 1) -> [Int] {
+        guard totalTrackCount > 0 else {
+            return []
+        }
+        guard insertionTrackIndex != nil || trackPositions != nil else {
+            return Array(visibleRange(overscan: overscan))
+        }
+
+        let overscanAmount = Float(max(overscan, 0)) * max(trackHeight, insertedTrackHeight) /
+            viewportHeight
+        return (0..<totalTrackCount).filter { trackIndex in
+            guard let laneFrame = laneFrame(forTrackIndex: trackIndex) else {
+                return false
+            }
+            return laneFrame.bottom > -overscanAmount && laneFrame.top < 1 + overscanAmount
+        }
+    }
+
     func laneFrame(forTrackIndex trackIndex: Int) -> TimelineTrackLaneFrame? {
         guard trackIndex >= 0, trackIndex < totalTrackCount else {
             return nil
@@ -232,7 +317,10 @@ struct ResolvedTimelineTrackLayout: Sendable, Equatable {
 
         let topPixels: Float
         let bottomPixels: Float
-        if let insertionTrackIndex {
+        if let trackPositions {
+            topPixels = rulerLaneHeight + trackPositions[trackIndex] * trackHeight - scrollOffset
+            bottomPixels = topPixels + trackHeight
+        } else if let insertionTrackIndex {
             if trackIndex < insertionTrackIndex {
                 topPixels = rulerLaneHeight + Float(trackIndex) * trackHeight - scrollOffset
                 bottomPixels = topPixels + trackHeight
@@ -262,9 +350,9 @@ struct ResolvedTimelineTrackLayout: Sendable, Equatable {
             return nil
         }
 
-        if insertionTrackIndex != nil {
+        if insertionTrackIndex != nil || trackPositions != nil {
             let normalizedY = yFromTop / viewportHeight
-            for trackIndex in visibleRange(overscan: 1) {
+            for trackIndex in visibleTrackIndices(overscan: 1) {
                 guard let laneFrame = laneFrame(forTrackIndex: trackIndex) else {
                     continue
                 }
