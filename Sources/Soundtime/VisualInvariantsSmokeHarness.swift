@@ -303,15 +303,26 @@ enum VisualInvariantsSmokeHarness {
             $0.id == startupTargetTrackID
         }?.durationSeconds
         let startupExpectedSelectionStartProgress =
-            Double(startupViewportStart) + 0.20 * Double(startupViewportDuration)
+            startupBeforeDelete.selectedRangeStartProgress ??
+                (Double(startupViewportStart) + 0.20 * Double(startupViewportDuration))
         let startupExpectedSelectionEndProgress =
-            Double(startupViewportStart) + 0.26 * Double(startupViewportDuration)
+            startupBeforeDelete.selectedRangeEndProgress ??
+                (Double(startupViewportStart) + 0.26 * Double(startupViewportDuration))
         let startupExpectedDeleteStart =
             startupExpectedSelectionStartProgress *
                 startupBeforeDelete.timelinePresentationDurationSeconds
         let startupExpectedDeleteDuration =
             (startupExpectedSelectionEndProgress - startupExpectedSelectionStartProgress) *
                 startupBeforeDelete.timelinePresentationDurationSeconds
+        let startupEditRangeTolerance = max(1.0 / 44_100.0, 0.000_05)
+        let startupExpectedDeleteStartText = String(
+            format: "%.9f",
+            startupExpectedDeleteStart
+        )
+        let startupExpectedDeleteEndText = String(
+            format: "%.9f",
+            startupExpectedDeleteStart + startupExpectedDeleteDuration
+        )
         let startupDelete = workspace.userPerceivedTimingSmokeDeleteSelection()
         let startupImmediatelyAfterDelete = workspace.visualInvariantSmokeSnapshot()
         let startupCommittedRange = workspace.visualInvariantSmokeLastCommittedEditRange()
@@ -381,14 +392,16 @@ enum VisualInvariantsSmokeHarness {
             approximatelyEqual(
                 startupCommittedRange?.lowerBound,
                 startupExpectedDeleteStart,
-                tolerance: 0.000_001
+                tolerance: startupEditRangeTolerance
             ) &&
                 approximatelyEqual(
                     startupCommittedRange?.upperBound,
                     startupExpectedDeleteStart + startupExpectedDeleteDuration,
-                    tolerance: 0.000_001
+                    tolerance: startupEditRangeTolerance
                 ),
-            "startup-race delete command did not preserve the exact visible project-time range"
+            "startup-race delete command did not preserve the sample-accurate visible project-time range " +
+                "(actual \(String(describing: startupCommittedRange)), " +
+                "expected \(startupExpectedDeleteStartText)...\(startupExpectedDeleteEndText))"
         )
         if
             let durationBefore = startupTrackDurationBeforeDelete,

@@ -4,14 +4,13 @@ import QuartzCore
 final class SoundtimeMainThreadStallMonitor: @unchecked Sendable {
     static let shared = SoundtimeMainThreadStallMonitor()
 
-    private let queue = DispatchQueue(label: "Soundtime.main-thread-stall-monitor", qos: .utility)
     private let lock = NSLock()
     private let interval: TimeInterval = 0.25
     private let warningThreshold: TimeInterval = 0.050
-    private var timer: DispatchSourceTimer?
+    private var timer: CFRunLoopTimer?
     private var isStarted = false
+    private var lastHeartbeatTime: TimeInterval = 0
     private var lastReportedStallTime: TimeInterval = 0
-    private var generation: UInt64 = 0
 
     private init() {}
 
@@ -22,65 +21,69 @@ final class SoundtimeMainThreadStallMonitor: @unchecked Sendable {
             return
         }
         isStarted = true
+        lastHeartbeatTime = CACurrentMediaTime()
         lock.unlock()
 
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(30))
-        timer.setEventHandler { [weak self] in
-            self?.pingMainThread()
+        let timer = CFRunLoopTimerCreateWithHandler(
+            kCFAllocatorDefault,
+            CFAbsoluteTimeGetCurrent() + interval,
+            interval,
+            0,
+            0
+        ) { [weak self] _ in
+            self?.receiveMainRunLoopHeartbeat()
+        }
+        CFRunLoopTimerSetTolerance(timer, 0.030)
+
+        lock.lock()
+        guard isStarted else {
+            lock.unlock()
+            CFRunLoopTimerInvalidate(timer)
+            return
         }
         self.timer = timer
-        timer.resume()
+        lock.unlock()
+        CFRunLoopAddTimer(CFRunLoopGetMain(), timer, .commonModes)
     }
 
     func stop() {
         lock.lock()
         isStarted = false
-        generation &+= 1
         let timer = timer
         self.timer = nil
         lock.unlock()
-        timer?.cancel()
+        if let timer {
+            CFRunLoopTimerInvalidate(timer)
+        }
     }
 
     func resetForSmokeTesting() {
         lock.lock()
-        generation &+= 1
-        lastReportedStallTime = CACurrentMediaTime()
+        let now = CACurrentMediaTime()
+        lastHeartbeatTime = now
+        lastReportedStallTime = now
         lock.unlock()
     }
 
-    private func pingMainThread() {
-        let scheduledTime = CACurrentMediaTime()
+    private func receiveMainRunLoopHeartbeat() {
+        let now = CACurrentMediaTime()
         lock.lock()
-        let scheduledGeneration = generation
+        guard isStarted else {
+            lock.unlock()
+            return
+        }
+        let elapsed = now - lastHeartbeatTime
+        lastHeartbeatTime = now
+        let latency = max(elapsed - interval, 0)
+        let shouldReport = latency >= warningThreshold &&
+            now - lastReportedStallTime >= 1.0
+        if shouldReport {
+            lastReportedStallTime = now
+        }
         lock.unlock()
 
-        DispatchQueue.main.async { [weak self] in
-            guard let self else {
-                return
-            }
-
-            let latency = CACurrentMediaTime() - scheduledTime
-            guard latency >= warningThreshold else {
-                return
-            }
-
-            lock.lock()
-            guard scheduledGeneration == generation else {
-                lock.unlock()
-                return
-            }
-            let now = CACurrentMediaTime()
-            let shouldReport = now - lastReportedStallTime >= 1.0
-            if shouldReport {
-                lastReportedStallTime = now
-            }
-            lock.unlock()
-
-            if shouldReport {
-                SoundtimeDiagnostics.shared.recordMainThreadStall(milliseconds: latency * 1_000)
-            }
+        if shouldReport {
+            SoundtimeDiagnostics.shared.recordMainThreadStall(milliseconds: latency * 1_000)
         }
     }
 }

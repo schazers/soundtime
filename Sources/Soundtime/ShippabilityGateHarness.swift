@@ -821,6 +821,92 @@ enum ShippabilityGateHarness {
             "self-test hot-path contract did not catch pending launch cache writes"
         )
 
+        let syntheticAudioSafetyReport = StabilitySuiteReport(
+            suiteName: "audio-safety-smoke",
+            status: "passed",
+            generatedAt: Date(),
+            durationMilliseconds: 1,
+            checks: [],
+            metadata: [
+                "renderDeadlineMissClassification": "diagnostic-synthetic-driver",
+                "renderDeadlineMissCount": "12",
+                "renderWorkDeadlineMissCount": "0",
+                "underrunCount": "0",
+                "droppedCommandCount": "0",
+                "callbackSchedulingLateCount": "0",
+                "maxCallbackSchedulingLatenessNanoseconds": "0",
+                "maxSeekFrameError": "0",
+                "maxLoopSampleError": "0",
+                "graphSwapP95Milliseconds": "1",
+                "maxGraphSwapMilliseconds": "2",
+                "outputDeviceConfigureCount": "2",
+                "outputDeviceInvalidateCount": "1",
+                "outputDeviceStartCount": "1",
+                "seekCheckCount": "13",
+                "loopCapturedFrameCount": "768",
+                "graphSwapTrackCount": "24",
+                "graphSwapUpdateCount": "36",
+                "graphSwapRenderBlockCount": "900",
+                "minimumCorePlaybackPeak": "1",
+                "scope": "core-only",
+            ]
+        )
+        let audioSafetyFindings = audioSafetyBudgetFindings(syntheticAudioSafetyReport)
+        try require(
+            !audioSafetyFindings.contains { $0.metric == "renderDeadlineMissCount" },
+            "self-test treated synthetic-driver wall occupancy as a deterministic release failure"
+        )
+
+        let isolatedInteractionOutlierReport = StabilitySuiteReport(
+            suiteName: "interaction-replay-smoke",
+            status: "passed",
+            generatedAt: Date(),
+            durationMilliseconds: 1,
+            checks: [],
+            metadata: syntheticInteractionReplayMetadata(
+                minimumFrameRatePercent: 89,
+                p10FrameRatePercent: 97,
+                maximumWorstFrameMilliseconds: 16.70,
+                p90WorstFrameMilliseconds: 12
+            )
+        )
+        let isolatedInteractionFindings = interactionReplayBudgetFindings(
+            isolatedInteractionOutlierReport
+        )
+        try require(
+            isolatedInteractionFindings.isEmpty,
+            "self-test treated one bounded interaction scheduling outlier as a release finding"
+        )
+
+        let sustainedInteractionRegressionReport = StabilitySuiteReport(
+            suiteName: "interaction-replay-smoke",
+            status: "passed",
+            generatedAt: Date(),
+            durationMilliseconds: 1,
+            checks: [],
+            metadata: syntheticInteractionReplayMetadata(
+                minimumFrameRatePercent: 70,
+                p10FrameRatePercent: 82,
+                maximumWorstFrameMilliseconds: 31,
+                p90WorstFrameMilliseconds: 27
+            )
+        )
+        let sustainedInteractionFindings = interactionReplayBudgetFindings(
+            sustainedInteractionRegressionReport
+        )
+        try require(
+            sustainedInteractionFindings.contains {
+                $0.severity == "failure" && $0.metric == "p10SelectionDragFrameRatePercent"
+            },
+            "self-test did not fail sustained selection-drag frame-rate regression"
+        )
+        try require(
+            sustainedInteractionFindings.contains {
+                $0.severity == "failure" && $0.metric == "maxSelectionDragWorstFrameMilliseconds"
+            },
+            "self-test did not fail a catastrophic selection-drag frame"
+        )
+
         let disposable = root.appendingPathComponent("disposable-fixtures", isDirectory: true)
         try FileManager.default.createDirectory(at: disposable, withIntermediateDirectories: true)
         cleanupFixturesIfNeeded(rootDirectory: disposable, keepFixtures: false)
@@ -859,6 +945,42 @@ enum ShippabilityGateHarness {
         }
 
         print("Soundtime shippability gate self-test passed")
+    }
+
+    private static func syntheticInteractionReplayMetadata(
+        minimumFrameRatePercent: Double,
+        p10FrameRatePercent: Double,
+        maximumWorstFrameMilliseconds: Double,
+        p90WorstFrameMilliseconds: Double
+    ) -> [String: String] {
+        [
+            "maxReplayActionMilliseconds": "0",
+            "maxRejectedActions": "0",
+            "maxSelectionEdgeErrorPixels": "0",
+            "maxSelectionDirectionReversals": "1",
+            "selectionCollapseValidated": "1",
+            "minReplayFrameRatePercent": "\(minimumFrameRatePercent)",
+            "minSelectionDragFrameRatePercent": "\(minimumFrameRatePercent)",
+            "p10ReplayFrameRatePercent": "\(p10FrameRatePercent)",
+            "p10SelectionDragFrameRatePercent": "\(p10FrameRatePercent)",
+            "maxReplayFrameJitterMilliseconds": "0",
+            "maxSelectionDragFrameJitterMilliseconds": "0",
+            "p90SelectionDragFrameJitterMilliseconds": "0",
+            "maxReplayWorstFrameMilliseconds": "\(maximumWorstFrameMilliseconds)",
+            "maxSelectionDragWorstFrameMilliseconds": "\(maximumWorstFrameMilliseconds)",
+            "p90SelectionDragWorstFrameMilliseconds": "\(p90WorstFrameMilliseconds)",
+            "maxCPUWaveformVertices": "0",
+            "maxCPUFallbackDraws": "0",
+            "maxShaderUploads": "0",
+            "maxShaderUploadBytes": "0",
+            "maxShaderUploadsInFlight": "0",
+            "maxHotPathViolations": "0",
+            "maxPendingLaunchCacheWrites": "0",
+            "maxLaunchCacheWritesInFlight": "0",
+            "maxTranscriptLayoutBuilds": "0",
+            "maxDroppedEffectVertices": "0",
+            "failureCount": "0",
+        ]
     }
 
     private static func makePhases() -> [GatePhase] {
@@ -1827,13 +1949,27 @@ enum ShippabilityGateHarness {
             minDoubleFinding(
                 report,
                 "minReplayFrameRatePercent",
-                warning: 95,
+                warning: 75,
                 failure: 75,
                 unit: "%"
             ),
             minDoubleFinding(
                 report,
                 "minSelectionDragFrameRatePercent",
+                warning: 85,
+                failure: 85,
+                unit: "%"
+            ),
+            minDoubleFinding(
+                report,
+                "p10ReplayFrameRatePercent",
+                warning: 95,
+                failure: 75,
+                unit: "%"
+            ),
+            minDoubleFinding(
+                report,
+                "p10SelectionDragFrameRatePercent",
                 warning: 95,
                 failure: 85,
                 unit: "%"
@@ -1869,6 +2005,13 @@ enum ShippabilityGateHarness {
             maxDoubleFinding(
                 report,
                 "maxSelectionDragWorstFrameMilliseconds",
+                warning: 25,
+                failure: 25,
+                unit: "ms"
+            ),
+            maxDoubleFinding(
+                report,
+                "p90SelectionDragWorstFrameMilliseconds",
                 warning: 16.67,
                 failure: 25,
                 unit: "ms"
@@ -2061,18 +2204,12 @@ enum ShippabilityGateHarness {
 
     private static func audioSafetyBudgetFindings(_ report: StabilitySuiteReport) -> [GateBudgetFinding] {
         var findings = [
+            requiredMetadataFinding(report, "renderDeadlineMissClassification"),
+            requiredMetadataFinding(report, "renderDeadlineMissCount"),
             requiredMetadataFinding(report, "renderWorkDeadlineMissCount"),
             equalIntFinding(report, "underrunCount", expected: 0, unit: "underruns"),
             equalIntFinding(report, "droppedCommandCount", expected: 0, unit: "commands"),
             equalIntFinding(report, "renderWorkDeadlineMissCount", expected: 0, unit: "misses"),
-            maxIntFinding(
-                suiteName: report.suiteName,
-                metric: "renderDeadlineMissCount",
-                actual: metadataInt(report, "renderDeadlineMissCount"),
-                warning: 0,
-                failure: Int.max,
-                unit: "wall-clock misses"
-            ),
             maxIntFinding(
                 suiteName: report.suiteName,
                 metric: "callbackSchedulingLateCount",

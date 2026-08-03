@@ -313,7 +313,15 @@ enum InteractionReplaySmokeHarness {
         controller.prepareForDeferredProjectRestore()
         controller.restoreLastProjectAfterLaunchPreviewRender()
         let expectedTrackCount = manifestProject.trackCount ?? project.tracks.count
-        let readinessDeadline = CACurrentMediaTime() + 8
+        // Startup latency has its own strict gate. Interaction replay waits for
+        // all low-priority detail hydration so that background cache work cannot
+        // make the gesture measurements machine-speed dependent. Large stress
+        // fixtures receive bounded time proportional to their track count.
+        let readinessTimeoutSeconds = min(
+            30,
+            max(8, 8 + Double(expectedTrackCount) * 0.12)
+        )
+        let readinessDeadline = CACurrentMediaTime() + readinessTimeoutSeconds
         var readinessSnapshot = workspace.hotPathContractSmokeSnapshot()
         while CACurrentMediaTime() <= readinessDeadline {
             readinessSnapshot = workspace.hotPathContractSmokeSnapshot()
@@ -344,6 +352,7 @@ enum InteractionReplaySmokeHarness {
                 hydrated=\(workspace.hotPathContractSmokeIsProjectFullyHydrated()), \
                 rendererReady=\(workspace.hotPathContractSmokeIsRendererReady()), \
                 loading=\(readinessSnapshot.isLoadingProject), \
+                timeoutSeconds=\(String(format: "%.1f", readinessTimeoutSeconds)), \
                 status=\(readinessSnapshot.statusText))
                 """
             )
@@ -1215,9 +1224,12 @@ enum InteractionReplaySmokeHarness {
         )
         let minimumReplayFramesPerSecond = frameStats.map(\.framesPerSecond).min() ?? 0
         let minimumSelectionFramesPerSecond = selectionFrameStats.map(\.framesPerSecond).min() ?? 0
-        let replayFrameRatePercent = frameStats.map(frameRatePercent).min() ?? 0
-        let selectionFrameRatePercent = selectionFrameStats.map(frameRatePercent).min() ?? 0
+        let replayFrameRatePercentValues = frameStats.map(frameRatePercent)
+        let selectionFrameRatePercentValues = selectionFrameStats.map(frameRatePercent)
+        let replayFrameRatePercent = replayFrameRatePercentValues.min() ?? 0
+        let selectionFrameRatePercent = selectionFrameRatePercentValues.min() ?? 0
         let selectionJitterValues = selectionFrameStats.map(\.frameTimeJitterMilliseconds)
+        let selectionWorstFrameValues = selectionFrameStats.map(\.worstFrameTimeMilliseconds)
         let deleteIterationCount = scripts
             .filter { $0.name == "delete-undo-redo-undo" }
             .map(\.iterationCount)
@@ -1253,6 +1265,10 @@ enum InteractionReplaySmokeHarness {
             "targetDisplayFramesPerSecond": "\(displayRefreshFramesPerSecond)",
             "minReplayFramesPerSecond": "\(minimumReplayFramesPerSecond)",
             "minReplayFrameRatePercent": String(format: "%.3f", replayFrameRatePercent),
+            "p10ReplayFrameRatePercent": String(
+                format: "%.3f",
+                percentile(replayFrameRatePercentValues, percentile: 0.10)
+            ),
             "maxReplayFrameJitterMilliseconds": String(
                 format: "%.3f",
                 frameStats.map(\.frameTimeJitterMilliseconds).max() ?? 0
@@ -1263,6 +1279,10 @@ enum InteractionReplaySmokeHarness {
             ),
             "minSelectionDragFramesPerSecond": "\(minimumSelectionFramesPerSecond)",
             "minSelectionDragFrameRatePercent": String(format: "%.3f", selectionFrameRatePercent),
+            "p10SelectionDragFrameRatePercent": String(
+                format: "%.3f",
+                percentile(selectionFrameRatePercentValues, percentile: 0.10)
+            ),
             "maxSelectionDragFrameJitterMilliseconds": String(
                 format: "%.3f",
                 selectionJitterValues.max() ?? 0
@@ -1273,7 +1293,11 @@ enum InteractionReplaySmokeHarness {
             ),
             "maxSelectionDragWorstFrameMilliseconds": String(
                 format: "%.3f",
-                selectionFrameStats.map(\.worstFrameTimeMilliseconds).max() ?? 0
+                selectionWorstFrameValues.max() ?? 0
+            ),
+            "p90SelectionDragWorstFrameMilliseconds": String(
+                format: "%.3f",
+                percentile(selectionWorstFrameValues, percentile: 0.90)
             ),
             "maxCPUWaveformVertices": "\(frameStats.map(\.cpuWaveformVertexCount).max() ?? 0)",
             "maxCPUFallbackDraws": "\(frameStats.map(\.cpuWaveformFallbackDrawCount).max() ?? 0)",

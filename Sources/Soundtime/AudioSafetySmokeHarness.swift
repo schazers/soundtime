@@ -198,6 +198,7 @@ enum AudioSafetySmokeHarness {
         var checks = [
             "no underruns or dropped realtime commands",
             "output device configure/refresh matches engine core and sample rate",
+            "live output route refresh resumes active playback",
             "seek lands on expected frame position",
             "visual transport clock cannot outrun rendered audio callbacks",
             "mixed-rate track audio ends at its canonical visual endpoint",
@@ -221,6 +222,7 @@ enum AudioSafetySmokeHarness {
                 "underrunCount": "\(metrics.underrunCount)",
                 "droppedCommandCount": "\(metrics.droppedCommandCount)",
                 "renderDeadlineMissCount": "\(metrics.renderDeadlineMissCount)",
+                "renderDeadlineMissClassification": "diagnostic-synthetic-driver",
                 "maxRenderNanoseconds": "\(metrics.maxRenderNanoseconds)",
                 "renderWorkDeadlineMissCount": "\(metrics.renderWorkDeadlineMissCount)",
                 "maxRenderWorkNanoseconds": "\(metrics.maxRenderWorkNanoseconds)",
@@ -271,12 +273,15 @@ enum AudioSafetySmokeHarness {
         try playbackEngine.play()
         try require(outputDevice.startCount == 1, "output device did not start when playback started")
         render(corePointer: firstCorePointer, blockCount: 8, frameCount: 256, sampleRate: sampleRate)
-        playbackEngine.pause()
         try playbackEngine.refreshOutputDevice()
         try require(outputDevice.invalidateCount == 1, "output device refresh did not invalidate old configuration")
         try require(outputDevice.configureCount == 2, "output device refresh did not reconfigure")
         try require(outputDevice.corePointer == firstCorePointer, "output device refresh changed core pointer unexpectedly")
         try require(outputDevice.lastSampleRate == sampleRate, "output device refresh changed sample rate unexpectedly")
+        try require(outputDevice.stopCount == 1, "live output device refresh did not stop the old route")
+        try require(outputDevice.startCount == 2, "live output device refresh did not start the new route")
+        try require(playbackEngine.isPlaying, "live output device refresh interrupted transport playback")
+        playbackEngine.pause()
         metrics.outputDeviceConfigureCount = max(metrics.outputDeviceConfigureCount, outputDevice.configureCount)
         metrics.outputDeviceInvalidateCount = max(metrics.outputDeviceInvalidateCount, outputDevice.invalidateCount)
         metrics.outputDeviceStartCount = max(metrics.outputDeviceStartCount, outputDevice.startCount)
