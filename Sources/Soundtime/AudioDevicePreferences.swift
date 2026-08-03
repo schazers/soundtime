@@ -241,6 +241,13 @@ final class AudioDevicePreferences: @unchecked Sendable {
         explicitlySelectedDeviceID(key: selectedOutputDeviceIDKey)
     }
 
+    func followsSystemDefaultOutputDevice() -> Bool {
+        guard let explicitDeviceID = explicitlySelectedOutputDeviceID() else {
+            return true
+        }
+        return !AudioDeviceRegistry.outputDevices().contains { $0.id == explicitDeviceID }
+    }
+
     private func selectedDeviceID(
         key: String,
         availableDevices: [AudioDeviceInfo],
