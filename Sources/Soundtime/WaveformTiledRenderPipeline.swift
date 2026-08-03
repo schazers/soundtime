@@ -350,6 +350,18 @@ final class WaveformTiledRenderPipeline: @unchecked Sendable {
         uploadBudget: WaveformTileUploadBudget,
         callbacks: AsyncWorkCallbacks
     ) {
+        let workBudget = ImportWorkBudget.shared.snapshot()
+        if workBudget.isPlaybackActive || workBudget.isTimelineInteractionActive {
+            workQueue.asyncAfter(deadline: .now() + .milliseconds(50)) { [weak self] in
+                self?.runAsyncWorkPass(
+                    buildBatchLimit: buildBatchLimit,
+                    uploadBudget: uploadBudget,
+                    callbacks: callbacks
+                )
+            }
+            return
+        }
+
         lock.lock()
         let priorityAddresses = pendingAsyncUploadPriorityAddresses
         pendingAsyncUploadPriorityAddresses.removeAll()

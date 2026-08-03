@@ -140,6 +140,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainMenu.addItem(editMenuItem)
         editMenuItem.submenu = makeEditMenu()
 
+        let viewMenuItem = NSMenuItem(title: "View", action: nil, keyEquivalent: "")
+        mainMenu.addItem(viewMenuItem)
+        viewMenuItem.submenu = makeViewMenu()
+
         let effectsMenuItem = NSMenuItem(title: "Effects", action: nil, keyEquivalent: "")
         mainMenu.addItem(effectsMenuItem)
         effectsMenuItem.submenu = makeEffectsMenu()
@@ -420,12 +424,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             action: #selector(TimelineView.selectAllClipsOnTrack(_:)),
             keyEquivalent: ""
         ))
-        menu.addItem(NSMenuItem(
-            title: "Zoom to Selection",
-            action: #selector(TimelineView.zoomToSelection(_:)),
-            keyEquivalent: "j"
-        ))
+        return menu
+    }
 
+    private func makeViewMenu() -> NSMenu {
+        let menu = NSMenu(title: "View")
+        let zoomToSelectedRegionItem = NSMenuItem(
+            title: "Zoom to Selected Region",
+            action: #selector(TimelineView.zoomToSelection(_:)),
+            keyEquivalent: "z"
+        )
+        zoomToSelectedRegionItem.keyEquivalentModifierMask = []
+        menu.addItem(zoomToSelectedRegionItem)
         return menu
     }
 

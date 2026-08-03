@@ -37,7 +37,7 @@ enum WaveformPeakTileBuilder {
 
         for tileIndex in 0..<tileCount {
             if shouldYieldForPlayback, tileIndex.isMultiple(of: 4) {
-                try ImportWorkBudget.shared.waitIfPlaybackActive(.previewRefinement)
+                try ImportWorkBudget.shared.waitIfForegroundWorkIsActive(.previewRefinement)
             }
 
             let startFrame = Int64(tileIndex) * framesPerTile
@@ -108,7 +108,7 @@ enum WaveformPeakTileBuilder {
 
         while binStartFrame < descriptor.frameRange.endFrame {
             if shouldYieldForPlayback, bins.count.isMultiple(of: 512) {
-                try ImportWorkBudget.shared.waitIfPlaybackActive(.previewRefinement)
+                try ImportWorkBudget.shared.waitIfForegroundWorkIsActive(.previewRefinement)
             }
 
             let binEndFrame = min(

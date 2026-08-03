@@ -101,7 +101,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onSelectionChanged: ((TimelineSelection?) -> Void)?
     var onFrameStatsChanged: ((TimelineFrameStats) -> Void)?
     var onViewportChanged: ((TimelineViewport) -> Void)?
+    var onNavigationPresentationChanged: (() -> Void)?
     var onTimelineInteractionBegan: (() -> Void)?
+    var onNavigationScrollActivity: ((TimelineScrollbarAxis) -> Void)?
     var onTrackLaneLayoutChanged: ((ResolvedTimelineTrackLayout) -> Void)?
     var onTrackReorderCommitted: ((UUID, Int) -> Void)?
     var onLoopRangeChanged: ((TimelineLoopRange) -> Void)?
@@ -159,6 +161,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var currentTrackIDs: [UUID] = []
     private var currentRenderTracks: [TimelineRenderState.Track] = []
     private let transcriptOverlayView = TimelineTranscriptOverlayView()
+    private let leftOffscreenPlayheadButton = TimelineOffscreenPlayheadButton(direction: .left)
+    private let rightOffscreenPlayheadButton = TimelineOffscreenPlayheadButton(direction: .right)
     private let dropPreviewLayer = CALayer()
     private let dropPreviewAccentLayer = CALayer()
     private let dropPreviewTextLayer = CATextLayer()
@@ -171,6 +175,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var viewport = TimelineViewport.full
     private var settledViewport = TimelineViewport.full
     private var activeCameraTransition: TimelineCameraTransition?
+    private var activeTrackScrollTransition: TimelineScalarTransition?
     private var pendingRestoredViewport: TimelineViewport?
     private var trackLayout = TimelineTrackLayout.default
     private var lastPublishedTrackLayout: ResolvedTimelineTrackLayout?
@@ -232,6 +237,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var isSelectionContextMenuArmed = false
     private var rightPanMomentumTimer: Timer?
     private var rightPanMomentumLastTime: TimeInterval?
+    private var trackpadPanVelocityProgressPerSecond: Float = 0
+    private var trackpadPanPreviousTime: TimeInterval?
     private var zoomMomentumAnchorProgress: Float?
     private var zoomPreviousTime: TimeInterval?
     private var zoomLastInputTime: TimeInterval?
@@ -239,6 +246,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var zoomMomentumTimer: Timer?
     private var zoomMomentumLastTime: TimeInterval?
     private var scrollGestureMode: ScrollGestureMode?
+    private var suppressesNavigationGestureForSelectionFocus = false
     private var timelineDisplayLink: TimelineDisplayLink?
     private var transientRenderEndTime: CFTimeInterval?
     private var selectionDragRenderEndTime: CFTimeInterval?
@@ -262,8 +270,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var timelineDuration: TimeInterval = 0
     private var isTranscriptLayerVisible = false
     private var transcriptDisplayMode = TranscriptTimelineDisplayMode.hidden
-    private var pagingPlayheadProgress: Float = 0
-    private var pagingPlayheadAnchorTimestamp = CACurrentMediaTime()
+    private var presentationPlayheadProgress: Float = 0
+    private var presentationPlayheadAnchorTimestamp = CACurrentMediaTime()
     private var latestSubmittedPresentationTimestamp = CACurrentMediaTime()
     private let selectionDragThreshold: CGFloat = 0.01
     private let selectionDragVelocityRiseTimeConstant: CFTimeInterval = 0.055
@@ -393,6 +401,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             displayHoverProgress(nil)
             onSelectionChanged?(nil)
         }
+        updateOffscreenPlayheadButtons()
     }
 
     func displayTracks(
@@ -411,6 +420,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             projectDuration: previousTimelineDuration
         )
         activeCameraTransition = nil
+        activeTrackScrollTransition = nil
         currentTrackIDs = tracks.map(\.id)
         currentRenderTracks = tracks
         let nextTimelineDuration = Self.timelineDuration(for: tracks)
@@ -500,6 +510,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             displayHoverProgress(nil)
             onSelectionChanged?(nil)
         }
+        updateOffscreenPlayheadButtons()
     }
 
     func prepareTrackInsertionAnimation(at trackIndex: Int) {
@@ -742,9 +753,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         restartsPlayheadKick: Bool = false
     ) {
         let clampedProgress = min(max(progress, 0), 1)
-        pagingPlayheadProgress = clampedProgress
-        pagingPlayheadAnchorTimestamp = anchorTimestamp ?? CACurrentMediaTime()
-        pageViewportIfNeeded(forPlayheadProgress: clampedProgress)
+        presentationPlayheadProgress = clampedProgress
+        presentationPlayheadAnchorTimestamp = anchorTimestamp ?? CACurrentMediaTime()
+        updateOffscreenPlayheadButtons(playheadProgress: clampedProgress)
         let updateRenderer: @Sendable (TimelineRenderer) -> Void = { renderer in
             renderer.displayPlayheadProgress(
                 clampedProgress,
@@ -796,6 +807,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         if !isActive {
             startTransientRenderPulse(duration: playbackStopTouchTrailRenderPulseDuration)
         }
+        updateOffscreenPlayheadButtons()
     }
 
     func displayRecordingActive(_ isActive: Bool) {
@@ -884,6 +896,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             scrollGestureMode = nil
             flushPendingCursorRectInvalidationIfNeeded()
         }
+        updateOffscreenPlayheadButtons()
     }
 
     func displayModalBackdropActive(_ isActive: Bool) {
@@ -1419,6 +1432,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         transcriptOverlayView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(bootstrapWaveformView)
         addSubview(transcriptOverlayView)
+        leftOffscreenPlayheadButton.onActivate = { [weak self] _ in
+            self?.revealOffscreenPlayhead()
+        }
+        rightOffscreenPlayheadButton.onActivate = { [weak self] _ in
+            self?.revealOffscreenPlayhead()
+        }
+        addSubview(leftOffscreenPlayheadButton)
+        addSubview(rightOffscreenPlayheadButton)
 
         registerForDraggedTypes([.fileURL])
     }
@@ -1427,7 +1448,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         super.layout()
         bootstrapWaveformView.frame = bounds
         transcriptOverlayView.frame = bounds
+        layoutOffscreenPlayheadButtons()
         updateTrackLayoutForCurrentBounds(requestRender: false)
+        updateOffscreenPlayheadButtons()
         updateBootstrapWaveformView()
         updateDropPreviewLayout()
         updateTranscriptOverlay()
@@ -1537,7 +1560,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         let currentEmbeddedScrollbarsEnabled = areEmbeddedScrollbarsEnabled
         let currentShowsLoopMoveGuides = showsLoopMoveGuides
         let currentSelection = currentSelection
-        let currentPlayheadProgress = pagingPlayheadProgress
+        let currentPlayheadProgress = presentationPlayheadProgress
         let playbackActive = isTimelinePlaybackActive
         let drawableMetrics = currentTimelineDrawableMetricsForPrewarm()
         timelineRenderQueue.async { [renderer] in
@@ -1839,6 +1862,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             !hasActiveTransientRenderPulse(),
             !hasActiveSelectionDragRenderPulse(),
             activeCameraTransition == nil,
+            activeTrackScrollTransition == nil,
             !isEdgeAutoPanDragActive,
             trackReorderTrackID == nil,
             !isScrollbarHoverAnimating,
@@ -1894,12 +1918,17 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         transientRenderEndTime = nil
         selectionDragRenderEndTime = nil
         activeCameraTransition = nil
+        activeTrackScrollTransition = nil
         edgeAutoPanLastTimestamp = nil
         isProcessingSelectionAnimationActive = false
         needsTimelineRender = false
         isTimelinePlaybackActive = false
         stopRightPanMomentum()
         stopZoomMomentum()
+        scrollGestureMode = nil
+        suppressesNavigationGestureForSelectionFocus = false
+        trackpadPanPreviousTime = nil
+        trackpadPanVelocityProgressPerSecond = 0
         PerformanceSampler.shared.updateRenderDemand(.idle)
     }
 
@@ -1908,6 +1937,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         let sampledAt = CACurrentMediaTime()
         let didAutoPan = stepEdgeAutoPan(sampledAt: sampledAt)
         let didAdvanceCamera = stepCameraTransition(sampledAt: sampledAt)
+        let didAdvanceTrackScroll = stepTrackScrollTransition(sampledAt: sampledAt)
         let didAdvanceTrackReorder = stepTrackReorder(sampledAt: sampledAt)
         let didAdvanceScrollbarHover = stepScrollbarHover(sampledAt: sampledAt)
         let shouldRender = needsTimelineRender ||
@@ -1916,7 +1946,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             hasActiveTransientRenderPulse() ||
             hasActiveSelectionDragRenderPulse() ||
             activeCameraTransition != nil ||
+            activeTrackScrollTransition != nil ||
             didAdvanceCamera ||
+            didAdvanceTrackScroll ||
             didAutoPan ||
             didAdvanceTrackReorder ||
             didAdvanceScrollbarHover ||
@@ -1936,14 +1968,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         if isTimelinePlaybackActive,
-           let playheadProgress = projectedPagingPlayheadProgress(at: frame.targetPresentationTimestamp) {
+           let playheadProgress = projectedPresentationPlayheadProgress(at: frame.targetPresentationTimestamp) {
             onPlaybackVisualProgressChanged?(playheadProgress)
-            if !viewport.isFull {
-                pageViewportIfNeeded(
-                    forPlayheadProgress: playheadProgress,
-                    renderCadence: .coalescedInteraction
-                )
-            }
+            updateOffscreenPlayheadButtons(playheadProgress: playheadProgress)
         }
 
         let didSubmitRender = submitTimelineRender(frame: frame)
@@ -2115,6 +2142,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         if isProcessingSelectionAnimationActive ||
             activeCameraTransition != nil ||
+            activeTrackScrollTransition != nil ||
             hasActiveTransientRenderPulse()
         {
             return .animation
@@ -2233,6 +2261,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             invalidatesCursorRects: false,
             renderCadence: .coalescedInteraction
         )
+        onNavigationScrollActivity?(.horizontal)
 
         switch activeDragMode {
         case .resizeSelectionStart, .resizeSelectionEnd:
@@ -2269,13 +2298,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         max(selectionDragEffectRenderPulseDuration, selectionDragWaveformTuning.contactLifetime + 0.18)
     }
 
-    private func projectedPagingPlayheadProgress(at timestamp: CFTimeInterval) -> Float? {
+    private func projectedPresentationPlayheadProgress(at timestamp: CFTimeInterval) -> Float? {
         guard isTimelinePlaybackActive, timelineDuration.isFinite, timelineDuration > 0 else {
             return nil
         }
 
-        let elapsedTime = timestamp - pagingPlayheadAnchorTimestamp
-        let projectedProgress = pagingPlayheadProgress + Float(elapsedTime / timelineDuration)
+        let elapsedTime = timestamp - presentationPlayheadAnchorTimestamp
+        let projectedProgress = presentationPlayheadProgress + Float(elapsedTime / timelineDuration)
         return loopConstrainedPagingProgress(projectedProgress)
     }
 
@@ -2418,6 +2447,20 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        let focusSelectionModifiers = event.modifierFlags.intersection([
+            .command,
+            .control,
+            .option,
+            .shift,
+        ])
+        if event.keyCode == 6, focusSelectionModifiers.isEmpty {
+            guard !event.isARepeat else {
+                return
+            }
+            zoomToSelection()
+            return
+        }
+
         if event.keyCode == 7, event.modifierFlags.contains(.command) {
             onCutSelection?()
             return
@@ -2465,14 +2508,6 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             !event.modifierFlags.contains(.shift)
         {
             onInsertSilenceRequested?()
-            return
-        }
-
-        if
-            event.charactersIgnoringModifiers?.lowercased() == "j",
-            event.modifierFlags.contains(.command)
-        {
-            zoomToSelection()
             return
         }
 
@@ -3106,6 +3141,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             super.scrollWheel(with: event)
             return
         }
+        if shouldSuppressNavigationGestureForSelectionFocus(event) {
+            return
+        }
+        cancelSelectionFocusTransition()
 
         let hasGesturePhase = !event.phase.isEmpty || !event.momentumPhase.isEmpty
         let isGestureEnding =
@@ -3116,6 +3155,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         defer {
             if isGestureEnding || !hasGesturePhase {
                 scrollGestureMode = nil
+                trackpadPanPreviousTime = nil
+                trackpadPanVelocityProgressPerSecond = 0
                 flushPendingCursorRectInvalidationIfNeeded()
             }
         }
@@ -3126,6 +3167,21 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
         scrollGestureMode = .pan
+        let elapsedTime: TimeInterval
+        if let trackpadPanPreviousTime {
+            elapsedTime = min(max(event.timestamp - trackpadPanPreviousTime, 1 / 240), 1 / 12)
+        } else {
+            elapsedTime = 1 / 120
+        }
+        let horizontalProgressDelta = TimelineNavigationPanGeometry.horizontalProgressDelta(
+            scrollingDeltaX: horizontalDelta,
+            viewportWidth: bounds.width,
+            viewportDurationProgress: settledViewport.durationProgress
+        )
+        let instantVelocity = horizontalProgressDelta / Float(elapsedTime)
+        trackpadPanVelocityProgressPerSecond =
+            trackpadPanVelocityProgressPerSecond * 0.54 + instantVelocity * 0.46
+        trackpadPanPreviousTime = event.timestamp
         displayHoverProgress(nil, renderCadence: .coalescedInteraction)
         stopRightPanMomentum()
         applyTwoDimensionalPan(
@@ -3144,6 +3200,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             super.magnify(with: event)
             return
         }
+        if shouldSuppressNavigationGestureForSelectionFocus(event) {
+            return
+        }
+        cancelSelectionFocusTransition()
 
         stopRightPanMomentum()
         let hasGesturePhase = !event.phase.isEmpty || !event.momentumPhase.isEmpty
@@ -3211,6 +3271,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         window?.makeFirstResponder(self)
+        cancelSelectionFocusTransition()
         stopRightPanMomentum()
         stopZoomMomentum()
         onTimelineInteractionBegan?()
@@ -3741,6 +3802,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                 invalidatesCursorRects: false,
                 renderCadence: .coalescedInteraction
             )
+            onNavigationScrollActivity?(.horizontal)
             let instantVelocity = progressDelta / Float(elapsedTime)
             rightPanVelocityProgressPerSecond =
                 rightPanVelocityProgressPerSecond * (1 - rightPanVelocitySmoothing) +
@@ -3856,6 +3918,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             invalidatesCursorRects: false,
             renderCadence: .coalescedInteraction
         )
+        onNavigationScrollActivity?(.horizontal)
         let decay = Float(exp(-rightPanMomentumDecayRate * elapsedTime))
         rightPanVelocityProgressPerSecond *= decay
     }
@@ -4078,6 +4141,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         marksInteraction: Bool = true
     ) {
         activeCameraTransition = nil
+        activeTrackScrollTransition = nil
         settledViewport = nextViewport
         applyViewport(
             nextViewport,
@@ -4088,6 +4152,40 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             marksInteraction: marksInteraction,
             notifiesChange: true
         )
+    }
+
+    private func cancelSelectionFocusTransition() {
+        if activeCameraTransition != nil {
+            activeCameraTransition = nil
+            settledViewport = viewport
+            onViewportChanged?(viewport)
+        }
+        activeTrackScrollTransition = nil
+    }
+
+    private func shouldSuppressNavigationGestureForSelectionFocus(_ event: NSEvent) -> Bool {
+        guard suppressesNavigationGestureForSelectionFocus else {
+            return false
+        }
+        if event.phase.contains(.began) {
+            suppressesNavigationGestureForSelectionFocus = false
+            return false
+        }
+
+        let hasGesturePhase = !event.phase.isEmpty || !event.momentumPhase.isEmpty
+        let isGestureEnding =
+            event.phase.contains(.ended) ||
+            event.phase.contains(.cancelled) ||
+            event.momentumPhase.contains(.ended) ||
+            event.momentumPhase.contains(.cancelled)
+        if isGestureEnding || !hasGesturePhase {
+            suppressesNavigationGestureForSelectionFocus = false
+            scrollGestureMode = nil
+            trackpadPanPreviousTime = nil
+            trackpadPanVelocityProgressPerSecond = 0
+            flushPendingCursorRectInvalidationIfNeeded()
+        }
+        return true
     }
 
     private func applyViewport(
@@ -4106,6 +4204,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         viewport = nextViewport
         updateBootstrapWaveformView()
+        updateOffscreenPlayheadButtons()
+        onNavigationPresentationChanged?()
         if notifiesChange {
             onViewportChanged?(nextViewport)
         }
@@ -4139,7 +4239,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private func beginCameraTransition(
         from sourceCamera: TimelineCameraWindow,
         to targetViewport: TimelineViewport,
-        projectDuration: TimeInterval
+        projectDuration: TimeInterval,
+        startTimestamp: CFTimeInterval = CACurrentMediaTime(),
+        tuning: TimelineCameraTransition.Tuning = .editReframe,
+        initialVelocity: TimelineCameraVelocity? = nil
     ) {
         let targetCamera = TimelineCameraWindow(
             viewport: targetViewport,
@@ -4148,11 +4251,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         let transition = TimelineCameraTransition(
             source: sourceCamera,
             target: targetCamera,
-            startTimestamp: CACurrentMediaTime(),
-            tuning: .editReframe
+            startTimestamp: startTimestamp,
+            tuning: tuning,
+            initialVelocity: initialVelocity
         )
         settledViewport = targetViewport
         guard transition.isMeaningful(viewportWidth: bounds.width) else {
+            activeCameraTransition = nil
             applyViewport(
                 targetViewport,
                 kicksImmediateRender: false,
@@ -4180,6 +4285,53 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             notifiesChange: false
         )
         requestTimelineRender()
+    }
+
+    private func currentCameraMotion(
+        sampledAt timestamp: CFTimeInterval
+    ) -> (camera: TimelineCameraWindow, velocity: TimelineCameraVelocity) {
+        let camera: TimelineCameraWindow
+        var centerVelocity: TimeInterval = 0
+        var logDurationVelocity: Double = 0
+
+        if let activeCameraTransition {
+            camera = activeCameraTransition.camera(at: timestamp)
+            let transitionVelocity = activeCameraTransition.velocity(at: timestamp)
+            centerVelocity = transitionVelocity.centerTimePerSecond
+            logDurationVelocity = transitionVelocity.logVisibleDurationPerSecond
+        } else {
+            camera = TimelineCameraWindow(
+                viewport: viewport,
+                projectDuration: timelineDuration
+            )
+        }
+
+        if rightPanMomentumTimer != nil || isRightPanGestureActive {
+            centerVelocity += Double(rightPanVelocityProgressPerSecond) * timelineDuration
+        }
+        if scrollGestureMode == .pan {
+            centerVelocity += Double(trackpadPanVelocityProgressPerSecond) * timelineDuration
+        }
+        if
+            (zoomMomentumTimer != nil || scrollGestureMode == .zoom),
+            let zoomMomentumAnchorProgress
+        {
+            let zoomLogDurationVelocity = -Double(zoomVelocityLogScalePerSecond)
+            let anchorTime = Double(zoomMomentumAnchorProgress) * timelineDuration
+            let anchorFraction = (anchorTime - camera.startTime) /
+                max(camera.visibleDuration, 0.000_001)
+            centerVelocity += (0.5 - anchorFraction) * camera.visibleDuration *
+                zoomLogDurationVelocity
+            logDurationVelocity += zoomLogDurationVelocity
+        }
+
+        return (
+            camera,
+            TimelineCameraVelocity(
+                centerTimePerSecond: centerVelocity,
+                logVisibleDurationPerSecond: logDurationVelocity
+            )
+        )
     }
 
     @discardableResult
@@ -4226,22 +4378,109 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
-        let selectionStart = Float(selection.startProgress)
-        let selectionDuration = max(Float(selection.durationProgress), 0.000_001)
-        let padding = max(selectionDuration * 0.14, 0.002)
-        let nextViewport = TimelineViewport(
-            startProgress: selectionStart - padding,
-            durationProgress: min(selectionDuration + padding * 2, 1)
+        let resolvedLayout = resolvedTrackLayoutForCurrentBounds()
+        let plan = TimelineSelectionFocusPlan(
+            selection: selection,
+            trackIndex: selection.trackID.flatMap { currentTrackIDs.firstIndex(of: $0) },
+            trackLayout: resolvedLayout,
+            viewportWidth: bounds.width
         )
-        setViewport(
-            nextViewport,
-            transcriptCadence: .coalescedInteraction,
-            invalidatesCursorRects: false,
-            renderCadence: .coalescedInteraction
+        let startedAt = CACurrentMediaTime()
+        let currentMotion = currentCameraMotion(sampledAt: startedAt)
+        let targetCamera = TimelineCameraWindow(
+            viewport: plan.viewport,
+            projectDuration: timelineDuration
         )
+        let isMovingAway = currentMotion.velocity.alignment(
+            from: currentMotion.camera,
+            toward: targetCamera
+        ) < -0.000_001
+        let transitionTuning: TimelineCameraTransition.Tuning = isMovingAway ?
+            .selectionFocusOpposingMomentum :
+            .selectionFocus
+        let carriedVelocity = currentMotion.velocity.isEffectivelyZero ? nil :
+            currentMotion.velocity.clampedForFocusRetarget(
+                from: currentMotion.camera,
+                toward: targetCamera,
+                duration: transitionTuning.duration
+            )
+        if plan.viewport != viewport {
+            onNavigationScrollActivity?(.horizontal)
+        }
+        if abs(plan.trackScrollOffset - resolvedLayout.scrollOffset) > 0.5 {
+            onNavigationScrollActivity?(.vertical)
+        }
+
+        suppressesNavigationGestureForSelectionFocus =
+            scrollGestureMode != nil ||
+            rightPanMomentumTimer != nil ||
+            zoomMomentumTimer != nil
+        stopRightPanMomentum()
+        stopZoomMomentum()
+        scrollGestureMode = nil
+        trackpadPanPreviousTime = nil
+        trackpadPanVelocityProgressPerSecond = 0
+        beginCameraTransition(
+            from: currentMotion.camera,
+            to: plan.viewport,
+            projectDuration: timelineDuration,
+            startTimestamp: startedAt,
+            tuning: transitionTuning,
+            initialVelocity: carriedVelocity
+        )
+
+        let scrollTransition = TimelineScalarTransition(
+            source: resolvedLayout.scrollOffset,
+            target: plan.trackScrollOffset,
+            startTimestamp: startedAt,
+            duration: transitionTuning.duration,
+            easing: .easeOutCubic
+        )
+        if abs(scrollTransition.target - scrollTransition.source) > 0.5 {
+            activeTrackScrollTransition = scrollTransition
+        } else {
+            activeTrackScrollTransition = nil
+            applyTrackScrollOffset(plan.trackScrollOffset, updatesTranscript: true)
+        }
+        requestTimelineRender()
+    }
+
+    @discardableResult
+    private func stepTrackScrollTransition(sampledAt timestamp: CFTimeInterval) -> Bool {
+        guard let transition = activeTrackScrollTransition else {
+            return false
+        }
+        let isComplete = transition.isComplete(at: timestamp)
+        applyTrackScrollOffset(
+            isComplete ? transition.target : transition.value(at: timestamp),
+            updatesTranscript: true
+        )
+        if isComplete {
+            activeTrackScrollTransition = nil
+            invalidateTimelineCursorRects()
+        }
+        return true
+    }
+
+    private func applyTrackScrollOffset(_ scrollOffset: Float, updatesTranscript: Bool) {
+        let nextLayout = trackLayout.withScrollOffset(
+            scrollOffset,
+            totalTrackCount: currentTrackIDs.count,
+            viewportHeight: Float(max(bounds.height, 1))
+        )
+        guard nextLayout != trackLayout else {
+            return
+        }
+        publishTrackLayout(
+            nextLayout,
+            requestRender: true,
+            updatesTranscript: updatesTranscript
+        )
+        publishScrollbarPresentation()
     }
 
     func scrollTracks(byPixels deltaPixels: Float) {
+        activeTrackScrollTransition = nil
         let nextTrackLayout = trackLayout.scrolled(
             by: deltaPixels,
             totalTrackCount: currentTrackIDs.count,
@@ -4251,6 +4490,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        onNavigationScrollActivity?(.vertical)
         trackLayout = nextTrackLayout
         updateTimelineRendererImmediately { renderer in
             renderer.displayTrackLayout(nextTrackLayout)
@@ -4271,13 +4511,15 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         let horizontalProgressDelta = TimelineNavigationPanGeometry.horizontalProgressDelta(
             scrollingDeltaX: horizontalDeltaPixels,
             viewportWidth: bounds.width,
-            viewportDurationProgress: viewport.durationProgress
+            viewportDurationProgress: settledViewport.durationProgress
         )
         if horizontalProgressDelta != 0 {
-            let nextViewport = viewport.panned(byProgress: horizontalProgressDelta)
-            if nextViewport != viewport {
+            let canonicalViewport = settledViewport.panned(byProgress: horizontalProgressDelta)
+            let canonicalChanged = canonicalViewport != settledViewport
+            if canonicalChanged {
+                settledViewport = canonicalViewport
                 applyViewport(
-                    nextViewport,
+                    canonicalViewport,
                     kicksImmediateRender: false,
                     transcriptCadence: .coalescedInteraction,
                     invalidatesCursorRects: false,
@@ -4294,8 +4536,16 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             scrollingDeltaY: verticalDeltaPixels
         )
         if verticalTrackDelta != 0 {
-            let nextTrackLayout = trackLayout.scrolled(
-                by: verticalTrackDelta,
+            let resolvedCanonical = trackLayout.resolved(
+                totalTrackCount: currentTrackIDs.count,
+                viewportHeight: Float(max(bounds.height, 1))
+            )
+            let canonicalOffset = min(
+                max(resolvedCanonical.scrollOffset + verticalTrackDelta, 0),
+                resolvedCanonical.maximumScrollOffset
+            )
+            let nextTrackLayout = trackLayout.withScrollOffset(
+                canonicalOffset,
                 totalTrackCount: currentTrackIDs.count,
                 viewportHeight: Float(max(bounds.height, 1))
             )
@@ -4311,6 +4561,12 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         guard didChangeViewport || didChangeTrackLayout else {
             return
+        }
+        if didChangeViewport {
+            onNavigationScrollActivity?(.horizontal)
+        }
+        if didChangeTrackLayout {
+            onNavigationScrollActivity?(.vertical)
         }
         transcriptViewportRelayoutAllowedUntil = CACurrentMediaTime() + 0.18
         updateTranscriptOverlay(cadence: .coalescedInteraction)
@@ -4484,17 +4740,35 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     func setHorizontalScrollNormalized(_ value: Float) {
-        let travel = max(1 - viewport.durationProgress, 0)
+        let travel = max(1 - settledViewport.durationProgress, 0)
         let start = min(max(value, 0), 1) * travel
-        setViewport(
-            TimelineViewport(startProgress: start, durationProgress: viewport.durationProgress),
+        let nextViewport = TimelineViewport(
+            startProgress: start,
+            durationProgress: settledViewport.durationProgress
+        )
+        guard nextViewport != viewport else {
+            return
+        }
+        activeCameraTransition = nil
+        activeTrackScrollTransition = nil
+        settledViewport = nextViewport
+        applyViewport(
+            nextViewport,
+            kicksImmediateRender: false,
             transcriptCadence: .coalescedInteraction,
             invalidatesCursorRects: false,
-            renderCadence: .coalescedInteraction
+            renderCadence: .none,
+            marksInteraction: true,
+            notifiesChange: true,
+            updatesTranscript: false
         )
+        transcriptViewportRelayoutAllowedUntil = CACurrentMediaTime() + 0.18
+        updateTranscriptOverlay(cadence: .coalescedInteraction)
+        requestCoalescedInteractionRender()
     }
 
     func setVerticalScrollNormalized(_ value: Float) {
+        activeTrackScrollTransition = nil
         let resolved = resolvedTrackLayoutForCurrentBounds()
         guard resolved.maximumScrollOffset > 0 else {
             return
@@ -4526,6 +4800,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     func setVerticalZoomNormalized(_ value: Float) {
+        activeTrackScrollTransition = nil
         isZoomControlInteractionActive = true
         let clamped = min(max(value, 0), 1)
         let range: ClosedRange<Float> = 48...320
@@ -4716,8 +4991,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                 cadence: trackReorderTrackID == nil ? .immediate : .coalescedInteraction
             )
         }
+        let presentationTrackLayout = trackLayout
         updateTimelineRendererImmediately { renderer in
-            renderer.displayTrackLayout(clampedLayout, marksInteraction: requestRender)
+            renderer.displayTrackLayout(presentationTrackLayout, marksInteraction: requestRender)
         }
         if requestRender {
             requestTimelineRender()
@@ -4752,8 +5028,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        let presentationTrackLayout = trackLayout
         updateTimelineRendererImmediately { renderer in
-            renderer.displayTrackLayout(clampedLayout)
+            renderer.displayTrackLayout(presentationTrackLayout)
         }
         if requestRender {
             requestTimelineRender()
@@ -4926,61 +5203,90 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             rightPanPreviousPoint != nil
     }
 
-    private func pageViewportIfNeeded(
-        forPlayheadProgress progress: Float,
-        renderCadence: TimelineRenderCadence = .immediate
-    ) {
-        guard isSelectionEnabled, !viewport.isFull else {
+    private func layoutOffscreenPlayheadButtons() {
+        let controlSize = CGSize(width: 36, height: 46)
+        let availableTrackHeight = max(bounds.height - CGFloat(trackLayout.rulerLaneHeight), controlSize.height)
+        let originY = max((availableTrackHeight - controlSize.height) * 0.5, 0)
+        leftOffscreenPlayheadButton.frame = CGRect(
+            x: 8,
+            y: originY,
+            width: controlSize.width,
+            height: controlSize.height
+        )
+        rightOffscreenPlayheadButton.frame = CGRect(
+            x: max(bounds.width - controlSize.width - 8, 0),
+            y: originY,
+            width: controlSize.width,
+            height: controlSize.height
+        )
+    }
+
+    private func currentPresentationPlayheadProgress() -> Float {
+        guard isTimelinePlaybackActive else {
+            return presentationPlayheadProgress
+        }
+        let timestamp = max(CACurrentMediaTime(), latestSubmittedPresentationTimestamp)
+        return projectedPresentationPlayheadProgress(at: timestamp) ?? presentationPlayheadProgress
+    }
+
+    private func updateOffscreenPlayheadButtons(playheadProgress: Float? = nil) {
+        guard
+            isSelectionEnabled,
+            timelineDuration.isFinite,
+            timelineDuration > 0,
+            !isInteractionSuppressed
+        else {
+            leftOffscreenPlayheadButton.setPresented(false)
+            rightOffscreenPlayheadButton.setPresented(false)
             return
         }
 
-        let epsilon: Float = 0.00001
-        var nextViewport = viewport
-
-        while
-            progress >= nextViewport.endProgress - epsilon,
-            nextViewport.endProgress < 1 - epsilon
-        {
-            let nextStartProgress = min(
-                max(progress, nextViewport.startProgress + nextViewport.durationProgress),
-                1 - nextViewport.durationProgress
-            )
-
-            guard nextStartProgress > nextViewport.startProgress + epsilon else {
-                break
-            }
-
-            nextViewport = TimelineViewport(
-                startProgress: nextStartProgress,
-                durationProgress: nextViewport.durationProgress
-            )
-        }
-
-        while
-            progress < nextViewport.startProgress - epsilon,
-            nextViewport.startProgress > epsilon
-        {
-            let nextStartProgress = max(
-                nextViewport.startProgress - nextViewport.durationProgress,
-                0
-            )
-
-            guard nextStartProgress < nextViewport.startProgress - epsilon else {
-                break
-            }
-
-            nextViewport = TimelineViewport(
-                startProgress: nextStartProgress,
-                durationProgress: nextViewport.durationProgress
-            )
-        }
-
-        setViewport(
-            nextViewport,
-            transcriptCadence: renderCadence == .immediate ? .immediate : .coalescedInteraction,
-            invalidatesCursorRects: renderCadence == .immediate,
-            renderCadence: renderCadence
+        let progress = playheadProgress ?? currentPresentationPlayheadProgress()
+        let direction = TimelineOffscreenPlayheadNavigation.direction(
+            playheadProgress: progress,
+            viewport: viewport
         )
+        leftOffscreenPlayheadButton.setPresented(direction == .left)
+        rightOffscreenPlayheadButton.setPresented(direction == .right)
+    }
+
+    private func revealOffscreenPlayhead() {
+        guard
+            isSelectionEnabled,
+            timelineDuration.isFinite,
+            timelineDuration > 0
+        else {
+            return
+        }
+
+        let playheadProgress = currentPresentationPlayheadProgress()
+        guard TimelineOffscreenPlayheadNavigation.direction(
+            playheadProgress: playheadProgress,
+            viewport: viewport
+        ) != nil else {
+            updateOffscreenPlayheadButtons(playheadProgress: playheadProgress)
+            return
+        }
+
+        stopRightPanMomentum()
+        stopZoomMomentum()
+        scrollGestureMode = nil
+        onTimelineInteractionBegan?()
+        let sourceCamera = TimelineCameraWindow(
+            viewport: viewport,
+            projectDuration: timelineDuration
+        )
+        let targetViewport = TimelineOffscreenPlayheadNavigation.revealViewport(
+            playheadProgress: playheadProgress,
+            viewport: viewport
+        )
+        beginCameraTransition(
+            from: sourceCamera,
+            to: targetViewport,
+            projectDuration: timelineDuration,
+            tuning: .playheadReveal
+        )
+        requestTimelineRender()
     }
 
     private func updateHoverGuide(for event: NSEvent) {

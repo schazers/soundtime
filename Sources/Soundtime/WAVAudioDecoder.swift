@@ -247,7 +247,7 @@ enum WAVAudioDecoder {
             for binIndex in 0..<binCount {
                 if binIndex.isMultiple(of: 256) {
                     try Task.checkCancellation()
-                    try ImportWorkBudget.shared.waitIfPlaybackActive()
+                    try ImportWorkBudget.shared.waitIfForegroundWorkIsActive()
                 }
 
                 let startFrame = binIndex * fileInfo.frameCount / binCount
@@ -310,7 +310,7 @@ enum WAVAudioDecoder {
                 var channelSamples = [Float](repeating: 0, count: frameCount)
                 for outputFrameIndex in 0..<frameCount {
                     if outputFrameIndex.isMultiple(of: 4_096) {
-                        try ImportWorkBudget.shared.waitIfPlaybackActive()
+                        try ImportWorkBudget.shared.waitIfForegroundWorkIsActive()
                     }
 
                     let frameIndex = decodeStartFrame + outputFrameIndex

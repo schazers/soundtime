@@ -30,8 +30,17 @@ final class TimelineNavigationScrollbarView: TimelineMetalLayerView {
     private var hoverStartTime = CACurrentMediaTime()
     private let hoverDuration: CFTimeInterval = 0.06
     private var hoverTimer: Timer?
+    private var visibilityAmount: Float = 0
+    private var visibilitySource: Float = 0
+    private var visibilityTarget: Float = 0
+    private var visibilityStartTime = CACurrentMediaTime()
+    private var visibilityDuration: CFTimeInterval = 0
+    private var visibilityDismissTimer: Timer?
+    private var isPointerInside = false
     private var trackingArea: NSTrackingArea?
     private var dragOffset: CGFloat?
+    private var dragDisplayLink: TimelineDisplayLink?
+    private var hasPendingRender = false
     private var commandQueue: MTLCommandQueue?
     private var pipelineState: MTLRenderPipelineState?
     private var rendererInitializationID = UUID()
@@ -65,23 +74,38 @@ final class TimelineNavigationScrollbarView: TimelineMetalLayerView {
         false
     }
 
-    func display(value: Float, visibleFraction: Float) {
+    func display(
+        value: Float,
+        visibleFraction: Float
+    ) {
         let nextValue = min(max(value, 0), 1)
         let nextVisibleFraction = min(max(visibleFraction, 0), 1)
-        guard self.value != nextValue || self.visibleFraction != nextVisibleFraction else {
+        guard self.value != nextValue ||
+            self.visibleFraction != nextVisibleFraction
+        else {
             return
         }
         self.value = nextValue
         self.visibleFraction = nextVisibleFraction
-        window?.invalidateCursorRects(for: self)
-        render()
+        if !isScrollable {
+            hideImmediately()
+        }
+        requestRender()
+    }
+
+    func noteScrollActivity() {
+        guard isScrollable else {
+            return
+        }
+        showScrollbar()
+        scheduleVisibilityDismissal()
     }
 
     override func layout() {
         super.layout()
         layer?.cornerRadius = min(bounds.width, bounds.height) * 0.5
         layer?.masksToBounds = true
-        render()
+        requestRender()
     }
 
     override func viewDidMoveToWindow() {
@@ -89,6 +113,11 @@ final class TimelineNavigationScrollbarView: TimelineMetalLayerView {
         if window == nil {
             hoverTimer?.invalidate()
             hoverTimer = nil
+            visibilityDismissTimer?.invalidate()
+            visibilityDismissTimer = nil
+            abandonDragSession()
+            visibilityAmount = 0
+            visibilityTarget = 0
         }
     }
 
@@ -107,80 +136,87 @@ final class TimelineNavigationScrollbarView: TimelineMetalLayerView {
         addTrackingArea(nextTrackingArea)
     }
 
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard isScrollable, bounds.contains(point) else {
+            return nil
+        }
+        return self
+    }
+
     override func resetCursorRects() {
         super.resetCursorRects()
         guard isScrollable else {
             return
         }
-        addCursorRect(handleRect.insetBy(dx: -3, dy: -3), cursor: dragOffset == nil ? .openHand : .closedHand)
+        addCursorRect(bounds, cursor: .arrow)
     }
 
     override func mouseEntered(with event: NSEvent) {
+        isPointerInside = true
+        showScrollbar()
         transitionHover(to: 1)
     }
 
     override func mouseExited(with event: NSEvent) {
+        isPointerInside = false
         guard dragOffset == nil else {
             return
         }
         transitionHover(to: 0)
+        scheduleVisibilityDismissal()
     }
 
     override func mouseDown(with event: NSEvent) {
         guard isScrollable else {
             return
         }
+        abandonDragSession()
+        showScrollbar()
         window?.makeFirstResponder(self)
         let primary = primaryPosition(for: convert(event.locationInWindow, from: nil))
-        let start = handleStart
-        let length = handleLength
+        let start = baseHandleStart
+        let length = baseHandleLength
         if primary >= start, primary <= start + length {
             dragOffset = primary - start
         } else {
             dragOffset = length * 0.5
             updateValue(primaryPosition: primary)
         }
+        startDragDisplayLink()
         transitionHover(to: 1)
-        NSCursor.closedHand.set()
-        window?.invalidateCursorRects(for: self)
     }
 
     override func mouseDragged(with event: NSEvent) {
         guard dragOffset != nil else {
             return
         }
+        // Event delivery is the authoritative input path. Display-link sampling fills
+        // the gaps between uneven AppKit drag events, but never owns the drag itself.
         updateValue(primaryPosition: primaryPosition(for: convert(event.locationInWindow, from: nil)))
+        startDragDisplayLink()
     }
 
     override func mouseUp(with event: NSEvent) {
         guard dragOffset != nil else {
             return
         }
-        updateValue(primaryPosition: primaryPosition(for: convert(event.locationInWindow, from: nil)))
-        dragOffset = nil
-        onEditingEnded?()
         let localPoint = convert(event.locationInWindow, from: nil)
-        transitionHover(to: bounds.contains(localPoint) ? 1 : 0)
-        NSCursor.openHand.set()
-        window?.invalidateCursorRects(for: self)
+        updateValue(primaryPosition: primaryPosition(for: localPoint))
+        finishDragSession(pointerIsInside: bounds.contains(localPoint), notifiesEditingEnded: true)
     }
 
     override func cancelOperation(_ sender: Any?) {
         guard dragOffset != nil else {
             return
         }
-        dragOffset = nil
-        onEditingEnded?()
-        transitionHover(to: 0)
-        NSCursor.arrow.set()
-        window?.invalidateCursorRects(for: self)
+        finishDragSession(pointerIsInside: false, notifiesEditingEnded: true)
     }
 
     private var isScrollable: Bool {
         visibleFraction < 0.999
     }
 
-    private var handleLength: CGFloat {
+    private var baseHandleLength: CGFloat {
         let dimension = primaryDimension
         guard dimension > 0 else {
             return 1
@@ -189,8 +225,16 @@ final class TimelineNavigationScrollbarView: TimelineMetalLayerView {
         return min(max(CGFloat(visibleFraction), minimumLength), 1)
     }
 
+    private var baseHandleStart: CGFloat {
+        CGFloat(value) * max(1 - baseHandleLength, 0)
+    }
+
+    private var handleLength: CGFloat {
+        baseHandleLength
+    }
+
     private var handleStart: CGFloat {
-        CGFloat(value) * max(1 - handleLength, 0)
+        baseHandleStart
     }
 
     private var primaryDimension: CGFloat {
@@ -218,30 +262,119 @@ final class TimelineNavigationScrollbarView: TimelineMetalLayerView {
 
     private func primaryPosition(for point: CGPoint) -> CGFloat {
         if axis == .horizontal {
-            return min(max(point.x / max(bounds.width, 1), 0), 1)
+            return point.x / max(bounds.width, 1)
         }
-        return min(max((bounds.height - point.y) / max(bounds.height, 1), 0), 1)
+        return (bounds.height - point.y) / max(bounds.height, 1)
     }
 
     private func updateValue(primaryPosition: CGFloat) {
         guard let dragOffset else {
             return
         }
-        let travel = max(1 - handleLength, 0.000_001)
-        let nextValue = Float(min(max((primaryPosition - dragOffset) / travel, 0), 1))
-        guard value != nextValue else {
-            return
+        let nextValue = TimelineNavigationScrollbarDragGeometry.normalizedValue(
+            primaryPosition: primaryPosition,
+            dragOffset: dragOffset,
+            handleLength: baseHandleLength
+        )
+        if value != nextValue {
+            value = nextValue
+            onValueChanged?(nextValue)
         }
-        value = nextValue
-        onValueChanged?(nextValue)
-        render()
+        showScrollbar()
+        requestRender()
     }
 
     private func configure() {
         translatesAutoresizingMaskIntoConstraints = false
+        preferredFramesPerSecond = TimelineNavigationScrollbarDragGeometry.interactionFramesPerSecond
         colorPixelFormat = .bgra8Unorm
-        clearColor = MTLClearColor(red: 0.045, green: 0.047, blue: 0.048, alpha: 1)
+        clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+        timelineMetalLayer?.isOpaque = false
+        alphaValue = 1
         scheduleRendererInitializationIfNeeded()
+    }
+
+    private func showScrollbar() {
+        visibilityDismissTimer?.invalidate()
+        visibilityDismissTimer = nil
+        transitionVisibility(
+            to: 1,
+            duration: TimelineNavigationScrollbarVisibilityTiming.fadeInDuration
+        )
+    }
+
+    private func scheduleVisibilityDismissal() {
+        visibilityDismissTimer?.invalidate()
+        visibilityDismissTimer = nil
+        guard dragOffset == nil, !isPointerInside else {
+            return
+        }
+        let timer = Timer(timeInterval: TimelineNavigationScrollbarVisibilityTiming.lingerDuration, repeats: false) {
+            [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.fadeOutIfIdle()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        visibilityDismissTimer = timer
+    }
+
+    private func fadeOutIfIdle() {
+        visibilityDismissTimer?.invalidate()
+        visibilityDismissTimer = nil
+        guard dragOffset == nil, !isPointerInside else {
+            return
+        }
+        transitionVisibility(
+            to: 0,
+            duration: TimelineNavigationScrollbarVisibilityTiming.fadeOutDuration
+        )
+    }
+
+    private func hideImmediately() {
+        visibilityDismissTimer?.invalidate()
+        visibilityDismissTimer = nil
+        visibilityAmount = 0
+        visibilitySource = 0
+        visibilityTarget = 0
+        visibilityDuration = 0
+        requestRender()
+    }
+
+    private var isVisibilityTransitionActive: Bool {
+        abs(visibilityAmount - visibilityTarget) > 0.001
+    }
+
+    private func transitionVisibility(to target: Float, duration: CFTimeInterval) {
+        let clampedTarget = min(max(target, 0), 1)
+        guard clampedTarget != visibilityTarget else {
+            requestRender()
+            return
+        }
+        let now = CACurrentMediaTime()
+        visibilityAmount = currentVisibilityAmount(at: now)
+        visibilitySource = visibilityAmount
+        visibilityTarget = clampedTarget
+        visibilityStartTime = now
+        visibilityDuration = duration * CFTimeInterval(abs(visibilityTarget - visibilitySource))
+        requestRender()
+    }
+
+    private func currentVisibilityAmount(at timestamp: CFTimeInterval) -> Float {
+        guard visibilityDuration > 0 else {
+            return visibilityTarget
+        }
+        let progress = Float(min(max((timestamp - visibilityStartTime) / visibilityDuration, 0), 1))
+        let eased = progress * progress * (3 - 2 * progress)
+        return visibilitySource + (visibilityTarget - visibilitySource) * eased
+    }
+
+    private func advanceVisibilityTransition() {
+        visibilityAmount = currentVisibilityAmount(at: CACurrentMediaTime())
+        if abs(visibilityAmount - visibilityTarget) < 0.001 {
+            visibilityAmount = visibilityTarget
+        }
+        requestRender()
     }
 
     private func transitionHover(to target: Float) {
@@ -253,7 +386,7 @@ final class TimelineNavigationScrollbarView: TimelineMetalLayerView {
         hoverTimer?.invalidate()
         guard abs(hoverTarget - hoverAmount) > 0.001 else {
             hoverAmount = hoverTarget
-            render()
+            requestRender()
             return
         }
         let timer = Timer(timeInterval: 1 / 120, repeats: true) { [weak self] _ in
@@ -275,7 +408,7 @@ final class TimelineNavigationScrollbarView: TimelineMetalLayerView {
 
     private func advanceHoverTransition() {
         hoverAmount = currentHoverAmount(at: CACurrentMediaTime())
-        render()
+        requestRender()
         if abs(hoverAmount - hoverTarget) < 0.001 {
             hoverAmount = hoverTarget
             hoverTimer?.invalidate()
@@ -311,7 +444,7 @@ final class TimelineNavigationScrollbarView: TimelineMetalLayerView {
                     self.installMetalDevice(resources.device)
                     self.commandQueue = resources.commandQueue
                     self.pipelineState = resources.pipelineState
-                    self.render()
+                    self.requestRender()
                 case let .failure(error):
                     Swift.print("Soundtime could not create timeline scrollbar renderer: \(error)")
                 }
@@ -346,6 +479,11 @@ final class TimelineNavigationScrollbarView: TimelineMetalLayerView {
         descriptor.vertexFunction = vertexFunction
         descriptor.fragmentFunction = fragmentFunction
         descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+        descriptor.colorAttachments[0].isBlendingEnabled = true
+        descriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        descriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
+        descriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
         return RendererResources(
             device: device,
             commandQueue: commandQueue,
@@ -353,9 +491,103 @@ final class TimelineNavigationScrollbarView: TimelineMetalLayerView {
         )
     }
 
-    private func render() {
+    private func requestRender() {
+        hasPendingRender = true
+        startDragDisplayLink()
+    }
+
+    private func startDragDisplayLink() {
+        guard window != nil, let timelineMetalLayer else {
+            return
+        }
+        if dragDisplayLink == nil {
+            let displayLink = TimelineDisplayLink(
+                metalLayer: timelineMetalLayer,
+                preferredFramesPerSecond: TimelineNavigationScrollbarDragGeometry.interactionFramesPerSecond
+            )
+            displayLink.onFrame = { [weak self] frame in
+                MainActor.assumeIsolated {
+                    self?.dragDisplayLinkDidTick(frame)
+                }
+            }
+            dragDisplayLink = displayLink
+        }
+        dragDisplayLink?.start()
+    }
+
+    private func stopDragDisplayLink() {
+        dragDisplayLink?.invalidate()
+        dragDisplayLink = nil
+    }
+
+    private func dragDisplayLinkDidTick(_ frame: TimelineDisplayLinkFrame) {
+        if dragOffset != nil {
+            guard TimelineNavigationScrollbarDragGeometry.shouldContinueDisplayPacedDrag(
+                hasDragOffset: true,
+                pressedMouseButtons: NSEvent.pressedMouseButtons
+            ) else {
+                finishDragSession(pointerIsInside: pointerIsInsideBounds(), notifiesEditingEnded: true)
+                return
+            }
+            sampleActiveDragFromCurrentMouse()
+        }
+
+        if isVisibilityTransitionActive {
+            advanceVisibilityTransition()
+        }
+
+        if hasPendingRender || dragOffset != nil || hoverTimer != nil || isVisibilityTransitionActive {
+            hasPendingRender = false
+            render(frame: frame)
+        }
+        if dragOffset == nil, hoverTimer == nil, !hasPendingRender, !isVisibilityTransitionActive {
+            stopDragDisplayLink()
+        }
+    }
+
+    private func finishDragSession(pointerIsInside: Bool, notifiesEditingEnded: Bool) {
+        guard dragOffset != nil else {
+            stopDragDisplayLink()
+            return
+        }
+        dragOffset = nil
+        requestRender()
+        if notifiesEditingEnded {
+            onEditingEnded?()
+        }
+        transitionHover(to: pointerIsInside ? 1 : 0)
+        if !pointerIsInside {
+            scheduleVisibilityDismissal()
+        }
+    }
+
+    private func abandonDragSession() {
+        dragOffset = nil
+        hasPendingRender = false
+        stopDragDisplayLink()
+    }
+
+    private func pointerIsInsideBounds() -> Bool {
+        guard let window else {
+            return false
+        }
+        let windowPoint = window.convertPoint(fromScreen: NSEvent.mouseLocation)
+        return bounds.contains(convert(windowPoint, from: nil))
+    }
+
+    private func sampleActiveDragFromCurrentMouse() {
+        guard dragOffset != nil, let window else {
+            return
+        }
+        let windowPoint = window.convertPoint(fromScreen: NSEvent.mouseLocation)
+        let localPoint = convert(windowPoint, from: nil)
+        updateValue(primaryPosition: primaryPosition(for: localPoint))
+    }
+
+    private func render(frame: TimelineDisplayLinkFrame? = nil) {
+        let target = frame.flatMap(makeTimelineRenderTarget(frame:)) ?? makeTimelineRenderTarget()
         guard
-            let renderTarget = makeTimelineRenderTarget(),
+            let renderTarget = target,
             let commandQueue,
             let pipelineState,
             let commandBuffer = commandQueue.makeCommandBuffer(),
@@ -374,7 +606,7 @@ final class TimelineNavigationScrollbarView: TimelineMetalLayerView {
             metrics: SIMD4<Float>(
                 Float(renderTarget.viewportSize.width),
                 Float(renderTarget.viewportSize.height),
-                isScrollable ? 1 : 0,
+                isScrollable ? visibilityAmount : 0,
                 0
             )
         )
@@ -441,20 +673,6 @@ final class TimelineNavigationScrollbarView: TimelineMetalLayerView {
         float2 scrollbarPoint = float2(primary * primarySize, cross * crossSize);
         float crossCenter = crossSize * 0.5;
 
-        float containerRadius = min(primarySize, crossSize) * 0.5;
-        float container = rounded_rect_alpha(
-            scrollbarPoint,
-            float2(primarySize * 0.5, crossCenter),
-            float2(primarySize * 0.5, crossCenter),
-            containerRadius
-        );
-        float railCrossHalf = max(crossSize * 0.24, 1.0);
-        float rail = rounded_rect_alpha(
-            scrollbarPoint,
-            float2(primarySize * 0.5, crossCenter),
-            float2(max(primarySize * 0.5 - 2.0, railCrossHalf), railCrossHalf),
-            railCrossHalf
-        );
         float handleCrossHalf = max(crossSize * 0.31, 1.0);
         float handlePrimaryHalf = max(handleLength * primarySize * 0.5 - 1.0, handleCrossHalf);
         float handle = rounded_rect_alpha(
@@ -464,18 +682,14 @@ final class TimelineNavigationScrollbarView: TimelineMetalLayerView {
             handleCrossHalf
         );
 
-        float3 color = float3(0.045, 0.047, 0.048);
-        color = mix(color, float3(0.095, 0.105, 0.108), rail * 0.72);
-        float3 neutral = float3(0.58, 0.61, 0.62);
-        float3 teal = float3(0.23, 0.53, 0.55);
-        float3 handleColor = mix(neutral, teal, hover);
+        float3 neutral = float3(0.50, 0.51, 0.52);
+        float3 hovered = float3(0.64, 0.65, 0.66);
+        float3 handleColor = mix(neutral, hovered, hover);
         float stripe = 0.5 + 0.5 * sin(primary * 96.0 + cross * 7.0);
         float centerGlow = exp(-pow((cross - 0.42) / 0.23, 2.0));
-        handleColor *= 0.82 + stripe * 0.07 + centerGlow * 0.13;
-        handleColor += float3(0.10, 0.13, 0.13) * centerGlow * (0.35 + hover * 0.35);
-        color = mix(color, handleColor, handle * mix(0.56, 0.92, enabled));
-        color += float3(0.09, 0.11, 0.11) * container * (1.0 - rail) * 0.18;
-        return float4(color, 1.0);
+        handleColor *= 0.90 + stripe * 0.025 + centerGlow * 0.075;
+        float alpha = handle * enabled * mix(0.84, 0.95, hover);
+        return float4(handleColor, alpha);
     }
     """
 }

@@ -1956,6 +1956,9 @@ final class WorkspaceView: NSView {
     private var deleteAutosaveProtectedUntil: CFTimeInterval = 0
     private var keyDownMonitor: Any?
     private var audioDevicePreferencesObserver: NSObjectProtocol?
+    private var audioSystemOutputRouteObserver: AudioSystemOutputRouteObserver?
+    private var audioOutputRouteRefreshWorkItem: DispatchWorkItem?
+    private var audioOutputRouteRefreshGeneration = 0
     private var debugToolsVisible = false
     private var isTranscriptLayerVisible = false
     private var editScope: EditScope = .group
@@ -2502,6 +2505,12 @@ final class WorkspaceView: NSView {
             }
         }
 
+        // Navigation overlays overlap the timeline by design. Give them first claim
+        // on pointer input so a scrollbar drag can never leak into region selection.
+        if let scrollbarHitView = hitTestTimelineNavigationScrollbars(point) {
+            return scrollbarHitView
+        }
+
         if let addTrackHitView = hitTestAddTrackButton(point) {
             return addTrackHitView
         }
@@ -2523,6 +2532,16 @@ final class WorkspaceView: NSView {
         }
 
         return hitView
+    }
+
+    private func hitTestTimelineNavigationScrollbars(_ point: NSPoint) -> NSView? {
+        for scrollbar in [verticalTimelineScrollbar, horizontalTimelineScrollbar] {
+            let scrollbarPoint = scrollbar.convert(point, from: self)
+            if let hitView = scrollbar.hitTest(scrollbarPoint) {
+                return hitView
+            }
+        }
+        return nil
     }
 
     private var isDenoiseModalInteractionActive: Bool {
@@ -2805,9 +2824,20 @@ final class WorkspaceView: NSView {
             self?.markTimelineHotInteraction(reason: "viewport")
             self?.timelineViewportDidChange(viewport)
         }
+        timelineSurface.onNavigationPresentationChanged = { [weak self] in
+            self?.updateTimelineNavigationScrollbars()
+        }
         timelineSurface.onTimelineInteractionBegan = { [weak self] in
             self?.markTimelineHotInteraction(reason: "timeline-began")
             self?.clearSelectedTrack()
+        }
+        timelineSurface.onNavigationScrollActivity = { [weak self] axis in
+            switch axis {
+            case .horizontal:
+                self?.horizontalTimelineScrollbar.noteScrollActivity()
+            case .vertical:
+                self?.verticalTimelineScrollbar.noteScrollActivity()
+            }
         }
         timelineSurface.onTrackLaneLayoutChanged = { [weak self] layout in
             self?.updateTrackLaneLayout(layout)
@@ -3038,18 +3068,21 @@ final class WorkspaceView: NSView {
 
             timelineSurface.topAnchor.constraint(equalTo: trackControlsStack.topAnchor),
             timelineSurface.leadingAnchor.constraint(equalTo: trackControlsStack.trailingAnchor, constant: 10),
-            timelineSurface.trailingAnchor.constraint(equalTo: verticalTimelineScrollbar.leadingAnchor, constant: -6),
-            timelineSurface.bottomAnchor.constraint(equalTo: horizontalTimelineScrollbar.topAnchor, constant: -6),
+            timelineSurface.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            timelineSurface.bottomAnchor.constraint(equalTo: agentCommandBar.topAnchor, constant: -8),
 
-            verticalTimelineScrollbar.topAnchor.constraint(equalTo: timelineSurface.topAnchor),
-            verticalTimelineScrollbar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-            verticalTimelineScrollbar.bottomAnchor.constraint(equalTo: timelineSurface.bottomAnchor),
-            verticalTimelineScrollbar.widthAnchor.constraint(equalToConstant: 16),
+            verticalTimelineScrollbar.topAnchor.constraint(
+                equalTo: timelineSurface.topAnchor,
+                constant: CGFloat(TimelineTrackLayout.defaultRulerLaneHeight) + 1
+            ),
+            verticalTimelineScrollbar.trailingAnchor.constraint(equalTo: timelineSurface.trailingAnchor, constant: -3),
+            verticalTimelineScrollbar.bottomAnchor.constraint(equalTo: timelineSurface.bottomAnchor, constant: -4),
+            verticalTimelineScrollbar.widthAnchor.constraint(equalToConstant: 14),
 
-            horizontalTimelineScrollbar.leadingAnchor.constraint(equalTo: timelineSurface.leadingAnchor),
-            horizontalTimelineScrollbar.trailingAnchor.constraint(equalTo: timelineSurface.trailingAnchor),
-            horizontalTimelineScrollbar.bottomAnchor.constraint(equalTo: agentCommandBar.topAnchor, constant: -8),
-            horizontalTimelineScrollbar.heightAnchor.constraint(equalToConstant: 16),
+            horizontalTimelineScrollbar.leadingAnchor.constraint(equalTo: timelineSurface.leadingAnchor, constant: 4),
+            horizontalTimelineScrollbar.trailingAnchor.constraint(equalTo: timelineSurface.trailingAnchor, constant: -4),
+            horizontalTimelineScrollbar.bottomAnchor.constraint(equalTo: timelineSurface.bottomAnchor, constant: 3),
+            horizontalTimelineScrollbar.heightAnchor.constraint(equalToConstant: 14),
 
             timelineZoomControls.trailingAnchor.constraint(equalTo: timelineSurface.trailingAnchor),
             timelineZoomControls.bottomAnchor.constraint(equalTo: timelineSurface.topAnchor, constant: -8),
@@ -3918,6 +3951,11 @@ final class WorkspaceView: NSView {
             NotificationCenter.default.removeObserver(audioDevicePreferencesObserver)
             self.audioDevicePreferencesObserver = nil
         }
+        audioSystemOutputRouteObserver?.stop()
+        audioSystemOutputRouteObserver = nil
+        audioOutputRouteRefreshWorkItem?.cancel()
+        audioOutputRouteRefreshWorkItem = nil
+        audioOutputRouteRefreshGeneration += 1
         stopPlaybackTimer()
         scheduledProjectTrackMixWorkItem?.cancel()
         scheduledProjectTrackMixWorkItem = nil
@@ -4236,21 +4274,27 @@ final class WorkspaceView: NSView {
     }
 
     private func installAudioDevicePreferencesObserver() {
-        guard audioDevicePreferencesObserver == nil else {
-            return
+        if audioDevicePreferencesObserver == nil {
+            audioDevicePreferencesObserver = NotificationCenter.default.addObserver(
+                forName: AudioDevicePreferences.didChangeNotification,
+                object: AudioDevicePreferences.shared,
+                queue: .main
+            ) { [weak self] notification in
+                let changedDeviceKind = notification.userInfo?[
+                    AudioDevicePreferences.changedDeviceKindUserInfoKey
+                ] as? String
+                Task { @MainActor in
+                    self?.handleAudioDevicePreferencesChanged(changedDeviceKind: changedDeviceKind)
+                }
+            }
         }
 
-        audioDevicePreferencesObserver = NotificationCenter.default.addObserver(
-            forName: AudioDevicePreferences.didChangeNotification,
-            object: AudioDevicePreferences.shared,
-            queue: .main
-        ) { [weak self] notification in
-            let changedDeviceKind = notification.userInfo?[
-                AudioDevicePreferences.changedDeviceKindUserInfoKey
-            ] as? String
-            Task { @MainActor in
-                self?.handleAudioDevicePreferencesChanged(changedDeviceKind: changedDeviceKind)
+        if audioSystemOutputRouteObserver == nil {
+            let routeObserver = AudioSystemOutputRouteObserver { [weak self] change in
+                self?.handleSystemOutputRouteChanged(change)
             }
+            audioSystemOutputRouteObserver = routeObserver
+            routeObserver.start()
         }
     }
 
@@ -4265,6 +4309,102 @@ final class WorkspaceView: NSView {
         } catch {
             stopPlaybackTimer()
             updateStatus("audio device failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func handleSystemOutputRouteChanged(_ change: AudioSystemOutputRouteChange) {
+        guard AudioDevicePreferences.shared.followsSystemDefaultOutputDevice() else {
+            SoundtimeDiagnostics.shared.record(
+                category: .device,
+                severity: .info,
+                name: "system-output-route-change-ignored",
+                message: "The system output changed while Soundtime was using an explicitly selected device.",
+                fields: ["reasons": change.reasons.joined(separator: ",")]
+            )
+            return
+        }
+        guard playbackControllerStorage?.hasSource == true else {
+            return
+        }
+
+        audioOutputRouteRefreshGeneration += 1
+        scheduleSystemOutputRouteRefresh(
+            generation: audioOutputRouteRefreshGeneration,
+            attempt: 0,
+            change: change,
+            delay: 0
+        )
+    }
+
+    private func scheduleSystemOutputRouteRefresh(
+        generation: Int,
+        attempt: Int,
+        change: AudioSystemOutputRouteChange,
+        delay: TimeInterval
+    ) {
+        audioOutputRouteRefreshWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.refreshSystemOutputRoute(
+                generation: generation,
+                attempt: attempt,
+                change: change
+            )
+        }
+        audioOutputRouteRefreshWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func refreshSystemOutputRoute(
+        generation: Int,
+        attempt: Int,
+        change: AudioSystemOutputRouteChange
+    ) {
+        guard generation == audioOutputRouteRefreshGeneration else {
+            return
+        }
+        audioOutputRouteRefreshWorkItem = nil
+
+        do {
+            try playbackController.refreshOutputDevice()
+            updateStatus("audio output switched")
+            SoundtimeDiagnostics.shared.record(
+                category: .device,
+                severity: .info,
+                name: "system-output-route-refreshed",
+                message: "Realtime playback moved to the current system output device.",
+                fields: [
+                    "attempt": "\(attempt + 1)",
+                    "deviceID": change.outputDeviceID.map(String.init) ?? "unavailable",
+                    "reasons": change.reasons.joined(separator: ","),
+                    "playing": "\(playbackController.isPlaying)",
+                ]
+            )
+        } catch {
+            let retryDelays: [TimeInterval] = [0.06, 0.18, 0.40]
+            if attempt < retryDelays.count {
+                scheduleSystemOutputRouteRefresh(
+                    generation: generation,
+                    attempt: attempt + 1,
+                    change: change,
+                    delay: retryDelays[attempt]
+                )
+                return
+            }
+
+            stopPlaybackTimer()
+            updateStatus("audio output failed: \(error.localizedDescription)")
+            SoundtimeDiagnostics.shared.record(
+                category: .device,
+                severity: .severe,
+                name: "system-output-route-refresh-failed",
+                message: "Soundtime could not move realtime playback to the new system output device.",
+                fields: [
+                    "attempts": "\(attempt + 1)",
+                    "deviceID": change.outputDeviceID.map(String.init) ?? "unavailable",
+                    "error": error.localizedDescription,
+                    "reasons": change.reasons.joined(separator: ","),
+                ]
+            )
         }
     }
 
@@ -4334,6 +4474,19 @@ final class WorkspaceView: NSView {
             } else {
                 undoLastEdit()
             }
+            return nil
+        }
+
+        if
+            event.keyCode == 6,
+            shortcutModifiers.isEmpty,
+            let selectedTimelineRange,
+            selectedTimelineRange.durationProgress > 0
+        {
+            guard !event.isARepeat else {
+                return nil
+            }
+            timelineSurface.focusSelection(selectedTimelineRange)
             return nil
         }
 
@@ -17631,6 +17784,7 @@ final class WorkspaceView: NSView {
     private func markTimelineHotInteraction(reason: String) {
         _ = reason
         lastTimelineHotInteractionTime = CACurrentMediaTime()
+        ImportWorkBudget.shared.noteTimelineInteraction()
     }
 
     private func scheduleTimelineViewportPersistence(delay: TimeInterval? = nil) {

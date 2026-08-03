@@ -28,7 +28,7 @@ enum WaveformRawSampleTileBuilder {
 
         for frameOffset in 0..<frameCount {
             if shouldYieldForPlayback, frameOffset.isMultiple(of: 4096) {
-                try ImportWorkBudget.shared.waitIfPlaybackActive(.previewRefinement)
+                try ImportWorkBudget.shared.waitIfForegroundWorkIsActive(.previewRefinement)
             }
 
             let frameIndex = Int(startFrame) + frameOffset

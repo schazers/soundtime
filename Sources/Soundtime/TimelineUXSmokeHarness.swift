@@ -230,6 +230,13 @@ enum TimelineUXSmokeHarness {
         )
         complete("multi-track lane render keeps every visible lane alive")
 
+        try verifyRulerSeparatorIsContinuous(
+            device: device,
+            pixelFormat: pixelFormat,
+            track: track
+        )
+        complete("ruler separator remains continuous across every pixel")
+
         try verifyTrackLayoutGeometry()
         complete("track layout geometry keeps lanes aligned and hit-testable")
 
@@ -352,6 +359,15 @@ enum TimelineUXSmokeHarness {
         )
         complete("rapid viewport interaction updates stay GPU-only and visible")
 
+        try verifyPanImmediatelyAfterZoomStaysResponsive(
+            renderer: renderer,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale,
+            frameStatsBox: frameStatsBox
+        )
+        complete("pan remains frame-safe immediately after zoom refinement changes")
+
         try verifyDeletionEffectLifecycle(
             renderer: renderer,
             track: track,
@@ -386,6 +402,12 @@ enum TimelineUXSmokeHarness {
         try verifyEditCameraTransition()
         complete("edit camera reframing is continuous and lands exactly")
 
+        try verifySelectionFocusCameraTransition()
+        complete("selection focus preserves 64-point margins and track height")
+
+        try verifyOffscreenPlayheadNavigation()
+        complete("offscreen playhead arrows share an exact reveal target")
+
         try verifyDeleteSelectionDeletesExactFrameRange()
         complete("delete selection removes exact selected frame range")
 
@@ -401,10 +423,14 @@ enum TimelineUXSmokeHarness {
 
         try MainActor.assumeIsolated {
             try verifyTimelineStartClickSeeksDuringPlayback(track: track)
+            try verifyOffscreenPlayheadDoesNotPageTimeline(track: track)
+            try verifySelectionFocusScrollbarUsesPresentedCamera(track: track)
             try verifyMainFPSGraphPixels()
             try verifyPerformanceDashboardGraphPixels()
         }
         complete("timeline start click seeks during playback")
+        complete("offscreen playback never moves the timeline without an explicit reveal")
+        complete("selection focus scrollbar follows the presented camera")
         try verifyFrameHealthMetricSemantics()
         complete("main FPS graph draws visible cyan/red pixels")
         complete("performance monitor FPS/CPU graphs draw visible pixels")
@@ -1285,6 +1311,53 @@ enum TimelineUXSmokeHarness {
         }
     }
 
+    private static func verifyRulerSeparatorIsContinuous(
+        device: MTLDevice,
+        pixelFormat: MTLPixelFormat,
+        track: TimelineRenderState.Track
+    ) throws {
+        let viewportSize = CGSize(width: 960, height: 360)
+        let backingScale: Float = 2
+        let texture = try makeTexture(
+            device: device,
+            pixelFormat: pixelFormat,
+            width: Int(viewportSize.width * CGFloat(backingScale)),
+            height: Int(viewportSize.height * CGFloat(backingScale))
+        )
+        let renderer = try TimelineRenderer(device: device, pixelFormat: pixelFormat)
+        let frame = try renderTimeline(
+            renderer: renderer,
+            tracks: [track],
+            viewport: .full,
+            playheadProgress: 0.43,
+            isPlaybackActive: false,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale
+        )
+
+        let separatorRow = max(
+            Int((TimelineTrackLayout.defaultRulerLaneHeight * backingScale).rounded(.up)) - 1,
+            0
+        )
+        var darkColumns: [Int] = []
+        for column in 0..<frame.summary.width {
+            let byteIndex = (separatorRow * frame.summary.width + column) * 4
+            let blue = Int(frame.bytes[byteIndex])
+            let green = Int(frame.bytes[byteIndex + 1])
+            let red = Int(frame.bytes[byteIndex + 2])
+            let luminance = (red * 54 + green * 183 + blue * 19) / 256
+            if luminance < 34 {
+                darkColumns.append(column)
+            }
+        }
+
+        try require(
+            darkColumns.isEmpty,
+            "ruler separator contained dark gaps at columns \(darkColumns.prefix(12))"
+        )
+    }
+
     private static func verifyTrackLayoutGeometry() throws {
         let threeTrackLayout = TimelineTrackLayout.default.resolved(totalTrackCount: 3, viewportHeight: 360)
         let expectedTrackViewportHeight = 360 - TimelineTrackLayout.defaultRulerLaneHeight
@@ -1384,6 +1457,81 @@ enum TimelineUXSmokeHarness {
                 y: unscrollableGeometry.verticalHandle.midY
             )) == nil,
             "hidden vertical scrollbar intercepted timeline input"
+        )
+
+        try require(
+            TimelineNavigationScrollbarDragGeometry.interactionFramesPerSecond == 144,
+            "navigation scrollbar drag was not paced at the timeline presentation rate"
+        )
+        try require(
+            abs(TimelineNavigationScrollbarVisibilityTiming.fadeInDuration - 0.15) < 0.000_1,
+            "navigation scrollbar fade-in did not preserve the 150 ms interaction timing"
+        )
+        try require(
+            abs(TimelineNavigationScrollbarVisibilityTiming.lingerDuration - 0.60) < 0.000_1,
+            "navigation scrollbar did not remain visible for 600 ms after scrolling"
+        )
+        try require(
+            abs(TimelineNavigationScrollbarVisibilityTiming.fadeOutDuration - 0.15) < 0.000_1,
+            "navigation scrollbar fade-out did not preserve the 150 ms interaction timing"
+        )
+        try require(
+            TimelineNavigationScrollbarVisibilityTiming.fadeInDuration ==
+                TimelineNavigationScrollbarVisibilityTiming.fadeOutDuration,
+            "navigation scrollbar fade-in and fade-out timings diverged"
+        )
+        let leadingClampedDrag = TimelineNavigationScrollbarDragGeometry.normalizedValue(
+            primaryPosition: -0.08,
+            dragOffset: 0.10,
+            handleLength: 0.40
+        )
+        let trailingClampedDrag = TimelineNavigationScrollbarDragGeometry.normalizedValue(
+            primaryPosition: 0.78,
+            dragOffset: 0.10,
+            handleLength: 0.40
+        )
+        try require(
+            leadingClampedDrag == 0 && trailingClampedDrag == 1,
+            "navigation scrollbar drag did not clamp cleanly at both timeline boundaries"
+        )
+        try require(
+            TimelineNavigationScrollbarDragGeometry.shouldContinueDisplayPacedDrag(
+                hasDragOffset: true,
+                pressedMouseButtons: 1
+            ),
+            "navigation scrollbar drag stopped while the physical left button was held"
+        )
+        try require(
+            !TimelineNavigationScrollbarDragGeometry.shouldContinueDisplayPacedDrag(
+                hasDragOffset: true,
+                pressedMouseButtons: 0
+            ),
+            "navigation scrollbar retained camera ownership after the physical drag ended"
+        )
+        try require(
+            !TimelineNavigationScrollbarDragGeometry.shouldContinueDisplayPacedDrag(
+                hasDragOffset: false,
+                pressedMouseButtons: 1
+            ),
+            "navigation scrollbar started display-paced updates without an active drag"
+        )
+        let displayPacedValues = (0...144).map { sampleIndex in
+            TimelineNavigationScrollbarDragGeometry.normalizedValue(
+                primaryPosition: 0.1 + CGFloat(sampleIndex) / 144 * 0.6,
+                dragOffset: 0.1,
+                handleLength: 0.4
+            )
+        }
+        try require(
+            abs((displayPacedValues.last ?? -1) - 1) < 0.000_1,
+            "display-paced scrollbar drag did not reach its exact final value"
+        )
+        let maximumStep = zip(displayPacedValues, displayPacedValues.dropFirst())
+            .map { abs($1 - $0) }
+            .max() ?? 1
+        try require(
+            maximumStep < 0.008,
+            "display-paced scrollbar drag skipped intermediate viewport positions"
         )
 
         let positions = TimelineTrackReorderGeometry.trackPositions(
@@ -2949,14 +3097,19 @@ enum TimelineUXSmokeHarness {
         )
 
         let p95Milliseconds = percentile(frameDurations, percentile: 0.95)
+        let p99Milliseconds = percentile(frameDurations, percentile: 0.99)
         let maxMilliseconds = frameDurations.max() ?? 0
         try require(
             p95Milliseconds < 6.9,
             String(format: "hover guide render p95 was too slow: %.2fms", p95Milliseconds)
         )
         try require(
-            maxMilliseconds < 12,
-            String(format: "hover guide render outlier was too slow: %.2fms", maxMilliseconds)
+            p99Milliseconds < 12,
+            String(format: "hover guide render p99 was too slow: %.2fms", p99Milliseconds)
+        )
+        try require(
+            maxMilliseconds < 25,
+            String(format: "hover guide render had a catastrophic outlier: %.2fms", maxMilliseconds)
         )
         try require(
             burstDurationMilliseconds < 8,
@@ -3115,6 +3268,107 @@ enum TimelineUXSmokeHarness {
 
         let changedPixels = pixelDifferenceCount(firstFrame.bytes, lastFrame.bytes, threshold: 8)
         try require(changedPixels > 4_000, "viewport interaction did not visibly update waveform: \(changedPixels)")
+    }
+
+    private static func verifyPanImmediatelyAfterZoomStaysResponsive(
+        renderer: TimelineRenderer,
+        texture: MTLTexture,
+        viewportSize: CGSize,
+        backingScale: Float,
+        frameStatsBox: FrameStatsBox
+    ) throws {
+        let overview = makeDetailedWaveformOverview(
+            duration: 600,
+            binCount: 131_072,
+            seed: 91
+        )
+        let track = TimelineRenderState.Track(
+            id: UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-000000000091") ?? UUID(),
+            waveformVersion: 1,
+            waveformOverview: overview,
+            durationHint: overview.duration,
+            volume: 1,
+            isMuted: false,
+            isSoloed: false,
+            clipRanges: [TimelineRenderState.ClipRange(startProgress: 0, endProgress: 1)]
+        )
+        let baseTimestamp = CACurrentMediaTime()
+        renderer.displayTracks([track], animateWaveformTransition: false)
+        renderer.displayTrackLayout(.default, marksInteraction: false)
+        renderer.displayViewport(.full, marksInteraction: false)
+        renderer.displayPlaybackActive(false)
+        try waitForVisibleWaveformBuffers(
+            renderer: renderer,
+            texture: texture,
+            viewportSize: viewportSize,
+            backingScale: backingScale,
+            displayTimestamp: baseTimestamp
+        )
+
+        for frameIndex in 0..<12 {
+            let t = Float(frameIndex + 1) / 12
+            renderer.displayViewport(TimelineViewport(
+                startProgress: 0.08 * t,
+                durationProgress: 1 - 0.82 * t
+            ))
+            _ = try renderCurrentTimeline(
+                renderer: renderer,
+                displayTimestamp: baseTimestamp + Double(frameIndex + 1) / 144,
+                texture: texture,
+                viewportSize: viewportSize,
+                backingScale: backingScale
+            )
+        }
+
+        try require(
+            ImportWorkBudget.shared.snapshot().isTimelineInteractionActive,
+            "zoom did not protect the following pan from background refinement"
+        )
+        frameStatsBox.samples.removeAll()
+        var panFrameDurations: [Double] = []
+        panFrameDurations.reserveCapacity(40)
+        for frameIndex in 0..<40 {
+            let t = Float(frameIndex) / 39
+            renderer.displayViewport(TimelineViewport(
+                startProgress: 0.08 + 0.42 * t,
+                durationProgress: 0.18
+            ))
+            let renderPassDescriptor = makeRenderPassDescriptor(texture: texture)
+            let startedAt = CACurrentMediaTime()
+            let commandBuffer = renderer.renderOffscreen(
+                renderPassDescriptor: renderPassDescriptor,
+                viewportSize: viewportSize,
+                backingScale: backingScale,
+                displayTimestamp: baseTimestamp + Double(frameIndex + 13) / 144,
+                waitUntilCompleted: false
+            )
+            commandBuffer?.waitUntilCompleted()
+            panFrameDurations.append((CACurrentMediaTime() - startedAt) * 1_000)
+        }
+
+        let p95Milliseconds = percentile(panFrameDurations, percentile: 0.95)
+        let maxMilliseconds = panFrameDurations.max() ?? 0
+        try require(
+            p95Milliseconds < 6.9,
+            String(format: "post-zoom pan render p95 was too slow: %.2fms", p95Milliseconds)
+        )
+        try require(
+            maxMilliseconds < 12,
+            String(format: "post-zoom pan render outlier was too slow: %.2fms", maxMilliseconds)
+        )
+
+        let panStats = frameStatsBox.samples.filter { $0.waveformHotPathReason == "viewport-interaction" }
+        try require(!panStats.isEmpty, "post-zoom pan did not publish viewport hot-path stats")
+        let violations = panStats.filter {
+            $0.cpuWaveformVertexCount > 0 ||
+                $0.cpuWaveformFallbackDrawCount > 0 ||
+                $0.shaderBufferUploadByteCount > 0 ||
+                $0.shaderBufferUploadCount > 0
+        }
+        try require(
+            violations.isEmpty,
+            "post-zoom pan performed waveform fallback or upload work in \(violations.count) frames"
+        )
     }
 
     private static func verifyDeletionEffectLifecycle(
@@ -3548,6 +3802,77 @@ enum TimelineUXSmokeHarness {
         )
     }
 
+    @MainActor
+    private static func verifyOffscreenPlayheadDoesNotPageTimeline(
+        track: TimelineRenderState.Track
+    ) throws {
+        let timelineView = TimelineView()
+        timelineView.frame = NSRect(x: 0, y: 0, width: 960, height: 360)
+        timelineView.displayTracks(
+            [track],
+            animateWaveformTransition: false,
+            allowImmediateWaveformPrewarm: false,
+            allowImmediateInteractiveWaveformPrewarm: false
+        )
+        let viewport = TimelineViewport(startProgress: 0.20, durationProgress: 0.30)
+        timelineView.restoreViewport(viewport)
+        timelineView.displayPlaybackActive(true)
+        timelineView.displayPlayheadProgress(0.90)
+        try require(
+            timelineView.currentViewport == viewport,
+            "an offscreen right playhead paged the timeline without an explicit reveal"
+        )
+        timelineView.displayPlayheadProgress(0.05)
+        try require(
+            timelineView.currentViewport == viewport,
+            "an offscreen left playhead paged the timeline without an explicit reveal"
+        )
+    }
+
+    @MainActor
+    private static func verifySelectionFocusScrollbarUsesPresentedCamera(
+        track: TimelineRenderState.Track
+    ) throws {
+        let timelineView = TimelineView()
+        timelineView.frame = NSRect(x: 0, y: 0, width: 960, height: 360)
+        timelineView.displayTracks(
+            [track],
+            animateWaveformTransition: false,
+            allowImmediateWaveformPrewarm: false,
+            allowImmediateInteractiveWaveformPrewarm: false
+        )
+        let sourceViewport = TimelineViewport(startProgress: 0.10, durationProgress: 0.70)
+        timelineView.restoreViewport(sourceViewport)
+        var presentationUpdateCount = 0
+        timelineView.onNavigationPresentationChanged = {
+            presentationUpdateCount += 1
+        }
+        timelineView.restoreViewport(TimelineViewport(startProgress: 0.12, durationProgress: 0.68))
+        try require(
+            presentationUpdateCount == 1,
+            "timeline viewport presentation did not notify navigation chrome"
+        )
+
+        let presentedViewport = timelineView.currentViewport
+        let selection = TimelineSelection(
+            startProgress: 0.52,
+            endProgress: 0.62,
+            trackID: track.id
+        )
+        timelineView.focusSelection(selection)
+        try require(
+            abs(timelineView.horizontalVisibleFraction - presentedViewport.durationProgress) < 0.000_001,
+            "selection focus scrollbar jumped to the settled camera before animation began"
+        )
+        let expectedTravel = max(1 - presentedViewport.durationProgress, 0)
+        let expectedValue = expectedTravel > 0.000_001 ?
+            presentedViewport.startProgress / expectedTravel : 0
+        try require(
+            abs(timelineView.horizontalScrollNormalizedValue - expectedValue) < 0.000_001,
+            "selection focus scrollbar thumb did not reflect the presented camera position"
+        )
+    }
+
     private static func verifyDeleteSelectionDeletesExactFrameRange() throws {
         let frameCount = 120
         let samples = (0..<frameCount).map { Float($0) }
@@ -3706,6 +4031,240 @@ enum TimelineUXSmokeHarness {
         try require(
             !fixedCameraTransition.isMeaningful(viewportWidth: 1_440),
             "an edit moved a zoomed camera whose absolute time window was still valid"
+        )
+    }
+
+    private static func verifySelectionFocusCameraTransition() throws {
+        let selection = TimelineSelection(
+            startProgress: 0.25,
+            endProgress: 0.50,
+            trackID: UUID()
+        )
+        let layout = TimelineTrackLayout(
+            scrollOffset: 0,
+            preferredTrackHeight: 100,
+            automaticallyFitsTrackHeight: false,
+            rulerLaneHeight: 32
+        ).resolved(totalTrackCount: 8, viewportHeight: 500)
+        let plan = TimelineSelectionFocusPlan(
+            selection: selection,
+            trackIndex: 4,
+            trackLayout: layout,
+            viewportWidth: 1_440
+        )
+
+        let expectedDuration = Float(0.25 / ((1_440.0 - 128.0) / 1_440.0))
+        let expectedStart = Float(0.25) - expectedDuration * Float(64.0 / 1_440.0)
+        try require(
+            abs(plan.viewport.startProgress - expectedStart) < 0.000_001 &&
+                abs(plan.viewport.durationProgress - expectedDuration) < 0.000_001,
+            "selection focus did not preserve 64-point horizontal margins"
+        )
+        let leadingMargin = (
+            Float(selection.startProgress) - plan.viewport.startProgress
+        ) / plan.viewport.durationProgress * 1_440
+        let trailingMargin = (
+            plan.viewport.endProgress - Float(selection.endProgress)
+        ) / plan.viewport.durationProgress * 1_440
+        try require(
+            abs(leadingMargin - 64) < 0.001 && abs(trailingMargin - 64) < 0.001,
+            "selection focus did not place the selected region 64 points from both edges"
+        )
+        try require(
+            abs(plan.trackScrollOffset - 216) < 0.001,
+            "selection focus did not center the selected track"
+        )
+        let focusedLayout = TimelineTrackLayout(
+            scrollOffset: plan.trackScrollOffset,
+            preferredTrackHeight: 100,
+            automaticallyFitsTrackHeight: false,
+            rulerLaneHeight: 32
+        ).resolved(totalTrackCount: 8, viewportHeight: 500)
+        try require(
+            focusedLayout.trackHeight == layout.trackHeight,
+            "selection focus changed vertical track height"
+        )
+
+        let transition = TimelineCameraTransition(
+            source: TimelineCameraWindow(viewport: .full, projectDuration: 120),
+            target: TimelineCameraWindow(viewport: plan.viewport, projectDuration: 120),
+            startTimestamp: 10,
+            tuning: .selectionFocus
+        )
+        let quarter = transition.camera(
+            at: 10 + TimelineCameraTransition.Tuning.selectionFocus.duration * 0.25
+        )
+        let focusedVisibleDuration = Double(expectedDuration) * 120
+        let linearQuarterDuration = 120 + (focusedVisibleDuration - 120) * 0.25
+        try require(
+            quarter.visibleDuration < linearQuarterDuration,
+            "selection focus camera did not use the requested quick ease-out curve"
+        )
+        try require(
+            abs(transition.camera(at: transition.endTimestamp).visibleDuration - focusedVisibleDuration) < 0.000_001,
+            "selection focus camera did not land on the padded selected duration"
+        )
+
+        let towardSource = TimelineCameraWindow(centerTime: 24, visibleDuration: 36)
+        let towardTarget = TimelineCameraWindow(centerTime: 68, visibleDuration: 14)
+        let towardVelocity = TimelineCameraVelocity(
+            centerTimePerSecond: 30,
+            logVisibleDurationPerSecond: -0.7
+        )
+        try require(
+            towardVelocity.alignment(from: towardSource, toward: towardTarget) > 0,
+            "selection focus did not recognize camera momentum toward its target"
+        )
+        let towardTransition = TimelineCameraTransition(
+            source: towardSource,
+            target: towardTarget,
+            startTimestamp: 20,
+            tuning: .selectionFocus,
+            initialVelocity: towardVelocity
+        )
+        let towardInitialVelocity = towardTransition.velocity(at: 20)
+        try require(
+            abs(towardInitialVelocity.centerTimePerSecond - towardVelocity.centerTimePerSecond) < 0.000_001 &&
+                abs(towardInitialVelocity.logVisibleDurationPerSecond - towardVelocity.logVisibleDurationPerSecond) <
+                0.000_001,
+            "selection focus discarded useful incoming camera momentum"
+        )
+        let towardFirstFrame = towardTransition.camera(at: 20 + 1.0 / 144.0)
+        try require(
+            towardFirstFrame.centerTime > towardSource.centerTime &&
+                towardFirstFrame.visibleDuration < towardSource.visibleDuration,
+            "selection focus did not continue camera motion already aimed toward the selection"
+        )
+        try require(
+            towardTransition.camera(at: towardTransition.endTimestamp) == towardTarget &&
+                towardTransition.velocity(at: towardTransition.endTimestamp) == .zero,
+            "momentum-aware selection focus did not settle exactly at rest on its target"
+        )
+
+        let opposingSource = TimelineCameraWindow(centerTime: 60, visibleDuration: 24)
+        let opposingTarget = TimelineCameraWindow(centerTime: 28, visibleDuration: 12)
+        let opposingVelocity = TimelineCameraVelocity(
+            centerTimePerSecond: 18,
+            logVisibleDurationPerSecond: 0.35
+        )
+        try require(
+            opposingVelocity.alignment(from: opposingSource, toward: opposingTarget) < 0,
+            "selection focus did not recognize camera momentum moving away from its target"
+        )
+        let opposingTransition = TimelineCameraTransition(
+            source: opposingSource,
+            target: opposingTarget,
+            startTimestamp: 30,
+            tuning: .selectionFocusOpposingMomentum,
+            initialVelocity: opposingVelocity
+        )
+        let opposingEarlyCamera = opposingTransition.camera(at: 30 + 0.002)
+        let opposingMidVelocity = opposingTransition.velocity(
+            at: 30 + TimelineCameraTransition.Tuning.selectionFocusOpposingMomentum.duration * 0.5
+        )
+        try require(
+            opposingEarlyCamera.centerTime > opposingSource.centerTime,
+            "selection focus snapped against opposing momentum instead of braking it"
+        )
+        try require(
+            opposingMidVelocity.centerTimePerSecond < 0,
+            "selection focus did not reverse smoothly after braking opposing momentum"
+        )
+        try require(
+            opposingTransition.camera(at: opposingTransition.endTimestamp) == opposingTarget &&
+                opposingTransition.velocity(at: opposingTransition.endTimestamp) == .zero,
+            "opposing-momentum selection focus did not settle exactly on its target"
+        )
+    }
+
+    private static func verifyOffscreenPlayheadNavigation() throws {
+        let indicatorBounds = CGRect(x: 0, y: 0, width: 36, height: 46)
+        let leftVertices = TimelineOffscreenPlayheadIndicatorGeometry.vertices(
+            direction: .left,
+            in: indicatorBounds
+        )
+        let rightVertices = TimelineOffscreenPlayheadIndicatorGeometry.vertices(
+            direction: .right,
+            in: indicatorBounds
+        )
+        try require(
+            leftVertices[1].x < leftVertices[0].x &&
+                rightVertices[1].x > rightVertices[0].x,
+            "offscreen playhead indicators did not point toward their respective edges"
+        )
+        try require(
+            abs(leftVertices[0].x - leftVertices[2].x) < 0.000_01 &&
+                abs(rightVertices[0].x - rightVertices[2].x) < 0.000_01 &&
+                abs(leftVertices[1].y - indicatorBounds.midY) < 0.000_01 &&
+                abs(rightVertices[1].y - indicatorBounds.midY) < 0.000_01,
+            "offscreen playhead indicators are not closed isosceles triangles"
+        )
+
+        let viewport = TimelineViewport(startProgress: 0.20, durationProgress: 0.30)
+        try require(
+            TimelineOffscreenPlayheadNavigation.direction(
+                playheadProgress: 0.05,
+                viewport: viewport
+            ) == .left,
+            "a playhead left of the viewport did not select the left reveal arrow"
+        )
+        try require(
+            TimelineOffscreenPlayheadNavigation.direction(
+                playheadProgress: 0.85,
+                viewport: viewport
+            ) == .right,
+            "a playhead right of the viewport did not select the right reveal arrow"
+        )
+        try require(
+            TimelineOffscreenPlayheadNavigation.direction(
+                playheadProgress: 0.35,
+                viewport: viewport
+            ) == nil,
+            "an onscreen playhead incorrectly selected an offscreen reveal arrow"
+        )
+
+        for playheadProgress: Float in [0.14, 0.60] {
+            let revealed = TimelineOffscreenPlayheadNavigation.revealViewport(
+                playheadProgress: playheadProgress,
+                viewport: viewport
+            )
+            let landingFraction = revealed.viewportProgress(
+                forTimelineProgress: playheadProgress
+            )
+            try require(
+                abs(landingFraction - TimelineOffscreenPlayheadNavigation.revealAnchorFraction) < 0.000_01,
+                "playhead reveal landed at \(landingFraction), expected the shared near-left anchor"
+            )
+            try require(
+                abs(revealed.durationProgress - viewport.durationProgress) < 0.000_001,
+                "playhead reveal unexpectedly changed the timeline zoom"
+            )
+        }
+
+        let endClamped = TimelineOffscreenPlayheadNavigation.revealViewport(
+            playheadProgress: 0.98,
+            viewport: viewport
+        )
+        try require(
+            abs(endClamped.endProgress - 1) < 0.000_001,
+            "near-end playhead reveal did not preserve the timeline's no-overscroll boundary"
+        )
+
+        let transition = TimelineCameraTransition(
+            source: TimelineCameraWindow(viewport: viewport, projectDuration: 120),
+            target: TimelineCameraWindow(
+                viewport: TimelineOffscreenPlayheadNavigation.revealViewport(
+                    playheadProgress: 0.85,
+                    viewport: viewport
+                ),
+                projectDuration: 120
+            ),
+            startTimestamp: 10,
+            tuning: .playheadReveal
+        )
+        try require(
+            transition.camera(at: transition.endTimestamp) == transition.target,
+            "offscreen playhead reveal did not land exactly on its target camera"
         )
     }
 

@@ -3,6 +3,7 @@ import Dispatch
 
 struct ImportWorkBudgetSnapshot: Sendable {
     let isPlaybackActive: Bool
+    let isTimelineInteractionActive: Bool
     let exclusiveWorkInFlight: Int
     let completedWorkCount: Int
     let deferredWorkCount: Int
@@ -39,6 +40,7 @@ final class ImportWorkBudget: @unchecked Sendable {
     private let lock = NSLock()
     private let heavyWorkSemaphore = DispatchSemaphore(value: 1)
     private var isPlaybackActive = false
+    private var lastTimelineInteractionTimestamp: TimeInterval = -Double.infinity
     private var exclusiveWorkInFlight = 0
     private var completedWorkCount = 0
     private var deferredWorkCount = 0
@@ -50,6 +52,12 @@ final class ImportWorkBudget: @unchecked Sendable {
     func setPlaybackActive(_ isActive: Bool) {
         lock.lock()
         isPlaybackActive = isActive
+        lock.unlock()
+    }
+
+    func noteTimelineInteraction(at timestamp: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        lock.lock()
+        lastTimelineInteractionTimestamp = max(lastTimelineInteractionTimestamp, timestamp)
         lock.unlock()
     }
 
@@ -66,7 +74,7 @@ final class ImportWorkBudget: @unchecked Sendable {
         _ workClass: WorkClass,
         work: () throws -> T
     ) throws -> T {
-        try waitIfPlaybackActive(workClass)
+        try waitIfForegroundWorkIsActive(workClass)
         while heavyWorkSemaphore.wait(timeout: .now() + .milliseconds(20)) != .success {
             if Task.isCancelled {
                 throw CancellationError()
@@ -85,12 +93,12 @@ final class ImportWorkBudget: @unchecked Sendable {
         return try work()
     }
 
-    func waitIfPlaybackActive(_ workClass: WorkClass = .rendererMaintenance) throws {
+    func waitIfForegroundWorkIsActive(_ workClass: WorkClass = .rendererMaintenance) throws {
         if Task.isCancelled {
             throw CancellationError()
         }
 
-        let delay = playbackBackoff(for: workClass)
+        let delay = foregroundBackoff(for: workClass)
         guard delay > 0 else {
             return
         }
@@ -104,7 +112,7 @@ final class ImportWorkBudget: @unchecked Sendable {
             throw CancellationError()
         }
 
-        let delay = playbackBackoff(for: workClass)
+        let delay = foregroundBackoff(for: workClass)
         guard delay > 0 else {
             return
         }
@@ -121,6 +129,9 @@ final class ImportWorkBudget: @unchecked Sendable {
 
         return ImportWorkBudgetSnapshot(
             isPlaybackActive: isPlaybackActive,
+            isTimelineInteractionActive: timelineInteractionIsActiveLocked(
+                at: ProcessInfo.processInfo.systemUptime
+            ),
             exclusiveWorkInFlight: exclusiveWorkInFlight,
             completedWorkCount: completedWorkCount,
             deferredWorkCount: deferredWorkCount,
@@ -129,11 +140,17 @@ final class ImportWorkBudget: @unchecked Sendable {
         )
     }
 
-    private func playbackBackoff(for workClass: WorkClass) -> TimeInterval {
+    private func foregroundBackoff(for workClass: WorkClass) -> TimeInterval {
         lock.lock()
-        let shouldBackOff = isPlaybackActive
+        let shouldBackOff = isPlaybackActive || timelineInteractionIsActiveLocked(
+            at: ProcessInfo.processInfo.systemUptime
+        )
         lock.unlock()
         return shouldBackOff ? workClass.playbackBackoff : 0
+    }
+
+    private func timelineInteractionIsActiveLocked(at timestamp: TimeInterval) -> Bool {
+        timestamp - lastTimelineInteractionTimestamp < 0.45
     }
 
     private func markExclusiveWorkStarted() {

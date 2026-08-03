@@ -23,6 +23,34 @@ enum TimelineNavigationPanGeometry {
     }
 }
 
+enum TimelineNavigationScrollbarDragGeometry {
+    static let interactionFramesPerSecond = 144
+
+    static func shouldContinueDisplayPacedDrag(
+        hasDragOffset: Bool,
+        pressedMouseButtons: Int
+    ) -> Bool {
+        hasDragOffset && pressedMouseButtons & 1 != 0
+    }
+
+    static func normalizedValue(
+        primaryPosition: CGFloat,
+        dragOffset: CGFloat,
+        handleLength: CGFloat
+    ) -> Float {
+        let travel = max(1 - handleLength, 0.000_001)
+        return Float(min(max((primaryPosition - dragOffset) / travel, 0), 1))
+    }
+
+}
+
+enum TimelineNavigationScrollbarVisibilityTiming {
+    static let fadeDuration: TimeInterval = 0.15
+    static let fadeInDuration = fadeDuration
+    static let lingerDuration: TimeInterval = 0.60
+    static let fadeOutDuration = fadeDuration
+}
+
 struct TimelineScrollbarGeometry: Equatable, Sendable {
     static let horizontalThickness: CGFloat = 9
     static let verticalThickness: CGFloat = 9

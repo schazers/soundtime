@@ -93,6 +93,7 @@ struct TimelineRenderTarget: @unchecked Sendable {
 final class TimelineRenderer: NSObject, @unchecked Sendable {
     // Reserved for future musical meter and measure boundaries.
     private static let drawsRepeatedVerticalTimeGrid = false
+    private static let trackSeparatorColor = SIMD4<Float>(0.18, 0.19, 0.20, 1.0)
 
     private struct TimelineVertex {
         var position: SIMD4<Float>
@@ -1178,6 +1179,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     )
     private let waveformGeometryStore = WaveformGeometryStore()
     private let waveformHotPathLock = NSLock()
+    private let waveformViewportRefinementLock = NSLock()
+    private var waveformViewportRefinementWorkItem: DispatchWorkItem?
+    private var waveformViewportRefinementGeneration = 0
     private let renderStateStore = TimelineRenderStateStore(initialState: .empty)
     private let interactionStateStore = TimelineInteractionStateStore()
     private let tiledWaveformPipeline: WaveformTiledRenderPipeline?
@@ -2240,11 +2244,15 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         previousRenderedPlayheadX = nil
         previousRenderedPlayheadTime = nil
         renderState = renderState.withViewport(viewport)
-        prewarmCurrentInteractiveWaveformShaderBuffers(
-            drawableSize: lastRenderViewportSize,
-            backingScale: lastRenderBackingScale,
-            allowsSynchronousUpload: !marksInteraction
-        )
+        if marksInteraction {
+            scheduleWaveformRefinementAfterViewportInteraction()
+        } else {
+            prewarmCurrentInteractiveWaveformShaderBuffers(
+                drawableSize: lastRenderViewportSize,
+                backingScale: lastRenderBackingScale,
+                allowsSynchronousUpload: true
+            )
+        }
     }
 
     func displayTrackLayout(_ trackLayout: TimelineTrackLayout, marksInteraction: Bool = true) {
@@ -2421,6 +2429,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     func publishInteractionViewport(_ viewport: TimelineViewport) {
         markWaveformHotInteraction()
         interactionStateStore.publishViewport(viewport)
+        scheduleWaveformRefinementAfterViewportInteraction()
     }
 
     func displaySelectedTrack(_ trackID: UUID?) {
@@ -3112,7 +3121,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 backingScale: backingScale,
                 allowsSynchronousUpload: true
             )
-        } else if waveformHotPathReason == "viewport-interaction" || hoverNeedsInitialPrewarm {
+        } else if hoverNeedsInitialPrewarm {
             prewarmCurrentInteractiveWaveformShaderBuffers(
                 drawableSize: viewportSize,
                 backingScale: backingScale,
@@ -3217,11 +3226,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             drawableSize: viewportSize,
             renderState: renderState
         )
-        let rulerSeparatorVertices = makeRulerSeparatorVertices(
-            drawableSize: viewportSize,
-            backingScale: backingScale,
-            renderState: renderState
-        )
         let loopRangeUniform = makeLoopRangeUniform(
             drawableSize: viewportSize,
             backingScale: backingScale,
@@ -3296,7 +3300,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         )
         drawLoopRange(uniform: loopRangeUniform, encoder: encoder)
         encoder.setRenderPipelineState(pipelineState)
-        draw(vertices: rulerSeparatorVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: selectedTrackVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: processingTrackVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: candidateRegionVertices, primitiveType: .triangle, encoder: encoder)
@@ -3395,6 +3398,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         encoder.setRenderPipelineState(pipelineState)
         draw(vertices: clipBoundaryVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: trimPreviewVertices, primitiveType: .triangle, encoder: encoder)
+        drawTimelineRulerSeparator(
+            drawableSize: viewportSize,
+            backingScale: backingScale,
+            renderState: renderState,
+            encoder: encoder
+        )
+        encoder.setRenderPipelineState(pipelineState)
         draw(vertices: hoverGuideVertices, primitiveType: .triangle, encoder: encoder)
         draw(vertices: playheadVertices, primitiveType: .triangle, encoder: encoder)
         drawScrollbars(uniform: scrollbarUniform, encoder: encoder)
@@ -4302,8 +4312,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         var shaderBins: [WaveformShaderBin] = []
         shaderBins.reserveCapacity(bins.count)
         for (index, bin) in bins.enumerated() {
-            if shouldYieldForPlayback, index.isMultiple(of: 8_192) {
-                try? ImportWorkBudget.shared.waitIfPlaybackActive()
+            if shouldYieldForPlayback, index.isMultiple(of: 2_048) {
+                try? ImportWorkBudget.shared.waitIfForegroundWorkIsActive()
             }
             shaderBins.append(WaveformShaderBin(
                 minimumSample: bin.minimumSample,
@@ -5727,6 +5737,50 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
     }
 
+    private func drawTimelineRulerSeparator(
+        drawableSize: CGSize,
+        backingScale: Float,
+        renderState: TimelineRenderState,
+        encoder: MTLRenderCommandEncoder
+    ) {
+        let width = Float(drawableSize.width)
+        let height = Float(drawableSize.height)
+        guard width > 0, height > 0 else {
+            return
+        }
+
+        let scale = max(backingScale, 1)
+        let trackLayout = renderState.trackLayout.resolved(
+            totalTrackCount: renderState.tracks.count,
+            viewportHeight: height
+        )
+        var uniform = TimelineRulerUniform(
+            viewport: .zero,
+            metrics: SIMD4<Float>(
+                width,
+                height,
+                scale,
+                max(trackLayout.rulerLaneHeight * scale, 1)
+            ),
+            style: .zero,
+            color: Self.trackSeparatorColor
+        )
+        // A zero tick cadence selects the shader's full-width separator mode.
+        encoder.setRenderPipelineState(rulerPipelineState)
+        encoder.setVertexBuffer(waveformQuadVertexBuffer, offset: 0, index: 0)
+        encoder.setVertexBytes(
+            &uniform,
+            length: MemoryLayout<TimelineRulerUniform>.stride,
+            index: 1
+        )
+        encoder.setFragmentBytes(
+            &uniform,
+            length: MemoryLayout<TimelineRulerUniform>.stride,
+            index: 1
+        )
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+    }
+
     private func makeTimelineRulerUniform(
         drawableSize: CGSize,
         backingScale: Float,
@@ -5804,40 +5858,6 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             top: 0,
             bottom: rulerHeight,
             color: SIMD4<Float>(0.055, 0.058, 0.060, 0.96),
-            drawableSize: size
-        )
-        return vertices
-    }
-
-    private func makeRulerSeparatorVertices(
-        drawableSize: CGSize,
-        backingScale: Float,
-        renderState: TimelineRenderState
-    ) -> [TimelineVertex] {
-        let width = Float(drawableSize.width)
-        let height = Float(drawableSize.height)
-        guard width > 0, height > 0 else {
-            return []
-        }
-
-        let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
-        let rulerHeight = min(max(trackLayout.rulerLaneHeight, 0), height)
-        guard rulerHeight > 0 else {
-            return []
-        }
-
-        let size = SIMD2<Float>(width, height)
-        let lineWidth = pixelLength(backingScale: backingScale)
-        let separatorY = pixelAligned(rulerHeight, backingScale: backingScale)
-        var vertices: [TimelineVertex] = []
-        vertices.reserveCapacity(6)
-        appendRectangle(
-            to: &vertices,
-            left: 0,
-            right: width,
-            top: max(separatorY - lineWidth, 0),
-            bottom: min(separatorY, height),
-            color: SIMD4<Float>(0.20, 0.22, 0.23, 0.72),
             drawableSize: size
         )
         return vertices
@@ -6077,6 +6097,40 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         waveformHotPathLock.lock()
         lastWaveformHotInteractionTimestamp = timestamp
         waveformHotPathLock.unlock()
+        ImportWorkBudget.shared.noteTimelineInteraction()
+    }
+
+    private func scheduleWaveformRefinementAfterViewportInteraction() {
+        waveformViewportRefinementLock.lock()
+        waveformViewportRefinementGeneration += 1
+        let generation = waveformViewportRefinementGeneration
+        waveformViewportRefinementWorkItem?.cancel()
+        waveformViewportRefinementLock.unlock()
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else {
+                return
+            }
+
+            self.waveformViewportRefinementLock.lock()
+            guard generation == self.waveformViewportRefinementGeneration else {
+                self.waveformViewportRefinementLock.unlock()
+                return
+            }
+            self.waveformViewportRefinementWorkItem = nil
+            self.waveformViewportRefinementLock.unlock()
+            self.onRenderDataPrepared?()
+        }
+
+        waveformViewportRefinementLock.lock()
+        if generation == waveformViewportRefinementGeneration {
+            waveformViewportRefinementWorkItem = workItem
+        }
+        waveformViewportRefinementLock.unlock()
+        DispatchQueue.global(qos: .utility).asyncAfter(
+            deadline: .now() + gpuResidentShadowInteractionCooldown,
+            execute: workItem
+        )
     }
 
     private func isViewportInteractionHot(at timestamp: CFTimeInterval) -> Bool {
@@ -7899,6 +7953,14 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         }
 
         let trackLayout = resolvedTrackLayout(renderState: renderState, drawableSize: drawableSize)
+        var bottommostLaneBottom: Float?
+        for trackIndex in 0..<trackLayout.totalTrackCount {
+            guard let laneBottom = trackLayout.laneFrame(forTrackIndex: trackIndex)?.bottom else {
+                continue
+            }
+            bottommostLaneBottom = max(bottommostLaneBottom ?? laneBottom, laneBottom)
+        }
+        bottommostLaneBottom = bottommostLaneBottom.map { $0 * height }
         for trackIndex in trackLayout.visibleTrackIndices(overscan: 0) {
             guard let laneFrame = trackLayout.laneFrame(forTrackIndex: trackIndex), laneFrame.isVisible else {
                 continue
@@ -7915,7 +7977,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                         right: width,
                         top: separatorY,
                         bottom: min(separatorY + lineWidth, height),
-                        color: SIMD4<Float>(0.18, 0.19, 0.20, 1.0),
+                        color: Self.trackSeparatorColor,
                         drawableSize: size
                     )
                 }
@@ -7934,6 +7996,21 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
                 color: centerColor,
                 drawableSize: size
             )
+        }
+
+        if let bottommostLaneBottom {
+            let separatorY = pixelAligned(bottommostLaneBottom, backingScale: backingScale)
+            if separatorY >= 0, separatorY <= height {
+                appendRectangle(
+                    to: &vertices,
+                    left: 0,
+                    right: width,
+                    top: max(separatorY - lineWidth, 0),
+                    bottom: separatorY,
+                    color: Self.trackSeparatorColor,
+                    drawableSize: size
+                )
+            }
         }
 
         return vertices
@@ -8266,7 +8343,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         var binIndex = 0
         while binIndex < bins.count {
             if sampledBinCount.isMultiple(of: 256) {
-                try? ImportWorkBudget.shared.waitIfPlaybackActive()
+                try? ImportWorkBudget.shared.waitIfForegroundWorkIsActive()
             }
             let bin = bins[binIndex]
             let score = transientParticleScore(for: bin)
@@ -11380,8 +11457,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         bins.reserveCapacity(targetBinCount)
 
         for targetIndex in 0..<targetBinCount {
-            if shouldYieldForPlayback, targetIndex.isMultiple(of: 1_024) {
-                try? ImportWorkBudget.shared.waitIfPlaybackActive()
+            if shouldYieldForPlayback, targetIndex.isMultiple(of: 512) {
+                try? ImportWorkBudget.shared.waitIfForegroundWorkIsActive()
             }
             let unclampedStartIndex = targetIndex * sourceBinCount / targetBinCount
             let sourceStartIndex = min(max(unclampedStartIndex, 0), sourceBinCount - 1)
@@ -13210,6 +13287,18 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         float yFromTrackTopPixels = rulerHeightPixels - yPixels;
         if (yFromTrackTopPixels < -1.0) {
             return float4(0.0);
+        }
+
+        if (in.style.x < 0.5) {
+            // Pixel centers in the final ruler row are exactly 0.5 physical
+            // pixels above the track boundary. This branch deliberately has
+            // no x-dependent math, so ticks can never punch holes in it.
+            float separatorCoverage = 1.0 - smoothstep(
+                0.5,
+                1.0,
+                abs(yFromTrackTopPixels - 0.5)
+            );
+            return float4(in.color.rgb, in.color.a * separatorCoverage);
         }
 
         float projectDuration = max(in.viewport.z, 0.000001);

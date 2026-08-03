@@ -55,7 +55,7 @@ struct AudioZeroCrossingIndex: Sendable {
 
         for frameIndex in 1..<buffer.frameCount {
             if frameIndex.isMultiple(of: 8_192) {
-                try? ImportWorkBudget.shared.waitIfPlaybackActive(.zeroCrossingAnalysis)
+                try? ImportWorkBudget.shared.waitIfForegroundWorkIsActive(.zeroCrossingAnalysis)
             }
 
             let sample = mixedSample(in: buffer, at: frameIndex)
