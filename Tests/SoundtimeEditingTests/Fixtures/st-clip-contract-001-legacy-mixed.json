@@ -1,0 +1,72 @@
+{
+  "fixtureVersion": 1,
+  "name": "st-clip-contract-001-legacy-mixed",
+  "timelineSampleRate": 48000,
+  "tracks": [
+    {
+      "id": "10000000-0000-0000-0000-000000000001",
+      "name": "Dialogue",
+      "source": {
+        "id": "source-dialogue-a",
+        "path": "media/dialogue-a.wav",
+        "frameCount": 480000,
+        "sampleRate": 48000,
+        "channelCount": 1
+      },
+      "clipNames": {
+        "20000000-0000-0000-0000-000000000001": "Opening",
+        "20000000-0000-0000-0000-000000000002": "Answer"
+      },
+      "segments": [
+        {
+          "sourceStartFrame": 0,
+          "frameCount": 96000,
+          "gainStart": 1,
+          "gainEnd": 1,
+          "startsNewClip": true,
+          "clipID": "20000000-0000-0000-0000-000000000001"
+        },
+        {
+          "sourceStartFrame": 0,
+          "frameCount": 48000,
+          "gainStart": 0,
+          "gainEnd": 0,
+          "startsNewClip": true,
+          "clipID": "20000000-0000-0000-0000-000000000099"
+        },
+        {
+          "sourceStartFrame": 192000,
+          "frameCount": 144000,
+          "gainStart": 1,
+          "gainEnd": 1,
+          "startsNewClip": true,
+          "clipID": "20000000-0000-0000-0000-000000000002"
+        }
+      ]
+    },
+    {
+      "id": "10000000-0000-0000-0000-000000000002",
+      "name": "Music",
+      "source": {
+        "id": "source-music-b",
+        "path": "media/music-b.wav",
+        "frameCount": 720000,
+        "sampleRate": 48000,
+        "channelCount": 2
+      },
+      "clipNames": {
+        "30000000-0000-0000-0000-000000000001": "Bed"
+      },
+      "segments": [
+        {
+          "sourceStartFrame": 24000,
+          "frameCount": 336000,
+          "gainStart": 0.75,
+          "gainEnd": 0.75,
+          "startsNewClip": true,
+          "clipID": "30000000-0000-0000-0000-000000000001"
+        }
+      ]
+    }
+  ]
+}

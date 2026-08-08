@@ -5,6 +5,14 @@ public enum AudioTimelineFadeDirection: Sendable {
     case fadeOut
 }
 
+public struct AudioTimelineClipID: RawRepresentable, Hashable, Codable, Sendable {
+    public let rawValue: UUID
+
+    public init(rawValue: UUID = UUID()) {
+        self.rawValue = rawValue
+    }
+}
+
 public struct AudioTimelinePlaybackSegment: Equatable, Sendable {
     public let outputStartFrame: Int
     public let sourceStartFrame: Int
@@ -13,6 +21,7 @@ public struct AudioTimelinePlaybackSegment: Equatable, Sendable {
     public let gainStart: Float
     public let gainEnd: Float
     public let startsNewClip: Bool
+    public let clipID: AudioTimelineClipID
 
     public init(
         outputStartFrame: Int,
@@ -21,7 +30,8 @@ public struct AudioTimelinePlaybackSegment: Equatable, Sendable {
         sourceFrameScale: Double,
         gainStart: Float,
         gainEnd: Float,
-        startsNewClip: Bool = false
+        startsNewClip: Bool = false,
+        clipID: AudioTimelineClipID = AudioTimelineClipID()
     ) {
         self.outputStartFrame = outputStartFrame
         self.sourceStartFrame = sourceStartFrame
@@ -30,16 +40,26 @@ public struct AudioTimelinePlaybackSegment: Equatable, Sendable {
         self.gainStart = gainStart
         self.gainEnd = gainEnd
         self.startsNewClip = startsNewClip
+        self.clipID = clipID
     }
 }
 
 public struct AudioTimelineClipRange: Equatable, Sendable {
+    public let id: AudioTimelineClipID
     public let startProgress: Double
     public let endProgress: Double
+    public let isSilent: Bool
 
-    public init(startProgress: Double, endProgress: Double) {
+    public init(
+        id: AudioTimelineClipID = AudioTimelineClipID(),
+        startProgress: Double,
+        endProgress: Double,
+        isSilent: Bool = false
+    ) {
+        self.id = id
         self.startProgress = startProgress
         self.endProgress = endProgress
+        self.isSilent = isSilent
     }
 }
 
@@ -48,25 +68,35 @@ public enum AudioTimelineClipEdge: Sendable {
     case trailing
 }
 
+public enum AudioTimelineFollowingClipPolicy: Sendable {
+    /// Later clips move by the same duration as the edit.
+    case ripple
+    /// Later clips retain their output-frame positions. Deleted time becomes silence.
+    case preserveTimelinePositions
+}
+
 public struct AudioTimelineSegment: Equatable, Sendable {
     public let sourceStartFrame: Int
     public let frameCount: Int
     public let gainStart: Float
     public let gainEnd: Float
     public let startsNewClip: Bool
+    public let clipID: AudioTimelineClipID
 
     public init(
         sourceStartFrame: Int,
         frameCount: Int,
         gainStart: Float,
         gainEnd: Float,
-        startsNewClip: Bool = false
+        startsNewClip: Bool = false,
+        clipID: AudioTimelineClipID = AudioTimelineClipID()
     ) {
         self.sourceStartFrame = sourceStartFrame
         self.frameCount = frameCount
         self.gainStart = gainStart
         self.gainEnd = gainEnd
         self.startsNewClip = startsNewClip
+        self.clipID = clipID
     }
 
     public var sourceEndFrame: Int {
@@ -94,7 +124,8 @@ public struct AudioTimelineSegment: Equatable, Sendable {
             frameCount: frameCount,
             gainStart: gainStart * gain,
             gainEnd: gainEnd * gain,
-            startsNewClip: startsNewClip
+            startsNewClip: startsNewClip,
+            clipID: clipID
         )
     }
 
@@ -104,17 +135,36 @@ public struct AudioTimelineSegment: Equatable, Sendable {
             frameCount: frameCount,
             gainStart: gainStart * startMultiplier,
             gainEnd: gainEnd * endMultiplier,
-            startsNewClip: startsNewClip
+            startsNewClip: startsNewClip,
+            clipID: clipID
         )
     }
 
-    public func withClipBoundary(_ startsNewClip: Bool) -> Self {
+    public func withClipBoundary(
+        _ startsNewClip: Bool,
+        clipID replacementClipID: AudioTimelineClipID? = nil
+    ) -> Self {
         Self(
             sourceStartFrame: sourceStartFrame,
             frameCount: frameCount,
             gainStart: gainStart,
             gainEnd: gainEnd,
-            startsNewClip: startsNewClip
+            startsNewClip: startsNewClip,
+            clipID: replacementClipID ?? (startsNewClip ? AudioTimelineClipID() : clipID)
+        )
+    }
+
+    public func withClipID(
+        _ clipID: AudioTimelineClipID,
+        startsNewClip: Bool? = nil
+    ) -> Self {
+        Self(
+            sourceStartFrame: sourceStartFrame,
+            frameCount: frameCount,
+            gainStart: gainStart,
+            gainEnd: gainEnd,
+            startsNewClip: startsNewClip ?? self.startsNewClip,
+            clipID: clipID
         )
     }
 
@@ -124,7 +174,8 @@ public struct AudioTimelineSegment: Equatable, Sendable {
             frameCount: frameCount,
             gainStart: gainStart,
             gainEnd: gainEnd,
-            startsNewClip: startsNewClip
+            startsNewClip: startsNewClip,
+            clipID: clipID
         )
     }
 }
@@ -145,7 +196,8 @@ public struct AudioSegmentArrangement: Sendable {
                     sourceStartFrame: 0,
                     frameCount: sourceFrameCount,
                     gainStart: 1,
-                    gainEnd: 1
+                    gainEnd: 1,
+                    clipID: AudioTimelineClipID()
                 ),
             ]
             frameCount = sourceFrameCount
@@ -177,7 +229,8 @@ public struct AudioSegmentArrangement: Sendable {
                 sourceFrameScale: 0,
                 gainStart: segment.gainStart,
                 gainEnd: segment.gainEnd,
-                startsNewClip: segment.startsNewClip
+                startsNewClip: segment.startsNewClip,
+                clipID: segment.clipID
             )
         }
     }
@@ -190,20 +243,31 @@ public struct AudioSegmentArrangement: Sendable {
         var ranges: [AudioTimelineClipRange] = []
         var clipStartFrame = 0
         var timelineFrame = 0
+        var activeClipID = segments[0].clipID
+        var activeClipIsSilent = true
         for segment in segments {
             if segment.startsNewClip, timelineFrame > clipStartFrame {
                 ranges.append(AudioTimelineClipRange(
+                    id: activeClipID,
                     startProgress: Double(clipStartFrame) / Double(frameCount),
-                    endProgress: Double(timelineFrame) / Double(frameCount)
+                    endProgress: Double(timelineFrame) / Double(frameCount),
+                    isSilent: activeClipIsSilent
                 ))
                 clipStartFrame = timelineFrame
+                activeClipID = segment.clipID
+                activeClipIsSilent = true
             }
+            activeClipIsSilent = activeClipIsSilent &&
+                abs(segment.gainStart) <= Self.gainEpsilon &&
+                abs(segment.gainEnd) <= Self.gainEpsilon
             timelineFrame += segment.frameCount
         }
         if timelineFrame > clipStartFrame {
             ranges.append(AudioTimelineClipRange(
+                id: activeClipID,
                 startProgress: Double(clipStartFrame) / Double(frameCount),
-                endProgress: Double(timelineFrame) / Double(frameCount)
+                endProgress: Double(timelineFrame) / Double(frameCount),
+                isSilent: activeClipIsSilent
             ))
         }
         return ranges
@@ -228,6 +292,51 @@ public struct AudioSegmentArrangement: Sendable {
             timelineFrame += segment.frameCount
         }
         return timelineFrame == sourceFrameCount
+    }
+
+    public func clipRange(id: AudioTimelineClipID) -> AudioTimelineClipRange? {
+        clipRanges.first(where: { $0.id == id })
+    }
+
+    public func frameRange(forClipID id: AudioTimelineClipID) -> Range<Int>? {
+        var lowerBound: Int?
+        var upperBound: Int?
+        var timelineFrame = 0
+        for segment in segments {
+            let segmentStart = timelineFrame
+            timelineFrame += segment.frameCount
+            guard segment.clipID == id else {
+                if lowerBound != nil {
+                    break
+                }
+                continue
+            }
+            lowerBound = lowerBound ?? segmentStart
+            upperBound = timelineFrame
+        }
+        guard let lowerBound, let upperBound, upperBound > lowerBound else {
+            return nil
+        }
+        return lowerBound..<upperBound
+    }
+
+    public func segments(forClipID id: AudioTimelineClipID) -> [AudioTimelineSegment] {
+        guard let range = frameRange(forClipID: id) else {
+            return []
+        }
+        return segments(in: range)
+    }
+
+    public func clampedLocalFrameRange(
+        _ requestedRange: Range<Int>,
+        forClipID id: AudioTimelineClipID
+    ) -> Range<Int>? {
+        guard let clipRange = frameRange(forClipID: id) else {
+            return nil
+        }
+        let lower = min(max(requestedRange.lowerBound, 0), clipRange.count)
+        let upper = min(max(requestedRange.upperBound, lower), clipRange.count)
+        return lower..<upper
     }
 
     public func frameRange(for selection: TimelineSelection) -> Range<Int> {
@@ -266,7 +375,9 @@ public struct AudioSegmentArrangement: Sendable {
                 offset: overlapStart - segmentStart,
                 count: overlapEnd - overlapStart
             )
-            output.append(output.isEmpty ? selected.withClipBoundary(true) : selected)
+            output.append(output.isEmpty
+                ? selected.withClipBoundary(true, clipID: selected.clipID)
+                : selected)
         }
         return Self.coalescedSegments(output)
     }
@@ -345,6 +456,343 @@ public struct AudioSegmentArrangement: Sendable {
         return deletedFrameCount
     }
 
+    @discardableResult
+    public mutating func deleteClip(id: AudioTimelineClipID) -> Int {
+        guard let range = frameRange(forClipID: id) else {
+            return 0
+        }
+        return delete(frameRange: range)
+    }
+
+    /// Deletes several clips as one arrangement mutation. Source ranges are
+    /// removed from right to left so every requested clip is resolved against
+    /// the same pre-edit timeline and the remaining material ripples once.
+    @discardableResult
+    public mutating func deleteClips(ids: Set<AudioTimelineClipID>) -> Int {
+        let ranges = ids.compactMap { id in
+            frameRange(forClipID: id).map { (id: id, range: $0) }
+        }
+        guard ranges.count == ids.count, !ranges.isEmpty else {
+            return 0
+        }
+
+        var working = self
+        var removed = 0
+        for item in ranges.sorted(by: { $0.range.lowerBound > $1.range.lowerBound }) {
+            let count = working.deleteClip(id: item.id)
+            guard count == item.range.count else {
+                return 0
+            }
+            removed += count
+        }
+        self = working
+        return removed
+    }
+
+    @discardableResult
+    public mutating func deleteWithinClip(
+        id: AudioTimelineClipID,
+        localFrameRange requestedLocalRange: Range<Int>,
+        followingClipPolicy: AudioTimelineFollowingClipPolicy
+    ) -> Int {
+        guard
+            let clipRange = frameRange(forClipID: id),
+            let localRange = clampedLocalFrameRange(requestedLocalRange, forClipID: id),
+            !localRange.isEmpty
+        else {
+            return 0
+        }
+
+        let globalLowerBound = clipRange.lowerBound + localRange.lowerBound
+        let globalUpperBound = clipRange.lowerBound + localRange.upperBound
+        let globalRange = globalLowerBound..<globalUpperBound
+        let removed = delete(frameRange: globalRange)
+        guard removed > 0, followingClipPolicy == .preserveTimelinePositions else {
+            return removed
+        }
+
+        let insertionFrame: Int
+        if let remainingClipRange = frameRange(forClipID: id) {
+            insertionFrame = remainingClipRange.upperBound
+        } else {
+            insertionFrame = min(clipRange.lowerBound, frameCount)
+        }
+        _ = insertSilentClip(frameCount: removed, atFrame: insertionFrame)
+        return removed
+    }
+
+    @discardableResult
+    public mutating func clearWithinClip(
+        id: AudioTimelineClipID,
+        localFrameRange requestedLocalRange: Range<Int>
+    ) -> Int {
+        guard
+            let clipRange = frameRange(forClipID: id),
+            let localRange = clampedLocalFrameRange(requestedLocalRange, forClipID: id),
+            !localRange.isEmpty
+        else {
+            return 0
+        }
+        let globalLowerBound = clipRange.lowerBound + localRange.lowerBound
+        let globalUpperBound = clipRange.lowerBound + localRange.upperBound
+        return clear(frameRange: globalLowerBound..<globalUpperBound)
+    }
+
+    @discardableResult
+    public mutating func insertWithinClip(
+        id: AudioTimelineClipID,
+        localFrame requestedLocalFrame: Int,
+        segments replacementSegments: [AudioTimelineSegment]
+    ) -> Int? {
+        guard let clipRange = frameRange(forClipID: id) else {
+            return nil
+        }
+        let localFrame = min(max(requestedLocalFrame, 0), clipRange.count)
+        let replacements = Self.validatedSegments(
+            replacementSegments,
+            sourceFrameCount: sourceFrameCount
+        ).map { segment in
+            segment.withClipID(id, startsNewClip: false)
+        }
+        guard !replacements.isEmpty else {
+            return nil
+        }
+        return insert(replacements, atFrame: clipRange.lowerBound + localFrame)
+    }
+
+    @discardableResult
+    public mutating func duplicateClip(
+        id: AudioTimelineClipID,
+        atFrame requestedFrame: Int
+    ) -> AudioTimelineClipID? {
+        let clipSegments = segments(forClipID: id)
+        guard !clipSegments.isEmpty else {
+            return nil
+        }
+        let duplicateID = AudioTimelineClipID()
+        let duplicate = clipSegments.enumerated().map { index, segment in
+            segment.withClipID(duplicateID, startsNewClip: index == 0)
+        }
+        guard insert(duplicate, atFrame: requestedFrame) != nil else {
+            return nil
+        }
+        return duplicateID
+    }
+
+    @discardableResult
+    public mutating func moveClip(
+        id: AudioTimelineClipID,
+        toFrame requestedFrame: Int
+    ) -> Range<Int>? {
+        guard let originalRange = frameRange(forClipID: id) else {
+            return nil
+        }
+        let clipSegments = segments(in: originalRange)
+        guard !clipSegments.isEmpty else {
+            return nil
+        }
+        let destinationBeforeRemoval = min(max(requestedFrame, 0), frameCount)
+        if destinationBeforeRemoval >= originalRange.lowerBound,
+           destinationBeforeRemoval <= originalRange.upperBound {
+            return originalRange
+        }
+
+        _ = delete(frameRange: originalRange)
+        let destination = destinationBeforeRemoval > originalRange.upperBound
+            ? destinationBeforeRemoval - originalRange.count
+            : destinationBeforeRemoval
+        guard insert(clipSegments, atFrame: destination) != nil else {
+            return nil
+        }
+        return destination..<(destination + originalRange.count)
+    }
+
+    /// Relocates a clip without rippling any other timeline content.
+    ///
+    /// The source range becomes silence and the destination must contain only
+    /// silence. Moving beyond the current end extends the arrangement with
+    /// silence. The operation is transactional: a blocked destination leaves
+    /// the arrangement unchanged.
+    @discardableResult
+    public mutating func relocateClip(
+        id: AudioTimelineClipID,
+        toFrame requestedFrame: Int
+    ) -> Range<Int>? {
+        guard let originalRange = frameRange(forClipID: id) else {
+            return nil
+        }
+        let clipSegments = segments(in: originalRange)
+        guard !clipSegments.isEmpty else {
+            return nil
+        }
+
+        let destination = max(requestedFrame, 0)
+        if destination == originalRange.lowerBound {
+            return originalRange
+        }
+
+        var working = self
+        _ = working.delete(frameRange: originalRange)
+        guard working.insertSilentClip(
+            frameCount: originalRange.count,
+            atFrame: originalRange.lowerBound
+        ) == originalRange.count else {
+            return nil
+        }
+
+        let destinationEnd = destination + originalRange.count
+        if destinationEnd > working.frameCount {
+            let extensionFrameCount = destinationEnd - working.frameCount
+            guard working.insertSilentClip(
+                frameCount: extensionFrameCount,
+                atFrame: working.frameCount
+            ) == extensionFrameCount else {
+                return nil
+            }
+        }
+
+        let destinationRange = destination..<destinationEnd
+        let destinationIsSilent = working.segments(in: destinationRange).allSatisfy {
+            $0.gainStart == 0 && $0.gainEnd == 0
+        }
+        guard destinationIsSilent,
+              working.replace(frameRange: destinationRange, with: clipSegments) == originalRange.count
+        else {
+            return nil
+        }
+
+        self = working
+        return destinationRange
+    }
+
+    /// Relocates clips by a shared frame delta while preserving their spacing.
+    /// All source and destination checks happen on a working copy, so a single
+    /// occupied destination rejects the entire group without a partial move.
+    @discardableResult
+    public mutating func relocateClips(
+        ids: Set<AudioTimelineClipID>,
+        byFrames delta: Int
+    ) -> [AudioTimelineClipID: Range<Int>]? {
+        guard !ids.isEmpty else {
+            return nil
+        }
+        let originals = ids.compactMap { id in
+            frameRange(forClipID: id).map { (id: id, range: $0, segments: segments(forClipID: id)) }
+        }
+        guard
+            originals.count == ids.count,
+            originals.allSatisfy({ !$0.segments.isEmpty }),
+            originals.allSatisfy({ $0.range.lowerBound + delta >= 0 })
+        else {
+            return nil
+        }
+        if delta == 0 {
+            return Dictionary(uniqueKeysWithValues: originals.map { ($0.id, $0.range) })
+        }
+
+        var working = self
+        for item in originals.sorted(by: { $0.range.lowerBound > $1.range.lowerBound }) {
+            guard
+                working.delete(frameRange: item.range) == item.range.count,
+                working.insertSilentClip(
+                    frameCount: item.range.count,
+                    atFrame: item.range.lowerBound
+                ) == item.range.count
+            else {
+                return nil
+            }
+        }
+
+        let maximumEnd = originals.map { $0.range.upperBound + delta }.max() ?? working.frameCount
+        if maximumEnd > working.frameCount {
+            guard working.insertSilentClip(
+                frameCount: maximumEnd - working.frameCount,
+                atFrame: working.frameCount
+            ) == maximumEnd - working.frameCount else {
+                return nil
+            }
+        }
+
+        var relocated: [AudioTimelineClipID: Range<Int>] = [:]
+        for item in originals.sorted(by: { $0.range.lowerBound < $1.range.lowerBound }) {
+            let destination = (item.range.lowerBound + delta)..<(item.range.upperBound + delta)
+            guard
+                working.segments(in: destination).allSatisfy({ $0.gainStart == 0 && $0.gainEnd == 0 }),
+                working.replace(frameRange: destination, with: item.segments) == destination.count
+            else {
+                return nil
+            }
+            relocated[item.id] = destination
+        }
+
+        self = working
+        return relocated
+    }
+
+    @discardableResult
+    public mutating func splitClip(
+        id: AudioTimelineClipID,
+        atLocalFrame requestedLocalFrame: Int
+    ) -> AudioTimelineClipID? {
+        guard let range = frameRange(forClipID: id) else {
+            return nil
+        }
+        let localFrame = min(max(requestedLocalFrame, 1), range.count - 1)
+        let splitFrame = range.lowerBound + localFrame
+        guard split(atFrame: splitFrame) else {
+            return nil
+        }
+        return segments.first(where: { $0.clipID != id && frameRange(forClipID: $0.clipID)?.lowerBound == splitFrame })?.clipID
+    }
+
+    /// Trims the leading edge without moving the clip or any following clips.
+    /// The removed portion becomes a distinct silent clip in the arrangement.
+    @discardableResult
+    public mutating func trimClipStart(
+        id: AudioTimelineClipID,
+        toLocalFrame requestedLocalFrame: Int
+    ) -> Int {
+        guard let originalRange = frameRange(forClipID: id), originalRange.count > 1 else {
+            return 0
+        }
+        let removedCount = min(max(requestedLocalFrame, 0), originalRange.count - 1)
+        guard removedCount > 0 else {
+            return 0
+        }
+
+        let removed = delete(frameRange: originalRange.lowerBound..<(originalRange.lowerBound + removedCount))
+        guard removed > 0 else {
+            return 0
+        }
+        _ = insertSilentClip(frameCount: removed, atFrame: originalRange.lowerBound)
+        return removed
+    }
+
+    /// Trims the trailing edge without moving the clip or any following clips.
+    /// The removed portion becomes a distinct silent clip in the arrangement.
+    @discardableResult
+    public mutating func trimClipEnd(
+        id: AudioTimelineClipID,
+        toLocalFrame requestedLocalFrame: Int
+    ) -> Int {
+        guard let originalRange = frameRange(forClipID: id), originalRange.count > 1 else {
+            return 0
+        }
+        let retainedCount = min(max(requestedLocalFrame, 1), originalRange.count)
+        let removedCount = originalRange.count - retainedCount
+        guard removedCount > 0 else {
+            return 0
+        }
+
+        let trimStart = originalRange.lowerBound + retainedCount
+        let removed = delete(frameRange: trimStart..<originalRange.upperBound)
+        guard removed > 0 else {
+            return 0
+        }
+        _ = insertSilentClip(frameCount: removed, atFrame: trimStart)
+        return removed
+    }
+
     public mutating func clear(frameRange: Range<Int>) -> Int {
         applyGain(0, frameRange: frameRange)
     }
@@ -375,12 +823,39 @@ public struct AudioSegmentArrangement: Sendable {
                 frameCount: chunk,
                 gainStart: 0,
                 gainEnd: 0,
-                startsNewClip: silence.isEmpty
+                startsNewClip: silence.isEmpty,
+                clipID: silence.first?.clipID ?? AudioTimelineClipID()
             ))
             remaining -= chunk
         }
 
         return insert(silence, atFrame: insertionFrame) ?? 0
+    }
+
+    @discardableResult
+    private mutating func insertSilentClip(
+        frameCount requestedFrameCount: Int,
+        atFrame requestedFrame: Int
+    ) -> Int {
+        guard requestedFrameCount > 0, sourceFrameCount > 0 else {
+            return 0
+        }
+        let clipID = AudioTimelineClipID()
+        var remaining = requestedFrameCount
+        var silence: [AudioTimelineSegment] = []
+        while remaining > 0 {
+            let count = min(remaining, sourceFrameCount)
+            silence.append(AudioTimelineSegment(
+                sourceStartFrame: 0,
+                frameCount: count,
+                gainStart: 0,
+                gainEnd: 0,
+                startsNewClip: silence.isEmpty,
+                clipID: clipID
+            ))
+            remaining -= count
+        }
+        return insert(silence, atFrame: min(max(requestedFrame, 0), frameCount)) ?? 0
     }
 
     public mutating func applyGain(_ gain: Float, frameRange requestedRange: Range<Int>) -> Int {
@@ -570,7 +1045,18 @@ public struct AudioSegmentArrangement: Sendable {
             return false
         }
 
-        segments[nearestIndex] = segments[nearestIndex].withClipBoundary(false)
+        let mergedClipID = segments[nearestIndex - 1].clipID
+        var index = nearestIndex
+        while index < segments.count {
+            if index > nearestIndex, segments[index].startsNewClip {
+                break
+            }
+            segments[index] = segments[index].withClipID(
+                mergedClipID,
+                startsNewClip: false
+            )
+            index += 1
+        }
         segments = Self.coalescedSegments(segments)
         frameCount = Self.totalFrameCount(segments)
         return true
@@ -727,7 +1213,8 @@ public struct AudioSegmentArrangement: Sendable {
                 frameCount: 0,
                 gainStart: segment.gain(at: offset),
                 gainEnd: segment.gain(at: offset),
-                startsNewClip: offset == 0 && segment.startsNewClip
+                startsNewClip: offset == 0 && segment.startsNewClip,
+                clipID: segment.clipID
             )
         }
         return AudioTimelineSegment(
@@ -735,7 +1222,8 @@ public struct AudioSegmentArrangement: Sendable {
             frameCount: count,
             gainStart: segment.gain(at: offset),
             gainEnd: segment.gain(at: offset + count - 1),
-            startsNewClip: offset == 0 && segment.startsNewClip
+            startsNewClip: offset == 0 && segment.startsNewClip,
+            clipID: segment.clipID
         )
     }
 
@@ -745,13 +1233,19 @@ public struct AudioSegmentArrangement: Sendable {
         var result: [AudioTimelineSegment] = []
         result.reserveCapacity(input.count)
         for rawSegment in input where rawSegment.frameCount > 0 {
-            let segment = result.isEmpty ? rawSegment.withClipBoundary(false) : rawSegment
+            let segment = result.isEmpty
+                ? rawSegment.withClipBoundary(false)
+                : rawSegment.withClipBoundary(
+                    rawSegment.startsNewClip || rawSegment.clipID != result.last?.clipID,
+                    clipID: rawSegment.clipID
+                )
             guard let previous = result.last else {
                 result.append(segment)
                 continue
             }
             if
                 !segment.startsNewClip,
+                previous.clipID == segment.clipID,
                 previous.sourceEndFrame == segment.sourceStartFrame,
                 previous.hasConstantGain,
                 segment.hasConstantGain,
@@ -762,7 +1256,8 @@ public struct AudioSegmentArrangement: Sendable {
                     frameCount: previous.frameCount + segment.frameCount,
                     gainStart: previous.gainStart,
                     gainEnd: previous.gainEnd,
-                    startsNewClip: previous.startsNewClip
+                    startsNewClip: previous.startsNewClip,
+                    clipID: previous.clipID
                 )
             } else {
                 result.append(segment)
@@ -779,7 +1274,8 @@ public struct AudioSegmentArrangement: Sendable {
         _ input: [AudioTimelineSegment],
         sourceFrameCount: Int
     ) -> [AudioTimelineSegment] {
-        coalescedSegments(input.compactMap { segment in
+        var activeClipID: AudioTimelineClipID?
+        let validated = input.compactMap { segment -> AudioTimelineSegment? in
             guard
                 segment.sourceStartFrame >= 0,
                 segment.frameCount > 0,
@@ -795,13 +1291,18 @@ public struct AudioSegmentArrangement: Sendable {
             guard count > 0 else {
                 return nil
             }
+            if activeClipID == nil || segment.startsNewClip {
+                activeClipID = segment.clipID
+            }
             return AudioTimelineSegment(
                 sourceStartFrame: segment.sourceStartFrame,
                 frameCount: count,
                 gainStart: segment.gainStart,
                 gainEnd: segment.gainEnd,
-                startsNewClip: segment.startsNewClip
+                startsNewClip: segment.startsNewClip,
+                clipID: activeClipID ?? segment.clipID
             )
-        })
+        }
+        return coalescedSegments(validated)
     }
 }

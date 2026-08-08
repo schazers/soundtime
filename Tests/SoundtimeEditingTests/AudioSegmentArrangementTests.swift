@@ -138,6 +138,213 @@ final class AudioSegmentArrangementTests: XCTestCase {
         XCTAssertFalse(arrangement.segments.dropFirst().contains(where: \.startsNewClip))
     }
 
+    func testClipIdentitySurvivesInternalEditsAndLegacyBoundaries() throws {
+        var arrangement = AudioSegmentArrangement(sourceFrameCount: 1_000)
+        let originalID = try XCTUnwrap(arrangement.clipRanges.first?.id)
+
+        XCTAssertTrue(arrangement.splitClip(id: originalID, atLocalFrame: 400) != nil)
+        XCTAssertEqual(arrangement.clipRanges.count, 2)
+        XCTAssertEqual(arrangement.clipRanges.first?.id, originalID)
+
+        let firstRange = try XCTUnwrap(arrangement.frameRange(forClipID: originalID))
+        XCTAssertEqual(firstRange, 0..<400)
+        XCTAssertEqual(arrangement.deleteWithinClip(
+            id: originalID,
+            localFrameRange: 100..<200,
+            followingClipPolicy: .ripple
+        ), 100)
+        XCTAssertEqual(arrangement.frameRange(forClipID: originalID), 0..<300)
+    }
+
+    func testClipLocalDeleteCanPreserveLaterClipPositions() throws {
+        var arrangement = AudioSegmentArrangement(sourceFrameCount: 1_000)
+        let firstID = try XCTUnwrap(arrangement.clipRanges.first?.id)
+        let secondID = try XCTUnwrap(arrangement.splitClip(id: firstID, atLocalFrame: 400))
+        let secondRangeBefore = try XCTUnwrap(arrangement.frameRange(forClipID: secondID))
+
+        XCTAssertEqual(arrangement.deleteWithinClip(
+            id: firstID,
+            localFrameRange: 100..<250,
+            followingClipPolicy: .preserveTimelinePositions
+        ), 150)
+
+        XCTAssertEqual(arrangement.frameCount, 1_000)
+        XCTAssertEqual(arrangement.frameRange(forClipID: firstID), 0..<250)
+        XCTAssertEqual(arrangement.frameRange(forClipID: secondID), secondRangeBefore)
+        let insertedGap = arrangement.playbackSegments.first {
+            $0.outputStartFrame == 250 && $0.frameCount == 150
+        }
+        XCTAssertEqual(insertedGap?.gainStart, 0)
+        XCTAssertEqual(insertedGap?.gainEnd, 0)
+    }
+
+    func testClipLocalPasteExtendsFocusedClipAndRipplesFollowingClip() throws {
+        var arrangement = AudioSegmentArrangement(sourceFrameCount: 1_000)
+        let firstID = try XCTUnwrap(arrangement.clipRanges.first?.id)
+        let secondID = try XCTUnwrap(arrangement.splitClip(id: firstID, atLocalFrame: 400))
+        let copied = arrangement.segments(in: 50..<150)
+
+        XCTAssertEqual(arrangement.insertWithinClip(
+            id: firstID,
+            localFrame: 200,
+            segments: copied
+        ), 100)
+
+        XCTAssertEqual(arrangement.frameCount, 1_100)
+        XCTAssertEqual(arrangement.frameRange(forClipID: firstID), 0..<500)
+        XCTAssertEqual(arrangement.frameRange(forClipID: secondID), 500..<1_100)
+        XCTAssertTrue(arrangement.segments(in: 200..<300).allSatisfy { $0.clipID == firstID })
+    }
+
+    func testMovingAndDuplicatingClipsKeepStableDistinctIdentities() throws {
+        var arrangement = AudioSegmentArrangement(sourceFrameCount: 1_000)
+        let firstID = try XCTUnwrap(arrangement.clipRanges.first?.id)
+        let secondID = try XCTUnwrap(arrangement.splitClip(id: firstID, atLocalFrame: 400))
+        let duplicateID = try XCTUnwrap(arrangement.duplicateClip(id: firstID, atFrame: 1_000))
+
+        XCTAssertNotEqual(duplicateID, firstID)
+        XCTAssertEqual(arrangement.frameRange(forClipID: duplicateID), 1_000..<1_400)
+        XCTAssertEqual(arrangement.moveClip(id: duplicateID, toFrame: 0), 0..<400)
+        XCTAssertEqual(arrangement.frameRange(forClipID: duplicateID), 0..<400)
+        XCTAssertNotNil(arrangement.frameRange(forClipID: firstID))
+        XCTAssertNotNil(arrangement.frameRange(forClipID: secondID))
+    }
+
+    func testRelocatingClipLeavesSilenceAndPreservesTimelinePositions() throws {
+        var arrangement = AudioSegmentArrangement(sourceFrameCount: 1_000)
+        let clipID = try XCTUnwrap(arrangement.clipRanges.first?.id)
+
+        XCTAssertEqual(arrangement.relocateClip(id: clipID, toFrame: 1_200), 1_200..<2_200)
+        XCTAssertEqual(arrangement.frameCount, 2_200)
+        XCTAssertEqual(arrangement.frameRange(forClipID: clipID), 1_200..<2_200)
+        XCTAssertTrue(arrangement.playbackSegments.filter {
+            $0.outputStartFrame < 1_000
+        }.allSatisfy {
+            $0.gainStart == 0 && $0.gainEnd == 0
+        })
+    }
+
+    func testRelocatingClipRejectsOccupiedDestinationTransactionally() throws {
+        var arrangement = AudioSegmentArrangement(sourceFrameCount: 1_000)
+        let firstID = try XCTUnwrap(arrangement.clipRanges.first?.id)
+        let secondID = try XCTUnwrap(arrangement.splitClip(id: firstID, atLocalFrame: 400))
+        let originalSegments = arrangement.segments
+
+        XCTAssertNil(arrangement.relocateClip(id: firstID, toFrame: 500))
+        XCTAssertEqual(arrangement.segments, originalSegments)
+        XCTAssertEqual(arrangement.frameRange(forClipID: firstID), 0..<400)
+        XCTAssertEqual(arrangement.frameRange(forClipID: secondID), 400..<1_000)
+    }
+
+    func testRelocatingClipGroupPreservesSpacingAndIdentity() throws {
+        var arrangement = AudioSegmentArrangement(sourceFrameCount: 300)
+        let firstID = try XCTUnwrap(arrangement.clipRanges.first?.id)
+        let secondID = try XCTUnwrap(arrangement.splitClip(id: firstID, atLocalFrame: 100))
+        let thirdID = try XCTUnwrap(arrangement.splitClip(id: secondID, atLocalFrame: 100))
+        XCTAssertEqual(arrangement.relocateClip(id: thirdID, toFrame: 500), 500..<600)
+
+        let relocated = try XCTUnwrap(arrangement.relocateClips(
+            ids: [firstID, secondID],
+            byFrames: 200
+        ))
+
+        XCTAssertEqual(relocated[firstID], 200..<300)
+        XCTAssertEqual(relocated[secondID], 300..<400)
+        XCTAssertEqual(arrangement.frameRange(forClipID: firstID), 200..<300)
+        XCTAssertEqual(arrangement.frameRange(forClipID: secondID), 300..<400)
+        XCTAssertEqual(arrangement.frameRange(forClipID: thirdID), 500..<600)
+    }
+
+    func testRelocatingClipGroupRejectsBlockedDestinationTransactionally() throws {
+        var arrangement = AudioSegmentArrangement(sourceFrameCount: 300)
+        let firstID = try XCTUnwrap(arrangement.clipRanges.first?.id)
+        let secondID = try XCTUnwrap(arrangement.splitClip(id: firstID, atLocalFrame: 100))
+        let thirdID = try XCTUnwrap(arrangement.splitClip(id: secondID, atLocalFrame: 100))
+        let originalSegments = arrangement.segments
+
+        XCTAssertNil(arrangement.relocateClips(
+            ids: [firstID, secondID],
+            byFrames: 100
+        ))
+        XCTAssertEqual(arrangement.segments, originalSegments)
+        XCTAssertEqual(arrangement.frameRange(forClipID: firstID), 0..<100)
+        XCTAssertEqual(arrangement.frameRange(forClipID: secondID), 100..<200)
+        XCTAssertEqual(arrangement.frameRange(forClipID: thirdID), 200..<300)
+    }
+
+    func testTrimClipStartPreservesTimelinePositionAndClipIdentity() throws {
+        var arrangement = AudioSegmentArrangement(sourceFrameCount: 1_000)
+        let clipID = try XCTUnwrap(arrangement.clipRanges.first?.id)
+
+        XCTAssertEqual(arrangement.trimClipStart(id: clipID, toLocalFrame: 200), 200)
+
+        XCTAssertEqual(arrangement.frameCount, 1_000)
+        XCTAssertEqual(arrangement.frameRange(forClipID: clipID), 200..<1_000)
+        let leadingGap = try XCTUnwrap(arrangement.playbackSegments.first)
+        XCTAssertEqual(leadingGap.outputStartFrame, 0)
+        XCTAssertEqual(leadingGap.frameCount, 200)
+        XCTAssertEqual(leadingGap.gainStart, 0)
+        XCTAssertEqual(leadingGap.gainEnd, 0)
+        XCTAssertNotEqual(leadingGap.clipID, clipID)
+    }
+
+    func testTrimClipEndPreservesFollowingClipPositionAndClipIdentity() throws {
+        var arrangement = AudioSegmentArrangement(sourceFrameCount: 1_000)
+        let firstID = try XCTUnwrap(arrangement.clipRanges.first?.id)
+        let secondID = try XCTUnwrap(arrangement.splitClip(id: firstID, atLocalFrame: 600))
+        let secondRangeBefore = try XCTUnwrap(arrangement.frameRange(forClipID: secondID))
+
+        XCTAssertEqual(arrangement.trimClipEnd(id: firstID, toLocalFrame: 350), 250)
+
+        XCTAssertEqual(arrangement.frameCount, 1_000)
+        XCTAssertEqual(arrangement.frameRange(forClipID: firstID), 0..<350)
+        XCTAssertEqual(arrangement.frameRange(forClipID: secondID), secondRangeBefore)
+        let trailingGap = try XCTUnwrap(arrangement.playbackSegments.first {
+            $0.outputStartFrame == 350 && $0.frameCount == 250
+        })
+        XCTAssertEqual(trailingGap.gainStart, 0)
+        XCTAssertEqual(trailingGap.gainEnd, 0)
+        XCTAssertNotEqual(trailingGap.clipID, firstID)
+    }
+
+    func testDeleteClipRemovesOnlyTargetAndRipplesFollowingClips() throws {
+        var arrangement = AudioSegmentArrangement(sourceFrameCount: 1_000)
+        let firstID = try XCTUnwrap(arrangement.clipRanges.first?.id)
+        let secondID = try XCTUnwrap(arrangement.splitClip(id: firstID, atLocalFrame: 300))
+        let thirdID = try XCTUnwrap(arrangement.splitClip(id: secondID, atLocalFrame: 300))
+
+        XCTAssertEqual(arrangement.deleteClip(id: secondID), 300)
+
+        XCTAssertNil(arrangement.frameRange(forClipID: secondID))
+        XCTAssertEqual(arrangement.frameRange(forClipID: firstID), 0..<300)
+        XCTAssertEqual(arrangement.frameRange(forClipID: thirdID), 300..<700)
+        XCTAssertEqual(arrangement.frameCount, 700)
+    }
+
+    func testDeletingClipGroupIsAtomicAndRipplesRemainingClipOnce() throws {
+        var arrangement = AudioSegmentArrangement(sourceFrameCount: 900)
+        let firstID = try XCTUnwrap(arrangement.clipRanges.first?.id)
+        let secondID = try XCTUnwrap(arrangement.splitClip(id: firstID, atLocalFrame: 300))
+        let thirdID = try XCTUnwrap(arrangement.splitClip(id: secondID, atLocalFrame: 300))
+
+        XCTAssertEqual(arrangement.deleteClips(ids: [firstID, thirdID]), 600)
+
+        XCTAssertNil(arrangement.frameRange(forClipID: firstID))
+        XCTAssertEqual(arrangement.frameRange(forClipID: secondID), 0..<300)
+        XCTAssertNil(arrangement.frameRange(forClipID: thirdID))
+        XCTAssertEqual(arrangement.frameCount, 300)
+    }
+
+    func testMoveDestinationInsideClipIsStableNoOp() throws {
+        var arrangement = AudioSegmentArrangement(sourceFrameCount: 1_000)
+        let clipID = try XCTUnwrap(arrangement.clipRanges.first?.id)
+        let segmentsBefore = arrangement.segments
+
+        XCTAssertEqual(arrangement.moveClip(id: clipID, toFrame: 500), 0..<1_000)
+        XCTAssertEqual(arrangement.segments, segmentsBefore)
+        XCTAssertEqual(arrangement.frameRange(forClipID: clipID), 0..<1_000)
+    }
+
     func testGainAndFadeChangeOnlyRequestedRange() {
         var arrangement = AudioSegmentArrangement(sourceFrameCount: 1_000)
 
