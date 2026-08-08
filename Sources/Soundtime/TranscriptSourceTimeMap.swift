@@ -130,6 +130,77 @@ struct TranscriptSourceTimeMap: Codable, Equatable, Sendable {
         )
     }
 
+    /// Projects a source-timed transcript through the canonical clip graph.
+    /// A transcript remains attached to its media source, so splitting, moving,
+    /// trimming, duplicating, or moving clips between tracks only changes this
+    /// projection; it never rewrites the provider's source timestamps.
+    static func fromClipGraph(
+        _ graph: TimelineClipGraph,
+        trackID: UUID,
+        sourceFingerprint: String? = nil,
+        fallbackTimelineDuration: TimeInterval = 0
+    ) -> TranscriptSourceTimeMap? {
+        guard let track = graph.track(id: trackID) else {
+            return nil
+        }
+
+        let referencedSourceIDs = Set(track.clips.map(\.sourceID))
+        let matchingSourceIDs: Set<TimelineMediaSourceID>
+        if let sourceFingerprint, !sourceFingerprint.isEmpty {
+            matchingSourceIDs = Set(graph.sources.values.compactMap { source in
+                guard source.fingerprint == sourceFingerprint || source.id.rawValue == sourceFingerprint else {
+                    return nil
+                }
+                return source.id
+            })
+        } else if referencedSourceIDs.count == 1 {
+            matchingSourceIDs = referencedSourceIDs
+        } else {
+            // A track-level transcript without source identity is ambiguous once
+            // clips from multiple media sources share the lane.
+            return nil
+        }
+        guard !matchingSourceIDs.isEmpty else {
+            return nil
+        }
+
+        let matchingSources = matchingSourceIDs.compactMap { graph.source(id: $0) }
+        guard !matchingSources.isEmpty, graph.timelineSampleRate > 0 else {
+            return nil
+        }
+        let sourceDuration = matchingSources.reduce(0) { duration, source in
+            max(duration, TimeInterval(source.frameCount) / source.sampleRate)
+        }
+        let graphDuration = TimeInterval(graph.endFrame) / graph.timelineSampleRate
+        let timelineDuration = max(graphDuration, fallbackTimelineDuration)
+        let segments = track.clips.compactMap { clip -> Segment? in
+            guard
+                matchingSourceIDs.contains(clip.sourceID),
+                let source = graph.source(id: clip.sourceID),
+                source.sampleRate > 0,
+                clip.timelineRange.frameCount > 0,
+                clip.sourceRange.frameCount > 0
+            else {
+                return nil
+            }
+            let gainStart = clip.isMuted ? 0 : clip.gain * clip.gainEnvelope.startMultiplier
+            let gainEnd = clip.isMuted ? 0 : clip.gain * clip.gainEnvelope.endMultiplier
+            return Segment(
+                outputStartTime: TimeInterval(clip.timelineRange.startFrame) / graph.timelineSampleRate,
+                outputEndTime: TimeInterval(clip.timelineRange.endFrame) / graph.timelineSampleRate,
+                sourceStartTime: TimeInterval(clip.sourceRange.startFrame) / source.sampleRate,
+                sourceEndTime: TimeInterval(clip.sourceRange.endFrame) / source.sampleRate,
+                gainStart: gainStart,
+                gainEnd: gainEnd
+            )
+        }
+        return TranscriptSourceTimeMap(
+            sourceDuration: sourceDuration,
+            timelineDuration: timelineDuration,
+            segments: segments
+        )
+    }
+
     private static func fromPlaybackSegments(
         _ playbackSegments: [AudioEditTimeline.PlaybackSegment],
         sampleRate: Double,

@@ -16,6 +16,7 @@ struct TimelineTranscriptOverlayDiagnosticsSnapshot: Codable, Sendable {
     var runLayerCount: Int
     var expectedVisibleRunLayerCount: Int
     var visibleRunLayerCount: Int
+    var staticRunImageBuildCount: Int
     var lastLayoutBuildReason: String?
 }
 
@@ -25,15 +26,42 @@ struct TimelineTranscriptOverlayLayerGeometrySnapshot {
 }
 
 final class TimelineTranscriptOverlayView: NSView {
+    private struct RunLayerIdentity: Hashable {
+        let trackID: UUID
+        let wordID: UUID?
+        let segmentID: UUID
+        let projectStartTime: TimeInterval
+        let projectEndTime: TimeInterval
+        let isWord: Bool
+
+        init(_ run: TranscriptTimelineLayout.Run) {
+            trackID = run.trackID
+            wordID = run.wordID
+            segmentID = run.segmentID
+            projectStartTime = run.projectRange.startTime
+            projectEndTime = run.projectRange.endTime
+            isWord = run.isWord
+        }
+    }
+
     private final class RunLayerBundle {
-        let layoutRun: TranscriptTimelineLayout.Run
+        var layoutRun: TranscriptTimelineLayout.Run
+        var identity: RunLayerIdentity
         let containerLayer = CALayer()
         let backgroundLayer = CALayer()
-        let textLayer = CATextLayer()
+        let textLayer = CALayer()
+        let interactionLayer = CALayer()
 
         init(layoutRun: TranscriptTimelineLayout.Run) {
             self.layoutRun = layoutRun
+            identity = RunLayerIdentity(layoutRun)
         }
+    }
+
+    private struct TextImageKey: Hashable {
+        let text: String
+        let isWord: Bool
+        let backingScale: Int
     }
 
     private struct VisibleTextRun {
@@ -76,12 +104,21 @@ final class TimelineTranscriptOverlayView: NSView {
     private struct CachedLayout {
         let key: String
         let reuseKeyComponents: [String]
+        let projectionViewport: TimelineViewport
         let visibleProjectRange: TranscriptionTimeRange
         let backgrounds: [TranscriptTimelineLayout.Background]
         let runs: [VisibleTextRun]
         let wordRects: [UUID: CGRect]
         let segmentRects: [UUID: CGRect]
         let usesWordRuns: Bool
+    }
+
+    private struct AppliedGeometryState: Equatable {
+        let viewport: TimelineViewport
+        let trackLayout: TimelineTrackLayout
+        let timelineDuration: TimeInterval
+        let displayMode: TranscriptTimelineDisplayMode
+        let boundsSize: CGSize
     }
 
     private var tracks: [TimelineRenderState.Track] = []
@@ -91,10 +128,15 @@ final class TimelineTranscriptOverlayView: NSView {
     private var displayMode = TranscriptTimelineDisplayMode.hidden
     private var interactionState = TranscriptInteractionState.empty
     private var cachedLayout: CachedLayout?
+    private var appliedGeometryState: AppliedGeometryState?
     private let transcriptBackgroundLayer = CALayer()
     private let transcriptRunLayer = CALayer()
+    private let transcriptRunImageLayer = CALayer()
+    private let transcriptInteractionLayer = CALayer()
     private var transcriptBandLayers: [CALayer] = []
     private var transcriptRunLayers: [RunLayerBundle] = []
+    private var textImageCache: [TextImageKey: CGImage] = [:]
+    private var activeRunLayerCount = 0
     private var verticalGeometryByTrackID: [UUID: TranscriptTrackVerticalGeometry] = [:]
     private var diagnosticsConfigureCount = 0
     private var diagnosticsLayoutBuildCount = 0
@@ -107,6 +149,7 @@ final class TimelineTranscriptOverlayView: NSView {
     private var diagnosticsCursorRectResetCount = 0
     private var diagnosticsMaxCursorRectResetMilliseconds: Double = 0
     private var diagnosticsMaxCursorRectCount = 0
+    private var diagnosticsStaticRunImageBuildCount = 0
     private var diagnosticsLastLayoutBuildReason: String?
 
     override init(frame frameRect: NSRect) {
@@ -214,17 +257,27 @@ final class TimelineTranscriptOverlayView: NSView {
         timelineDuration: TimeInterval,
         displayMode: TranscriptTimelineDisplayMode
     ) -> Bool {
+        let nextGeometryState = AppliedGeometryState(
+            viewport: viewport,
+            trackLayout: trackLayout,
+            timelineDuration: timelineDuration,
+            displayMode: displayMode,
+            boundsSize: bounds.size
+        )
         self.viewport = viewport
         self.trackLayout = trackLayout
         self.timelineDuration = timelineDuration
         self.displayMode = displayMode
-        rebuildVerticalGeometryCache()
         isHidden = displayMode == .hidden
 
         guard displayMode != .hidden, cachedLayout != nil else {
             return false
         }
+        guard appliedGeometryState != nextGeometryState else {
+            return false
+        }
 
+        rebuildVerticalGeometryCache()
         updateLayerGeometry()
         if interactionState.alignmentDebugEnabled {
             needsDisplay = true
@@ -302,10 +355,11 @@ final class TimelineTranscriptOverlayView: NSView {
             cursorRectResetCount: diagnosticsCursorRectResetCount,
             maxCursorRectResetMilliseconds: diagnosticsMaxCursorRectResetMilliseconds,
             maxCursorRectCount: diagnosticsMaxCursorRectCount,
-            visibleRunCount: cachedLayout?.runs.count ?? 0,
-            runLayerCount: transcriptRunLayers.count,
+            visibleRunCount: activeRunLayerCount,
+            runLayerCount: activeRunLayerCount,
             expectedVisibleRunLayerCount: expectedVisibleRunLayerCountForDiagnostics(),
-            visibleRunLayerCount: transcriptRunLayers.lazy.filter { !$0.containerLayer.isHidden }.count,
+            visibleRunLayerCount: activeRunLayerCount,
+            staticRunImageBuildCount: diagnosticsStaticRunImageBuildCount,
             lastLayoutBuildReason: diagnosticsLastLayoutBuildReason
         )
     }
@@ -313,9 +367,13 @@ final class TimelineTranscriptOverlayView: NSView {
     func layerGeometrySnapshotForSmokeTesting() -> TimelineTranscriptOverlayLayerGeometrySnapshot {
         TimelineTranscriptOverlayLayerGeometrySnapshot(
             bandFrames: transcriptBandLayers.filter { !$0.isHidden }.map(\.frame),
-            runFrames: transcriptRunLayers
-                .filter { !$0.containerLayer.isHidden }
-                .map(\.containerLayer.frame)
+            runFrames: cachedLayout?.runs.compactMap { cachedRun in
+                let frame = projectedDisplayRect(for: cachedRun.layoutRun).intersection(trackContentBounds)
+                guard !frame.isNull, frame.width > 2, frame.height > 2 else {
+                    return nil
+                }
+                return layerFrame(forTopDownRect: frame)
+            } ?? []
         )
     }
 
@@ -331,6 +389,7 @@ final class TimelineTranscriptOverlayView: NSView {
         diagnosticsCursorRectResetCount = 0
         diagnosticsMaxCursorRectResetMilliseconds = 0
         diagnosticsMaxCursorRectCount = 0
+        diagnosticsStaticRunImageBuildCount = 0
         diagnosticsLastLayoutBuildReason = nil
     }
 
@@ -351,7 +410,7 @@ final class TimelineTranscriptOverlayView: NSView {
             return 0
         }
         return cachedLayout.runs.lazy.filter { run in
-            let rect = self.displayRun(run).rect.intersection(self.bounds).insetBy(dx: 3, dy: 0)
+            let rect = self.displayRun(run).rect.intersection(self.trackContentBounds).insetBy(dx: 3, dy: 0)
             return !rect.isNull && rect.width > 2 && rect.height > 2
         }.count
     }
@@ -441,10 +500,24 @@ final class TimelineTranscriptOverlayView: NSView {
         layer.isGeometryFlipped = true
         transcriptBackgroundLayer.masksToBounds = true
         transcriptRunLayer.masksToBounds = true
+        transcriptRunImageLayer.masksToBounds = true
+        transcriptInteractionLayer.masksToBounds = true
         transcriptBackgroundLayer.isGeometryFlipped = true
         transcriptRunLayer.isGeometryFlipped = true
+        transcriptRunImageLayer.isGeometryFlipped = true
+        transcriptInteractionLayer.isGeometryFlipped = true
+        // Backgrounds and transcript text are stable between layout-cache
+        // promotions. Their children remain in the cache viewport's coordinate
+        // system while live pan/zoom applies one parent transform.
+        transcriptBackgroundLayer.shouldRasterize = true
+        transcriptRunLayer.shouldRasterize = false
+        transcriptRunImageLayer.contentsGravity = .resize
+        transcriptInteractionLayer.shouldRasterize = false
+        updateRasterizationScale()
         layer.addSublayer(transcriptBackgroundLayer)
         layer.addSublayer(transcriptRunLayer)
+        transcriptRunLayer.addSublayer(transcriptRunImageLayer)
+        layer.addSublayer(transcriptInteractionLayer)
         isHidden = true
     }
 
@@ -455,9 +528,12 @@ final class TimelineTranscriptOverlayView: NSView {
             }
             for bundle in transcriptRunLayers {
                 bundle.containerLayer.removeFromSuperlayer()
+                bundle.interactionLayer.removeFromSuperlayer()
             }
             transcriptBandLayers.removeAll(keepingCapacity: true)
             transcriptRunLayers.removeAll(keepingCapacity: true)
+            transcriptRunImageLayer.contents = nil
+            activeRunLayerCount = 0
 
             guard displayMode != .hidden, let cachedLayout else {
                 return
@@ -474,27 +550,8 @@ final class TimelineTranscriptOverlayView: NSView {
                 transcriptBandLayers.append(bandLayer)
             }
 
-            let contentsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
-            transcriptRunLayers.reserveCapacity(cachedLayout.runs.count)
-            for run in cachedLayout.runs {
-                let bundle = RunLayerBundle(layoutRun: run.layoutRun)
-                bundle.containerLayer.masksToBounds = true
-                bundle.containerLayer.isGeometryFlipped = true
-                bundle.backgroundLayer.isGeometryFlipped = true
-                bundle.textLayer.isGeometryFlipped = true
-                bundle.textLayer.contentsScale = contentsScale
-                bundle.textLayer.alignmentMode = .center
-                bundle.textLayer.truncationMode = .end
-                bundle.textLayer.isWrapped = false
-                bundle.textLayer.masksToBounds = true
-                bundle.containerLayer.addSublayer(bundle.backgroundLayer)
-                bundle.containerLayer.addSublayer(bundle.textLayer)
-                transcriptRunLayer.addSublayer(bundle.containerLayer)
-                transcriptRunLayers.append(bundle)
-            }
-
             updateLayerGeometryWithoutTransaction()
-            updateAllRunLayerStylesWithoutTransaction()
+            rebuildStaticRunImageWithoutTransaction()
         }
     }
 
@@ -505,8 +562,20 @@ final class TimelineTranscriptOverlayView: NSView {
     }
 
     private func updateLayerGeometryWithoutTransaction() {
+        appliedGeometryState = AppliedGeometryState(
+            viewport: viewport,
+            trackLayout: trackLayout,
+            timelineDuration: timelineDuration,
+            displayMode: displayMode,
+            boundsSize: bounds.size
+        )
         transcriptBackgroundLayer.frame = bounds
         transcriptRunLayer.frame = bounds
+        transcriptRunImageLayer.frame = transcriptRunLayer.bounds
+        transcriptInteractionLayer.frame = bounds
+        let liveTransform = cachedLayout.map(horizontalProjectionTransform) ?? .identity
+        transcriptRunLayer.sublayerTransform = CATransform3DMakeAffineTransform(liveTransform)
+        transcriptInteractionLayer.sublayerTransform = CATransform3DMakeAffineTransform(liveTransform)
 
         if let cachedLayout {
             for (index, bandLayer) in transcriptBandLayers.enumerated() {
@@ -518,7 +587,7 @@ final class TimelineTranscriptOverlayView: NSView {
                 let rect = (
                     verticalGeometryByTrackID[background.trackID]?.bandRect ??
                     background.rect
-                ).intersection(bounds)
+                ).intersection(trackContentBounds)
                 bandLayer.isHidden = rect.isNull || rect.width <= 0 || rect.height <= 0
                 if !bandLayer.isHidden {
                     bandLayer.frame = layerFrame(forTopDownRect: rect)
@@ -530,28 +599,140 @@ final class TimelineTranscriptOverlayView: NSView {
             }
         }
 
-        for bundle in transcriptRunLayers {
-            let displayRect = projectedDisplayRect(for: bundle.layoutRun)
-            let clippedRect = displayRect.intersection(bounds).insetBy(dx: 3, dy: 0)
+        guard let cachedLayout else {
+            activeRunLayerCount = 0
+            for bundle in transcriptRunLayers {
+                bundle.containerLayer.isHidden = true
+                bundle.interactionLayer.isHidden = true
+            }
+            return
+        }
+
+        let cachedRuns: [(run: TranscriptTimelineLayout.Run, rect: CGRect)] = cachedLayout.runs.compactMap { cachedRun in
+            let referenceRect = referenceDisplayRect(for: cachedRun.layoutRun)
+            let clippedRect = referenceRect.intersection(trackContentBounds).insetBy(dx: 3, dy: 0)
             guard
                 !clippedRect.isNull,
                 clippedRect.width > 2,
                 clippedRect.height > 2
             else {
-                bundle.containerLayer.isHidden = true
-                continue
+                return nil
             }
+            return (cachedRun.layoutRun, clippedRect)
+        }
+
+        let existingByIdentity = Dictionary(
+            uniqueKeysWithValues: transcriptRunLayers.map { ($0.identity, $0) }
+        )
+        var claimedBundles = Set<ObjectIdentifier>()
+        var inactiveBundles = transcriptRunLayers
+
+        for visibleRun in cachedRuns {
+            let identity = RunLayerIdentity(visibleRun.run)
+            let bundle: RunLayerBundle
+            if let existing = existingByIdentity[identity], !claimedBundles.contains(ObjectIdentifier(existing)) {
+                bundle = existing
+            } else if let reusableIndex = inactiveBundles.firstIndex(where: {
+                !claimedBundles.contains(ObjectIdentifier($0))
+            }) {
+                bundle = inactiveBundles.remove(at: reusableIndex)
+                bundle.layoutRun = visibleRun.run
+                bundle.identity = identity
+                updateBaseRunLayerStyle(bundle)
+                updateRunInteractionStyle(bundle)
+            } else {
+                bundle = makeRunLayerBundle(for: visibleRun.run)
+                transcriptRunLayers.append(bundle)
+                updateBaseRunLayerStyle(bundle)
+                updateRunInteractionStyle(bundle)
+            }
+            claimedBundles.insert(ObjectIdentifier(bundle))
 
             bundle.containerLayer.isHidden = false
-            bundle.containerLayer.frame = layerFrame(forTopDownRect: clippedRect)
-            let localBounds = CGRect(origin: .zero, size: clippedRect.size)
+            bundle.containerLayer.frame = layerFrame(forTopDownRect: visibleRun.rect)
+            bundle.interactionLayer.frame = layerFrame(forTopDownRect: visibleRun.rect)
+            let localBounds = CGRect(origin: .zero, size: visibleRun.rect.size)
             bundle.backgroundLayer.frame = localBounds
             bundle.backgroundLayer.cornerRadius = bundle.layoutRun.isWord
-                ? clippedRect.height * 0.46
+                ? visibleRun.rect.height * 0.46
                 : 8
-            let verticalTextInset = max((clippedRect.height - 14) * 0.5, 1)
+            bundle.interactionLayer.cornerRadius = bundle.layoutRun.isWord
+                ? visibleRun.rect.height * 0.46
+                : 8
+            let verticalTextInset = max((visibleRun.rect.height - 14) * 0.5, 1)
             bundle.textLayer.frame = localBounds.insetBy(dx: 5, dy: verticalTextInset)
         }
+
+        activeRunLayerCount = expectedVisibleRunLayerCountForDiagnostics()
+        for bundle in transcriptRunLayers where !claimedBundles.contains(ObjectIdentifier(bundle)) {
+            bundle.containerLayer.isHidden = true
+            bundle.interactionLayer.isHidden = true
+        }
+    }
+
+    /// Collapses the immutable word-pill subtree into one GPU-composited image.
+    /// Live pan and zoom then transform a single layer; only interaction
+    /// highlights remain as independent layers.
+    private func rebuildStaticRunImageWithoutTransaction() {
+        transcriptRunImageLayer.contents = nil
+        transcriptRunImageLayer.isHidden = true
+
+        for bundle in transcriptRunLayers where !bundle.containerLayer.isHidden {
+            if bundle.containerLayer.superlayer !== transcriptRunLayer {
+                transcriptRunLayer.addSublayer(bundle.containerLayer)
+            }
+        }
+
+        let scale = max(window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2, 1)
+        let pixelWidth = max(Int(ceil(bounds.width * scale)), 1)
+        let pixelHeight = max(Int(ceil(bounds.height * scale)), 1)
+        guard
+            bounds.width > 0,
+            bounds.height > 0,
+            let context = CGContext(
+                data: nil,
+                width: pixelWidth,
+                height: pixelHeight,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )
+        else {
+            transcriptRunImageLayer.isHidden = false
+            return
+        }
+
+        let savedTransform = transcriptRunLayer.sublayerTransform
+        transcriptRunLayer.sublayerTransform = CATransform3DIdentity
+        context.scaleBy(x: scale, y: scale)
+        transcriptRunLayer.render(in: context)
+        transcriptRunLayer.sublayerTransform = savedTransform
+
+        for bundle in transcriptRunLayers {
+            bundle.containerLayer.removeFromSuperlayer()
+        }
+        transcriptRunImageLayer.contents = context.makeImage()
+        transcriptRunImageLayer.contentsScale = scale
+        transcriptRunImageLayer.isHidden = false
+        diagnosticsStaticRunImageBuildCount += 1
+    }
+
+    private func makeRunLayerBundle(
+        for run: TranscriptTimelineLayout.Run
+    ) -> RunLayerBundle {
+        let bundle = RunLayerBundle(layoutRun: run)
+        bundle.containerLayer.masksToBounds = true
+        bundle.containerLayer.isGeometryFlipped = true
+        bundle.backgroundLayer.isGeometryFlipped = true
+        bundle.textLayer.isGeometryFlipped = true
+        bundle.textLayer.contentsGravity = .center
+        bundle.textLayer.masksToBounds = true
+        bundle.containerLayer.addSublayer(bundle.backgroundLayer)
+        bundle.containerLayer.addSublayer(bundle.textLayer)
+        transcriptRunLayer.addSublayer(bundle.containerLayer)
+        transcriptInteractionLayer.addSublayer(bundle.interactionLayer)
+        return bundle
     }
 
     private func layerFrame(forTopDownRect rect: CGRect) -> CGRect {
@@ -571,7 +752,7 @@ final class TimelineTranscriptOverlayView: NSView {
 
     private func updateAllRunLayerStylesWithoutTransaction() {
         for bundle in transcriptRunLayers {
-            updateRunLayerStyle(bundle)
+            updateRunInteractionStyle(bundle)
         }
     }
 
@@ -588,67 +769,74 @@ final class TimelineTranscriptOverlayView: NSView {
                 let shouldUpdate = layoutRun.wordID.map(wordIDs.contains) == true ||
                     segmentIDs.contains(layoutRun.segmentID)
                 if shouldUpdate {
-                    updateRunLayerStyle(bundle)
+                    updateRunInteractionStyle(bundle)
                 }
             }
         }
     }
 
-    private func updateRunLayerStyle(_ bundle: RunLayerBundle) {
+    private func updateBaseRunLayerStyle(_ bundle: RunLayerBundle) {
+        let run = bundle.layoutRun
+        bundle.backgroundLayer.backgroundColor = run.isWord ? NSColor(
+            calibratedRed: 0.14,
+            green: 0.86,
+            blue: 0.94,
+            alpha: 0.14
+        ).cgColor : NSColor.clear.cgColor
+        bundle.backgroundLayer.borderColor = NSColor.clear.cgColor
+        bundle.backgroundLayer.borderWidth = 0
+        bundle.textLayer.contents = cachedTextImage(for: run)
+    }
+
+    private func updateRunInteractionStyle(_ bundle: RunLayerBundle) {
         let run = bundle.layoutRun
         let isSelected = run.wordID.map { interactionState.selectedWordIDs.contains($0) } == true ||
             interactionState.selectedSegmentIDs.contains(run.segmentID)
         let isHovered = run.wordID.map { interactionState.hoveredWordID == $0 } == true ||
             (run.wordID == nil && interactionState.hoveredSegmentID == run.segmentID)
         let isActive = run.wordID.map { interactionState.activeWordID == $0 } == true
+        bundle.interactionLayer.isHidden = !(isSelected || isHovered || isActive)
 
         if run.isWord {
             let fillAlpha: CGFloat
             if isSelected {
-                fillAlpha = 0.34
+                fillAlpha = 0.24
             } else if isActive {
-                fillAlpha = 0.28
+                fillAlpha = 0.18
             } else if isHovered {
-                fillAlpha = 0.22
+                fillAlpha = 0.12
             } else {
-                fillAlpha = 0.14
+                fillAlpha = 0
             }
-            bundle.backgroundLayer.backgroundColor = NSColor(
+            bundle.interactionLayer.backgroundColor = NSColor(
                 calibratedRed: 0.14,
                 green: 0.86,
                 blue: 0.94,
                 alpha: fillAlpha
             ).cgColor
             if isSelected || isHovered || isActive {
-                bundle.backgroundLayer.borderColor = NSColor.white
+                bundle.interactionLayer.borderColor = NSColor.white
                     .withAlphaComponent(isSelected ? 0.28 : 0.16)
                     .cgColor
-                bundle.backgroundLayer.borderWidth = isSelected ? 1.2 : 0.8
+                bundle.interactionLayer.borderWidth = isSelected ? 1.2 : 0.8
             } else {
-                bundle.backgroundLayer.borderColor = NSColor.clear.cgColor
-                bundle.backgroundLayer.borderWidth = 0
+                bundle.interactionLayer.borderColor = NSColor.clear.cgColor
+                bundle.interactionLayer.borderWidth = 0
             }
         } else if isSelected || isHovered {
-            bundle.backgroundLayer.backgroundColor = NSColor(
+            bundle.interactionLayer.backgroundColor = NSColor(
                 calibratedRed: 0.14,
                 green: 0.86,
                 blue: 0.94,
                 alpha: isSelected ? 0.24 : 0.13
             ).cgColor
-            bundle.backgroundLayer.borderColor = NSColor.clear.cgColor
-            bundle.backgroundLayer.borderWidth = 0
+            bundle.interactionLayer.borderColor = NSColor.clear.cgColor
+            bundle.interactionLayer.borderWidth = 0
         } else {
-            bundle.backgroundLayer.backgroundColor = NSColor.clear.cgColor
-            bundle.backgroundLayer.borderColor = NSColor.clear.cgColor
-            bundle.backgroundLayer.borderWidth = 0
+            bundle.interactionLayer.backgroundColor = NSColor.clear.cgColor
+            bundle.interactionLayer.borderColor = NSColor.clear.cgColor
+            bundle.interactionLayer.borderWidth = 0
         }
-
-        bundle.textLayer.string = attributedText(
-            for: VisibleTextRun(layoutRun: run),
-            isSelected: isSelected,
-            isHovered: isHovered,
-            isActive: isActive
-        )
     }
 
     private func withDisabledLayerActions(_ update: () -> Void) {
@@ -660,16 +848,34 @@ final class TimelineTranscriptOverlayView: NSView {
 
     override func layout() {
         super.layout()
-        rebuildVerticalGeometryCache()
-        updateLayerGeometry()
+        withDisabledLayerActions {
+            rebuildVerticalGeometryCache()
+            updateLayerGeometryWithoutTransaction()
+            if displayMode != .hidden, cachedLayout != nil {
+                rebuildStaticRunImageWithoutTransaction()
+            }
+        }
     }
 
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
         let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        updateRasterizationScale(scale)
+        textImageCache.removeAll(keepingCapacity: true)
         for bundle in transcriptRunLayers {
-            bundle.textLayer.contentsScale = scale
+            bundle.textLayer.contents = cachedTextImage(for: bundle.layoutRun, scale: scale)
         }
+        withDisabledLayerActions {
+            if displayMode != .hidden, cachedLayout != nil {
+                rebuildStaticRunImageWithoutTransaction()
+            }
+        }
+    }
+
+    private func updateRasterizationScale(_ requestedScale: CGFloat? = nil) {
+        let scale = requestedScale ?? window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        transcriptBackgroundLayer.rasterizationScale = scale
+        transcriptRunLayer.rasterizationScale = scale
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -722,6 +928,7 @@ final class TimelineTranscriptOverlayView: NSView {
                     timelineDuration: timelineDuration,
                     displayMode: displayMode
                 ),
+                projectionViewport: viewport,
                 visibleProjectRange: TranscriptViewportGeometry.layoutCacheProjectRange(
                     viewport: viewport,
                     timelineDuration: timelineDuration
@@ -759,6 +966,7 @@ final class TimelineTranscriptOverlayView: NSView {
                 timelineDuration: timelineDuration,
                 displayMode: displayMode
             ),
+            projectionViewport: layoutViewport,
             visibleProjectRange: TranscriptViewportGeometry.layoutCacheProjectRange(
                 viewport: viewport,
                 timelineDuration: timelineDuration
@@ -860,7 +1068,7 @@ final class TimelineTranscriptOverlayView: NSView {
     }
 
     private func expandedDirtyRect(_ rect: CGRect) -> CGRect {
-        rect.insetBy(dx: -10, dy: -8).intersection(bounds)
+        rect.insetBy(dx: -10, dy: -8).intersection(trackContentBounds)
     }
 
     private func rectsByWordID(_ runs: [VisibleTextRun]) -> [UUID: CGRect] {
@@ -916,6 +1124,49 @@ final class TimelineTranscriptOverlayView: NSView {
         )
     }
 
+    private func referenceDisplayRect(
+        for run: TranscriptTimelineLayout.Run
+    ) -> CGRect {
+        guard let cachedLayout else {
+            return projectedDisplayRect(for: run)
+        }
+        let horizontalRect = TranscriptViewportGeometry.displayRect(
+            for: run,
+            viewport: cachedLayout.projectionViewport,
+            timelineDuration: timelineDuration,
+            boundsWidth: bounds.width
+        )
+        guard let verticalGeometry = verticalGeometryByTrackID[run.trackID] else {
+            return horizontalRect
+        }
+        return verticalGeometry.runRect(
+            x: horizontalRect.minX,
+            width: horizontalRect.width,
+            isWord: run.isWord
+        )
+    }
+
+    private func horizontalProjectionTransform(
+        for cachedLayout: CachedLayout
+    ) -> CGAffineTransform {
+        let reference = cachedLayout.projectionViewport
+        let live = viewport
+        let referenceDuration = max(reference.durationProgress, 0.000_001)
+        let liveDuration = max(live.durationProgress, 0.000_001)
+        let scale = referenceDuration / liveDuration
+        let translation = CGFloat(
+            (reference.startProgress - live.startProgress) / liveDuration
+        ) * bounds.width
+        return CGAffineTransform(
+            a: CGFloat(scale),
+            b: 0,
+            c: 0,
+            d: 1,
+            tx: translation,
+            ty: 0
+        )
+    }
+
     private func rebuildVerticalGeometryCache() {
         let resolvedLayout = trackLayout.resolved(
             totalTrackCount: tracks.count,
@@ -937,6 +1188,20 @@ final class TimelineTranscriptOverlayView: NSView {
         }
     }
 
+    private var trackContentBounds: CGRect {
+        let resolvedLayout = trackLayout.resolved(
+            totalTrackCount: tracks.count,
+            viewportHeight: Float(max(bounds.height, 1))
+        )
+        let rulerHeight = CGFloat(resolvedLayout.rulerLaneHeight)
+        return CGRect(
+            x: 0,
+            y: rulerHeight,
+            width: bounds.width,
+            height: max(bounds.height - rulerHeight, 0)
+        )
+    }
+
     private func union(_ existing: CGRect?, _ next: CGRect) -> CGRect {
         guard let existing else {
             return next
@@ -954,7 +1219,7 @@ final class TimelineTranscriptOverlayView: NSView {
     }
 
     private func draw(_ run: VisibleTextRun) {
-        let clippedRect = run.rect.intersection(bounds).insetBy(dx: 3, dy: 0)
+        let clippedRect = run.rect.intersection(trackContentBounds).insetBy(dx: 3, dy: 0)
         guard clippedRect.width > 2, clippedRect.height > 2 else {
             return
         }
@@ -1022,6 +1287,75 @@ final class TimelineTranscriptOverlayView: NSView {
                 .paragraphStyle: paragraphStyle,
             ]
         )
+    }
+
+    private func cachedTextImage(
+        for run: TranscriptTimelineLayout.Run,
+        scale requestedScale: CGFloat? = nil
+    ) -> CGImage? {
+        let scale = max(
+            requestedScale ?? window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2,
+            1
+        )
+        let key = TextImageKey(
+            text: run.text,
+            isWord: run.isWord,
+            backingScale: Int((scale * 100).rounded())
+        )
+        if let cached = textImageCache[key] {
+            return cached
+        }
+
+        let attributed = attributedText(
+            for: VisibleTextRun(layoutRun: run),
+            isSelected: false,
+            isHovered: false,
+            isActive: false
+        )
+        let measured = attributed.boundingRect(
+            with: NSSize(width: 2_048, height: 20),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        )
+        let pointSize = NSSize(
+            width: min(max(ceil(measured.width) + 4, 2), 2_048),
+            height: 18
+        )
+        guard let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: max(Int(ceil(pointSize.width * scale)), 1),
+            pixelsHigh: max(Int(ceil(pointSize.height * scale)), 1),
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else {
+            return nil
+        }
+        bitmap.size = pointSize
+        guard let context = NSGraphicsContext(bitmapImageRep: bitmap) else {
+            return nil
+        }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        context.cgContext.clear(CGRect(origin: .zero, size: pointSize))
+        attributed.draw(
+            in: CGRect(
+                x: 0,
+                y: max((pointSize.height - measured.height) * 0.5, 0),
+                width: pointSize.width,
+                height: measured.height
+            )
+        )
+        context.flushGraphics()
+        NSGraphicsContext.restoreGraphicsState()
+        guard let image = bitmap.cgImage else {
+            return nil
+        }
+        textImageCache[key] = image
+        return image
     }
 
     private func drawAlignmentDebug(for runs: [VisibleTextRun], dirtyRect: NSRect) {

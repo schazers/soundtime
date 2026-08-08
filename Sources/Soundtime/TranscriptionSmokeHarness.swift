@@ -78,6 +78,7 @@ enum TranscriptionSmokeHarness {
         try verifyChunkingAndStitching(trackID: trackID)
         try verifyDeepgramParser(trackID: trackID)
         try verifyTranscriptionScopeAndTimeMap(trackID: trackID)
+        try verifyCanonicalClipGraphTranscriptProjection(trackID: trackID)
         try MainActor.assumeIsolated {
             try verifyRippleDeleteTranscriptProjection(trackID: trackID)
         }
@@ -99,6 +100,7 @@ enum TranscriptionSmokeHarness {
                 "long-form transcription chunking and stitching is deterministic",
                 "Deepgram parser preserves words, utterances, speaker metadata, and request ID",
                 "transcription scopes preserve render mode, domain, and source time maps",
+                "canonical clip split, trim, move, duplicate, and cross-track edits remap source-timed transcripts",
                 "ripple delete removes deleted transcript words and shifts surviving words for decoded timelines",
                 "transcript layout aligns runs through edit-graph source remapping",
                 "transcript overlay live geometry tracks viewport changes without layout rebuilds",
@@ -475,6 +477,96 @@ enum TranscriptionSmokeHarness {
         let outputRanges = timeMap.projectRanges(forSourceRange: 6.5..<7.0)
         try require(outputRanges.count == 1, "source range did not map back to one project range")
         try require(abs((outputRanges.first?.lowerBound ?? 0) - 3.5) < 0.000_1, "source range mapped to wrong project start")
+    }
+
+    private static func verifyCanonicalClipGraphTranscriptProjection(trackID: UUID) throws {
+        let sourceID = TimelineMediaSourceID(rawValue: "transcript-source")
+        let otherSourceID = TimelineMediaSourceID(rawValue: "music-source")
+        let destinationTrackID = UUID(uuidString: "aaaaaaaa-bbbb-cccc-dddd-ffffffffffff")!
+        let source = TimelineMediaSource(
+            id: sourceID,
+            absolutePath: "/tmp/transcript-source.wav",
+            fingerprint: "transcript-fingerprint",
+            frameCount: 1_000,
+            sampleRate: 100,
+            channelCount: 1
+        )
+        let music = TimelineMediaSource(
+            id: otherSourceID,
+            absolutePath: "/tmp/music-source.wav",
+            fingerprint: "music-fingerprint",
+            frameCount: 2_000,
+            sampleRate: 200,
+            channelCount: 2
+        )
+        let first = TimelineClip(
+            sourceID: sourceID,
+            timelineRange: TimelineFrameRange(startFrame: 100, frameCount: 200),
+            sourceRange: TimelineFrameRange(startFrame: 0, frameCount: 200),
+            name: "Split left"
+        )
+        let trimmedAndMoved = TimelineClip(
+            sourceID: sourceID,
+            timelineRange: TimelineFrameRange(startFrame: 500, frameCount: 100),
+            sourceRange: TimelineFrameRange(startFrame: 300, frameCount: 100),
+            name: "Trimmed and moved"
+        )
+        let duplicate = TimelineClip(
+            sourceID: sourceID,
+            timelineRange: TimelineFrameRange(startFrame: 700, frameCount: 100),
+            sourceRange: TimelineFrameRange(startFrame: 300, frameCount: 100),
+            name: "Duplicate"
+        )
+        let unrelated = TimelineClip(
+            sourceID: otherSourceID,
+            timelineRange: TimelineFrameRange(startFrame: 0, frameCount: 100),
+            sourceRange: TimelineFrameRange(startFrame: 0, frameCount: 200),
+            name: "Unrelated source"
+        )
+        let graph = try TimelineClipGraph(
+            sources: [source, music],
+            tracks: [
+                TimelineTrack(id: trackID, name: "Transcript", clips: [first, trimmedAndMoved, unrelated]),
+                TimelineTrack(id: destinationTrackID, name: "Destination", clips: [duplicate]),
+            ],
+            timelineSampleRate: 100,
+            explicitEndFrame: 1_000
+        )
+
+        let map = try requireValue(
+            TranscriptSourceTimeMap.fromClipGraph(
+                graph,
+                trackID: trackID,
+                sourceFingerprint: "transcript-fingerprint"
+            ),
+            "canonical clip graph did not produce a transcript time map"
+        )
+        try require(map.segments.count == 2, "mixed-source lane leaked unrelated clips into transcript mapping")
+        try require(
+            abs((map.sourceTime(forProjectTime: 5.5) ?? -1) - 3.5) < 0.000_1,
+            "trimmed and moved clip did not preserve provider source time"
+        )
+        try require(
+            map.projectRanges(forSourceRange: 3.25..<3.75) == [5.25..<5.75],
+            "trimmed source words did not map into the moved clip"
+        )
+
+        let destinationMap = try requireValue(
+            TranscriptSourceTimeMap.fromClipGraph(
+                graph,
+                trackID: destinationTrackID,
+                sourceFingerprint: "transcript-fingerprint"
+            ),
+            "cross-track duplicate did not produce a transcript map"
+        )
+        try require(
+            destinationMap.projectRanges(forSourceRange: 3.25..<3.75) == [7.25..<7.75],
+            "duplicated or cross-track clip rewrote transcript source timing"
+        )
+        try require(
+            TranscriptSourceTimeMap.fromClipGraph(graph, trackID: trackID) == nil,
+            "mixed-source track accepted an ambiguous transcript without source identity"
+        )
     }
 
     @MainActor
@@ -1024,6 +1116,26 @@ enum TranscriptionSmokeHarness {
         try require(
             overlay.diagnosticsSnapshotForSmokeTesting().layoutBuildCount == initialBuildCount,
             "live resize rebuilt transcript text instead of projecting existing layers"
+        )
+        let repeatedGeometryUpdate = overlay.updateLiveGeometry(
+            viewport: .full,
+            trackLayout: .default,
+            timelineDuration: 7,
+            displayMode: .waveformOverlay
+        )
+        try require(
+            !repeatedGeometryUpdate,
+            "unchanged transcript geometry was needlessly reapplied"
+        )
+        let staticImageBuildCount = overlay
+            .diagnosticsSnapshotForSmokeTesting()
+            .staticRunImageBuildCount
+        var hoveredState = TranscriptInteractionState.empty
+        hoveredState.hoveredWordID = resizedRun.wordID
+        overlay.updateInteractionState(hoveredState)
+        try require(
+            overlay.diagnosticsSnapshotForSmokeTesting().staticRunImageBuildCount == staticImageBuildCount,
+            "transcript interaction rebuilt the static word image"
         )
 
         let layerFrame = try requireValue(

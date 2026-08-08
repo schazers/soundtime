@@ -457,8 +457,10 @@ enum TranscriptLayoutEngine {
     }
 
     private static func rect(for laneFrame: TimelineTrackLaneFrame, bounds: CGSize) -> CGRect {
-        let top = CGFloat(laneFrame.clampedTop) * bounds.height
-        let bottom = CGFloat(laneFrame.clampedBottom) * bounds.height
+        // Derive transcript sizing from the complete lane. The overlay clips
+        // the resulting band and runs against trackContentBounds after layout.
+        let top = CGFloat(laneFrame.top) * bounds.height
+        let bottom = CGFloat(laneFrame.bottom) * bounds.height
         return CGRect(
             x: 0,
             y: top,
