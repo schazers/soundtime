@@ -174,6 +174,14 @@ final class MixerPanelView: NSView {
     func testingSetMixerCloseHovered(_ isHovered: Bool) {
         header.testingSetCloseHovered(isHovered)
     }
+    var testingMixerCursorRegionsAreDisjoint: Bool {
+        let bodyPoint = CGPoint(x: bounds.midX, y: mixerBodyCursorRect.midY)
+        let headerPoint = CGPoint(x: bounds.midX, y: header.frame.midY)
+        return !mixerBodyCursorRect.isEmpty &&
+            mixerBodyCursorRect.contains(bodyPoint) &&
+            !mixerBodyCursorRect.contains(headerPoint) &&
+            header.testingUsesResizeCursor(at: convert(headerPoint, to: header))
+    }
 
     func displayAutomatedMix(
         volumeByTrackID: [UUID: Float],
@@ -281,6 +289,25 @@ final class MixerPanelView: NSView {
             layout.itemSize.height = max(scrollView.contentSize.height - 1, 1)
         }
         updateMeterGeometry()
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        // AppKit keeps the most recently selected cursor when the pointer moves
+        // into a region with no cursor rect. The header owns resizeUpDown; the
+        // rest of the mixer must explicitly restore the ordinary arrow.
+        if !mixerBodyCursorRect.isEmpty {
+            addCursorRect(mixerBodyCursorRect, cursor: .arrow)
+        }
+    }
+
+    private var mixerBodyCursorRect: CGRect {
+        bounds.intersection(CGRect(
+            x: bounds.minX,
+            y: bounds.minY,
+            width: bounds.width,
+            height: max(header.frame.minY - bounds.minY, 0)
+        ))
     }
 
     private func updateTopEdgeShadowPath() {
@@ -411,6 +438,13 @@ private final class MixerHeaderView: NSView {
     override func mouseUp(with event: NSEvent) {
         dragStartY = nil
         window?.invalidateCursorRects(for: self)
+        let localPoint = convert(event.locationInWindow, from: nil)
+        if !bounds.contains(localPoint) {
+            // Mouse capture can finish after the pointer has left the moving
+            // header. Do not leave its resize cursor globally installed while
+            // waiting for AppKit's next cursor-rect transition.
+            NSCursor.arrow.set()
+        }
     }
 
     var testingCloseControlWinsHitTesting: Bool {
@@ -430,6 +464,10 @@ private final class MixerHeaderView: NSView {
 
     func testingSetCloseHovered(_ isHovered: Bool) {
         closeButton.testingSetHovered(isHovered, animated: false)
+    }
+
+    func testingUsesResizeCursor(at point: CGPoint) -> Bool {
+        resizeCursorRects.contains(where: { $0.contains(point) })
     }
 
     private var resizeCursorRects: [CGRect] {

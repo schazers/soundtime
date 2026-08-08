@@ -47,6 +47,7 @@ enum MixerSmokeHarness {
             "plain-X View menu command contract",
             "shared bottom-panel switching and responder restoration",
             "mixer close control owns hit testing and hover presentation",
+            "mixer resize cursor remains confined to the header",
             "mixer channel controls retain an eight-point vertical rhythm",
             "stable channel identity across reorder",
             "muted channel presentation remains stable through live resize",
@@ -195,6 +196,10 @@ enum MixerSmokeHarness {
         try require(
             panel.testingMixerCloseControlWinsHitTesting,
             "mixer resize header swallowed the close control hit target"
+        )
+        try require(
+            panel.testingMixerCursorRegionsAreDisjoint,
+            "mixer resize cursor leaked from the header into the mixer body"
         )
         panel.testingSetMixerCloseHovered(true)
         let hoveredClose = panel.testingMixerCloseHoverPresentation
