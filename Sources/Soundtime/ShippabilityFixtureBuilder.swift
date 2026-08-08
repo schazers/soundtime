@@ -44,7 +44,9 @@ enum ShippabilityFixtureBuilder {
         var path: String
         var trackCount: Int
         var durationSeconds: Double
-        var transcriptWordCount: Int
+        var transcriptWordCount: Int?
+        var clipCount: Int? = nil
+        var automationPointCount: Int? = nil
     }
 
     private enum FixtureProfile: String {
@@ -85,6 +87,8 @@ enum ShippabilityFixtureBuilder {
         var trackCount: Int
         var duration: TimeInterval
         var transcriptWordCount: Int
+        var clipCount: Int
+        var automationPointCount: Int
         var relatedURLs: [URL]
     }
 
@@ -104,6 +108,8 @@ enum ShippabilityFixtureBuilder {
             var projectReady: Bool?
             var importExpectation: FixtureImportExpectation?
             var transcriptWordCount: Int?
+            var clipCount: Int?
+            var automationPointCount: Int?
             var sha256: String
             var relatedFiles: [FileDigest]
         }
@@ -310,11 +316,22 @@ enum ShippabilityFixtureBuilder {
             durationSeconds: 1_800,
             transcriptWordCount: 0
         ),
+        ExpectedProjectFixture(
+            id: "st-ship-project-009",
+            role: "Extreme 1,000-track timeline with 128,000 clips, dense automation, mixed waveform sources, and transcripts",
+            path: "projects/st-ship-project-009-extreme-timeline.soundtime",
+            trackCount: 1_000,
+            durationSeconds: 7_200,
+            transcriptWordCount: nil,
+            clipCount: 128_000,
+            automationPointCount: 256_000
+        ),
     ]
 
     private static func expectedProjectFixtures(for profile: FixtureProfile) -> [ExpectedProjectFixture] {
         expectedProjectFixtures.filter { expected in
-            profile.includesTrueLongFixtures || expected.id != "st-ship-project-008"
+            profile.includesTrueLongFixtures ||
+                (expected.id != "st-ship-project-008" && expected.id != "st-ship-project-009")
         }
     }
 
@@ -925,6 +942,10 @@ enum ShippabilityFixtureBuilder {
                     viewport: .init(startProgress: 0.36, durationProgress: 0.035)
                 )
             ))
+            projects.append(try makeExtremeTimelineProject(
+                projectDirectory: projectDirectory,
+                sourceAudio: [shortVoice, longPodcast, musicBed, transients]
+            ))
         }
 
         return projects
@@ -961,12 +982,14 @@ enum ShippabilityFixtureBuilder {
             role: role,
             url: url,
             trackCount: project.tracks.count,
-            duration: project.tracks
+            duration: project.timelineEndTime ?? project.tracks
                 .compactMap { trackDuration($0) }
                 .max() ?? 0,
             transcriptWordCount: project.tracks.reduce(0) {
                 $0 + ($1.transcript?.words.count ?? 0)
             },
+            clipCount: project.clipGraphDocument?.graph.tracks.reduce(0) { $0 + $1.clips.count } ?? 0,
+            automationPointCount: project.automationDocument?.lanes.reduce(0) { $0 + $1.points.count } ?? 0,
             relatedURLs: relatedURLs
         )
     }
@@ -975,7 +998,10 @@ enum ShippabilityFixtureBuilder {
         id: UUID,
         tracks: [SoundtimeProject.Track],
         viewport: SoundtimeProject.TimelineViewport,
-        transcriptDisplayMode: TranscriptTimelineDisplayMode? = nil
+        transcriptDisplayMode: TranscriptTimelineDisplayMode? = nil,
+        timelineEndTime: TimeInterval? = nil,
+        clipGraphDocument: TimelineClipGraphDocument? = nil,
+        automationDocument: TimelineAutomationDocument? = nil
     ) -> SoundtimeProject {
         SoundtimeProject(
             projectID: id,
@@ -986,7 +1012,10 @@ enum ShippabilityFixtureBuilder {
             windowLayout: .init(x: 80, y: 80, width: 1_920, height: 1_080),
             masterVolume: 0.92,
             timelineViewport: viewport,
-            transcriptDisplayMode: transcriptDisplayMode
+            transcriptDisplayMode: transcriptDisplayMode,
+            timelineEndTime: timelineEndTime,
+            clipGraphDocument: clipGraphDocument,
+            automationDocument: automationDocument
         )
     }
 
@@ -1087,6 +1116,144 @@ enum ShippabilityFixtureBuilder {
                 previewBinCount: 256
             )
         }
+    }
+
+    private static func makeExtremeTimelineProject(
+        projectDirectory: URL,
+        sourceAudio: [GeneratedAudio]
+    ) throws -> GeneratedProject {
+        let timelineDuration: TimeInterval = 7_200
+        let timelineSampleRate = sampleRate
+        let trackCount = 1_000
+        let clipsPerTrack = 128
+        let automationPointsPerTrack = 256
+        let transcriptStride = 8
+        let clipDurationSeconds: TimeInterval = 6
+        let clipSpacingSeconds: TimeInterval = 56
+        let sourceIDs = sourceAudio.enumerated().map { index, _ in
+            TimelineMediaSourceID(rawValue: "st-extreme-source-\(index + 1)")
+        }
+        let graphSources = try zip(sourceIDs, sourceAudio).map { sourceID, audio in
+            let fileInfo = try requireValue(audio.fileInfo, "extreme fixture source is missing WAV info")
+            return TimelineMediaSource(
+                id: sourceID,
+                absolutePath: audio.url.standardizedFileURL.path,
+                fingerprint: "st-extreme-\(audio.id)",
+                frameCount: fileInfo.frameCount,
+                sampleRate: fileInfo.sampleRate,
+                channelCount: fileInfo.channelCount,
+                metadata: ["fixture": "extreme"]
+            )
+        }
+
+        var presentationTracks: [SoundtimeProject.Track] = []
+        var graphTracks: [TimelineTrack] = []
+        var automationLanes: [TimelineAutomationLane] = []
+        presentationTracks.reserveCapacity(trackCount)
+        graphTracks.reserveCapacity(trackCount)
+        automationLanes.reserveCapacity(trackCount)
+
+        for trackIndex in 0..<trackCount {
+            let trackID = uuid(300_000 + trackIndex)
+            let presentationSource = sourceAudio[trackIndex % sourceAudio.count]
+            let trackTranscript = trackIndex.isMultiple(of: transcriptStride) ?
+                transcript(trackID: trackID, duration: presentationSource.duration) : nil
+            presentationTracks.append(track(
+                id: trackID,
+                groupID: uuid(400_000 + trackIndex / 8),
+                name: String(format: "Extreme Track %04d", trackIndex + 1),
+                audio: presentationSource,
+                volume: 0.42 + Float(trackIndex % 9) * 0.055,
+                isMuted: trackIndex % 11 == 0,
+                transcript: trackTranscript,
+                previewBinCount: 128
+            ))
+
+            var clips: [TimelineClip] = []
+            clips.reserveCapacity(clipsPerTrack)
+            for clipIndex in 0..<clipsPerTrack {
+                let sourceIndex = (trackIndex + clipIndex) % graphSources.count
+                let source = graphSources[sourceIndex]
+                let timelineStart = Int((Double(clipIndex) * clipSpacingSeconds * timelineSampleRate).rounded())
+                let timelineFrameCount = Int((clipDurationSeconds * timelineSampleRate).rounded())
+                let sourceFrameCount = min(
+                    Int((clipDurationSeconds * source.sampleRate).rounded()),
+                    source.frameCount
+                )
+                let maximumSourceStart = max(source.frameCount - sourceFrameCount, 0)
+                let sourceStart = maximumSourceStart > 0 ?
+                    ((clipIndex * 9_973 + trackIndex * 1_009) % maximumSourceStart) : 0
+                clips.append(TimelineClip(
+                    id: AudioTimelineClipID(
+                        rawValue: uuid(1_000_000 + trackIndex * clipsPerTrack + clipIndex)
+                    ),
+                    sourceID: sourceIDs[sourceIndex],
+                    timelineRange: TimelineFrameRange(
+                        startFrame: timelineStart,
+                        frameCount: timelineFrameCount
+                    ),
+                    sourceRange: TimelineFrameRange(
+                        startFrame: sourceStart,
+                        frameCount: sourceFrameCount
+                    ),
+                    name: "Extreme Clip \(trackIndex + 1).\(clipIndex + 1)",
+                    gain: 0.70 + Float(clipIndex % 6) * 0.05,
+                    fades: TimelineClipFades(
+                        fadeInFrames: clipIndex.isMultiple(of: 5) ? min(timelineFrameCount / 8, 24_000) : 0,
+                        fadeOutFrames: clipIndex.isMultiple(of: 7) ? min(timelineFrameCount / 10, 18_000) : 0
+                    ),
+                    isMuted: clipIndex % 31 == 0,
+                    colorToken: "extreme-\((trackIndex + clipIndex) % 12)"
+                ))
+            }
+            graphTracks.append(TimelineTrack(
+                id: trackID,
+                name: String(format: "Extreme Track %04d", trackIndex + 1),
+                clips: clips,
+                volume: 0.42 + Float(trackIndex % 9) * 0.055,
+                isMuted: trackIndex % 11 == 0,
+                colorToken: "extreme-track-\(trackIndex % 16)"
+            ))
+
+            let points = (0..<automationPointsPerTrack).map { pointIndex in
+                let progress = Double(pointIndex) / Double(max(automationPointsPerTrack - 1, 1))
+                return TimelineAutomationPoint(
+                    id: uuid(2_000_000 + trackIndex * automationPointsPerTrack + pointIndex),
+                    frame: Int((progress * timelineDuration * timelineSampleRate).rounded()),
+                    normalizedValue: 0.52 + sin(Float(progress * .pi * 2 * Double(2 + trackIndex % 11))) * 0.36,
+                    curveToNext: Float((pointIndex % 7) - 3) / 3
+                )
+            }
+            automationLanes.append(try TimelineAutomationLane(
+                address: .track(trackID, parameterID: .volume),
+                defaultNormalizedValue: 0.8,
+                points: points
+            ))
+        }
+
+        let clipGraph = try TimelineClipGraph(
+            sources: graphSources,
+            tracks: graphTracks,
+            revision: 1,
+            timelineSampleRate: timelineSampleRate,
+            explicitEndFrame: Int((timelineDuration * timelineSampleRate).rounded())
+        )
+        let automationGraph = try TimelineAutomationGraph(revision: 1, lanes: automationLanes)
+        return try writeProject(
+            id: "st-ship-project-009",
+            slug: "extreme-timeline",
+            role: "Extreme 1,000-track timeline with 128,000 clips, dense automation, mixed waveform sources, and transcripts",
+            directory: projectDirectory,
+            project: project(
+                id: uuid(9),
+                tracks: presentationTracks,
+                viewport: .init(startProgress: 0.42, durationProgress: 0.018),
+                transcriptDisplayMode: .waveformOverlay,
+                timelineEndTime: timelineDuration,
+                clipGraphDocument: try TimelineClipGraphDocument(graph: clipGraph),
+                automationDocument: TimelineAutomationDocument(graph: automationGraph)
+            )
+        )
     }
 
     private static func editedDeletePasteTimeline(for audio: GeneratedAudio) throws -> AudioFileEditTimeline {
@@ -1457,7 +1624,7 @@ enum ShippabilityFixtureBuilder {
         projects: [GeneratedProject]
     ) throws {
         let manifest = FixtureManifest(
-            schemaVersion: 2,
+            schemaVersion: 3,
             fixtureVersion: "v1",
             profile: profile.rawValue,
             generatedBy: "Soundtime ShippabilityFixtureBuilder",
@@ -1475,6 +1642,8 @@ enum ShippabilityFixtureBuilder {
                     projectReady: item.projectReady,
                     importExpectation: item.importExpectation,
                     transcriptWordCount: nil,
+                    clipCount: nil,
+                    automationPointCount: nil,
                     sha256: try sha256(of: item.url),
                     relatedFiles: []
                 )
@@ -1490,6 +1659,8 @@ enum ShippabilityFixtureBuilder {
                     projectReady: true,
                     importExpectation: nil,
                     transcriptWordCount: project.transcriptWordCount,
+                    clipCount: project.clipCount,
+                    automationPointCount: project.automationPointCount,
                     sha256: try sha256(of: project.url),
                     relatedFiles: try project.relatedURLs.map {
                         FixtureManifest.FileDigest(
@@ -1520,6 +1691,9 @@ enum ShippabilityFixtureBuilder {
 
         The fixture projects intentionally include compact launch waveform previews,
         edit timelines, mute state, compressed-import metadata, and transcript data.
+        Full-profile generation also creates an ignored extreme project with 1,000
+        tracks, 128,000 clips, 256,000 automation points, mixed waveform sources,
+        and transcript-bearing lanes.
         They are deterministic and should be regenerated rather than hand-edited.
         """
         try readme.write(
@@ -1534,7 +1708,7 @@ enum ShippabilityFixtureBuilder {
         let manifestData = try Data(contentsOf: manifestURL)
         let manifest = try JSONDecoder().decode(FixtureManifest.self, from: manifestData)
 
-        try require(manifest.schemaVersion == 2, "unexpected fixture manifest schema \(manifest.schemaVersion)")
+        try require(manifest.schemaVersion == 3, "unexpected fixture manifest schema \(manifest.schemaVersion)")
         try require(manifest.fixtureVersion == "v1", "unexpected fixture version \(manifest.fixtureVersion)")
         try require(manifest.profile == profile.rawValue, "fixture profile drifted: \(manifest.profile)")
         try require(manifest.namingScheme == expectedNamingScheme, "fixture naming scheme drifted")
@@ -1578,6 +1752,8 @@ enum ShippabilityFixtureBuilder {
                 "\(expected.id) duration drifted: \(entry.durationSeconds ?? -1)"
             )
             try require(entry.transcriptWordCount == nil, "\(expected.id) unexpectedly has transcript metadata")
+            try require(entry.clipCount == nil, "\(expected.id) unexpectedly has clip metadata")
+            try require(entry.automationPointCount == nil, "\(expected.id) unexpectedly has automation metadata")
             try require(entry.relatedFiles.isEmpty, "\(expected.id) unexpectedly has related files")
 
             let url = rootDirectory.appendingPathComponent(entry.path)
@@ -1634,10 +1810,21 @@ enum ShippabilityFixtureBuilder {
                 approximately(entry.durationSeconds ?? -1, expected.durationSeconds, tolerance: 0.05),
                 "\(expected.id) duration drifted: \(entry.durationSeconds ?? -1)"
             )
-            try require(
-                entry.transcriptWordCount == expected.transcriptWordCount,
-                "\(expected.id) transcript word count drifted"
-            )
+            if let expectedTranscriptWordCount = expected.transcriptWordCount {
+                try require(
+                    entry.transcriptWordCount == expectedTranscriptWordCount,
+                    "\(expected.id) transcript word count drifted"
+                )
+            }
+            if let expectedClipCount = expected.clipCount {
+                try require(entry.clipCount == expectedClipCount, "\(expected.id) clip count drifted")
+            }
+            if let expectedAutomationPointCount = expected.automationPointCount {
+                try require(
+                    entry.automationPointCount == expectedAutomationPointCount,
+                    "\(expected.id) automation point count drifted"
+                )
+            }
 
             let url = rootDirectory.appendingPathComponent(entry.path)
             try require(FileManager.default.fileExists(atPath: url.path), "missing \(url.lastPathComponent)")
@@ -1651,9 +1838,22 @@ enum ShippabilityFixtureBuilder {
             try require(loaded.tracks.count == expected.trackCount, "\(url.lastPathComponent) track count mismatch")
             let hydrated = try SoundtimeProjectStore.load(from: url)
             try require(
-                hydrated.tracks.reduce(0) { $0 + ($1.transcript?.words.count ?? 0) } == expected.transcriptWordCount,
+                expected.transcriptWordCount == nil ||
+                    hydrated.tracks.reduce(0) { $0 + ($1.transcript?.words.count ?? 0) } == expected.transcriptWordCount,
                 "\(url.lastPathComponent) transcript payload drifted"
             )
+            if let expectedClipCount = expected.clipCount {
+                try require(
+                    hydrated.clipGraphDocument?.graph.tracks.reduce(0) { $0 + $1.clips.count } == expectedClipCount,
+                    "\(url.lastPathComponent) clip graph payload drifted"
+                )
+            }
+            if let expectedAutomationPointCount = expected.automationPointCount {
+                try require(
+                    hydrated.automationDocument?.lanes.reduce(0) { $0 + $1.points.count } == expectedAutomationPointCount,
+                    "\(url.lastPathComponent) automation payload drifted"
+                )
+            }
             try require(
                 loaded.tracks.allSatisfy { $0.waveformPreview != nil },
                 "\(url.lastPathComponent) has tracks without launch waveform previews"

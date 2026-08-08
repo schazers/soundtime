@@ -1,5 +1,6 @@
 import Foundation
 import QuartzCore
+import SoundtimeEditing
 
 enum LaunchPerformanceSmokeHarness {
     enum SmokeError: LocalizedError {
@@ -242,6 +243,94 @@ enum LaunchPerformanceSmokeHarness {
             try require(zeroCrossingProbe == nil, "plain playback prime should defer zero-crossing probes")
         default:
             throw SmokeError.failed("plain playback prime did not use file source")
+        }
+
+        // A saved project's legacy track fields can describe the original
+        // whole file while its canonical graph contains shorter, rearranged
+        // clips. Startup playback must follow the graph that the timeline
+        // renders, never the legacy whole-file representation.
+        let canonicalEditedSource = TimelineMediaSource(
+            id: TimelineMediaSourceID(rawValue: "launch-prime-edited"),
+            absolutePath: primeEditedURL.path,
+            frameCount: primeEditedInfo.frameCount,
+            sampleRate: primeEditedInfo.sampleRate,
+            channelCount: primeEditedInfo.channelCount
+        )
+        let canonicalPlainSource = TimelineMediaSource(
+            id: TimelineMediaSourceID(rawValue: "launch-prime-plain"),
+            absolutePath: primePlainURL.path,
+            frameCount: primePlainInfo.frameCount,
+            sampleRate: primePlainInfo.sampleRate,
+            channelCount: primePlainInfo.channelCount
+        )
+        let canonicalPlainEndFrame = 3_000
+        let canonicalGraph = try TimelineClipGraph(
+            sources: [canonicalEditedSource, canonicalPlainSource],
+            tracks: [
+                TimelineTrack(
+                    id: primeEditedTrackID,
+                    name: "Edited Prime",
+                    clips: [
+                        TimelineClip(
+                            sourceID: canonicalEditedSource.id,
+                            timelineRange: TimelineFrameRange(startFrame: 0, frameCount: 1_200),
+                            sourceRange: TimelineFrameRange(startFrame: 0, frameCount: 1_200),
+                            name: "Edited Canonical Clip"
+                        ),
+                    ],
+                    volume: 0.9
+                ),
+                TimelineTrack(
+                    id: primePlainTrackID,
+                    name: "Plain Prime",
+                    clips: [
+                        TimelineClip(
+                            sourceID: canonicalPlainSource.id,
+                            timelineRange: TimelineFrameRange(startFrame: 0, frameCount: 1_800),
+                            sourceRange: TimelineFrameRange(startFrame: 0, frameCount: 1_800),
+                            name: "Plain Canonical 1"
+                        ),
+                        TimelineClip(
+                            sourceID: canonicalPlainSource.id,
+                            timelineRange: TimelineFrameRange(startFrame: 1_800, frameCount: 1_200),
+                            sourceRange: TimelineFrameRange(startFrame: 2_400, frameCount: 1_200),
+                            name: "Plain Canonical 2"
+                        ),
+                    ],
+                    volume: 0.7,
+                    isMuted: true
+                ),
+            ],
+            timelineSampleRate: sampleRate
+        )
+        let canonicalPlaybackPrime = ProjectLaunchPlaybackPrimer.prime(
+            project: primeProject,
+            projectURL: projectURL,
+            activeTrackID: primePlainTrackID,
+            selectedTrackIDs: [],
+            playbackSnapshot: try TimelineClipPlaybackProjection.snapshot(from: canonicalGraph)
+        )
+        try require(canonicalPlaybackPrime.isComplete, "canonical playback prime should load every project track")
+        try require(canonicalPlaybackPrime.usesCanonicalClipGraph, "startup playback prime did not report canonical graph use")
+        let canonicalPlainPlaybackTrack = try requireValue(
+            canonicalPlaybackPrime.playbackTracks.first { $0.logicalTrackID == primePlainTrackID },
+            "canonical plain playback lane missing"
+        )
+        switch canonicalPlainPlaybackTrack.source {
+        case let .fileSegments(url, sourceFrameCount, _, _, segments, _):
+            try require(url == primePlainURL.standardizedFileURL, "canonical playback lane URL mismatch")
+            try require(sourceFrameCount == primePlainInfo.frameCount, "canonical playback source length mismatch")
+            try require(segments.count == 2, "canonical playback prime lost clip boundaries")
+            try require(
+                segments.map { $0.outputStartFrame + $0.frameCount }.max() == canonicalPlainEndFrame,
+                "canonical playback prime did not stop at the visible clip edge"
+            )
+            try require(
+                canonicalPlainEndFrame < primePlainInfo.frameCount,
+                "canonical launch regression fixture must be shorter than its source file"
+            )
+        default:
+            throw SmokeError.failed("canonical playback prime bypassed clip segments")
         }
 
         let launchOverviewCache = WaveformOverviewDiskCacheStore(

@@ -23,7 +23,9 @@ if CommandLine.arguments.contains("--application-update-smoke") {
     }
 }
 
-if CommandLine.arguments.contains("--timeline-perf-baseline") {
+if CommandLine.arguments.contains("--timeline-perf-baseline") ||
+    CommandLine.arguments.contains("--extreme-timeline-performance")
+{
     do {
         try TimelinePerfBaselineHarness.runFromCommandLine(arguments: CommandLine.arguments)
         exit(0)
@@ -224,6 +226,18 @@ if CommandLine.arguments.contains("--diagnostics-smoke") {
     }
 }
 
+if CommandLine.arguments.contains("--mixer-smoke") {
+    do {
+        try MainActor.assumeIsolated {
+            try MixerSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        }
+        exit(0)
+    } catch {
+        fputs("Soundtime mixer smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
 if CommandLine.arguments.contains("--waveform-tile-model-smoke") {
     do {
         try WaveformTileModelSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
@@ -250,6 +264,18 @@ if CommandLine.arguments.contains("--audio-asset-importer-smoke") {
         exit(0)
     } catch {
         fputs("Soundtime audio asset importer smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
+if CommandLine.arguments.contains("--large-audio-import-smoke") {
+    do {
+        try AudioAssetImporterSmokeHarness.runLargeFileFromCommandLine(
+            arguments: CommandLine.arguments
+        )
+        exit(0)
+    } catch {
+        fputs("Soundtime large audio import smoke failed: \(error)\n", stderr)
         exit(1)
     }
 }
@@ -428,6 +454,30 @@ if CommandLine.arguments.contains("--edit-preview-smoke") {
         exit(0)
     } catch {
         fputs("Soundtime edit preview smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
+if CommandLine.arguments.contains("--clip-graph-cutover-smoke") {
+    do {
+        try MainActor.assumeIsolated {
+            try ClipGraphCutoverSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        }
+        exit(0)
+    } catch {
+        fputs("Soundtime clip graph cutover smoke failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
+if CommandLine.arguments.contains("--project-transaction-smoke") {
+    do {
+        try MainActor.assumeIsolated {
+            try ProjectTransactionSmokeHarness.runFromCommandLine(arguments: CommandLine.arguments)
+        }
+        exit(0)
+    } catch {
+        fputs("Soundtime project transaction smoke failed: \(error)\n", stderr)
         exit(1)
     }
 }

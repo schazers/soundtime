@@ -464,7 +464,8 @@ enum VisualInvariantsSmokeHarness {
         record(playbackReady.playbackPrimedTrackCount == expectedTrackCount, "not every track was playback-primed")
         record(
             playbackReady.timelinePresentationMatchesProject,
-            "hydration left the visible timeline out of sync with the canonical edit projection"
+            "hydration left the visible timeline out of sync with the canonical edit projection" +
+                (playbackReady.timelinePresentationMismatchReason.map { ": \($0)" } ?? "")
         )
         record(
             approximatelyEqual(
@@ -540,8 +541,7 @@ enum VisualInvariantsSmokeHarness {
         let deleteSnapshot = workspace.visualInvariantSmokeSnapshot()
         let expectedDeleteStartTime =
             selectionStart * selectionSnapshot.timelinePresentationDurationSeconds
-        let renderedDeletePlayheadTime =
-            Double(deleteSnapshot.playheadProgress) * deleteSnapshot.projectDurationSeconds
+        let renderedDeletePlayheadTime = deleteSnapshot.playheadProjectTimeSeconds
         record(deleteResult.accepted, "delete visual command was rejected")
         record(deleteSnapshot.editAnimationGeneration > deleteGenerationBefore, "delete did not advance the edit animation generation")
         record(

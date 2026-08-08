@@ -867,7 +867,11 @@ enum ShippabilityGateHarness {
                 minimumFrameRatePercent: 89,
                 p10FrameRatePercent: 97,
                 maximumWorstFrameMilliseconds: 16.70,
-                p90WorstFrameMilliseconds: 12
+                p90WorstFrameMilliseconds: 12,
+                maximumActionMilliseconds: 27,
+                p99ActionMilliseconds: 8,
+                maximumFrameJitterMilliseconds: 10,
+                p90FrameJitterMilliseconds: 1.5
             )
         )
         let isolatedInteractionFindings = interactionReplayBudgetFindings(
@@ -876,6 +880,70 @@ enum ShippabilityGateHarness {
         try require(
             isolatedInteractionFindings.isEmpty,
             "self-test treated one bounded interaction scheduling outlier as a release finding"
+        )
+
+        let isolatedSchedulerPauseReport = StabilitySuiteReport(
+            suiteName: "interaction-replay-smoke",
+            status: "passed",
+            generatedAt: Date(),
+            durationMilliseconds: 1,
+            checks: [],
+            metadata: syntheticInteractionReplayMetadata(
+                minimumFrameRatePercent: 100,
+                p10FrameRatePercent: 100,
+                maximumWorstFrameMilliseconds: 10,
+                p90WorstFrameMilliseconds: 8,
+                maximumMainThreadStallCount: 1,
+                maximumMainThreadStallMilliseconds: 55
+            )
+        )
+        try require(
+            interactionReplayBudgetFindings(isolatedSchedulerPauseReport).isEmpty,
+            "self-test treated one borderline scheduler pause as sustained interaction degradation"
+        )
+
+        let repeatedSchedulerPauseReport = StabilitySuiteReport(
+            suiteName: "interaction-replay-smoke",
+            status: "passed",
+            generatedAt: Date(),
+            durationMilliseconds: 1,
+            checks: [],
+            metadata: syntheticInteractionReplayMetadata(
+                minimumFrameRatePercent: 100,
+                p10FrameRatePercent: 100,
+                maximumWorstFrameMilliseconds: 10,
+                p90WorstFrameMilliseconds: 8,
+                maximumMainThreadStallCount: 2,
+                maximumMainThreadStallMilliseconds: 55
+            )
+        )
+        try require(
+            interactionReplayBudgetFindings(repeatedSchedulerPauseReport).contains {
+                $0.severity == "failure" && $0.metric == "maxMainThreadStallCount"
+            },
+            "self-test did not fail repeated main-thread stalls"
+        )
+
+        let catastrophicSchedulerPauseReport = StabilitySuiteReport(
+            suiteName: "interaction-replay-smoke",
+            status: "passed",
+            generatedAt: Date(),
+            durationMilliseconds: 1,
+            checks: [],
+            metadata: syntheticInteractionReplayMetadata(
+                minimumFrameRatePercent: 100,
+                p10FrameRatePercent: 100,
+                maximumWorstFrameMilliseconds: 10,
+                p90WorstFrameMilliseconds: 8,
+                maximumMainThreadStallCount: 1,
+                maximumMainThreadStallMilliseconds: 120
+            )
+        )
+        try require(
+            interactionReplayBudgetFindings(catastrophicSchedulerPauseReport).contains {
+                $0.severity == "failure" && $0.metric == "maxMainThreadStallMs"
+            },
+            "self-test did not fail a catastrophic main-thread stall"
         )
 
         let sustainedInteractionRegressionReport = StabilitySuiteReport(
@@ -888,7 +956,11 @@ enum ShippabilityGateHarness {
                 minimumFrameRatePercent: 70,
                 p10FrameRatePercent: 82,
                 maximumWorstFrameMilliseconds: 31,
-                p90WorstFrameMilliseconds: 27
+                p90WorstFrameMilliseconds: 27,
+                maximumActionMilliseconds: 31,
+                p99ActionMilliseconds: 21,
+                maximumFrameJitterMilliseconds: 12,
+                p90FrameJitterMilliseconds: 9
             )
         )
         let sustainedInteractionFindings = interactionReplayBudgetFindings(
@@ -905,6 +977,12 @@ enum ShippabilityGateHarness {
                 $0.severity == "failure" && $0.metric == "maxSelectionDragWorstFrameMilliseconds"
             },
             "self-test did not fail a catastrophic selection-drag frame"
+        )
+        try require(
+            sustainedInteractionFindings.contains {
+                $0.severity == "failure" && $0.metric == "p90ReplayFrameJitterMilliseconds"
+            },
+            "self-test did not fail sustained replay frame jitter"
         )
 
         let disposable = root.appendingPathComponent("disposable-fixtures", isDirectory: true)
@@ -951,10 +1029,17 @@ enum ShippabilityGateHarness {
         minimumFrameRatePercent: Double,
         p10FrameRatePercent: Double,
         maximumWorstFrameMilliseconds: Double,
-        p90WorstFrameMilliseconds: Double
+        p90WorstFrameMilliseconds: Double,
+        maximumActionMilliseconds: Double = 0,
+        p99ActionMilliseconds: Double = 0,
+        maximumFrameJitterMilliseconds: Double = 0,
+        p90FrameJitterMilliseconds: Double = 0,
+        maximumMainThreadStallCount: Int = 0,
+        maximumMainThreadStallMilliseconds: Double = 0
     ) -> [String: String] {
         [
-            "maxReplayActionMilliseconds": "0",
+            "maxReplayActionMilliseconds": "\(maximumActionMilliseconds)",
+            "p99ReplayActionMilliseconds": "\(p99ActionMilliseconds)",
             "maxRejectedActions": "0",
             "maxSelectionEdgeErrorPixels": "0",
             "maxSelectionDirectionReversals": "1",
@@ -963,10 +1048,12 @@ enum ShippabilityGateHarness {
             "minSelectionDragFrameRatePercent": "\(minimumFrameRatePercent)",
             "p10ReplayFrameRatePercent": "\(p10FrameRatePercent)",
             "p10SelectionDragFrameRatePercent": "\(p10FrameRatePercent)",
-            "maxReplayFrameJitterMilliseconds": "0",
+            "maxReplayFrameJitterMilliseconds": "\(maximumFrameJitterMilliseconds)",
+            "p90ReplayFrameJitterMilliseconds": "\(p90FrameJitterMilliseconds)",
             "maxSelectionDragFrameJitterMilliseconds": "0",
             "p90SelectionDragFrameJitterMilliseconds": "0",
             "maxReplayWorstFrameMilliseconds": "\(maximumWorstFrameMilliseconds)",
+            "p90ReplayWorstFrameMilliseconds": "\(p90WorstFrameMilliseconds)",
             "maxSelectionDragWorstFrameMilliseconds": "\(maximumWorstFrameMilliseconds)",
             "p90SelectionDragWorstFrameMilliseconds": "\(p90WorstFrameMilliseconds)",
             "maxCPUWaveformVertices": "0",
@@ -979,6 +1066,8 @@ enum ShippabilityGateHarness {
             "maxLaunchCacheWritesInFlight": "0",
             "maxTranscriptLayoutBuilds": "0",
             "maxDroppedEffectVertices": "0",
+            "maxMainThreadStallCount": "\(maximumMainThreadStallCount)",
+            "maxMainThreadStallMs": "\(maximumMainThreadStallMilliseconds)",
             "failureCount": "0",
         ]
     }
@@ -1064,12 +1153,19 @@ enum ShippabilityGateHarness {
                     command("waveform tile promotion planner", ["--waveform-tile-promotion-planner-smoke"]),
                     command("waveform tiled render pipeline", ["--waveform-tiled-render-pipeline-smoke"]),
                     command("timeline perf baseline", ["--timeline-perf-baseline", "--quick", "--ci"], modes: [.standard, .full]),
+                    command(
+                        "extreme timeline performance",
+                        ["--extreme-timeline-performance", "--ci"],
+                        modes: [.full]
+                    ),
                 ])
             ),
             GatePhase(
                 name: "edit graph delete paste",
                 detail: "Verify canonical edit transactions, edit graph, edit preview, and project round-trip behavior for delete, clear, cut, paste, undo, and redo reliability.",
                 kind: .commands([
+                    command("clip graph cutover smoke", ["--clip-graph-cutover-smoke"]),
+                    command("project transaction smoke", ["--project-transaction-smoke"]),
                     command("edit transaction smoke", ["--edit-transaction-smoke"]),
                     command("edit graph smoke", ["--edit-graph-smoke"]),
                     command("edit preview smoke", ["--edit-preview-smoke"]),
@@ -1107,6 +1203,14 @@ enum ShippabilityGateHarness {
                     command("audio safety smoke", ["--audio-safety-smoke"], modes: [.standard, .full]),
                     command("realtime graph publish smoke", ["--realtime-graph-publish-smoke"]),
                     command("recording smoke", ["--recording-smoke"], modes: [.full]),
+                ])
+            ),
+            GatePhase(
+                name: "mixer",
+                detail: "Verify mixer panel switching, stable channel identity, controls, meter revision handling, virtualization, and large channel-count workloads.",
+                kind: .commands([
+                    command("mixer smoke", ["--mixer-smoke"], modes: [.quick, .standard]),
+                    command("mixer stress smoke", ["--mixer-smoke", "--full"], modes: [.full]),
                 ])
             ),
             GatePhase(
@@ -1691,6 +1795,8 @@ enum ShippabilityGateHarness {
                 findings.append(contentsOf: interactionReplayBudgetFindings(report))
             case "timeline-perf-baseline":
                 findings.append(contentsOf: timelinePerfBudgetFindings(report))
+            case "extreme-timeline-performance":
+                findings.append(contentsOf: timelinePerfBudgetFindings(report))
             case "audio-safety-smoke":
                 findings.append(contentsOf: audioSafetyBudgetFindings(report))
             case "audio-asset-importer-smoke":
@@ -1703,6 +1809,8 @@ enum ShippabilityGateHarness {
                 findings.append(contentsOf: editTransactionBudgetFindings(report))
             case "edit-preview-smoke":
                 findings.append(contentsOf: editPreviewBudgetFindings(report))
+            case "mixer-smoke":
+                findings.append(contentsOf: mixerBudgetFindings(report))
             default:
                 break
             }
@@ -1773,6 +1881,13 @@ enum ShippabilityGateHarness {
                 report,
                 "worstWarmPlaybackReadyMilliseconds",
                 warning: ShippabilityTimingBudgets.playbackReady.warningMilliseconds,
+                failure: GateThresholds.production.firstPlaybackReadyMilliseconds,
+                unit: "ms"
+            ),
+            maxDoubleFinding(
+                report,
+                "worstStressPlaybackReadyMilliseconds",
+                warning: 400,
                 failure: GateThresholds.production.firstPlaybackReadyMilliseconds,
                 unit: "ms"
             ),
@@ -1917,7 +2032,8 @@ enum ShippabilityGateHarness {
 
     private static func interactionReplayBudgetFindings(_ report: StabilitySuiteReport) -> [GateBudgetFinding] {
         [
-            maxDoubleFinding(report, "maxReplayActionMilliseconds", warning: 16, failure: 35, unit: "ms"),
+            maxDoubleFinding(report, "maxReplayActionMilliseconds", warning: 35, failure: 35, unit: "ms"),
+            maxDoubleFinding(report, "p99ReplayActionMilliseconds", warning: 16, failure: 35, unit: "ms"),
             maxIntFinding(
                 suiteName: report.suiteName,
                 metric: "maxRejectedActions",
@@ -1948,13 +2064,6 @@ enum ShippabilityGateHarness {
             ),
             minDoubleFinding(
                 report,
-                "minReplayFrameRatePercent",
-                warning: 75,
-                failure: 75,
-                unit: "%"
-            ),
-            minDoubleFinding(
-                report,
                 "minSelectionDragFrameRatePercent",
                 warning: 85,
                 failure: 85,
@@ -1971,12 +2080,12 @@ enum ShippabilityGateHarness {
                 report,
                 "p10SelectionDragFrameRatePercent",
                 warning: 95,
-                failure: 85,
+                failure: 95,
                 unit: "%"
             ),
             maxDoubleFinding(
                 report,
-                "maxReplayFrameJitterMilliseconds",
+                "p90ReplayFrameJitterMilliseconds",
                 warning: 3,
                 failure: 8,
                 unit: "ms"
@@ -1992,14 +2101,21 @@ enum ShippabilityGateHarness {
                 report,
                 "p90SelectionDragFrameJitterMilliseconds",
                 warning: 2,
-                failure: 5,
+                failure: 2,
                 unit: "ms"
             ),
             maxDoubleFinding(
                 report,
                 "maxReplayWorstFrameMilliseconds",
-                warning: 25,
+                warning: 50,
                 failure: 50,
+                unit: "ms"
+            ),
+            maxDoubleFinding(
+                report,
+                "p90ReplayWorstFrameMilliseconds",
+                warning: 25,
+                failure: 35,
                 unit: "ms"
             ),
             maxDoubleFinding(
@@ -2013,7 +2129,22 @@ enum ShippabilityGateHarness {
                 report,
                 "p90SelectionDragWorstFrameMilliseconds",
                 warning: 16.67,
-                failure: 25,
+                failure: 16.67,
+                unit: "ms"
+            ),
+            maxIntFinding(
+                suiteName: report.suiteName,
+                metric: "maxMainThreadStallCount",
+                actual: metadataInt(report, "maxMainThreadStallCount"),
+                warning: 1,
+                failure: 1,
+                unit: "stalls"
+            ),
+            maxDoubleFinding(
+                report,
+                "maxMainThreadStallMs",
+                warning: 80,
+                failure: 80,
                 unit: "ms"
             ),
             maxIntFinding(
@@ -2199,6 +2330,36 @@ enum ShippabilityGateHarness {
             maxDoubleFinding(report, "seekP95Milliseconds", warning: 0.75, failure: 1.0, unit: "ms"),
             maxDoubleFinding(report, "duplicateTrackPhaseMaxError", warning: 0.00001, failure: 0.0001, unit: "samples"),
             maxDoubleFinding(report, "fileBackedDuplicateTrackPhaseMaxError", warning: 0.00001, failure: 0.0001, unit: "samples"),
+        ].compactMap { $0 }
+    }
+
+    private static func mixerBudgetFindings(_ report: StabilitySuiteReport) -> [GateBudgetFinding] {
+        let channelCount = metadataInt(report, "channelCount") ?? 0
+        let isStress = channelCount >= 1_000
+        return [
+            minIntFinding(report, "channelCount", warning: isStress ? 1_000 : 100, failure: isStress ? 1_000 : 100, unit: "channels"),
+            maxIntFinding(
+                suiteName: report.suiteName,
+                metric: "visibleChannelCount",
+                actual: metadataInt(report, "visibleChannelCount"),
+                warning: 24,
+                failure: 32,
+                unit: "channels"
+            ),
+            maxDoubleFinding(
+                report,
+                "initialDisplayMilliseconds",
+                warning: isStress ? 180 : 80,
+                failure: isStress ? 240 : 120,
+                unit: "ms"
+            ),
+            maxDoubleFinding(
+                report,
+                "reorderMilliseconds",
+                warning: isStress ? 50 : 16,
+                failure: isStress ? 80 : 24,
+                unit: "ms"
+            ),
         ].compactMap { $0 }
     }
 

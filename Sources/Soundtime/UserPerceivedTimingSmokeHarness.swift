@@ -263,8 +263,14 @@ enum UserPerceivedTimingSmokeHarness {
         ) {
             let snapshot = workspace.startupCloseSmokeSnapshot()
             return snapshot.playbackHasSource &&
-                snapshot.playbackPrimedTrackCount == expectedTrackCount &&
-                !snapshot.isLoadingProject
+                snapshot.playbackPrimedTrackCount == expectedTrackCount
+        }
+        let playbackHydrationMilliseconds = try waitUntilElapsed(
+            since: windowVisibleAt,
+            timeoutMilliseconds: 3_000,
+            description: "\(manifestProject.id) background project hydration did not complete"
+        ) {
+            !workspace.startupCloseSmokeSnapshot().isLoadingProject
         }
         let startupEvents = LaunchStartupTrace.shared.snapshot()
         let launchPlanResolutionMilliseconds = phaseMilliseconds(
@@ -462,7 +468,7 @@ enum UserPerceivedTimingSmokeHarness {
             firstPaintToWindowShowMilliseconds: firstPaintToWindowShowMilliseconds,
             windowOrderingMilliseconds: windowOrderingMilliseconds,
             cachedWaveformPaintMilliseconds: firstWaveformVisibleMilliseconds,
-            playbackHydrationMilliseconds: playbackReadyMilliseconds,
+            playbackHydrationMilliseconds: playbackHydrationMilliseconds,
             windowVisibleMilliseconds: windowVisibleMilliseconds,
             firstWaveformVisibleMilliseconds: firstWaveformVisibleMilliseconds,
             playbackReadyMilliseconds: playbackReadyMilliseconds,
@@ -651,7 +657,10 @@ enum UserPerceivedTimingSmokeHarness {
             )
             metadata["worstColdPlaybackReadyMillisecondsProject"] = coldTiming.id
         }
-        let worstWarmTiming = timings.dropFirst().max {
+        let warmTimings = Array(timings.dropFirst())
+        let ordinaryWarmTimings = warmTimings.filter { $0.trackCount < 100 }
+        let stressWarmTimings = warmTimings.filter { $0.trackCount >= 100 }
+        let worstWarmTiming = ordinaryWarmTimings.max {
             $0.playbackReadyMilliseconds < $1.playbackReadyMilliseconds
         }
         metadata["worstWarmPlaybackReadyMilliseconds"] = String(
@@ -659,6 +668,15 @@ enum UserPerceivedTimingSmokeHarness {
             worstWarmTiming?.playbackReadyMilliseconds ?? 0
         )
         metadata["worstWarmPlaybackReadyMillisecondsProject"] = worstWarmTiming?.id ?? "none"
+        let worstStressWarmTiming = stressWarmTimings.max {
+            $0.playbackReadyMilliseconds < $1.playbackReadyMilliseconds
+        }
+        metadata["worstStressPlaybackReadyMilliseconds"] = String(
+            format: "%.3f",
+            worstStressWarmTiming?.playbackReadyMilliseconds ?? 0
+        )
+        metadata["worstStressPlaybackReadyMillisecondsProject"] =
+            worstStressWarmTiming?.id ?? "none"
         metadata["projects"] = timings.map(\.id).joined(separator: ",")
         return metadata
     }

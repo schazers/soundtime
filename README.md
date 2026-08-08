@@ -42,10 +42,27 @@ swift build
 
 ## Regression Gates
 
-Run the fast local gate before renderer or audio-engine changes:
+Run the quick product gate before renderer, timeline, or audio-engine changes:
 
 ```sh
-scripts/perf-gate.sh
+swift run Soundtime --shippability-gate --quick
 ```
 
-That runs the audio-core tests, the recording smoke harness, and the quick 10/50/100-track Metal timeline perf budget. Use `scripts/perf-gate.sh --full` for the longer 10/50/100/250-track baseline.
+Run the full release gate before a release candidate:
+
+```sh
+swift run -c release Soundtime --shippability-gate --full
+```
+
+Full mode generates and verifies the deterministic golden projects and includes
+the extreme timeline performance contract: 1,000 tracks, 128,000 clips,
+256,000 automation points, transcript overlays, source-resident waveforms, and
+simultaneous playback, selection, pan, zoom, and vertical scrolling. The
+dedicated benchmark can be run directly with:
+
+```sh
+swift run -c release Soundtime --extreme-timeline-performance --ci
+```
+
+See [Extreme Timeline Performance](docs/EXTREME_TIMELINE_PERFORMANCE.md) for
+the fixture, budgets, metrics, and interpretation of the results.
