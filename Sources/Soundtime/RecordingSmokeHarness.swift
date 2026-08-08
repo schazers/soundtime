@@ -1,4 +1,5 @@
 import Foundation
+import SoundtimeEditing
 
 enum RecordingSmokeHarness {
     enum SmokeError: LocalizedError {
@@ -28,6 +29,11 @@ enum RecordingSmokeHarness {
         let expectedFrameCount = chunkFrameCount * chunkCount
         let writer = try StreamingWAVTakeWriter(url: tempURL)
         var liveAccumulator = LiveRecordingWaveformAccumulator(sampleRate: sampleRate)
+        let liveLayerID = UUID()
+        var liveRevision = 0
+        var publishedCompletedBinCount = 0
+        var emittedCompletedBinCount = 0
+        var previousPublishedDuration: TimeInterval = 0
 
         for chunkIndex in 0..<chunkCount {
             let chunk = makeSyntheticChunk(
@@ -41,7 +47,48 @@ enum RecordingSmokeHarness {
                 samplesByChannel: chunk.samplesByChannel,
                 frameCount: chunk.frameCount
             )
+            liveRevision += 1
+            let publication = liveAccumulator.makePublication(
+                layerID: liveLayerID,
+                revision: liveRevision,
+                afterCompletedBinCount: publishedCompletedBinCount,
+                sampleRate: sampleRate
+            )
+            try require(publication.layerID == liveLayerID, "live publication changed layer identity")
+            try require(publication.revision == liveRevision, "live publication changed revision")
+            try require(
+                publication.completedBinStartIndex == publishedCompletedBinCount,
+                "live publication did not continue at the last published bin"
+            )
+            try require(
+                publication.completedBins.count == publication.totalCompletedBinCount - publishedCompletedBinCount,
+                "live publication duplicated or omitted completed bins"
+            )
+            try require(
+                publication.duration >= previousPublishedDuration,
+                "live publication duration moved backward"
+            )
+            try require(publication.drawableBinCount > 0, "live publication had no drawable waveform")
+            emittedCompletedBinCount += publication.completedBins.count
+            publishedCompletedBinCount = publication.totalCompletedBinCount
+            previousPublishedDuration = publication.duration
         }
+
+        liveRevision += 1
+        let unchangedPublication = liveAccumulator.makePublication(
+            layerID: liveLayerID,
+            revision: liveRevision,
+            afterCompletedBinCount: publishedCompletedBinCount,
+            sampleRate: sampleRate
+        )
+        try require(
+            unchangedPublication.completedBins.isEmpty,
+            "an unchanged live publication resent completed bins"
+        )
+        try require(
+            emittedCompletedBinCount == liveAccumulator.bins.count,
+            "incremental live publications did not cover every completed bin exactly once"
+        )
 
         let take = try writer.finish()
         try require(take.frameCount == expectedFrameCount, "recorded take frame count mismatch")
@@ -71,6 +118,7 @@ enum RecordingSmokeHarness {
         try require(decoded.frameCount == expectedFrameCount, "decoded recording frame count mismatch")
         try require(decoded.samplesByChannel.count == channelCount, "decoded recording channel count mismatch")
         try require(decoded.samplesByChannel.allSatisfy { $0.count == expectedFrameCount }, "decoded channel lengths mismatch")
+        try verifyPunchInOverwrite()
 
         if let reportURL = StabilityReportWriter.writePassedSuite(
             name: "recording-smoke",
@@ -78,7 +126,9 @@ enum RecordingSmokeHarness {
             checks: [
                 "streaming WAV writer preserves frame/channel/sample-rate metadata",
                 "recording preview and live preview produce waveform bins",
+                "live preview publishes append-only waveform deltas without rebuilding history",
                 "decoded recording round-trips channel samples",
+                "punch-in recording overwrites only the recorded interval",
             ],
             metadata: [
                 "frameCount": "\(expectedFrameCount)",
@@ -95,6 +145,77 @@ enum RecordingSmokeHarness {
             "Soundtime recording smoke passed: \(expectedFrameCount) frames, " +
             "\(channelCount) channels, \(Int(sampleRate)) Hz"
         )
+    }
+
+    private static func verifyPunchInOverwrite() throws {
+        let trackID = UUID()
+        let originalSource = TimelineMediaSource(
+            id: .init(rawValue: "recording-smoke-original"),
+            frameCount: 1_000,
+            sampleRate: 100,
+            channelCount: 1
+        )
+        let recordedSource = TimelineMediaSource(
+            id: .init(rawValue: "recording-smoke-take"),
+            frameCount: 200,
+            sampleRate: 100,
+            channelCount: 1
+        )
+        let originalClip = TimelineClip(
+            sourceID: originalSource.id,
+            timelineRange: .init(startFrame: 0, frameCount: 1_000),
+            sourceRange: .init(startFrame: 0, frameCount: 1_000),
+            name: "Original"
+        )
+        let graph = try TimelineClipGraph(
+            sources: [originalSource],
+            tracks: [TimelineTrack(
+                id: trackID,
+                name: "Voice",
+                clips: [originalClip],
+                volume: 0.72,
+                pan: -0.25,
+                isMuted: false,
+                isSoloed: true
+            )],
+            revision: 7,
+            timelineSampleRate: 100
+        )
+        let takeID = AudioTimelineClipID()
+        let result = try TimelineRecordingEditingService.overwrite(
+            trackID: trackID,
+            timelineStartFrame: 400,
+            source: recordedSource,
+            clipID: takeID,
+            clipName: "Voice Take",
+            in: graph,
+            expectedRevision: graph.revision
+        )
+        guard let track = result.graph.track(id: trackID) else {
+            throw SmokeError.invalidTake("punch-in removed its destination track")
+        }
+        let clips = track.clips.sorted { $0.timelineRange.startFrame < $1.timelineRange.startFrame }
+        try require(clips.count == 3, "punch-in did not split the overwritten clip into three regions")
+        try require(
+            clips[0].timelineRange == TimelineFrameRange(startFrame: 0, frameCount: 400),
+            "punch-in changed media before the playhead"
+        )
+        try require(clips[1].id == takeID, "punch-in did not preserve the recording clip identity")
+        try require(
+            clips[1].timelineRange == TimelineFrameRange(startFrame: 400, frameCount: 200),
+            "recording was not placed at the playhead"
+        )
+        try require(
+            clips[2].timelineRange == TimelineFrameRange(startFrame: 600, frameCount: 400),
+            "punch-in changed media after the recorded interval"
+        )
+        try require(
+            clips[2].sourceRange == TimelineFrameRange(startFrame: 600, frameCount: 400),
+            "right-side source mapping changed after punch-in"
+        )
+        try require(abs(track.volume - 0.72) < 0.000_1, "punch-in changed track volume")
+        try require(abs(track.pan - (-0.25)) < 0.000_1, "punch-in changed track pan")
+        try require(track.isSoloed, "punch-in changed track solo state")
     }
 
     private static func makeSyntheticChunk(

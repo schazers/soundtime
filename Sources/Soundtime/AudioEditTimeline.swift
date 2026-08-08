@@ -48,7 +48,8 @@ struct AudioEditTimeline: Sendable {
                     frameCount: segment.frameCount,
                     gainStart: max(segment.gainStart, 0),
                     gainEnd: max(segment.gainEnd, 0),
-                    startsNewClip: segment.startsNewClip
+                    startsNewClip: segment.startsNewClip,
+                    clipID: segment.clipID
                 )
             }
         )
@@ -70,6 +71,14 @@ struct AudioEditTimeline: Sendable {
         arrangement.clipRanges
     }
 
+    func clipRange(id: AudioTimelineClipID) -> ClipRange? {
+        arrangement.clipRange(id: id)
+    }
+
+    func frameRange(forClipID id: AudioTimelineClipID) -> Range<Int>? {
+        arrangement.frameRange(forClipID: id)
+    }
+
     var duration: TimeInterval {
         guard sourceBuffer.sampleRate > 0 else {
             return 0
@@ -89,6 +98,64 @@ struct AudioEditTimeline: Sendable {
         arrangement.delete(frameRange: frameRange)
     }
 
+    mutating func deleteClip(id: AudioTimelineClipID) -> Int {
+        arrangement.deleteClip(id: id)
+    }
+
+    mutating func deleteClips(ids: Set<AudioTimelineClipID>) -> Int {
+        arrangement.deleteClips(ids: ids)
+    }
+
+    mutating func deleteWithinClip(
+        id: AudioTimelineClipID,
+        localFrameRange: Range<Int>,
+        followingClipPolicy: AudioTimelineFollowingClipPolicy
+    ) -> Int {
+        arrangement.deleteWithinClip(
+            id: id,
+            localFrameRange: localFrameRange,
+            followingClipPolicy: followingClipPolicy
+        )
+    }
+
+    mutating func clearWithinClip(
+        id: AudioTimelineClipID,
+        localFrameRange: Range<Int>
+    ) -> Int {
+        arrangement.clearWithinClip(id: id, localFrameRange: localFrameRange)
+    }
+
+    mutating func duplicateClip(id: AudioTimelineClipID, atFrame frame: Int) -> AudioTimelineClipID? {
+        arrangement.duplicateClip(id: id, atFrame: frame)
+    }
+
+    mutating func moveClip(id: AudioTimelineClipID, toFrame frame: Int) -> Range<Int>? {
+        arrangement.moveClip(id: id, toFrame: frame)
+    }
+
+    mutating func relocateClip(id: AudioTimelineClipID, toFrame frame: Int) -> Range<Int>? {
+        arrangement.relocateClip(id: id, toFrame: frame)
+    }
+
+    mutating func relocateClips(
+        ids: Set<AudioTimelineClipID>,
+        byFrames delta: Int
+    ) -> [AudioTimelineClipID: Range<Int>]? {
+        arrangement.relocateClips(ids: ids, byFrames: delta)
+    }
+
+    mutating func splitClip(id: AudioTimelineClipID, atLocalFrame frame: Int) -> AudioTimelineClipID? {
+        arrangement.splitClip(id: id, atLocalFrame: frame)
+    }
+
+    mutating func trimClipStart(id: AudioTimelineClipID, toLocalFrame frame: Int) -> Int {
+        arrangement.trimClipStart(id: id, toLocalFrame: frame)
+    }
+
+    mutating func trimClipEnd(id: AudioTimelineClipID, toLocalFrame frame: Int) -> Int {
+        arrangement.trimClipEnd(id: id, toLocalFrame: frame)
+    }
+
     mutating func clear(_ selection: TimelineSelection) -> Int {
         arrangement.clear(frameRange: frameRange(for: selection))
     }
@@ -106,8 +173,11 @@ struct AudioEditTimeline: Sendable {
         guard !selectedSegments.isEmpty else {
             return nil
         }
+        let copiedClipID = AudioTimelineClipID()
         return Clip(
-            segments: selectedSegments,
+            segments: selectedSegments.enumerated().map { index, segment in
+                segment.withClipID(copiedClipID, startsNewClip: index == 0)
+            },
             sourceID: sourceID,
             sourceSampleRate: sourceBuffer.sampleRate
         )
@@ -137,6 +207,21 @@ struct AudioEditTimeline: Sendable {
             return nil
         }
         return arrangement.insert(clip.segments, atFrame: frame)
+    }
+
+    mutating func insertWithinClip(
+        id: AudioTimelineClipID,
+        localFrame: Int,
+        clip: Clip
+    ) -> Int? {
+        guard isCompatible(with: clip) else {
+            return nil
+        }
+        return arrangement.insertWithinClip(
+            id: id,
+            localFrame: localFrame,
+            segments: clip.segments
+        )
     }
 
     mutating func insertSilence(frameCount: Int, atProgress progress: Double) -> Int {

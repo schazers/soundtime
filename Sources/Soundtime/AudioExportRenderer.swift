@@ -35,7 +35,7 @@ enum AudioExportRenderer {
     ) throws -> AudioExportRenderStats {
         let tracks: [AudioExportTrackSnapshot]
         switch snapshot.request.scope {
-        case .trackRange:
+        case .trackRange, .clip:
             tracks = snapshot.tracks
         case .fullMixdown, .timeRange, .stems:
             tracks = audibleTracks(in: snapshot.tracks)
@@ -82,6 +82,33 @@ enum AudioExportRenderer {
             writer: writer,
             blockFrameCount: blockFrameCount,
             message: "Rendering \(track.name)",
+            cancellationCheck: cancellationCheck,
+            progressHandler: progressHandler
+        )
+    }
+
+    static func renderLogicalTrack(
+        _ tracks: [AudioExportTrackSnapshot],
+        snapshot: AudioExportSnapshot,
+        to writer: AudioExportSampleWriter,
+        blockFrameCount: Int = defaultBlockFrameCount,
+        cancellationCheck: CancellationCheck? = nil,
+        progressHandler: ProgressHandler? = nil
+    ) throws -> AudioExportRenderStats {
+        guard let first = tracks.first else {
+            throw RenderError.graphPreparationFailed
+        }
+        let context = try CanonicalAudioExportRenderContext(
+            snapshot: snapshot,
+            tracks: tracks,
+            gainPosition: snapshot.request.stemOptions.gainPosition
+        )
+        return try render(
+            snapshot: snapshot,
+            context: context,
+            writer: writer,
+            blockFrameCount: blockFrameCount,
+            message: "Rendering \(first.name)",
             cancellationCheck: cancellationCheck,
             progressHandler: progressHandler
         )
@@ -286,17 +313,58 @@ private final class CanonicalAudioExportRenderContext: AudioExportBlockRendering
             )
         }
         let gain: Float
+        let volumeAutomation: [PreparedRealtimeAutomationPoint]
+        let pan: Float
+        let panAutomation: [PreparedRealtimeAutomationPoint]
+        let muteAutomation: [PreparedRealtimeAutomationPoint]
         switch gainPosition {
         case .preFader:
             gain = 1
+            volumeAutomation = []
+            pan = 0
+            panAutomation = []
+            muteAutomation = []
         case .postFader:
-            gain = max(track.volume, 0) * max(track.volume, 0)
+            if track.volumeAutomation.isEmpty {
+                let clampedVolume = min(max(track.volume, 0), 1)
+                gain = clampedVolume * clampedVolume
+            } else {
+                // Volume automation drives the fader; it is not an additional gain stage.
+                gain = 1
+            }
+            volumeAutomation = track.volumeAutomation.map {
+                let normalizedValue = min(max($0.normalizedValue, 0), 1)
+                return PreparedRealtimeAutomationPoint(
+                    frame: $0.frame,
+                    gain: normalizedValue * normalizedValue,
+                    curveToNext: $0.curveToNext
+                )
+            }
+            pan = track.pan
+            panAutomation = track.panAutomation.map {
+                PreparedRealtimeAutomationPoint(
+                    frame: $0.frame,
+                    gain: $0.normalizedValue,
+                    curveToNext: $0.curveToNext
+                )
+            }
+            muteAutomation = track.muteAutomation.map {
+                PreparedRealtimeAutomationPoint(
+                    frame: $0.frame,
+                    gain: $0.normalizedValue >= 0.5 ? 0 : 1,
+                    curveToNext: TimelineAutomationCurve.stepped
+                )
+            }
         }
 
         return PreparedRealtimeAudioTrack(
             source: source,
             gain: gain,
-            segments: segments
+            pan: pan,
+            segments: segments,
+            volumeAutomation: volumeAutomation,
+            panAutomation: panAutomation,
+            muteAutomation: muteAutomation
         )
     }
 

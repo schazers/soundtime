@@ -68,15 +68,12 @@ enum EditTransactionPlanner {
             guard let destinationTrack = targetTracks.first else {
                 throw EditTransactionError.missingTrack(command.anchorTrackID)
             }
-            let insertionFrame = min(
-                max(
-                    insertionTime.frameIndex(
-                        sampleRate: destinationTrack.sampleRate,
-                        rounding: .down
-                    ),
-                    0
+            let insertionFrame = max(
+                insertionTime.frameIndex(
+                    sampleRate: destinationTrack.sampleRate,
+                    rounding: .down
                 ),
-                destinationTrack.frameCount
+                0
             )
             trackEdits = [
                 PlannedTrackEdit(

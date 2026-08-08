@@ -55,6 +55,8 @@ enum AudioExportSmokeHarness {
         try verifyAvailableCodecMatrix(root: root, sampleRate: sampleRate, track: trackA)
         try verifyCompressedQualityMatrix(root: root, sampleRate: sampleRate, track: trackA)
         try verifyScopeSemantics(root: root, sampleRate: sampleRate)
+        try verifyClipIsolation(sourceURL: sourceAURL, sampleRate: sampleRate)
+        try verifyVolumeAutomationGainSemantics(root: root, sampleRate: sampleRate)
         try verifyAllMutedMixdownProducesSilence(root: root, sampleRate: sampleRate)
         try verifyResampledExport(root: root)
         try verifyEditedTimelineExport(root: root, sampleRate: sampleRate)
@@ -367,6 +369,150 @@ enum AudioExportSmokeHarness {
         try require(
             abs((selected.samplesByChannel.first?.first ?? 0) - 0.6) < 0.001,
             "explicit selected-track export incorrectly honored track mute"
+        )
+    }
+
+    private static func verifyClipIsolation(sourceURL: URL, sampleRate: Double) throws {
+        let sourceID = TimelineMediaSourceID(rawValue: "clip-export-source")
+        let source = TimelineMediaSource(
+            id: sourceID,
+            absolutePath: sourceURL.path,
+            frameCount: 22_050,
+            sampleRate: sampleRate,
+            channelCount: 2
+        )
+        let firstClip = TimelineClip(
+            sourceID: sourceID,
+            timelineRange: TimelineFrameRange(startFrame: 0, frameCount: 4_000),
+            sourceRange: TimelineFrameRange(startFrame: 0, frameCount: 4_000),
+            name: "First"
+        )
+        let secondClip = TimelineClip(
+            sourceID: sourceID,
+            timelineRange: TimelineFrameRange(startFrame: 8_000, frameCount: 4_000),
+            sourceRange: TimelineFrameRange(startFrame: 4_000, frameCount: 4_000),
+            name: "Second"
+        )
+        let trackID = UUID()
+        let graph = try TimelineClipGraph(
+            sources: [source],
+            tracks: [TimelineTrack(id: trackID, name: "Clip Export", clips: [firstClip, secondClip])],
+            timelineSampleRate: sampleRate
+        )
+
+        guard let isolated = try ProjectClipGraphAudioExportProjection.isolatingClip(
+            secondClip.id,
+            on: trackID,
+            from: graph
+        ) else {
+            throw SmokeFailure("clip export did not find its canonical clip")
+        }
+        try require(isolated.tracks.count == 1, "clip export retained unrelated tracks")
+        try require(
+            isolated.tracks[0].clips.map { $0.id } == [secondClip.id],
+            "clip export retained neighboring clips"
+        )
+        try require(
+            Set(isolated.sources.keys) == [sourceID],
+            "clip export retained unrelated media sources"
+        )
+        let playbackSnapshot = try TimelineClipPlaybackProjection.snapshot(from: isolated)
+        let projectedClipIDs = playbackSnapshot.lanes
+            .flatMap(\.segments)
+            .compactMap(\.clipID)
+        try require(
+            Set(projectedClipIDs) == [secondClip.id],
+            "clip export projected audio from a neighboring clip"
+        )
+    }
+
+    private static func verifyVolumeAutomationGainSemantics(
+        root: URL,
+        sampleRate: Double
+    ) throws {
+        let frameCount = 64
+        let track = AudioExportTrackSnapshot(
+            id: UUID(),
+            name: "automated-volume",
+            volume: 0.5,
+            volumeAutomation: [
+                TimelinePlaybackAutomationPoint(
+                    frame: 0,
+                    normalizedValue: 0.5,
+                    curveToNext: 0
+                ),
+            ],
+            source: .decoded(makeConstantBuffer(
+                url: root.appendingPathComponent("automated-volume-source.wav"),
+                sampleRate: sampleRate,
+                frameCount: frameCount,
+                value: 1
+            ))
+        )
+
+        let postFaderURL = root.appendingPathComponent("automated-volume-post-fader.wav")
+        let postFaderRequest = AudioExportRequest(
+            projectName: "Automated Volume",
+            scope: .fullMixdown,
+            format: .wav,
+            destinationURL: postFaderURL,
+            wavEncoding: .float32
+        )
+        let postFaderSnapshot = makeSnapshot(
+            request: postFaderRequest,
+            tracks: [track],
+            sampleRate: sampleRate,
+            frameCount: frameCount
+        )
+        let postFaderWriter = try AudioExportStreamingWAVWriter(
+            url: postFaderURL,
+            sampleRate: sampleRate,
+            channelCount: 2,
+            encoding: .float32
+        )
+        _ = try AudioExportRenderer.renderMixdown(
+            snapshot: postFaderSnapshot,
+            to: postFaderWriter
+        )
+        let postFader = try WAVAudioDecoder.decode(url: postFaderURL, frameRange: 0..<1)
+        try require(
+            abs((postFader.samplesByChannel.first?.first ?? 0) - 0.25) < 0.000_1,
+            "post-fader automation multiplied the static fader instead of replacing it"
+        )
+
+        let preFaderURL = root.appendingPathComponent("automated-volume-pre-fader.wav")
+        let preFaderRequest = AudioExportRequest(
+            projectName: "Automated Volume Stem",
+            scope: .stems(includeMixdown: false, selection: nil),
+            format: .wav,
+            destinationURL: preFaderURL,
+            wavEncoding: .float32,
+            stemOptions: AudioExportStemOptions(
+                trackInclusion: .allTracks,
+                gainPosition: .preFader
+            )
+        )
+        let preFaderSnapshot = makeSnapshot(
+            request: preFaderRequest,
+            tracks: [track],
+            sampleRate: sampleRate,
+            frameCount: frameCount
+        )
+        let preFaderWriter = try AudioExportStreamingWAVWriter(
+            url: preFaderURL,
+            sampleRate: sampleRate,
+            channelCount: 2,
+            encoding: .float32
+        )
+        _ = try AudioExportRenderer.renderTrack(
+            track,
+            snapshot: preFaderSnapshot,
+            to: preFaderWriter
+        )
+        let preFader = try WAVAudioDecoder.decode(url: preFaderURL, frameRange: 0..<1)
+        try require(
+            abs((preFader.samplesByChannel.first?.first ?? 0) - 1) < 0.000_1,
+            "pre-fader export applied track volume automation"
         )
     }
 

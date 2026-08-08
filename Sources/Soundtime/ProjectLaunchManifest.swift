@@ -85,6 +85,7 @@ struct ProjectLaunchVisualFingerprint: Codable, Equatable, Sendable {
             hasher.append("segment-gain-start:\(rounded(segment.gainStart))")
             hasher.append("segment-gain-end:\(rounded(segment.gainEnd))")
             hasher.append("segment-new-clip:\(segment.startsNewClip ?? false)")
+            hasher.append("segment-clip-id:\(segment.clipID?.uuidString.lowercased() ?? "legacy")")
         }
     }
 

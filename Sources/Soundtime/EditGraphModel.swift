@@ -171,6 +171,7 @@ struct EditableAudioSource: Equatable, Codable, Sendable {
 }
 
 struct TimelineClipSegment: Equatable, Codable, Sendable {
+    let clipID: AudioTimelineClipID
     let outputStartFrame: Int
     let sourceStartFrame: Int
     let frameCount: Int
@@ -203,6 +204,7 @@ struct TrackArrangement: Sendable {
     var clipSegments: [TimelineClipSegment] {
         timeline.playbackSegments.map { segment in
             TimelineClipSegment(
+                clipID: segment.clipID,
                 outputStartFrame: segment.outputStartFrame,
                 sourceStartFrame: segment.sourceStartFrame,
                 frameCount: segment.frameCount,

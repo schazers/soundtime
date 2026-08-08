@@ -1,7 +1,7 @@
 import Foundation
 
 struct SoundtimeProject: Codable, Sendable {
-    static let currentSchemaVersion = 9
+    static let currentSchemaVersion = 18
     static let launchWaveformPreviewBinCount = 4_096
 
     struct WindowLayout: Codable, Sendable {
@@ -20,6 +20,27 @@ struct SoundtimeProject: Codable, Sendable {
         var startProgress: Double
         var endProgress: Double
         var trackID: UUID?
+    }
+
+    struct FocusedClipInspectorState: Codable, Sendable {
+        var trackID: UUID
+        var clipID: UUID
+        var preferredHeight: Double
+        var viewport: TimelineViewport?
+        var localPlayheadProgress: Float
+        var localSelection: TimelineSelectionRange?
+        var displaysWholeTrack: Bool? = nil
+    }
+
+    struct MixerPanelState: Codable, Sendable {
+        var preferredHeight: Double
+        var horizontalScrollOffset: Double
+        var wasVisible: Bool
+    }
+
+    struct SelectedClipState: Codable, Sendable {
+        var trackID: UUID
+        var clipID: UUID
     }
 
     struct SilenceReviewCandidate: Codable, Sendable {
@@ -355,6 +376,7 @@ struct SoundtimeProject: Codable, Sendable {
         var name: String
         var filePath: String
         var volume: Float
+        var pan: Float? = nil
         var isMuted: Bool
         var isSoloed: Bool
         var editTimeline: AudioFileEditTimeline.PersistentState?
@@ -362,6 +384,7 @@ struct SoundtimeProject: Codable, Sendable {
         var waveformPreview: WaveformPreview? = nil
         var ownsSourceFile: Bool? = nil
         var transcript: TranscriptDocument? = nil
+        var clipNames: [UUID: String]? = nil
         var importedAssetState: ImportedAssetState? = nil
 
         var audioSourceCandidateURLs: [URL] {
@@ -396,6 +419,13 @@ struct SoundtimeProject: Codable, Sendable {
     var silenceReviewState: SilenceReviewState?
     var transcriptionJobs: [TranscriptionJob.PersistentSnapshot]?
     var transcriptDisplayMode: TranscriptTimelineDisplayMode?
+    var focusedClipInspectorState: FocusedClipInspectorState?
+    var mixerPanelState: MixerPanelState?
+    var selectedClipState: SelectedClipState?
+    var selectedClipStates: [SelectedClipState]?
+    var timelineEndTime: TimeInterval?
+    var clipGraphDocument: TimelineClipGraphDocument?
+    var automationDocument: TimelineAutomationDocument?
 
     var schemaVersion: Int
 
@@ -411,6 +441,13 @@ struct SoundtimeProject: Codable, Sendable {
         silenceReviewState: SilenceReviewState? = nil,
         transcriptionJobs: [TranscriptionJob.PersistentSnapshot]? = nil,
         transcriptDisplayMode: TranscriptTimelineDisplayMode? = nil,
+        focusedClipInspectorState: FocusedClipInspectorState? = nil,
+        mixerPanelState: MixerPanelState? = nil,
+        selectedClipState: SelectedClipState? = nil,
+        selectedClipStates: [SelectedClipState]? = nil,
+        timelineEndTime: TimeInterval? = nil,
+        clipGraphDocument: TimelineClipGraphDocument? = nil,
+        automationDocument: TimelineAutomationDocument? = nil,
         schemaVersion: Int = SoundtimeProject.currentSchemaVersion
     ) {
         self.projectID = projectID
@@ -424,6 +461,13 @@ struct SoundtimeProject: Codable, Sendable {
         self.silenceReviewState = silenceReviewState
         self.transcriptionJobs = transcriptionJobs
         self.transcriptDisplayMode = transcriptDisplayMode
+        self.focusedClipInspectorState = focusedClipInspectorState
+        self.mixerPanelState = mixerPanelState
+        self.selectedClipState = selectedClipState
+        self.selectedClipStates = selectedClipStates
+        self.timelineEndTime = timelineEndTime
+        self.clipGraphDocument = clipGraphDocument
+        self.automationDocument = automationDocument
         self.schemaVersion = schemaVersion
     }
 
@@ -472,6 +516,13 @@ struct SoundtimeProject: Codable, Sendable {
         case silenceReviewState
         case transcriptionJobs
         case transcriptDisplayMode
+        case focusedClipInspectorState
+        case mixerPanelState
+        case selectedClipState
+        case selectedClipStates
+        case timelineEndTime
+        case clipGraphDocument
+        case automationDocument
     }
 
     init(from decoder: Decoder) throws {
@@ -494,6 +545,25 @@ struct SoundtimeProject: Codable, Sendable {
             TranscriptTimelineDisplayMode.self,
             forKey: .transcriptDisplayMode
         )
+        focusedClipInspectorState = try container.decodeIfPresent(
+            FocusedClipInspectorState.self,
+            forKey: .focusedClipInspectorState
+        )
+        mixerPanelState = try container.decodeIfPresent(MixerPanelState.self, forKey: .mixerPanelState)
+        selectedClipState = try container.decodeIfPresent(SelectedClipState.self, forKey: .selectedClipState)
+        selectedClipStates = try container.decodeIfPresent([SelectedClipState].self, forKey: .selectedClipStates)
+        if selectedClipStates == nil, let selectedClipState {
+            selectedClipStates = [selectedClipState]
+        }
+        timelineEndTime = try container.decodeIfPresent(TimeInterval.self, forKey: .timelineEndTime)
+        clipGraphDocument = try container.decodeIfPresent(
+            TimelineClipGraphDocument.self,
+            forKey: .clipGraphDocument
+        )
+        automationDocument = try container.decodeIfPresent(
+            TimelineAutomationDocument.self,
+            forKey: .automationDocument
+        )
     }
 
     func encode(to encoder: Encoder) throws {
@@ -510,6 +580,13 @@ struct SoundtimeProject: Codable, Sendable {
         try container.encodeIfPresent(silenceReviewState, forKey: .silenceReviewState)
         try container.encodeIfPresent(transcriptionJobs, forKey: .transcriptionJobs)
         try container.encodeIfPresent(transcriptDisplayMode, forKey: .transcriptDisplayMode)
+        try container.encodeIfPresent(focusedClipInspectorState, forKey: .focusedClipInspectorState)
+        try container.encodeIfPresent(mixerPanelState, forKey: .mixerPanelState)
+        try container.encodeIfPresent(selectedClipState, forKey: .selectedClipState)
+        try container.encodeIfPresent(selectedClipStates, forKey: .selectedClipStates)
+        try container.encodeIfPresent(timelineEndTime, forKey: .timelineEndTime)
+        try container.encodeIfPresent(clipGraphDocument, forKey: .clipGraphDocument)
+        try container.encodeIfPresent(automationDocument, forKey: .automationDocument)
     }
 }
 
@@ -517,6 +594,7 @@ struct SoundtimeProjectLaunchStateOverlay: Codable, Sendable {
     struct TrackState: Codable, Sendable {
         var id: UUID
         var volume: Float
+        var pan: Float? = nil
         var isMuted: Bool
         var isSoloed: Bool
     }

@@ -1,5 +1,19 @@
 import Foundation
 
+struct LiveRecordingWaveformPublication: Sendable {
+    let layerID: UUID
+    let revision: Int
+    let completedBinStartIndex: Int
+    let completedBins: [WaveformOverview.Bin]
+    let trailingBin: WaveformOverview.Bin?
+    let totalCompletedBinCount: Int
+    let duration: TimeInterval
+
+    var drawableBinCount: Int {
+        totalCompletedBinCount + (trailingBin == nil ? 0 : 1)
+    }
+}
+
 struct LiveRecordingWaveformAccumulator {
     private(set) var bins: [WaveformOverview.Bin] = []
     private var currentAccumulator = WaveformBinAccumulator()
@@ -49,5 +63,25 @@ struct LiveRecordingWaveformAccumulator {
 
         let duration = sampleRate > 0 ? Double(totalFrameCount) / sampleRate : 0
         return WaveformOverview(duration: duration, bins: overviewBins)
+    }
+
+    func makePublication(
+        layerID: UUID,
+        revision: Int,
+        afterCompletedBinCount publishedCompletedBinCount: Int,
+        sampleRate: Double
+    ) -> LiveRecordingWaveformPublication {
+        let startIndex = min(max(publishedCompletedBinCount, 0), bins.count)
+        let completedBins = startIndex < bins.count ? Array(bins[startIndex...]) : []
+        let duration = sampleRate > 0 ? Double(totalFrameCount) / sampleRate : 0
+        return LiveRecordingWaveformPublication(
+            layerID: layerID,
+            revision: revision,
+            completedBinStartIndex: startIndex,
+            completedBins: completedBins,
+            trailingBin: framesInCurrentBin > 0 ? currentAccumulator.makeBin() : nil,
+            totalCompletedBinCount: bins.count,
+            duration: duration
+        )
     }
 }

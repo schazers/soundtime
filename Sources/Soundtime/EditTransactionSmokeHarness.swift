@@ -25,6 +25,9 @@ enum EditTransactionSmokeHarness {
         try verifyUnequalDurationScopePlanning()
         checks.append("multi-track scope planning intersects unequal track durations")
 
+        try verifyPasteCanExtendPastTrackEnd()
+        checks.append("paste insertion may extend a lane beyond its current content")
+
         try verifyPlaybackAwareDeletePlayheadPlanning()
         checks.append("playing deletes remap the playhead to preserve source continuity")
 
@@ -320,6 +323,40 @@ enum EditTransactionSmokeHarness {
                 resultingProjectDuration: 2
             ) == range.start,
             "playing delete did not fall back when the shortened project removed the playhead"
+        )
+    }
+
+    private static func verifyPasteCanExtendPastTrackEnd() throws {
+        let trackID = fixedUUID(200)
+        let plan = try EditTransactionPlanner.plan(
+            command: EditCommand(
+                baseRevision: .initial,
+                kind: .paste,
+                scope: .track,
+                anchorTrackID: trackID,
+                targetTrackIDs: [trackID],
+                insertionTime: ProjectTime(seconds: 12),
+                clipboardID: fixedUUID(2_000),
+                wasPlaying: false,
+                playheadTimeAtDispatch: .zero
+            ),
+            currentRevision: .initial,
+            tracks: [
+                EditTrackDescriptor(
+                    trackID: trackID,
+                    sampleRate: 48_000,
+                    frameCount: 48_000,
+                    isEditable: true
+                ),
+            ]
+        )
+        guard case let .insert(frame) = plan.trackEdits.first?.mutation else {
+            throw SmokeError.failed("paste did not produce an insert mutation")
+        }
+        try require(frame == 576_000, "paste insertion was clamped to the old lane end")
+        try require(
+            plan.playheadTime == ProjectTime(seconds: 12),
+            "paste did not preserve its authored timeline position"
         )
     }
 

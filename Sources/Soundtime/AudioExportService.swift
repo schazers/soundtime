@@ -282,7 +282,14 @@ final class AudioExportService: @unchecked Sendable {
             includesMixdown = false
         }
 
-        let totalWriteCount = snapshot.tracks.count + (includesMixdown ? 1 : 0)
+        let logicalTrackGroups = Dictionary(grouping: snapshot.tracks, by: \.logicalTrackID)
+            .values
+            .sorted {
+                let left = $0.first?.name ?? ""
+                let right = $1.first?.name ?? ""
+                return left.localizedStandardCompare(right) == .orderedAscending
+            }
+        let totalWriteCount = logicalTrackGroups.count + (includesMixdown ? 1 : 0)
         var completedWriteCount = 0
 
         if includesMixdown {
@@ -326,8 +333,9 @@ final class AudioExportService: @unchecked Sendable {
             }
         }
 
-        for track in snapshot.tracks {
+        for trackGroup in logicalTrackGroups {
             try Task.checkCancellation()
+            guard let track = trackGroup.first else { continue }
             let stemURL = uniqueURL(
                 in: folderURL,
                 baseName: "\(snapshot.request.projectName)-\(track.name)-stem",
@@ -343,8 +351,8 @@ final class AudioExportService: @unchecked Sendable {
             )
             let writeBaseCount = completedWriteCount
             do {
-                let stats = try AudioExportRenderer.renderTrack(
-                    track,
+                let stats = try AudioExportRenderer.renderLogicalTrack(
+                    trackGroup,
                     snapshot: snapshot,
                     to: writer,
                     progressHandler: { fraction, stage, message in

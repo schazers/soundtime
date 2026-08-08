@@ -155,6 +155,7 @@ enum AudioExportScope: Sendable {
     case fullMixdown
     case timeRange(TimelineSelection)
     case trackRange(trackID: UUID, selection: TimelineSelection)
+    case clip(trackID: UUID, clipID: AudioTimelineClipID, selection: TimelineSelection)
     case stems(includeMixdown: Bool, selection: TimelineSelection?)
 
     var displayName: String {
@@ -165,6 +166,8 @@ enum AudioExportScope: Sendable {
             return "Selected Range"
         case .trackRange:
             return "Track Range"
+        case .clip:
+            return "Clip"
         case let .stems(includeMixdown, selection):
             if includeMixdown {
                 return selection == nil ? "Mixdown Plus Stems" : "Selected Mixdown Plus Stems"
@@ -180,6 +183,8 @@ enum AudioExportScope: Sendable {
         case let .timeRange(selection):
             return selection
         case let .trackRange(_, selection):
+            return selection
+        case let .clip(_, _, selection):
             return selection
         case let .stems(_, selection):
             return selection
@@ -334,26 +339,41 @@ enum AudioExportTrackSource: Sendable {
 
 struct AudioExportTrackSnapshot: Sendable {
     let id: UUID
+    let logicalTrackID: UUID
     let name: String
     let volume: Float
+    let pan: Float
     let isMuted: Bool
     let isSoloed: Bool
+    let volumeAutomation: [TimelinePlaybackAutomationPoint]
+    let panAutomation: [TimelinePlaybackAutomationPoint]
+    let muteAutomation: [TimelinePlaybackAutomationPoint]
     let source: AudioExportTrackSource
     let sourceFingerprint: AudioExportSourceFingerprint?
 
     init(
         id: UUID,
+        logicalTrackID: UUID? = nil,
         name: String,
         volume: Float,
+        pan: Float = 0,
         isMuted: Bool = false,
         isSoloed: Bool = false,
+        volumeAutomation: [TimelinePlaybackAutomationPoint] = [],
+        panAutomation: [TimelinePlaybackAutomationPoint] = [],
+        muteAutomation: [TimelinePlaybackAutomationPoint] = [],
         source: AudioExportTrackSource
     ) {
         self.id = id
+        self.logicalTrackID = logicalTrackID ?? id
         self.name = name
         self.volume = volume
+        self.pan = min(max(pan, -1), 1)
         self.isMuted = isMuted
         self.isSoloed = isSoloed
+        self.volumeAutomation = volumeAutomation
+        self.panAutomation = panAutomation
+        self.muteAutomation = muteAutomation
         self.source = source
         sourceFingerprint = AudioExportSourceFingerprint.capture(
             url: Self.sourceURL(for: source)
@@ -427,6 +447,33 @@ struct AudioExportSnapshot: Sendable {
     let fullDurationFrameCount: Int
     let exportFrameRange: Range<Int>
     let leasedURLs: [URL]
+    /// Canonical clip graph revision captured by this immutable export. Zero
+    /// identifies legacy/non-project smoke fixtures.
+    let clipGraphRevision: UInt64
+
+    init(
+        id: UUID,
+        createdAt: Date,
+        request: AudioExportRequest,
+        tracks: [AudioExportTrackSnapshot],
+        sampleRate: Double,
+        channelCount: Int,
+        fullDurationFrameCount: Int,
+        exportFrameRange: Range<Int>,
+        leasedURLs: [URL],
+        clipGraphRevision: UInt64 = 0
+    ) {
+        self.id = id
+        self.createdAt = createdAt
+        self.request = request
+        self.tracks = tracks
+        self.sampleRate = sampleRate
+        self.channelCount = channelCount
+        self.fullDurationFrameCount = fullDurationFrameCount
+        self.exportFrameRange = exportFrameRange
+        self.leasedURLs = leasedURLs
+        self.clipGraphRevision = clipGraphRevision
+    }
 
     var frameCount: Int {
         exportFrameRange.count

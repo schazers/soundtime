@@ -88,6 +88,16 @@ enum ProjectEditRoundTripSmokeHarness {
             "could not create launch waveform preview"
         )
         let transcript = syntheticTranscript(trackID: trackID, duration: timeline.duration)
+        var automationGraph = try TimelineAutomationGraph()
+        let volumeLane = try TimelineAutomationLane(
+            address: .track(trackID, parameterID: .volume),
+            defaultNormalizedValue: 0.73,
+            points: [
+                TimelineAutomationPoint(frame: 0, normalizedValue: 0.25),
+                TimelineAutomationPoint(frame: 4_800, normalizedValue: 0.8, curveToNext: -0.3),
+            ]
+        )
+        try automationGraph.upsertLane(volumeLane)
         let project = SoundtimeProject(
             tracks: [
                 SoundtimeProject.Track(
@@ -108,7 +118,8 @@ enum ProjectEditRoundTripSmokeHarness {
             timelineViewport: SoundtimeProject.TimelineViewport(
                 startProgress: 0.17,
                 durationProgress: 0.23
-            )
+            ),
+            automationDocument: TimelineAutomationDocument(graph: automationGraph)
         )
 
         let encodedProject = try JSONEncoder().encode(project)
@@ -118,6 +129,19 @@ enum ProjectEditRoundTripSmokeHarness {
             "project schema version did not persist"
         )
         try require(decodedProject.tracks.count == 1, "project track count mismatch")
+        let decodedAutomationGraph = try requireValue(
+            decodedProject.automationDocument,
+            "project dropped automation document"
+        ).makeGraph()
+        let decodedVolumeLane = try requireValue(
+            decodedAutomationGraph.lane(at: .track(trackID, parameterID: .volume)),
+            "project dropped track volume automation"
+        )
+        try require(decodedVolumeLane.points == volumeLane.points, "automation points did not persist")
+        try require(
+            abs(decodedVolumeLane.defaultNormalizedValue - volumeLane.defaultNormalizedValue) < 0.000_001,
+            "automation default value did not persist"
+        )
         try requireLegacyProjectWithoutMasterVolumeDecodes()
         try requireProjectStoreMigratesLegacyProject()
         try requireAutosaveRecoveryPreservesSavedWaveformPreviews(

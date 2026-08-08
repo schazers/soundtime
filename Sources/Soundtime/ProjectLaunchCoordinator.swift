@@ -86,6 +86,7 @@ struct ProjectLaunchFirstFrame: Sendable {
         var editableSource: SoundtimeProject.Track.EditableSource?
         var ownsSourceFile: Bool?
         var volume: Float
+        var pan: Float
         var isMuted: Bool
         var isSoloed: Bool
         var transcript: TranscriptDocument?
@@ -128,6 +129,9 @@ struct ProjectLaunchFirstFrame: Sendable {
 
             var mergedTrack = track
             mergedTrack.volume = min(max(overlayTrack.volume, 0), 1)
+            if let pan = overlayTrack.pan {
+                mergedTrack.pan = min(max(pan, -1), 1)
+            }
             mergedTrack.isMuted = overlayTrack.isMuted
             mergedTrack.isSoloed = overlayTrack.isSoloed
             return mergedTrack
@@ -732,6 +736,7 @@ enum ProjectLaunchCoordinator {
             editableSource: track.editableSource,
             ownsSourceFile: track.ownsSourceFile,
             volume: track.volume,
+            pan: 0,
             isMuted: track.isMuted,
             isSoloed: track.isSoloed,
             transcript: nil
@@ -759,6 +764,7 @@ enum ProjectLaunchCoordinator {
             editableSource: track.editableSource,
             ownsSourceFile: track.ownsSourceFile,
             volume: track.volume,
+            pan: 0,
             isMuted: track.isMuted,
             isSoloed: track.isSoloed,
             transcript: nil
@@ -778,6 +784,7 @@ enum ProjectLaunchCoordinator {
             editableSource: nil,
             ownsSourceFile: nil,
             volume: track.volume,
+            pan: 0,
             isMuted: track.isMuted,
             isSoloed: track.isSoloed,
             transcript: nil
@@ -805,6 +812,7 @@ enum ProjectLaunchCoordinator {
             editableSource: track.editableSource,
             ownsSourceFile: track.ownsSourceFile,
             volume: track.volume,
+            pan: track.pan ?? 0,
             isMuted: track.isMuted,
             isSoloed: track.isSoloed,
             transcript: track.transcript

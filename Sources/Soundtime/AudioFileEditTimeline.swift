@@ -10,26 +10,42 @@ struct AudioFileEditTimeline: Sendable {
         var gainStart: Float
         var gainEnd: Float
         var startsNewClip: Bool?
+        var clipID: UUID?
 
         init(
             sourceStartFrame: Int,
             frameCount: Int,
             gainStart: Float,
             gainEnd: Float,
-            startsNewClip: Bool? = nil
+            startsNewClip: Bool? = nil,
+            clipID: UUID? = nil
         ) {
             self.sourceStartFrame = sourceStartFrame
             self.frameCount = frameCount
             self.gainStart = gainStart
             self.gainEnd = gainEnd
             self.startsNewClip = startsNewClip
+            self.clipID = clipID
         }
     }
 
     struct PersistentState: Codable, Sendable {
         var sourceFrameCount: Int
         var sourceSampleRate: Double
+        var timelineSampleRate: Double?
         var segments: [PersistentSegment]
+
+        init(
+            sourceFrameCount: Int,
+            sourceSampleRate: Double,
+            timelineSampleRate: Double? = nil,
+            segments: [PersistentSegment]
+        ) {
+            self.sourceFrameCount = sourceFrameCount
+            self.sourceSampleRate = sourceSampleRate
+            self.timelineSampleRate = timelineSampleRate
+            self.segments = segments
+        }
     }
 
     struct Clip: Sendable {
@@ -51,6 +67,7 @@ struct AudioFileEditTimeline: Sendable {
 
     let sourceFrameCount: Int
     let sourceSampleRate: Double
+    let timelineSampleRate: Double
     private var arrangement: AudioSegmentArrangement
 
     init(fileInfo: WAVFileInfo) {
@@ -63,6 +80,7 @@ struct AudioFileEditTimeline: Sendable {
     init(sourceFrameCount: Int, sourceSampleRate: Double) {
         self.sourceFrameCount = max(sourceFrameCount, 0)
         self.sourceSampleRate = sourceSampleRate
+        timelineSampleRate = sourceSampleRate
         if sourceFrameCount > 0, sourceSampleRate.isFinite, sourceSampleRate > 0 {
             arrangement = AudioSegmentArrangement(sourceFrameCount: sourceFrameCount)
         } else {
@@ -77,16 +95,19 @@ struct AudioFileEditTimeline: Sendable {
         guard
             persistentState.sourceFrameCount >= 0,
             persistentState.sourceSampleRate > 0,
-            persistentState.sourceSampleRate.isFinite
+            persistentState.sourceSampleRate.isFinite,
+            (persistentState.timelineSampleRate ?? persistentState.sourceSampleRate) > 0,
+            (persistentState.timelineSampleRate ?? persistentState.sourceSampleRate).isFinite
         else {
             return nil
         }
 
         sourceFrameCount = persistentState.sourceFrameCount
         sourceSampleRate = persistentState.sourceSampleRate
+        timelineSampleRate = persistentState.timelineSampleRate ?? persistentState.sourceSampleRate
         arrangement = AudioSegmentArrangement(
             sourceFrameCount: sourceFrameCount,
-            segments: persistentState.segments.map(Self.segment)
+            segments: Self.segments(from: persistentState)
         )
         guard sourceFrameCount == 0 || !arrangement.segments.isEmpty else {
             return nil
@@ -96,18 +117,22 @@ struct AudioFileEditTimeline: Sendable {
     init?(
         sourceFrameCount: Int,
         sourceSampleRate: Double,
+        timelineSampleRate: Double? = nil,
         playbackSegments: [AudioEditTimeline.PlaybackSegment]
     ) {
         guard
             sourceFrameCount >= 0,
             sourceSampleRate > 0,
-            sourceSampleRate.isFinite
+            sourceSampleRate.isFinite,
+            (timelineSampleRate ?? sourceSampleRate) > 0,
+            (timelineSampleRate ?? sourceSampleRate).isFinite
         else {
             return nil
         }
 
         self.sourceFrameCount = sourceFrameCount
         self.sourceSampleRate = sourceSampleRate
+        self.timelineSampleRate = timelineSampleRate ?? sourceSampleRate
         arrangement = AudioSegmentArrangement(
             sourceFrameCount: sourceFrameCount,
             segments: playbackSegments.map { segment in
@@ -116,7 +141,8 @@ struct AudioFileEditTimeline: Sendable {
                     frameCount: segment.frameCount,
                     gainStart: segment.gainStart,
                     gainEnd: segment.gainEnd,
-                    startsNewClip: segment.startsNewClip
+                    startsNewClip: segment.startsNewClip,
+                    clipID: segment.clipID
                 )
             }
         )
@@ -130,10 +156,10 @@ struct AudioFileEditTimeline: Sendable {
     }
 
     var duration: TimeInterval {
-        guard sourceSampleRate > 0 else {
+        guard timelineSampleRate > 0 else {
             return 0
         }
-        return Double(frameCount) / sourceSampleRate
+        return Double(frameCount) / timelineSampleRate
     }
 
     var hasEdits: Bool {
@@ -147,6 +173,7 @@ struct AudioFileEditTimeline: Sendable {
         return PersistentState(
             sourceFrameCount: sourceFrameCount,
             sourceSampleRate: sourceSampleRate,
+            timelineSampleRate: timelineSampleRate == sourceSampleRate ? nil : timelineSampleRate,
             segments: arrangement.segments.map(Self.persistentSegment)
         )
     }
@@ -189,7 +216,8 @@ struct AudioFileEditTimeline: Sendable {
                 sourceFrameScale: 0,
                 gainStart: segment.gainStart,
                 gainEnd: segment.gainEnd,
-                startsNewClip: segment.startsNewClip
+                startsNewClip: segment.startsNewClip,
+                clipID: segment.clipID
             )
         }
         .filter { $0.frameCount > 0 }
@@ -197,12 +225,34 @@ struct AudioFileEditTimeline: Sendable {
         return AudioFileEditTimeline(
             sourceFrameCount: destinationSourceFrameCount,
             sourceSampleRate: destinationSampleRate,
+            timelineSampleRate: destinationSampleRate,
             playbackSegments: remappedSegments
         )
     }
 
+    /// Promotes an original compressed-file timeline onto its editable proxy.
+    /// Untouched imports must adopt the proxy's complete authoritative range;
+    /// only real edits should preserve the provisional arrangement by remapping.
+    func promotedToEditableProxy(fileInfo: WAVFileInfo) -> AudioFileEditTimeline {
+        guard hasEdits else {
+            return AudioFileEditTimeline(fileInfo: fileInfo)
+        }
+        return remapped(
+            toSourceFrameCount: fileInfo.frameCount,
+            sampleRate: fileInfo.sampleRate
+        ) ?? AudioFileEditTimeline(fileInfo: fileInfo)
+    }
+
     var clipRanges: [ClipRange] {
         arrangement.clipRanges
+    }
+
+    func clipRange(id: AudioTimelineClipID) -> ClipRange? {
+        arrangement.clipRange(id: id)
+    }
+
+    func frameRange(forClipID id: AudioTimelineClipID) -> Range<Int>? {
+        arrangement.frameRange(forClipID: id)
     }
 
     func audioTimeline(sourceBuffer: DecodedAudioBuffer) -> AudioEditTimeline {
@@ -231,10 +281,16 @@ struct AudioFileEditTimeline: Sendable {
         guard !selectedSegments.isEmpty else {
             return nil
         }
+        let copiedClipID = AudioTimelineClipID()
         return Clip(
             sourceFrameCount: sourceFrameCount,
             sourceSampleRate: sourceSampleRate,
-            segments: selectedSegments.map(Self.persistentSegment)
+            segments: selectedSegments.enumerated().map { index, segment in
+                Self.persistentSegment(segment.withClipID(
+                    copiedClipID,
+                    startsNewClip: index == 0
+                ))
+            }
         )
     }
 
@@ -248,7 +304,7 @@ struct AudioFileEditTimeline: Sendable {
         }
         return arrangement.replace(
             frameRange: frameRange,
-            with: clip.segments.map(Self.segment)
+            with: Self.segmentsForInsertion(clip.segments)
         )
     }
 
@@ -257,8 +313,23 @@ struct AudioFileEditTimeline: Sendable {
             return nil
         }
         return arrangement.insert(
-            clip.segments.map(Self.segment),
+            Self.segmentsForInsertion(clip.segments),
             atFrame: frame
+        )
+    }
+
+    mutating func insertWithinClip(
+        id: AudioTimelineClipID,
+        localFrame: Int,
+        clip: Clip
+    ) -> Int? {
+        guard isCompatible(with: clip) else {
+            return nil
+        }
+        return arrangement.insertWithinClip(
+            id: id,
+            localFrame: localFrame,
+            segments: Self.segmentsForInsertion(clip.segments)
         )
     }
 
@@ -365,6 +436,64 @@ struct AudioFileEditTimeline: Sendable {
         arrangement.delete(frameRange: frameRange)
     }
 
+    mutating func deleteClip(id: AudioTimelineClipID) -> Int {
+        arrangement.deleteClip(id: id)
+    }
+
+    mutating func deleteClips(ids: Set<AudioTimelineClipID>) -> Int {
+        arrangement.deleteClips(ids: ids)
+    }
+
+    mutating func deleteWithinClip(
+        id: AudioTimelineClipID,
+        localFrameRange: Range<Int>,
+        followingClipPolicy: AudioTimelineFollowingClipPolicy
+    ) -> Int {
+        arrangement.deleteWithinClip(
+            id: id,
+            localFrameRange: localFrameRange,
+            followingClipPolicy: followingClipPolicy
+        )
+    }
+
+    mutating func clearWithinClip(
+        id: AudioTimelineClipID,
+        localFrameRange: Range<Int>
+    ) -> Int {
+        arrangement.clearWithinClip(id: id, localFrameRange: localFrameRange)
+    }
+
+    mutating func duplicateClip(id: AudioTimelineClipID, atFrame frame: Int) -> AudioTimelineClipID? {
+        arrangement.duplicateClip(id: id, atFrame: frame)
+    }
+
+    mutating func moveClip(id: AudioTimelineClipID, toFrame frame: Int) -> Range<Int>? {
+        arrangement.moveClip(id: id, toFrame: frame)
+    }
+
+    mutating func relocateClip(id: AudioTimelineClipID, toFrame frame: Int) -> Range<Int>? {
+        arrangement.relocateClip(id: id, toFrame: frame)
+    }
+
+    mutating func relocateClips(
+        ids: Set<AudioTimelineClipID>,
+        byFrames delta: Int
+    ) -> [AudioTimelineClipID: Range<Int>]? {
+        arrangement.relocateClips(ids: ids, byFrames: delta)
+    }
+
+    mutating func splitClip(id: AudioTimelineClipID, atLocalFrame frame: Int) -> AudioTimelineClipID? {
+        arrangement.splitClip(id: id, atLocalFrame: frame)
+    }
+
+    mutating func trimClipStart(id: AudioTimelineClipID, toLocalFrame frame: Int) -> Int {
+        arrangement.trimClipStart(id: id, toLocalFrame: frame)
+    }
+
+    mutating func trimClipEnd(id: AudioTimelineClipID, toLocalFrame frame: Int) -> Int {
+        arrangement.trimClipEnd(id: id, toLocalFrame: frame)
+    }
+
     mutating func clear(_ selection: TimelineSelection) -> Int {
         arrangement.clear(frameRange: frameRange(for: selection))
     }
@@ -424,15 +553,77 @@ struct AudioFileEditTimeline: Sendable {
     }
 
     private static func segment(
-        _ persistent: PersistentSegment
+        _ persistent: PersistentSegment,
+        clipID: AudioTimelineClipID
     ) -> AudioTimelineSegment {
         AudioTimelineSegment(
             sourceStartFrame: persistent.sourceStartFrame,
             frameCount: persistent.frameCount,
             gainStart: persistent.gainStart,
             gainEnd: persistent.gainEnd,
-            startsNewClip: persistent.startsNewClip == true
+            startsNewClip: persistent.startsNewClip == true,
+            clipID: clipID
         )
+    }
+
+    private static func segmentsForInsertion(
+        _ persistentSegments: [PersistentSegment]
+    ) -> [AudioTimelineSegment] {
+        let insertedClipID = AudioTimelineClipID()
+        return persistentSegments.enumerated().map { index, persistent in
+            AudioTimelineSegment(
+                sourceStartFrame: persistent.sourceStartFrame,
+                frameCount: persistent.frameCount,
+                gainStart: persistent.gainStart,
+                gainEnd: persistent.gainEnd,
+                startsNewClip: index == 0,
+                clipID: insertedClipID
+            )
+        }
+    }
+
+    private static func segments(
+        from state: PersistentState
+    ) -> [AudioTimelineSegment] {
+        var clipOrdinal = 0
+        var activeClipID = stableLegacyClipID(state: state, clipOrdinal: clipOrdinal)
+        return state.segments.enumerated().map { index, persistent in
+            if index > 0, persistent.startsNewClip == true {
+                clipOrdinal += 1
+                activeClipID = stableLegacyClipID(state: state, clipOrdinal: clipOrdinal)
+            }
+            if let persistedClipID = persistent.clipID {
+                activeClipID = AudioTimelineClipID(rawValue: persistedClipID)
+            }
+            let clipID = activeClipID
+            return segment(persistent, clipID: clipID)
+        }
+    }
+
+    private static func stableLegacyClipID(
+        state: PersistentState,
+        clipOrdinal: Int
+    ) -> AudioTimelineClipID {
+        let seed = "\(state.sourceFrameCount)|\(state.sourceSampleRate.bitPattern)|\(clipOrdinal)"
+        let first = stableHash(seed.utf8, offset: 0xcbf29ce484222325)
+        let second = stableHash(seed.utf8, offset: 0x84222325cbf29ce4)
+        let value = String(format: "%016llx%016llx", first, second)
+        let firstPart = String(value.prefix(8))
+        let secondPart = String(value.dropFirst(8).prefix(4))
+        let thirdPart = String(value.dropFirst(12).prefix(4))
+        let fourthPart = String(value.dropFirst(16).prefix(4))
+        let fifthPart = String(value.dropFirst(20).prefix(12))
+        let uuidString = "\(firstPart)-\(secondPart)-\(thirdPart)-\(fourthPart)-\(fifthPart)"
+        return AudioTimelineClipID(rawValue: UUID(uuidString: uuidString) ?? UUID())
+    }
+
+    private static func stableHash<C: Collection>(
+        _ bytes: C,
+        offset: UInt64
+    ) -> UInt64 where C.Element == UInt8 {
+        bytes.reduce(offset) { value, byte in
+            (value ^ UInt64(byte)) &* 0x100000001b3
+        }
     }
 
     private static func persistentSegment(
@@ -443,7 +634,8 @@ struct AudioFileEditTimeline: Sendable {
             frameCount: segment.frameCount,
             gainStart: segment.gainStart,
             gainEnd: segment.gainEnd,
-            startsNewClip: segment.startsNewClip ? true : nil
+            startsNewClip: segment.startsNewClip ? true : nil,
+            clipID: segment.clipID.rawValue
         )
     }
 }
