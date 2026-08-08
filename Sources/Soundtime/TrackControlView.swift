@@ -1,11 +1,28 @@
 import AppKit
 
+enum TrackControlAutomationRowLayout {
+    static let horizontalContentInset: CGFloat = 28
+    static let parameterWidth: CGFloat = 80
+    static let controlSpacing: CGFloat = 6
+
+    static func modeWidth(forHeaderWidth headerWidth: CGFloat) -> CGFloat {
+        max(0, headerWidth - horizontalContentInset - parameterWidth - controlSpacing)
+    }
+}
+
 final class TrackControlView: NSView {
     var onMuteChanged: ((Bool) -> Void)?
     var onSoloChanged: ((Bool) -> Void)?
     var onRecordRequested: (() -> Void)?
+    var onVolumeEditingBegan: ((Float) -> Void)?
     var onVolumeChanged: ((Float) -> Void)?
     var onVolumeEditingEnded: (() -> Void)?
+    var onPanEditingBegan: ((Float) -> Void)?
+    var onPanChanged: ((Float) -> Void)?
+    var onPanEditingEnded: (() -> Void)?
+    var onAutomationParameterChanged: ((TimelineAutomationParameterID) -> Void)?
+    var onAutomationWriteModeChanged: ((TimelineAutomationWriteMode) -> Void)?
+    var onAutomationClearRequested: (() -> Void)?
     var onTrackSelected: ((NSEvent.ModifierFlags) -> Void)?
     var onCancelImport: (() -> Void)?
     var onReorderBegan: ((CGPoint) -> Void)?
@@ -18,6 +35,15 @@ final class TrackControlView: NSView {
     private let contentStack = NSStackView()
     private let titleLabel = NSTextField(labelWithString: "")
     private let volumeSlider = HorizontalTrackVolumeSliderView()
+    private let panKnob = TrackPanKnobView()
+    private let mixStack = NSStackView()
+    private let automationParameterPopUp = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let automationWriteModePopUp = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let automationValueLabel = NSTextField(labelWithString: "")
+    private let automationClearButton = NSButton()
+    private let automationTopRow = NSStackView()
+    private let automationValueRow = NSStackView()
+    private let automationStack = NSStackView()
     private let muteButton = TrackToggleButton(title: "M")
     private let soloButton = TrackToggleButton(title: "S")
     private let recordButton = TrackIconButton(systemSymbolName: "mic.fill")
@@ -77,6 +103,25 @@ final class TrackControlView: NSView {
         }
     }
 
+    var pan: Float {
+        get { panKnob.value }
+        set { panKnob.value = newValue }
+    }
+
+    func displayAutomatedMix(volume: Float, pan: Float, isMuted: Bool) {
+        if !volumeSlider.isEditing { volumeSlider.value = volume }
+        if !panKnob.isEditing { panKnob.value = pan }
+        self.isMuted = isMuted
+    }
+
+    func setAutomationControlsVisible(_ isVisible: Bool) {
+        let shouldHide = !isVisible
+        guard automationStack.isHidden != shouldHide else {
+            return
+        }
+        automationStack.isHidden = shouldHide
+    }
+
     init(title: String) {
         super.init(frame: .zero)
         titleLabel.stringValue = title
@@ -125,7 +170,16 @@ final class TrackControlView: NSView {
             return nil
         }
 
-        let interactiveControls: [NSView] = [volumeSlider, muteButton, soloButton, recordButton]
+        let interactiveControls: [NSView] = [
+            volumeSlider,
+            panKnob,
+            automationParameterPopUp,
+            automationWriteModePopUp,
+            automationClearButton,
+            muteButton,
+            soloButton,
+            recordButton,
+        ]
         if interactiveControls.contains(where: { control in
             hitView === control || hitView.isDescendant(of: control)
         }) {
@@ -210,16 +264,37 @@ final class TrackControlView: NSView {
         isMuted: Bool,
         isSoloed: Bool,
         volume: Float,
+        pan: Float,
+        showsAutomationControls: Bool = false,
+        automationParameterID: TimelineAutomationParameterID = .volume,
+        automationWriteMode: TimelineAutomationWriteMode = .read,
+        automationFormattedValue: String = "",
+        hasAutomationPoints: Bool = false,
         isTrackSelected: Bool,
         isRecording: Bool,
         importProgress: Double? = nil
     ) {
         if titleLabel.stringValue != title {
             titleLabel.stringValue = title
+            setAccessibilityLabel("Track: \(title)")
         }
         self.isMuted = isMuted
         self.isSoloed = isSoloed
         self.volume = volume
+        self.pan = pan
+        // Keep the physical controls available while their lanes are visible so
+        // Touch/Latch/Write gestures can be performed without changing views.
+        mixStack.isHidden = false
+        setAutomationControlsVisible(showsAutomationControls)
+        if let index = Self.automationParameters.firstIndex(where: { $0.id == automationParameterID }) {
+            automationParameterPopUp.selectItem(at: index)
+        }
+        if let index = Self.automationWriteModes.firstIndex(where: { $0.mode == automationWriteMode }) {
+            automationWriteModePopUp.selectItem(at: index)
+        }
+        automationValueLabel.stringValue = automationFormattedValue
+        automationValueLabel.setAccessibilityValue(automationFormattedValue)
+        automationClearButton.isEnabled = hasAutomationPoints
         self.isTrackSelected = isTrackSelected
         self.isRecording = isRecording
         canCancelImport = importProgress != nil
@@ -227,6 +302,10 @@ final class TrackControlView: NSView {
     }
 
     private func configure() {
+        setAccessibilityElement(true)
+        setAccessibilityRole(.group)
+        setAccessibilityLabel("Track: \(titleLabel.stringValue)")
+        setAccessibilityHelp("Select this track, or use its volume, solo, mute, and record controls.")
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
         layer?.masksToBounds = true
@@ -246,6 +325,16 @@ final class TrackControlView: NSView {
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
 
         volumeSlider.translatesAutoresizingMaskIntoConstraints = false
+        volumeSlider.setAccessibilityElement(true)
+        volumeSlider.setAccessibilityRole(.slider)
+        volumeSlider.setAccessibilityLabel("Track volume")
+        volumeSlider.setAccessibilityHelp("Use Left and Right Arrow to adjust track volume.")
+        volumeSlider.setAccessibilityMinValue(0)
+        volumeSlider.setAccessibilityMaxValue(1)
+        volumeSlider.setAccessibilityValue(Double(volumeSlider.value))
+        volumeSlider.onEditingBegan = { [weak self] value in
+            self?.onVolumeEditingBegan?(value)
+        }
         volumeSlider.onValueChanged = { [weak self] value in
             self?.onVolumeChanged?(value)
         }
@@ -253,9 +342,87 @@ final class TrackControlView: NSView {
             self?.onVolumeEditingEnded?()
         }
 
+        panKnob.translatesAutoresizingMaskIntoConstraints = false
+        panKnob.onEditingBegan = { [weak self] value in
+            self?.onPanEditingBegan?(value)
+        }
+        panKnob.onValueChanged = { [weak self] value in
+            self?.onPanChanged?(value)
+        }
+        panKnob.onEditingEnded = { [weak self] in
+            self?.onPanEditingEnded?()
+        }
+
+        automationParameterPopUp.translatesAutoresizingMaskIntoConstraints = false
+        automationParameterPopUp.controlSize = .small
+        automationParameterPopUp.font = .systemFont(ofSize: 11, weight: .medium)
+        automationParameterPopUp.addItems(withTitles: Self.automationParameters.map(\.displayName))
+        automationParameterPopUp.target = self
+        automationParameterPopUp.action = #selector(automationParameterChanged)
+        automationParameterPopUp.setAccessibilityElement(true)
+        automationParameterPopUp.setAccessibilityRole(.popUpButton)
+        automationParameterPopUp.setAccessibilityLabel("Track automation parameter")
+        automationParameterPopUp.setAccessibilityHelp("Choose which track parameter is shown in the automation lane.")
+        automationWriteModePopUp.translatesAutoresizingMaskIntoConstraints = false
+        automationWriteModePopUp.controlSize = .small
+        automationWriteModePopUp.font = .systemFont(ofSize: 10, weight: .medium)
+        automationWriteModePopUp.addItems(withTitles: Self.automationWriteModes.map(\.displayName))
+        automationWriteModePopUp.target = self
+        automationWriteModePopUp.action = #selector(automationWriteModeChanged)
+        automationWriteModePopUp.setAccessibilityElement(true)
+        automationWriteModePopUp.setAccessibilityRole(.popUpButton)
+        automationWriteModePopUp.setAccessibilityLabel("Automation mode")
+        automationWriteModePopUp.setAccessibilityHelp("Choose whether this automation lane is read or bypassed.")
+
+        automationValueLabel.font = .monospacedDigitSystemFont(ofSize: 10, weight: .medium)
+        automationValueLabel.textColor = NSColor(white: 0.72, alpha: 1)
+        automationValueLabel.lineBreakMode = .byTruncatingTail
+        automationValueLabel.setAccessibilityElement(true)
+        automationValueLabel.setAccessibilityRole(.staticText)
+        automationValueLabel.setAccessibilityLabel("Current automation value")
+
+        automationClearButton.translatesAutoresizingMaskIntoConstraints = false
+        automationClearButton.bezelStyle = .inline
+        automationClearButton.isBordered = false
+        automationClearButton.image = NSImage(
+            systemSymbolName: "trash",
+            accessibilityDescription: "Clear automation"
+        )
+        automationClearButton.contentTintColor = NSColor(white: 0.66, alpha: 1)
+        automationClearButton.target = self
+        automationClearButton.action = #selector(clearAutomation)
+        automationClearButton.toolTip = "Clear automation points"
+        automationClearButton.setAccessibilityElement(true)
+        automationClearButton.setAccessibilityRole(.button)
+        automationClearButton.setAccessibilityLabel("Clear automation points")
+
+        automationTopRow.orientation = .horizontal
+        automationTopRow.alignment = .centerY
+        automationTopRow.distribution = .fill
+        automationTopRow.spacing = TrackControlAutomationRowLayout.controlSpacing
+        automationTopRow.addArrangedSubview(automationParameterPopUp)
+        automationTopRow.addArrangedSubview(automationWriteModePopUp)
+        automationParameterPopUp.setContentHuggingPriority(.required, for: .horizontal)
+        automationWriteModePopUp.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        automationWriteModePopUp.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        automationValueRow.orientation = .horizontal
+        automationValueRow.alignment = .centerY
+        automationValueRow.spacing = 6
+        automationValueRow.addArrangedSubview(automationValueLabel)
+        automationValueRow.addArrangedSubview(automationClearButton)
+        automationStack.orientation = .vertical
+        automationStack.alignment = .leading
+        automationStack.spacing = 2
+        automationStack.addArrangedSubview(automationTopRow)
+        automationStack.addArrangedSubview(automationValueRow)
+        automationStack.isHidden = true
+
         muteButton.translatesAutoresizingMaskIntoConstraints = false
         soloButton.translatesAutoresizingMaskIntoConstraints = false
         recordButton.translatesAutoresizingMaskIntoConstraints = false
+        muteButton.configureAccessibility(label: "Mute track")
+        soloButton.configureAccessibility(label: "Solo track")
+        recordButton.configureAccessibility(label: "Record track")
         muteButton.onSelectedChanged = { [weak self] isSelected in
             self?.isMuted = isSelected
             self?.onMuteChanged?(isSelected)
@@ -282,7 +449,13 @@ final class TrackControlView: NSView {
         contentStack.spacing = 7
         contentStack.translatesAutoresizingMaskIntoConstraints = false
         contentStack.addArrangedSubview(titleLabel)
-        contentStack.addArrangedSubview(volumeSlider)
+        mixStack.orientation = .horizontal
+        mixStack.alignment = .centerY
+        mixStack.spacing = 8
+        mixStack.addArrangedSubview(volumeSlider)
+        mixStack.addArrangedSubview(panKnob)
+        contentStack.addArrangedSubview(mixStack)
+        contentStack.addArrangedSubview(automationStack)
         contentStack.addArrangedSubview(buttonStack)
 
         addSubview(panelView)
@@ -309,13 +482,25 @@ final class TrackControlView: NSView {
             contentStack.centerYAnchor.constraint(equalTo: panelView.centerYAnchor),
             contentStack.topAnchor.constraint(greaterThanOrEqualTo: panelView.topAnchor, constant: 10),
             contentStack.leadingAnchor.constraint(equalTo: panelView.leadingAnchor, constant: 14),
-            contentStack.trailingAnchor.constraint(lessThanOrEqualTo: panelView.trailingAnchor, constant: -14),
+            contentStack.trailingAnchor.constraint(equalTo: panelView.trailingAnchor, constant: -14),
             contentStack.bottomAnchor.constraint(lessThanOrEqualTo: panelView.bottomAnchor, constant: -10),
 
             titleLabel.widthAnchor.constraint(equalTo: panelView.widthAnchor, constant: -28),
 
             volumeSlider.widthAnchor.constraint(equalToConstant: 112),
             volumeSlider.heightAnchor.constraint(equalToConstant: 22),
+            panKnob.widthAnchor.constraint(equalToConstant: 30),
+            panKnob.heightAnchor.constraint(equalToConstant: 30),
+            automationParameterPopUp.widthAnchor.constraint(
+                equalToConstant: TrackControlAutomationRowLayout.parameterWidth
+            ),
+            automationParameterPopUp.heightAnchor.constraint(equalToConstant: 24),
+            automationWriteModePopUp.heightAnchor.constraint(equalToConstant: 24),
+            automationTopRow.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
+            automationValueLabel.widthAnchor.constraint(equalToConstant: 116),
+            automationValueLabel.heightAnchor.constraint(equalToConstant: 18),
+            automationClearButton.widthAnchor.constraint(equalToConstant: 22),
+            automationClearButton.heightAnchor.constraint(equalToConstant: 18),
 
             soloButton.widthAnchor.constraint(equalToConstant: 31),
             soloButton.heightAnchor.constraint(equalToConstant: 26),
@@ -325,6 +510,36 @@ final class TrackControlView: NSView {
             recordButton.heightAnchor.constraint(equalToConstant: 26),
         ])
     }
+
+    @objc private func automationParameterChanged() {
+        let index = automationParameterPopUp.indexOfSelectedItem
+        guard Self.automationParameters.indices.contains(index) else { return }
+        onAutomationParameterChanged?(Self.automationParameters[index].id)
+    }
+
+    @objc private func automationWriteModeChanged() {
+        let index = automationWriteModePopUp.indexOfSelectedItem
+        guard Self.automationWriteModes.indices.contains(index) else { return }
+        onAutomationWriteModeChanged?(Self.automationWriteModes[index].mode)
+    }
+
+    @objc private func clearAutomation() {
+        onAutomationClearRequested?()
+    }
+
+    private static let automationParameters = [
+        TimelineAutomationParameterRegistry.trackVolume,
+        TimelineAutomationParameterRegistry.trackPan,
+        TimelineAutomationParameterRegistry.trackMute,
+    ]
+
+    private static let automationWriteModes: [(mode: TimelineAutomationWriteMode, displayName: String)] = [
+        (.read, "Read"),
+        (.off, "Off"),
+        (.touch, "Touch"),
+        (.latch, "Latch"),
+        (.write, "Write"),
+    ]
 
     private func updateAppearance() {
         let baseWhite: CGFloat
@@ -392,6 +607,7 @@ private final class TrackIconButton: NSControl {
 
     var isSelected = false {
         didSet {
+            setAccessibilityValue(isSelected ? 1 : 0)
             updateBlinkTimer()
             needsDisplay = true
         }
@@ -414,6 +630,17 @@ private final class TrackIconButton: NSControl {
 
     required init?(coder: NSCoder) {
         nil
+    }
+
+    override var acceptsFirstResponder: Bool {
+        true
+    }
+
+    func configureAccessibility(label: String) {
+        setAccessibilityElement(true)
+        setAccessibilityRole(.checkBox)
+        setAccessibilityLabel(label)
+        setAccessibilityValue(isSelected ? 1 : 0)
     }
 
     override var mouseDownCanMoveWindow: Bool {
@@ -455,6 +682,23 @@ private final class TrackIconButton: NSControl {
     }
 
     override func mouseDown(with event: NSEvent) {
+        performPress()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        guard event.keyCode == 36 || event.keyCode == 49 else {
+            super.keyDown(with: event)
+            return
+        }
+        performPress()
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        performPress()
+        return true
+    }
+
+    private func performPress() {
         onPressed?()
     }
 
@@ -577,6 +821,7 @@ private final class TrackToggleButton: NSControl {
 
     var isSelected = false {
         didSet {
+            setAccessibilityValue(isSelected ? 1 : 0)
             needsDisplay = true
         }
     }
@@ -598,6 +843,17 @@ private final class TrackToggleButton: NSControl {
 
     required init?(coder: NSCoder) {
         nil
+    }
+
+    override var acceptsFirstResponder: Bool {
+        true
+    }
+
+    func configureAccessibility(label: String) {
+        setAccessibilityElement(true)
+        setAccessibilityRole(.checkBox)
+        setAccessibilityLabel(label)
+        setAccessibilityValue(isSelected ? 1 : 0)
     }
 
     override var mouseDownCanMoveWindow: Bool {
@@ -629,6 +885,24 @@ private final class TrackToggleButton: NSControl {
     }
 
     override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        toggleSelection()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        guard event.keyCode == 36 || event.keyCode == 49 else {
+            super.keyDown(with: event)
+            return
+        }
+        toggleSelection()
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        toggleSelection()
+        return true
+    }
+
+    private func toggleSelection() {
         isSelected.toggle()
         onSelectedChanged?(isSelected)
     }
@@ -677,14 +951,17 @@ private final class TrackToggleButton: NSControl {
 }
 
 private final class HorizontalTrackVolumeSliderView: NSView {
+    var isEditing: Bool { isDragging }
     var value: Float = 1 {
         didSet {
             value = min(max(value, 0), 1)
+            setAccessibilityValue(Double(value))
             needsDisplay = true
         }
     }
 
     var onValueChanged: ((Float) -> Void)?
+    var onEditingBegan: ((Float) -> Void)?
     var onEditingEnded: (() -> Void)?
 
     private var isHovered = false {
@@ -742,6 +1019,7 @@ private final class HorizontalTrackVolumeSliderView: NSView {
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         isDragging = true
+        onEditingBegan?(value)
         updateValue(with: event)
     }
 
@@ -753,6 +1031,30 @@ private final class HorizontalTrackVolumeSliderView: NSView {
         updateValue(with: event)
         isDragging = false
         onEditingEnded?()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        let step: Float
+        switch event.keyCode {
+        case 123:
+            step = -0.02
+        case 124:
+            step = 0.02
+        default:
+            super.keyDown(with: event)
+            return
+        }
+        onEditingBegan?(value)
+        value += step
+        onValueChanged?(value)
+    }
+
+    override func keyUp(with event: NSEvent) {
+        if event.keyCode == 123 || event.keyCode == 124 {
+            onEditingEnded?()
+        } else {
+            super.keyUp(with: event)
+        }
     }
 
     override func draw(_ dirtyRect: NSRect) {

@@ -637,17 +637,17 @@ private final class StemReviewIconButton: NSControl {
         let icon = NSBezierPath()
         icon.lineCapStyle = .round
         icon.lineJoinStyle = .round
-        icon.lineWidth = 2.4
+        icon.lineWidth = 2.1
         switch kind {
         case .accept:
-            icon.move(to: NSPoint(x: rect.midX - 8, y: rect.midY - 1))
-            icon.line(to: NSPoint(x: rect.midX - 2, y: rect.midY - 7))
-            icon.line(to: NSPoint(x: rect.midX + 9, y: rect.midY + 7))
+            icon.move(to: NSPoint(x: rect.midX - 6, y: rect.midY - 1))
+            icon.line(to: NSPoint(x: rect.midX - 1.5, y: rect.midY - 5.5))
+            icon.line(to: NSPoint(x: rect.midX + 7, y: rect.midY + 5.5))
         case .reject:
-            icon.move(to: NSPoint(x: rect.midX - 7, y: rect.midY - 7))
-            icon.line(to: NSPoint(x: rect.midX + 7, y: rect.midY + 7))
-            icon.move(to: NSPoint(x: rect.midX + 7, y: rect.midY - 7))
-            icon.line(to: NSPoint(x: rect.midX - 7, y: rect.midY + 7))
+            icon.move(to: NSPoint(x: rect.midX - 5.5, y: rect.midY - 5.5))
+            icon.line(to: NSPoint(x: rect.midX + 5.5, y: rect.midY + 5.5))
+            icon.move(to: NSPoint(x: rect.midX + 5.5, y: rect.midY - 5.5))
+            icon.line(to: NSPoint(x: rect.midX - 5.5, y: rect.midY + 5.5))
         }
         icon.stroke()
     }

@@ -1,5 +1,6 @@
 import AppKit
 import Metal
+import SoundtimeEditing
 
 struct TimelineSelectionDragSmokeSnapshot: Sendable {
     var leadingProgress: Float
@@ -14,39 +15,152 @@ struct TimelineSelectionDragSmokeSnapshot: Sendable {
 }
 
 struct TimelineDeletionEffectRequest: Sendable {
+    static let animationDuration: CFTimeInterval = 0.14
+    static let lifetime: CFTimeInterval = 0.18
+
     let selection: TimelineSelection
     let sourceSelection: TimelineSelection?
+}
+
+enum TimelineAutomationTool: String, Sendable {
+    case point
+    case curve
+    case pencil
+    case ramp
+    case eraser
+}
+
+struct TimelineAutomationDrawPresentationSample: Sendable {
+    let id: UUID
+    let frameProgress: Double
+    let normalizedValue: Float
+
+    init(
+        id: UUID = UUID(),
+        frameProgress: Double,
+        normalizedValue: Float
+    ) {
+        self.id = id
+        self.frameProgress = frameProgress
+        self.normalizedValue = normalizedValue
+    }
+}
+
+enum TimelineAutomationEditAction: Sendable {
+    case add(pointID: UUID, frameProgress: Double, normalizedValue: Float)
+    case remove(pointIDs: Set<UUID>)
+    case move(
+        pointIDs: Set<UUID>,
+        anchorPointID: UUID,
+        frameProgress: Double,
+        normalizedValue: Float
+    )
+    case setCurve(leavingPointID: UUID, curve: Float)
+    case setCurvePreset(pointIDs: Set<UUID>, preset: TimelineAutomationCurvePreset)
+    case nudge(pointIDs: Set<UUID>, frameDelta: Int, normalizedValueDelta: Float)
+    case setWriteMode(TimelineAutomationWriteMode)
+    case clear
+    case replaceRange(
+        startProgress: Double,
+        endProgress: Double,
+        samples: [TimelineAutomationDrawPresentationSample]
+    )
+    case copy(pointIDs: Set<UUID>)
+    case cut(pointIDs: Set<UUID>)
+    case paste(frameProgress: Double)
+}
+
+struct TimelineAutomationEditRequest: Sendable {
+    let trackID: UUID
+    let parameterID: String
+    let action: TimelineAutomationEditAction
+}
+
+private final class TimelineClipAccessibilityElement: NSAccessibilityElement {
+    private let pressHandler: () -> Void
+
+    init(pressHandler: @escaping () -> Void) {
+        self.pressHandler = pressHandler
+        super.init()
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        pressHandler()
+        return true
+    }
+}
+
+private final class TimelineAutomationPointAccessibilityElement: NSAccessibilityElement {
+    private let selectHandler: () -> Void
+    private let adjustmentHandler: (Int, Float) -> Void
+
+    init(
+        selectHandler: @escaping () -> Void,
+        adjustmentHandler: @escaping (Int, Float) -> Void
+    ) {
+        self.selectHandler = selectHandler
+        self.adjustmentHandler = adjustmentHandler
+        super.init()
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        selectHandler()
+        return true
+    }
+
+    override func accessibilityPerformIncrement() -> Bool {
+        adjustmentHandler(0, 0.01)
+        return true
+    }
+
+    override func accessibilityPerformDecrement() -> Bool {
+        adjustmentHandler(0, -0.01)
+        return true
+    }
+}
+
+final class TimelineRenderFlightGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isInFlight = false
+
+    func begin() -> Bool {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+
+        guard !isInFlight else {
+            return false
+        }
+
+        isInFlight = true
+        return true
+    }
+
+    func finish() {
+        lock.lock()
+        isInFlight = false
+        lock.unlock()
+    }
 }
 
 final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private static let timelineRenderQueueSpecificKey = DispatchSpecificKey<Bool>()
 
-    private final class RenderFlightGate: @unchecked Sendable {
-        private let lock = NSLock()
-        private var isInFlight = false
-
-        func begin() -> Bool {
-            lock.lock()
-            defer {
-                lock.unlock()
-            }
-
-            guard !isInFlight else {
-                return false
-            }
-
-            isInFlight = true
-            return true
-        }
-
-        func finish() {
-            lock.lock()
-            isInFlight = false
-            lock.unlock()
-        }
+    struct AudioDropTarget: Sendable {
+        let trackID: UUID?
+        let projectTime: TimeInterval
     }
 
-    var onAudioFileDropped: ((URL) -> Void)?
+    var onAudioFileDropped: ((URL, AudioDropTarget) -> Void)?
     var onAudioFileDragEntered: ((URL) -> Void)?
     var onAudioFileDragExited: ((URL) -> Void)?
     var onUnsupportedAudioFileDropped: ((URL) -> Void)?
@@ -63,14 +177,25 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onHealAdjacentClipsRequested: (() -> Void)?
     var onNudgeSelectionRequested: ((Int) -> Void)?
     var onSlipClipContentsRequested: ((Int) -> Void)?
+    var onSelectAdjacentClipRequested: ((Int, Bool) -> Void)?
+    var onToggleSelectedClipMuteRequested: (() -> Void)?
+    var onToggleSelectedClipLockRequested: (() -> Void)?
+    var onGroupSelectedClipsRequested: (() -> Void)?
+    var onUngroupSelectedClipsRequested: (() -> Void)?
+    var onRepeatSelectedClipsRequested: (() -> Void)?
+    var onCrossfadeSelectedClipsRequested: (() -> Void)?
     var onSnapSelectionRequested: (() -> Void)?
     var onSelectTimeAcrossLinkedTracksRequested: (() -> Void)?
     var onSelectAllClipsOnTrackRequested: (() -> Void)?
+    var onSelectFollowingClipsRequested: (() -> Void)?
+    var onSelectClipsInTimeSelectionRequested: (() -> Void)?
     var onUndo: (() -> Void)?
     var onRedo: (() -> Void)?
     var onExportRequested: (() -> Void)?
     var onSelectionRegionContextExportRequested: (() -> Void)?
     var onImportAudioFileRequested: (() -> Void)?
+    var onRelinkMissingMediaRequested: (() -> Void)?
+    var onCancelMissingMediaRelinkRequested: (() -> Void)?
     var onOpenProjectRequested: (() -> Void)?
     var onOpenRecentProjectRequested: ((URL) -> Void)?
     var onClearRecentProjectsRequested: (() -> Void)?
@@ -108,7 +233,30 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var onTrackReorderCommitted: ((UUID, Int) -> Void)?
     var onLoopRangeChanged: ((TimelineLoopRange) -> Void)?
     var onLoopRangeEnabledChanged: ((Bool) -> Void)?
+    var onTimelineEndChanged: ((TimeInterval) -> Void)?
     var onPlaybackVisualProgressChanged: ((Float) -> Void)?
+    var onClipDoubleClicked: ((TimelineClipFocusRequest) -> Void)?
+    var onClipSelected: ((TimelineClipFocusRequest?, TimelineClipSelectionIntent) -> Void)?
+    var onClipMarqueeSelected: (([TimelineClipFocusRequest], TimelineClipSelectionIntent) -> Void)?
+    var onClipDragCommitted: (([TimelineClipDragPreview], Bool) -> Void)?
+    var onValidateClipDragPreviews: (([TimelineClipDragPreview]) -> Bool)?
+    var onClipTrimmed: ((TimelineClipFocusRequest, TimelineClipEdge, Float) -> Void)?
+    var onClipPropertiesChanged: ((TimelineClipFocusRequest, TimelineClipPropertyPreview) -> Void)?
+    var onClipContextAction: ((TimelineClipFocusRequest, TimelineClipContextAction) -> Void)?
+    var onCloseFocusedClipRequested: (() -> Void)?
+    var onSplitFocusedClipRequested: (() -> Void)?
+    var onTrimFocusedClipStartRequested: (() -> Void)?
+    var onTrimFocusedClipEndRequested: (() -> Void)?
+    var onMoveFocusedClipEarlierRequested: (() -> Void)?
+    var onMoveFocusedClipLaterRequested: (() -> Void)?
+    var onDuplicateFocusedClipRequested: (() -> Void)?
+    var onRenameFocusedClipRequested: (() -> Void)?
+    var onDeleteFocusedClipRequested: (() -> Void)?
+    var onOpenSelectedClipInspectorRequested: (() -> Void)?
+    var onMoveSelectedClipsAcrossTracksRequested: ((Int) -> Void)?
+    var onAutomationEditRequested: ((TimelineAutomationEditRequest) -> Void)?
+    var onToggleAutomationModeRequested: (() -> Void)?
+    var onPointerPresenceChanged: ((Bool) -> Void)?
     var onExportWAVRequested: (() -> Void)?
     var onExportSelectedRegionRequested: (() -> Void)?
     var onExportMixdownAndStemsRequested: (() -> Void)?
@@ -127,9 +275,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     var canClearSelection = false
     var canDeleteSilence = false
     var canUseDeadAirCandidate = false
+    var canUseFocusedClipCommands = false
+    var canRelinkMissingMedia = false
+    var clipCommandContext = TimelineClipCommandContext()
+    private(set) var isClipSnappingEnabled = true
     var isDebugToolsVisible = false
 
     private enum TimelineDragMode {
+        case seek
         case selection
         case resizeSelectionStart
         case resizeSelectionEnd
@@ -139,6 +292,36 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         case moveLoopRegion
         case horizontalScrollbar
         case verticalScrollbar
+        case timelineEnd
+        case moveClip
+        case trimClipStart
+        case trimClipEnd
+        case clipMarquee
+        case clipFadeIn
+        case clipFadeOut
+        case automationPoint
+        case automationCurve
+        case automationMarquee
+        case automationPencil
+        case automationRamp
+        case automationEraser
+    }
+
+    private struct AutomationHit {
+        enum Kind: Equatable {
+            case point(UUID)
+            case segment(UUID)
+            case fence(UUID?)
+            case lane
+        }
+
+        let kind: Kind
+        let trackID: UUID
+        let parameterID: String
+        let projectProgress: Double
+        let normalizedValue: Float
+        let points: [TimelineRenderState.Track.AutomationPoint]
+        let initialCurve: Float
     }
 
     private enum ScrollGestureMode {
@@ -160,7 +343,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var isAwaitingFirstMetalFrame = true
     private var currentTrackIDs: [UUID] = []
     private var currentRenderTracks: [TimelineRenderState.Track] = []
+    private let clipLabelOverlayView = TimelineClipLabelOverlayView()
+    private var clipAccessibilityElements: [NSAccessibilityElement] = []
+    private var automationAccessibilityElements: [NSAccessibilityElement] = []
+    private let clipMarqueeLayer = CAShapeLayer()
+    private let automationMarqueeLayer = CAShapeLayer()
     private let transcriptOverlayView = TimelineTranscriptOverlayView()
+    private let timelineEndOverlayView = TimelineEndOverlayView()
     private let leftOffscreenPlayheadButton = TimelineOffscreenPlayheadButton(direction: .left)
     private let rightOffscreenPlayheadButton = TimelineOffscreenPlayheadButton(direction: .right)
     private let dropPreviewLayer = CALayer()
@@ -184,6 +373,26 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var selectionAnchorPoint: CGPoint?
     private var selectionAnchorTrackID: UUID?
     private var currentSelection: TimelineSelection?
+    private(set) var isAutomationModeVisible = false
+    private(set) var automationTool = TimelineAutomationTool.point
+    private var displayedAutomationParameterID = TimelineAutomationParameterID.volume.rawValue
+    private var activeAutomationHit: AutomationHit?
+    private var activeAutomationPoints: [TimelineRenderState.Track.AutomationPoint] = []
+    private var activeAutomationDidDrag = false
+    private var activeAutomationMouseDownModifierFlags: NSEvent.ModifierFlags = []
+    private var automationSelection = TimelineAutomationSelection.empty
+    private var automationMarqueeBaseSelection = TimelineAutomationSelection.empty
+    private var activeAutomationDrawSamples: [TimelineAutomationDrawPresentationSample] = []
+    private var activeAutomationErasedPointIDs = Set<UUID>()
+    private var lastAutomationDrawPoint: CGPoint?
+
+    var selectedRangeForEditing: TimelineSelection? {
+        currentSelection
+    }
+
+    var automationParameterID: TimelineAutomationParameterID {
+        TimelineAutomationParameterID(rawValue: displayedAutomationParameterID)
+    }
     private var liveSelectionDragSnapshot: TimelineSelectionDragSnapshot?
     private var selectionDragPreviousPoint: CGPoint?
     private var selectionDragPreviousTimestamp: CFTimeInterval?
@@ -191,8 +400,24 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var activeDragMode: TimelineDragMode?
     private var hoveredSelectionEndpoint: TimelineSelectionEndpoint?
     private var activeSelectionDragOffsetX: CGFloat = 0
+    private var activeClipRequest: TimelineClipFocusRequest?
+    private var activeClipRequests: [TimelineClipFocusRequest] = []
+    private var activeClipDragOffsetProgress: Float = 0
+    private var activeClipDragPreviews: [TimelineClipDragPreview] = []
+    private var activeClipPlacementIsAllowed = true
+    private var lastDisplayedClipPlacementIsAllowed = true
+    private var activeClipPropertyPreview: TimelineClipPropertyPreview?
+    private var activeClipPropertyControl: TimelineClipPropertyControl?
+    private var activeClipDragDuplicates = false
+    private var activeClipSnapGuideProgress: Float?
+    private var hoveredClipRequest: TimelineClipFocusRequest?
+    private var hoveredClipEdge: TimelineClipEdge?
+    private var hoveredClipProperty: TimelineClipPropertyHover?
+    private var armedClipContextRequest: TimelineClipFocusRequest?
+    private var contextMenuClipRequest: TimelineClipFocusRequest?
     private var hoveredLoopEndpoint: TimelineLoopEndpoint?
     private var activeLoopDragOffsetX: CGFloat = 0
+    private var activeLoopResizeFixedProgress: Float?
     private var activeLoopMoveInitialRange: TimelineLoopRange?
     private var activeScrollbarAxis: TimelineScrollbarAxis?
     private var activeScrollbarDragOffset: CGFloat = 0
@@ -252,9 +477,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var selectionDragRenderEndTime: CFTimeInterval?
     private var isProcessingSelectionAnimationActive = false
     private var needsTimelineRender = false
-    private var isRenderDataPreparedRenderPending = false
+    private var timelineRenderRequestGeneration: UInt64 = 0
     private var pendingRenderSubmittedCallbacks: [(CFTimeInterval) -> Void] = []
-    private let renderFlightGate = RenderFlightGate()
+    private let renderFlightGate = TimelineRenderFlightGate()
     private var pendingTranscriptOverlayUpdate = false
     private var pendingCursorRectInvalidation = false
     private var hotPathContractSmokeFrameStatsEndTime: CFTimeInterval?
@@ -268,6 +493,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var isTranscriptAlignmentDebugVisible = false
     private var isTimelinePlaybackActive = false
     private var timelineDuration: TimeInterval = 0
+    private var contentDuration: TimeInterval = 0
+    private var timelineEndTime: TimeInterval?
     private var isTranscriptLayerVisible = false
     private var transcriptDisplayMode = TranscriptTimelineDisplayMode.hidden
     private var presentationPlayheadProgress: Float = 0
@@ -393,6 +620,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             activeSelectionDragOffsetX = 0
             isDraggingSelection = false
             isDraggingLoop = false
+            activeLoopResizeFixedProgress = nil
             edgeAutoPanLastTimestamp = nil
             resetRightPanGestureState()
             stopRightPanMomentum()
@@ -410,7 +638,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         allowImmediateWaveformPrewarm: Bool = true,
         allowImmediateInteractiveWaveformPrewarm: Bool = true,
         updatesRendererImmediately: Bool = false,
-        viewportTransition: TimelineViewportTransitionPolicy = .immediate
+        viewportTransition: TimelineViewportTransitionPolicy = .immediate,
+        completesDeletionHandoff: Bool = false
     ) {
         let previousTimelineDuration = timelineDuration
         let previousViewport = viewport
@@ -423,7 +652,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         activeTrackScrollTransition = nil
         currentTrackIDs = tracks.map(\.id)
         currentRenderTracks = tracks
-        let nextTimelineDuration = Self.timelineDuration(for: tracks)
+        contentDuration = Self.timelineDuration(for: tracks)
+        let nextTimelineDuration = max(contentDuration, timelineEndTime ?? contentDuration)
         timelineDuration = nextTimelineDuration
         let wasSelectionEnabled = isSelectionEnabled
         isSelectionEnabled = Self.hasInteractiveTimelineContent(tracks)
@@ -455,9 +685,16 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             setViewport(pendingRestoredViewport, kicksImmediateRender: false, marksInteraction: false)
         }
         updateTrackLayoutForCurrentBounds(requestRender: false)
+        if completesDeletionHandoff {
+            clipLabelOverlayView.clearDeletionEffects()
+        }
+        updateClipLabelOverlay()
         let drawableMetrics = currentTimelineDrawableMetricsForPrewarm()
         updateBootstrapWaveformView()
         let rendererUpdate: @Sendable (TimelineRenderer) -> Void = { renderer in
+            if completesDeletionHandoff {
+                renderer.clearDeletionEffects()
+            }
             renderer.updatePrewarmViewportSize(
                 drawableMetrics.viewportSize,
                 backingScale: drawableMetrics.backingScale
@@ -466,7 +703,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                 tracks,
                 animateWaveformTransition: animateWaveformTransition,
                 allowImmediateWaveformPrewarm: allowImmediateWaveformPrewarm,
-                allowImmediateInteractiveWaveformPrewarm: allowImmediateInteractiveWaveformPrewarm
+                allowImmediateInteractiveWaveformPrewarm: allowImmediateInteractiveWaveformPrewarm,
+                projectDuration: nextTimelineDuration
             )
             if
                 updatesRendererImmediately,
@@ -493,6 +731,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         if animateWaveformTransition {
             startTransientRenderPulse(duration: waveformTransitionRenderPulseDuration)
         }
+        updateTimelineEndOverlay()
 
         if !isSelectionEnabled {
             selectionAnchorProgress = nil
@@ -502,6 +741,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             activeSelectionDragOffsetX = 0
             isDraggingSelection = false
             isDraggingLoop = false
+            activeLoopResizeFixedProgress = nil
             edgeAutoPanLastTimestamp = nil
             resetRightPanGestureState()
             stopRightPanMomentum()
@@ -511,6 +751,71 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             onSelectionChanged?(nil)
         }
         updateOffscreenPlayheadButtons()
+    }
+
+    func beginLiveRecordingWaveform(layerID: UUID) {
+        updateTimelineRendererImmediately { renderer in
+            renderer.beginLiveRecordingWaveform(layerID: layerID)
+        }
+    }
+
+    @discardableResult
+    func publishLiveRecordingWaveform(_ publication: LiveRecordingWaveformPublication) -> Bool {
+        guard timelineRenderer != nil else { return false }
+        updateTimelineRenderer(requestsRenderAfterUpdate: true) { renderer in
+            renderer.publishLiveRecordingWaveform(publication)
+        }
+        return true
+    }
+
+    func promoteLiveRecordingWaveform(
+        layerID: UUID,
+        toStaticLayerID staticLayerID: UUID,
+        waveformVersion: Int,
+        overview: WaveformOverview
+    ) {
+        updateTimelineRendererImmediately { renderer in
+            renderer.promoteLiveRecordingWaveform(
+                layerID: layerID,
+                toStaticLayerID: staticLayerID,
+                waveformVersion: waveformVersion,
+                overview: overview
+            )
+        }
+    }
+
+    func endLiveRecordingWaveform(layerID: UUID) {
+        updateTimelineRendererImmediately { renderer in
+            renderer.endLiveRecordingWaveform(layerID: layerID)
+        }
+    }
+
+    func displayTimelineEnd(_ endTime: TimeInterval?) {
+        let sanitized = endTime.flatMap { value in
+            value.isFinite ? max(value, 0) : nil
+        }
+        timelineEndTime = sanitized
+        let nextDuration = max(contentDuration, sanitized ?? contentDuration)
+        if nextDuration != timelineDuration {
+            let previousDuration = timelineDuration
+            timelineDuration = nextDuration
+            if previousDuration > 0, nextDuration > 0, !settledViewport.isFull {
+                setViewport(
+                    settledViewport.preservingAbsoluteTimes(
+                        previousDuration: previousDuration,
+                        nextDuration: nextDuration
+                    ),
+                    kicksImmediateRender: false,
+                    marksInteraction: false
+                )
+            }
+            updateTimelineRendererImmediately { renderer in
+                renderer.displayProjectDuration(nextDuration)
+            }
+        }
+        updateTimelineEndOverlay()
+        invalidateTimelineCursorRects()
+        requestTimelineRender()
     }
 
     func prepareTrackInsertionAnimation(at trackIndex: Int) {
@@ -568,10 +873,27 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     func displayTrackMixSettings(_ tracks: [TimelineRenderState.Track]) {
-        currentTrackIDs = tracks.map(\.id)
-        let mergedTracks = mergeTrackMetadata(tracks)
+        let mixesByID = Dictionary(uniqueKeysWithValues: tracks.map {
+            ($0.id, ProjectPlaybackTrackMix(
+                id: $0.id,
+                volume: $0.volume,
+                isMuted: $0.isMuted,
+                isSoloed: $0.isSoloed
+            ))
+        })
+        let mergedTracks = currentRenderTracks.map { track in
+            guard let mix = mixesByID[track.id] else {
+                return track
+            }
+            return track.applying(mix)
+        }
+        guard !mergedTracks.isEmpty else {
+            return
+        }
+        currentTrackIDs = mergedTracks.map(\.id)
         currentRenderTracks = mergedTracks
-        timelineDuration = Self.timelineDuration(for: mergedTracks)
+        contentDuration = Self.timelineDuration(for: mergedTracks)
+        timelineDuration = max(contentDuration, timelineEndTime ?? contentDuration)
         let wasSelectionEnabled = isSelectionEnabled
         isSelectionEnabled = Self.hasInteractiveTimelineContent(mergedTracks)
         updateTrackLayoutForCurrentBounds(requestRender: false)
@@ -597,39 +919,6 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         return true
-    }
-
-    private func mergeTrackMetadata(_ tracks: [TimelineRenderState.Track]) -> [TimelineRenderState.Track] {
-        let currentByID = Dictionary(uniqueKeysWithValues: currentRenderTracks.map { ($0.id, $0) })
-        return tracks.map { track in
-            let current = currentByID[track.id]
-            return TimelineRenderState.Track(
-                id: track.id,
-                waveformVersion: track.waveformOverview == nil ?
-                    (current?.waveformVersion ?? track.waveformVersion) :
-                    track.waveformVersion,
-                waveformOverview: track.waveformOverview ?? current?.waveformOverview,
-                durationHint: track.durationHint ?? current?.durationHint,
-                volume: track.volume,
-                isMuted: track.isMuted,
-                isSoloed: track.isSoloed,
-                hasWaveform: track.hasWaveform || current?.hasWaveform == true,
-                clipRanges: track.clipRanges.isEmpty ? (current?.clipRanges ?? []) : track.clipRanges,
-                waveformSegments: Self.shouldPreserveCurrentWaveformSegments(for: track) ?
-                    (current?.waveformSegments ?? []) :
-                    track.waveformSegments,
-                waveformTileSource: track.waveformTileSource ?? current?.waveformTileSource,
-                transcript: track.transcript ?? current?.transcript
-            )
-        }
-    }
-
-    private static func shouldPreserveCurrentWaveformSegments(
-        for track: TimelineRenderState.Track
-    ) -> Bool {
-        track.waveformSegments.isEmpty &&
-            track.waveformOverview == nil &&
-            track.waveformTileSource == nil
     }
 
     func displayTranscriptLayerVisible(_ isVisible: Bool) {
@@ -856,6 +1145,22 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         startTransientRenderPulse(duration: 0.20)
     }
 
+    func triggerClipShines(_ clips: [TimelineClipReference]) {
+        guard !clips.isEmpty else { return }
+        let timestamp = CACurrentMediaTime()
+        updateTimelineRendererImmediately { renderer in
+            for clip in clips {
+                renderer.triggerClipShine(
+                    trackID: clip.trackID,
+                    clipID: clip.clipID,
+                    at: timestamp
+                )
+            }
+        }
+        requestTimelineRender()
+        startTransientRenderPulse(duration: 0.46)
+    }
+
     func setInteractionSuppressed(_ isSuppressed: Bool) {
         guard isInteractionSuppressed != isSuppressed else {
             updateTimelineRendererImmediately { renderer in
@@ -883,6 +1188,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             activeTranscriptDrag = nil
             activeSelectionDragOffsetX = 0
             activeLoopDragOffsetX = 0
+            activeLoopResizeFixedProgress = nil
             activeLoopMoveInitialRange = nil
             edgeAutoPanLastTimestamp = nil
             displayHoverProgress(nil)
@@ -980,6 +1286,16 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         timelineRenderer != nil && !isAwaitingFirstMetalFrame
     }
 
+    func hotPathContractSmokeWaveformBuffersAreSettled() -> Bool {
+        guard let timelineRenderer else {
+            return false
+        }
+        let drawableMetrics = currentTimelineDrawableMetricsForPrewarm()
+        return timelineRenderer.waveformShaderBuffersAreSettledForSmokeTesting(
+            drawableSize: drawableMetrics.viewportSize
+        )
+    }
+
     func hotPathContractSmokeZoomBurst(stepCount: Int = 8, around anchorProgress: Float = 0.5) {
         hotPathContractSmokeBeginFrameStatsWindow(duration: 0.45)
         let count = max(stepCount, 1)
@@ -1032,7 +1348,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                 renderCadence: .immediate
             )
             submissionMilliseconds = max(submissionMilliseconds, (CACurrentMediaTime() - startedAt) * 1_000)
-            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.004))
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.008))
         }
         requestTimelineRender()
         return submissionMilliseconds
@@ -1300,6 +1616,274 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         requestRender(cadence: renderCadence)
     }
 
+    private func displayHighlightedClipEdge(
+        _ hit: ClipHit?,
+        renderCadence: TimelineRenderCadence = .immediate
+    ) {
+        let request = hit?.edge == nil ? nil : hit?.request
+        let edge = hit?.edge
+        guard hoveredClipRequest != request || hoveredClipEdge != edge else {
+            return
+        }
+
+        hoveredClipRequest = request
+        hoveredClipEdge = edge
+        updateTimelineRendererImmediately { renderer in
+            renderer.displayHighlightedClipEdge(
+                trackID: request?.trackID,
+                clipID: request?.clipID,
+                edge: edge
+            )
+        }
+        requestRender(cadence: renderCadence)
+    }
+
+    private func displayClipDragPreviews(
+        _ previews: [TimelineClipDragPreview],
+        renderCadence: TimelineRenderCadence = .coalescedInteraction
+    ) {
+        let placementAllowed = previews.isEmpty || activeClipPlacementIsAllowed
+        guard
+            activeClipDragPreviews != previews ||
+                lastDisplayedClipPlacementIsAllowed != placementAllowed
+        else {
+            return
+        }
+        activeClipDragPreviews = previews
+        lastDisplayedClipPlacementIsAllowed = placementAllowed
+        clipLabelOverlayView.displayDragPreviews(previews)
+        updateTimelineRendererImmediately { renderer in
+            renderer.displayClipDragPreviews(previews, placementAllowed: placementAllowed)
+        }
+        requestRender(cadence: renderCadence)
+    }
+
+    private func displayClipMarquee(from anchor: CGPoint?, to point: CGPoint?) {
+        guard let anchor, let point else {
+            clipMarqueeLayer.isHidden = true
+            clipMarqueeLayer.path = nil
+            return
+        }
+        let rect = NSRect(
+            x: min(anchor.x, point.x),
+            y: min(anchor.y, point.y),
+            width: abs(point.x - anchor.x),
+            height: abs(point.y - anchor.y)
+        )
+        clipMarqueeLayer.path = CGPath(
+            roundedRect: rect.insetBy(dx: 0.5, dy: 0.5),
+            cornerWidth: 4,
+            cornerHeight: 4,
+            transform: nil
+        )
+        clipMarqueeLayer.isHidden = false
+    }
+
+    private func displayAutomationMarquee(from anchor: CGPoint?, to point: CGPoint?) {
+        guard let anchor, let point else {
+            automationMarqueeLayer.isHidden = true
+            automationMarqueeLayer.path = nil
+            return
+        }
+        let rect = marqueeRect(from: anchor, to: point)
+        automationMarqueeLayer.path = CGPath(
+            roundedRect: rect.insetBy(dx: 0.5, dy: 0.5),
+            cornerWidth: 3,
+            cornerHeight: 3,
+            transform: nil
+        )
+        automationMarqueeLayer.isHidden = false
+    }
+
+    private func displayClipPropertyPreview(_ preview: TimelineClipPropertyPreview?) {
+        guard activeClipPropertyPreview != preview else { return }
+        activeClipPropertyPreview = preview
+        updateTimelineRendererImmediately { renderer in
+            renderer.displayClipPropertyPreview(preview)
+        }
+        requestRender(cadence: .coalescedInteraction)
+    }
+
+    private func displayClipPropertyHover(_ hover: TimelineClipPropertyHover?) {
+        guard hoveredClipProperty != hover else { return }
+        hoveredClipProperty = hover
+        updateTimelineRendererImmediately { renderer in
+            renderer.displayClipPropertyHover(hover)
+        }
+        requestRender(cadence: .coalescedInteraction)
+    }
+
+    @discardableResult
+    private func updateClipDragPreview(
+        to point: CGPoint,
+        renderCadence: TimelineRenderCadence = .coalescedInteraction
+    ) -> [TimelineClipDragPreview] {
+        guard let request = activeClipRequest else {
+            return []
+        }
+
+        let destination = progress(for: point, followsVisualFisheye: false)
+        let previews: [TimelineClipDragPreview]
+        switch activeDragMode {
+        case .moveClip:
+            let requests = activeClipRequests.isEmpty ? [request] : activeClipRequests
+            let minimumStart = requests.map(\.projectStartProgress).min() ?? request.projectStartProgress
+            let requestedDelta = destination - activeClipDragOffsetProgress - request.projectStartProgress
+            // The right side of the timeline is extendable. Clamping against
+            // progress 1 made any clip that defined the project duration
+            // immovable because its maximum permitted delta was always zero.
+            let clampedDelta = max(requestedDelta, -minimumStart)
+            let delta = snappedClipGroupDelta(
+                clampedDelta,
+                requests: requests
+            )
+            let destinationTrackID = trackID(at: point) ?? request.trackID
+            let anchorSourceIndex = currentTrackIDs.firstIndex(of: request.trackID) ?? 0
+            let requestedDestinationIndex = currentTrackIDs.firstIndex(of: destinationTrackID) ?? anchorSourceIndex
+            let selectedSourceIndices = requests.compactMap { currentTrackIDs.firstIndex(of: $0.trackID) }
+            let minimumSourceIndex = selectedSourceIndices.min() ?? anchorSourceIndex
+            let maximumSourceIndex = selectedSourceIndices.max() ?? anchorSourceIndex
+            let trackDelta = min(
+                max(requestedDestinationIndex - anchorSourceIndex, -minimumSourceIndex),
+                max(currentTrackIDs.count - 1 - maximumSourceIndex, 0)
+            )
+            previews = requests.map { item in
+                let sourceIndex = currentTrackIDs.firstIndex(of: item.trackID) ?? anchorSourceIndex
+                let destinationIndex = min(max(sourceIndex + trackDelta, 0), currentTrackIDs.count - 1)
+                return TimelineClipDragPreview(
+                    trackID: item.trackID,
+                    destinationTrackID: currentTrackIDs[destinationIndex],
+                    clipID: item.clipID,
+                    originalStartProjectProgress: item.projectStartProgress,
+                    originalEndProjectProgress: item.projectEndProgress,
+                    presentedStartProjectProgress: item.projectStartProgress + delta,
+                    presentedEndProjectProgress: item.projectEndProgress + delta,
+                    kind: activeClipDragDuplicates ? .duplicate : .move
+                )
+            }
+        case .trimClipStart:
+            let start = snappedClipEdgeProgress(
+                min(max(destination, 0), request.projectEndProgress),
+                request: request
+            )
+            previews = [TimelineClipDragPreview(
+                trackID: request.trackID,
+                clipID: request.clipID,
+                originalStartProjectProgress: request.projectStartProgress,
+                originalEndProjectProgress: request.projectEndProgress,
+                presentedStartProjectProgress: min(start, request.projectEndProgress),
+                presentedEndProjectProgress: request.projectEndProgress,
+                kind: .trimLeading
+            )]
+        case .trimClipEnd:
+            let end = snappedClipEdgeProgress(
+                max(min(destination, 1), request.projectStartProgress),
+                request: request
+            )
+            previews = [TimelineClipDragPreview(
+                trackID: request.trackID,
+                clipID: request.clipID,
+                originalStartProjectProgress: request.projectStartProgress,
+                originalEndProjectProgress: request.projectEndProgress,
+                presentedStartProjectProgress: request.projectStartProgress,
+                presentedEndProjectProgress: max(end, request.projectStartProgress),
+                kind: .trimTrailing
+            )]
+        default:
+            return []
+        }
+
+        activeClipPlacementIsAllowed = onValidateClipDragPreviews?(previews) ?? true
+        displayClipDragPreviews(previews, renderCadence: renderCadence)
+        displayHoverProgress(activeClipSnapGuideProgress ?? destination, isArmed: true, renderCadence: renderCadence)
+        return previews
+    }
+
+    private func clipSnapCandidates(excluding keys: Set<TimelineClipSelectionKey>) -> [Float] {
+        guard timelineDuration > 0 else {
+            return [0, 1]
+        }
+
+        var candidates: [Float] = [0, 1, currentPresentationPlayheadProgress()]
+        if isLoopRangeEnabled {
+            candidates.append(loopRange.startProgress)
+            candidates.append(loopRange.endProgress)
+        }
+        candidates.reserveCapacity(5 + currentRenderTracks.reduce(0) { $0 + $1.clipRanges.count * 2 })
+        for track in currentRenderTracks {
+            let trackDuration = track.durationHint ?? track.waveformOverview?.duration ?? 0
+            guard trackDuration > 0 else {
+                continue
+            }
+            let scale = Float(min(max(trackDuration / timelineDuration, 0), 1))
+            for clip in track.clipRanges where !clip.isSilent {
+                if keys.contains(TimelineClipSelectionKey(trackID: track.id, clipID: clip.id)) {
+                    continue
+                }
+                candidates.append(Float(clip.startProgress) * scale)
+                candidates.append(Float(clip.endProgress) * scale)
+            }
+        }
+        return candidates
+    }
+
+    private func clipSnapCandidates(excluding request: TimelineClipFocusRequest) -> [Float] {
+        clipSnapCandidates(excluding: [TimelineClipSelectionKey(request)])
+    }
+
+    private func snappedClipEdgeProgress(
+        _ progress: Float,
+        request: TimelineClipFocusRequest
+    ) -> Float {
+        snapProgress(progress, candidates: clipSnapCandidates(excluding: request))
+    }
+
+    private func snappedClipGroupDelta(
+        _ delta: Float,
+        requests: [TimelineClipFocusRequest]
+    ) -> Float {
+        let keys = Set(requests.map(TimelineClipSelectionKey.init))
+        let candidates = clipSnapCandidates(excluding: keys)
+        var bestDelta: Float?
+        for request in requests {
+            for edge in [request.projectStartProgress + delta, request.projectEndProgress + delta] {
+                for candidate in candidates {
+                    let snapDelta = candidate - edge
+                    let threshold = Float(8 / max(bounds.width, 1)) * viewport.durationProgress
+                    guard isClipSnappingEnabled, abs(snapDelta) <= threshold else {
+                        continue
+                    }
+                    if bestDelta == nil || abs(snapDelta) < abs(bestDelta!) {
+                        bestDelta = snapDelta
+                    }
+                }
+            }
+        }
+        let minimumStart = requests.map(\.projectStartProgress).min() ?? 0
+        let result = max(delta + (bestDelta ?? 0), -minimumStart)
+        activeClipSnapGuideProgress = bestDelta == nil ? nil : requests
+            .flatMap { [$0.projectStartProgress + result, $0.projectEndProgress + result] }
+            .first { edge in candidates.contains { abs($0 - edge) < 0.000_01 } }
+        return result
+    }
+
+    private func snapProgress(_ progress: Float, candidates: [Float]) -> Float {
+        let scale = 1_000_000
+        let thresholdProgress = Float(8 / max(bounds.width, 1)) * viewport.durationProgress
+        let result = TimelineClipSnapEngine.snap(
+            frame: Int((progress * Float(scale)).rounded()),
+            targets: candidates.map {
+                TimelineClipSnapTarget(frame: Int(($0 * Float(scale)).rounded()), kind: .clipEdge)
+            },
+            configuration: TimelineClipSnapConfiguration(
+                isEnabled: isClipSnappingEnabled,
+                toleranceFrames: Int((thresholdProgress * Float(scale)).rounded())
+            )
+        )
+        activeClipSnapGuideProgress = result.target == nil ? nil : Float(result.frame) / Float(scale)
+        return Float(result.frame) / Float(scale)
+    }
+
     private func displayHighlightedLoopRegion(
         _ isHighlighted: Bool,
         renderCadence: TimelineRenderCadence = .immediate
@@ -1319,11 +1903,21 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private func displayHoverProgress(
         _ progress: Float?,
         isArmed: Bool = false,
+        guideSpan: TimelineHoverGuideSpan? = nil,
         renderCadence: TimelineRenderCadence = .immediate
     ) {
         let publishedProgress = isInteractionSuppressed ? nil : progress
         let publishedArmed = isInteractionSuppressed ? false : isArmed
-        timelineRenderer?.publishInteractionHover(progress: publishedProgress, isArmed: publishedArmed)
+        timelineRenderer?.publishInteractionHover(
+            progress: publishedProgress,
+            isArmed: publishedArmed,
+            guideSpan: publishedProgress == nil ? nil : guideSpan
+        )
+        onHoverGuideStatePublishedForTesting?(
+            publishedProgress,
+            publishedArmed,
+            publishedProgress == nil ? nil : guideSpan
+        )
         requestRender(cadence: renderCadence)
     }
 
@@ -1391,8 +1985,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         guard !requests.isEmpty else {
             return
         }
+        let displayTimestamp = CACurrentMediaTime()
+        clipLabelOverlayView.displayDeletionEffects(
+            requests,
+            startTimestamp: displayTimestamp
+        )
         updateTimelineRendererImmediately { renderer in
-            renderer.triggerDeletionEffects(requests)
+            renderer.triggerDeletionEffects(requests, at: displayTimestamp)
         }
         requestTimelineRender()
         startTransientRenderPulse(duration: deletionEffectRenderPulseDuration)
@@ -1407,6 +2006,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     func clearDeletionEffects() {
+        clipLabelOverlayView.clearDeletionEffects()
         updateTimelineRenderer { renderer in
             renderer.clearDeletionEffects()
         }
@@ -1419,6 +2019,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     private func configure() {
+        setAccessibilityElement(true)
+        setAccessibilityRole(.group)
+        setAccessibilityLabel("Audio timeline")
+        setAccessibilityHelp(
+            "Select clips and time ranges, seek playback, edit the loop range, and navigate tracks. " +
+                "Clip commands are also available from the Edit and Clip menus."
+        )
         colorPixelFormat = .bgra8Unorm
         clearColor = MTLClearColor(red: 0.08, green: 0.08, blue: 0.08, alpha: 1.0)
         framebufferOnly = true
@@ -1428,10 +2035,36 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         layer?.cornerRadius = 0
         layer?.masksToBounds = true
         configureDropPreviewLayer()
+        clipMarqueeLayer.fillColor = NSColor(calibratedRed: 0.10, green: 0.68, blue: 0.72, alpha: 0.10).cgColor
+        clipMarqueeLayer.strokeColor = NSColor(calibratedRed: 0.64, green: 0.94, blue: 0.96, alpha: 0.82).cgColor
+        clipMarqueeLayer.lineWidth = 1
+        clipMarqueeLayer.isHidden = true
+        clipMarqueeLayer.actions = [
+            "path": NSNull(),
+            "hidden": NSNull(),
+            "bounds": NSNull(),
+            "position": NSNull(),
+        ]
+        layer?.addSublayer(clipMarqueeLayer)
+        automationMarqueeLayer.fillColor = NSColor(white: 0.92, alpha: 0.08).cgColor
+        automationMarqueeLayer.strokeColor = NSColor(white: 0.92, alpha: 0.74).cgColor
+        automationMarqueeLayer.lineWidth = 1
+        automationMarqueeLayer.isHidden = true
+        automationMarqueeLayer.actions = [
+            "path": NSNull(),
+            "hidden": NSNull(),
+            "bounds": NSNull(),
+            "position": NSNull(),
+        ]
+        layer?.addSublayer(automationMarqueeLayer)
         bootstrapWaveformView.translatesAutoresizingMaskIntoConstraints = false
+        clipLabelOverlayView.translatesAutoresizingMaskIntoConstraints = false
         transcriptOverlayView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(bootstrapWaveformView)
+        addSubview(clipLabelOverlayView)
         addSubview(transcriptOverlayView)
+        timelineEndOverlayView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(timelineEndOverlayView)
         leftOffscreenPlayheadButton.onActivate = { [weak self] _ in
             self?.revealOffscreenPlayhead()
         }
@@ -1447,13 +2080,19 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     override func layout() {
         super.layout()
         bootstrapWaveformView.frame = bounds
+        clipLabelOverlayView.frame = bounds
         transcriptOverlayView.frame = bounds
+        timelineEndOverlayView.frame = bounds
+        clipMarqueeLayer.frame = bounds
+        automationMarqueeLayer.frame = bounds
         layoutOffscreenPlayheadButtons()
         updateTrackLayoutForCurrentBounds(requestRender: false)
+        updateClipLabelOverlay()
         updateOffscreenPlayheadButtons()
         updateBootstrapWaveformView()
         updateDropPreviewLayout()
         updateTranscriptOverlay()
+        updateTimelineEndOverlay()
         requestTimelineRender()
     }
 
@@ -1547,7 +2186,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
         renderer.onRenderDataPrepared = { [weak self] in
             Task { @MainActor [weak self] in
-                self?.scheduleRenderDataPreparedRender()
+                guard let self, self.window != nil else {
+                    return
+                }
+                self.requestTimelineRender()
             }
         }
 
@@ -1560,6 +2202,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         let currentEmbeddedScrollbarsEnabled = areEmbeddedScrollbarsEnabled
         let currentShowsLoopMoveGuides = showsLoopMoveGuides
         let currentSelection = currentSelection
+        let currentAutomationParameterID = isAutomationModeVisible ? displayedAutomationParameterID : nil
         let currentPlayheadProgress = presentationPlayheadProgress
         let playbackActive = isTimelinePlaybackActive
         let drawableMetrics = currentTimelineDrawableMetricsForPrewarm()
@@ -1582,6 +2225,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                 allowImmediateInteractiveWaveformPrewarm: false
             )
             renderer.displaySelection(currentSelection, marksInteraction: false)
+            renderer.displayAutomationParameter(currentAutomationParameterID)
             renderer.displayPlayheadProgress(
                 currentPlayheadProgress,
                 force: true,
@@ -1682,8 +2326,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         let laneFrame = resolvedLayout.laneFrame(forTrackIndex: newTrackIndex)
         let laneRect: CGRect
         if let laneFrame, laneFrame.isVisible {
-            let topFromTop = CGFloat(laneFrame.clampedTop) * bounds.height
-            let bottomFromTop = CGFloat(laneFrame.clampedBottom) * bounds.height
+            let topFromTop = CGFloat(laneFrame.top) * bounds.height
+            let bottomFromTop = CGFloat(laneFrame.bottom) * bounds.height
             laneRect = CGRect(
                 x: 0,
                 y: bounds.height - bottomFromTop,
@@ -1763,6 +2407,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     private func requestTimelineRender() {
+        timelineRenderRequestGeneration &+= 1
         needsTimelineRender = true
         startTimelineDisplayLink()
     }
@@ -1806,25 +2451,6 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
     }
 
-    private func scheduleRenderDataPreparedRender() {
-        guard window != nil, !isRenderDataPreparedRenderPending else {
-            return
-        }
-
-        isRenderDataPreparedRenderPending = true
-        DispatchQueue.main.async { [weak self] in
-            guard let self else {
-                return
-            }
-
-            isRenderDataPreparedRenderPending = false
-            guard self.window != nil else {
-                return
-            }
-            requestTimelineRender()
-        }
-    }
-
     private func configureDisplayLinkIfNeeded() {
         guard
             timelineDisplayLink == nil,
@@ -1859,6 +2485,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             !needsTimelineRender,
             !isTimelinePlaybackActive,
             !isProcessingSelectionAnimationActive,
+            !isDraggingLoop,
+            !isAutomationDragActive,
             !hasActiveTransientRenderPulse(),
             !hasActiveSelectionDragRenderPulse(),
             activeCameraTransition == nil,
@@ -1888,6 +2516,12 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             isZoomControlInteractionActive ||
             scrollGestureMode != nil ||
             rightPanPreviousPoint != nil
+    }
+
+    private var isAutomationDragActive: Bool {
+        activeDragMode == .automationPoint ||
+            activeDragMode == .automationCurve ||
+            activeDragMode == .automationMarquee
     }
 
     private func invalidateTimelineCursorRects() {
@@ -1935,14 +2569,29 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private func displayLinkDidTick(_ frame: TimelineDisplayLinkFrame) {
         publishPerformanceRenderDemand()
         let sampledAt = CACurrentMediaTime()
+        let didAdvanceClipDeletion = clipLabelOverlayView.advanceDeletionPresentation(
+            at: sampledAt
+        )
         let didAutoPan = stepEdgeAutoPan(sampledAt: sampledAt)
         let didAdvanceCamera = stepCameraTransition(sampledAt: sampledAt)
         let didAdvanceTrackScroll = stepTrackScrollTransition(sampledAt: sampledAt)
         let didAdvanceTrackReorder = stepTrackReorder(sampledAt: sampledAt)
         let didAdvanceScrollbarHover = stepScrollbarHover(sampledAt: sampledAt)
+        let didRefreshSelection = refreshLiveSelectionFromCurrentMouse(sampledAt: sampledAt)
+        let didRefreshLoop = refreshLiveLoopFromCurrentMouse()
+        let didRefreshAutomation = refreshLiveAutomationFromCurrentMouse()
+        if didRefreshSelection || didRefreshLoop || didRefreshAutomation {
+            PerformanceSampler.shared.recordTimelineInputEvent(
+                kind: "display-paced-drag-sample",
+                at: sampledAt
+            )
+        }
         let shouldRender = needsTimelineRender ||
             isTimelinePlaybackActive ||
             isProcessingSelectionAnimationActive ||
+            isDraggingLoop ||
+            isAutomationDragActive ||
+            didAdvanceClipDeletion ||
             hasActiveTransientRenderPulse() ||
             hasActiveSelectionDragRenderPulse() ||
             activeCameraTransition != nil ||
@@ -1952,6 +2601,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             didAutoPan ||
             didAdvanceTrackReorder ||
             didAdvanceScrollbarHover ||
+            didRefreshSelection ||
+            didRefreshLoop ||
+            didRefreshAutomation ||
             isHotPathContractSmokeFrameStatsActive
 
         guard shouldRender else {
@@ -1963,7 +2615,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
-        if refreshLiveSelectionFromCurrentMouse(sampledAt: sampledAt) {
+        if didRefreshSelection || didRefreshLoop || didRefreshAutomation {
             needsTimelineRender = true
         }
 
@@ -1973,12 +2625,23 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             updateOffscreenPlayheadButtons(playheadProgress: playheadProgress)
         }
 
+        let submittedRequestGeneration = timelineRenderRequestGeneration
         let didSubmitRender = submitTimelineRender(frame: frame)
         if didSubmitRender {
-            needsTimelineRender = false
+            needsTimelineRender = Self.renderRequestRemainsPendingAfterSubmission(
+                submittedGeneration: submittedRequestGeneration,
+                currentGeneration: timelineRenderRequestGeneration
+            )
             finishBootstrapWaveformHandoffAfterSubmittedFrame()
         }
         stopTimelineDisplayLinkIfIdle()
+    }
+
+    nonisolated static func renderRequestRemainsPendingAfterSubmission(
+        submittedGeneration: UInt64,
+        currentGeneration: UInt64
+    ) -> Bool {
+        currentGeneration != submittedGeneration
     }
 
     private func stepTrackReorder(sampledAt timestamp: CFTimeInterval) -> Bool {
@@ -2055,13 +2718,17 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         latestSubmittedPresentationTimestamp = frame.targetPresentationTimestamp
-        timelineRenderQueue.async { [weak self, timelineRenderer, renderTarget] in
-            timelineRenderer.render(to: renderTarget)
+        timelineRenderQueue.async { [weak self, timelineRenderer, renderTarget, renderFlightGate] in
+            let didCommit = timelineRenderer.render(to: renderTarget) {
+                renderFlightGate.finish()
+            }
             let submittedAt = CACurrentMediaTime()
             DispatchQueue.main.async { [weak self] in
                 self?.finishPendingRenderSubmittedCallbacks(submittedAt: submittedAt)
             }
-            self?.renderFlightGate.finish()
+            if !didCommit {
+                renderFlightGate.finish()
+            }
         }
         return true
     }
@@ -2161,6 +2828,12 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         requestRender(cadence: cadence)
     }
 
+    private func wakeDisplayPacedInteractionSampler() {
+        // Raw mouse events can substantially outpace the display. They only keep the sampler
+        // awake; the display link owns pointer geometry publication and renderer interaction work.
+        startTimelineDisplayLink()
+    }
+
     private func currentMousePointInTimeline() -> CGPoint? {
         guard let window else {
             return nil
@@ -2173,7 +2846,6 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private func refreshLiveSelectionFromCurrentMouse(sampledAt timestamp: CFTimeInterval) -> Bool {
         guard
             isSelectionEnabled,
-            activeDragMode == .selection,
             isDraggingSelection,
             let selectionAnchorProgress,
             let point = currentMousePointInTimeline()
@@ -2181,19 +2853,48 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return false
         }
 
-        let dragVelocity = updateSelectionDragVelocity(to: point, timestamp: timestamp)
-        let dragProgress = preciseProgress(for: point)
-        updateSelection(
-            from: selectionAnchorProgress,
-            to: dragProgress,
-            notifyChange: false,
-            liveLeadingProgress: dragProgress,
-            liveVelocityPixelsPerSecond: dragVelocity.speed,
-            liveDirection: dragVelocity.direction,
-            liveTimestamp: timestamp,
-            schedulesRender: false
+        switch activeDragMode {
+        case .selection:
+            let dragVelocity = updateSelectionDragVelocity(to: point, timestamp: timestamp)
+            let dragProgress = preciseProgress(for: point)
+            updateSelection(
+                from: selectionAnchorProgress,
+                to: dragProgress,
+                notifyChange: false,
+                liveLeadingProgress: dragProgress,
+                liveVelocityPixelsPerSecond: dragVelocity.speed,
+                liveDirection: dragVelocity.direction,
+                liveTimestamp: timestamp,
+                schedulesRender: false
+            )
+            return true
+        case .resizeSelectionStart, .resizeSelectionEnd:
+            updateSelectionResizeDrag(
+                to: point,
+                timestamp: timestamp,
+                schedulesRender: false
+            )
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func refreshLiveLoopFromCurrentMouse() -> Bool {
+        guard
+            isDraggingLoop,
+            let point = currentMousePointInTimeline()
+        else {
+            return false
+        }
+
+        // AppKit drag events may arrive either above or below display cadence. This is the single
+        // live owner of loop geometry so each presentable frame consumes exactly one pointer sample.
+        return updateActiveLoopDrag(
+            to: point,
+            renderCadence: .none,
+            notifiesChange: true
         )
-        return true
     }
 
     private var isEdgeAutoPanDragActive: Bool {
@@ -2206,9 +2907,26 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return isDraggingSelection
         case .loopStart, .loopEnd:
             return isDraggingLoop
+        case .moveClip, .trimClipStart, .trimClipEnd:
+            return isDraggingSelection
+        case .clipFadeIn, .clipFadeOut:
+            return isDraggingSelection
+        case
+            .automationPoint,
+            .automationCurve,
+            .automationMarquee,
+            .automationPencil,
+            .automationRamp,
+            .automationEraser:
+            return false
+        case .clipMarquee:
+            return false
+        case .timelineEnd:
+            return true
         case .horizontalScrollbar, .verticalScrollbar:
             return false
         case
+            .seek,
             .selection,
             .loopRegion,
             .moveLoopRegion,
@@ -2264,20 +2982,32 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onNavigationScrollActivity?(.horizontal)
 
         switch activeDragMode {
-        case .resizeSelectionStart, .resizeSelectionEnd:
-            updateSelectionResizeDrag(
-                to: point,
-                timestamp: timestamp,
-                schedulesRender: false
-            )
-        case .loopStart, .loopEnd:
-            updateLoopEndpointDrag(to: point)
+        case .resizeSelectionStart, .resizeSelectionEnd, .loopStart, .loopEnd:
+            // The display-paced pointer refresh below owns these geometries. Recomputing them here
+            // would publish the same state twice in one display interval during edge auto-pan.
+            break
+        case .moveClip, .trimClipStart, .trimClipEnd:
+            updateClipDragPreview(to: point, renderCadence: .coalescedInteraction)
+        case .clipFadeIn, .clipFadeOut:
+            updateClipPropertyPreview(to: point)
+        case
+            .automationPoint,
+            .automationCurve,
+            .automationMarquee,
+            .automationPencil,
+            .automationRamp,
+            .automationEraser:
+            break
+        case .timelineEnd:
+            updateTimelineEndDrag(to: point)
         case .horizontalScrollbar, .verticalScrollbar:
             break
         case
+            .seek,
             .selection,
             .loopRegion,
             .moveLoopRegion,
+            .clipMarquee,
             .none:
             break
         }
@@ -2421,7 +3151,12 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         window?.makeFirstResponder(self)
 
         if let url = firstSupportedAudioURL(from: sender.draggingPasteboard) {
-            onAudioFileDropped?(url)
+            let point = convert(sender.draggingLocation, from: nil)
+            let target = AudioDropTarget(
+                trackID: trackID(at: point),
+                projectTime: projectTime(atRawX: point.x)
+            )
+            onAudioFileDropped?(url, target)
             return true
         }
 
@@ -2435,6 +3170,108 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     override func keyDown(with event: NSEvent) {
         guard !isInteractionSuppressed else {
+            return
+        }
+
+        let unmodifiedKey = event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty
+        if unmodifiedKey, event.charactersIgnoringModifiers?.lowercased() == "a" {
+            guard !event.isARepeat else { return }
+            toggleAutomationMode(nil)
+            return
+        }
+        if unmodifiedKey, event.charactersIgnoringModifiers?.lowercased() == "c" {
+            guard !event.isARepeat else { return }
+            selectAutomationCurveTool(nil)
+            return
+        }
+        if unmodifiedKey, event.charactersIgnoringModifiers?.lowercased() == "p" {
+            guard !event.isARepeat else { return }
+            cycleDisplayedAutomationParameter()
+            return
+        }
+        if isAutomationModeVisible,
+           (event.keyCode == 51 || event.keyCode == 117),
+           let address = automationSelection.address,
+           case let .track(trackID) = address.owner,
+           !automationSelection.pointIDs.isEmpty {
+            onAutomationEditRequested?(TimelineAutomationEditRequest(
+                trackID: trackID,
+                parameterID: address.parameterID.rawValue,
+                action: .remove(pointIDs: automationSelection.pointIDs)
+            ))
+            setAutomationSelection(.empty)
+            return
+        }
+
+        if isAutomationModeVisible,
+           event.modifierFlags.contains(.command),
+           event.modifierFlags.intersection([.control, .option]).isEmpty,
+           let character = event.charactersIgnoringModifiers?.lowercased(),
+           ["c", "x", "v"].contains(character),
+           let address = automationSelection.address,
+           case let .track(trackID) = address.owner {
+            switch character {
+            case "c" where !automationSelection.pointIDs.isEmpty:
+                onAutomationEditRequested?(TimelineAutomationEditRequest(
+                    trackID: trackID,
+                    parameterID: address.parameterID.rawValue,
+                    action: .copy(pointIDs: automationSelection.pointIDs)
+                ))
+                return
+            case "x" where !automationSelection.pointIDs.isEmpty:
+                onAutomationEditRequested?(TimelineAutomationEditRequest(
+                    trackID: trackID,
+                    parameterID: address.parameterID.rawValue,
+                    action: .cut(pointIDs: automationSelection.pointIDs)
+                ))
+                setAutomationSelection(.empty)
+                return
+            case "v":
+                onAutomationEditRequested?(TimelineAutomationEditRequest(
+                    trackID: trackID,
+                    parameterID: address.parameterID.rawValue,
+                    action: .paste(frameProgress: Double(currentPresentationPlayheadProgress()))
+                ))
+                return
+            default:
+                break
+            }
+        }
+
+        if
+            isAutomationModeVisible,
+            let address = automationSelection.address,
+            case let .track(trackID) = address.owner,
+            !automationSelection.pointIDs.isEmpty,
+            [123, 124, 125, 126].contains(event.keyCode),
+            event.modifierFlags.intersection([.command, .control, .option]).isEmpty
+        {
+            let multiplier = event.modifierFlags.contains(.shift) ? 10 : 1
+            let frameDelta: Int
+            let normalizedValueDelta: Float
+            switch event.keyCode {
+            case 123:
+                frameDelta = -multiplier
+                normalizedValueDelta = 0
+            case 124:
+                frameDelta = multiplier
+                normalizedValueDelta = 0
+            case 125:
+                frameDelta = 0
+                normalizedValueDelta = -0.01 * Float(multiplier)
+            default:
+                frameDelta = 0
+                normalizedValueDelta = 0.01 * Float(multiplier)
+            }
+            onAutomationEditRequested?(TimelineAutomationEditRequest(
+                trackID: trackID,
+                parameterID: address.parameterID.rawValue,
+                action: .nudge(
+                    pointIDs: automationSelection.pointIDs,
+                    frameDelta: frameDelta,
+                    normalizedValueDelta: normalizedValueDelta
+                )
+            ))
             return
         }
 
@@ -2550,6 +3387,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        if event.modifierFlags.contains(.control), (event.keyCode == 123 || event.keyCode == 124) {
+            onSelectAdjacentClipRequested?(
+                event.keyCode == 124 ? 1 : -1,
+                event.modifierFlags.contains(.shift)
+            )
+            return
+        }
+
         if event.keyCode == 14, event.modifierFlags.contains(.command) {
             onExportRequested?()
             return
@@ -2570,7 +3415,11 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         if event.keyCode == 15, event.modifierFlags.contains(.command) {
-            onReapplyLastEffect?()
+            if event.modifierFlags.contains(.shift) {
+                onReapplyLastEffect?()
+            } else if clipCommandContext.isEnabled(.repeatClips) {
+                onRepeatSelectedClipsRequested?()
+            }
             return
         }
 
@@ -2586,14 +3435,22 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         if event.keyCode == 53 {
             displaySelection(nil)
             displayTranscriptSelection(nil)
+            displayAutomationMarquee(from: nil, to: nil)
+            displayAutomationPreview(points: nil, hit: nil)
             onSelectionChanged?(nil)
             onTranscriptSelectionChanged?(nil)
             onTimelineInteractionBegan?()
             activeDragMode = nil
+            activeAutomationHit = nil
+            activeAutomationPoints.removeAll(keepingCapacity: true)
+            activeAutomationDidDrag = false
+            activeAutomationMouseDownModifierFlags = []
+            automationMarqueeBaseSelection = .empty
             activeTranscriptDrag = nil
             activeSelectionDragOffsetX = 0
             isDraggingSelection = false
             isDraggingLoop = false
+            activeLoopResizeFixedProgress = nil
             flushPendingCursorRectInvalidationIfNeeded()
             return
         }
@@ -2642,8 +3499,23 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         addTranscriptCursorRects()
+        if isAutomationModeVisible {
+            addCursorRect(bounds, cursor: .crosshair)
+        }
+        if let markerX = timelineEndMarkerX() {
+            addCursorRect(
+                NSRect(
+                    x: markerX - 6,
+                    y: rulerLaneRect().minY,
+                    width: 30,
+                    height: rulerLaneRect().height
+                ),
+                cursor: .resizeLeftRight
+            )
+        }
         addLoopHandleCursorRects()
         addSelectionEdgeCursorRects()
+        addClipCursorRects()
         if areEmbeddedScrollbarsEnabled {
             let scrollbarGeometry = currentScrollbarGeometry()
             if scrollbarGeometry.isHorizontalScrollable {
@@ -2659,14 +3531,36 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         guard
             !isInteractionSuppressed,
             isSelectionEnabled,
-            activeDragMode == nil
+            activeDragMode == nil,
+            isFrontmostPointerOwner(for: event)
         else {
-            super.cursorUpdate(with: event)
             return
         }
 
         let point = convert(event.locationInWindow, from: nil)
+        if isAutomationModeVisible, let hit = automationHit(at: point) {
+            displayClipPropertyHover(nil)
+            displayAutomationHover(for: hit)
+            switch hit.kind {
+            case .point:
+                NSCursor.pointingHand.set()
+            case .segment where automationTool == .curve:
+                NSCursor.resizeUpDown.set()
+            case .segment, .fence, .lane:
+                NSCursor.crosshair.set()
+            }
+            return
+        }
+        if timelineEndHandleHit(at: point) {
+            displayClipPropertyHover(nil)
+            timelineEndOverlayView.isHandleHovered = true
+            NSCursor.resizeLeftRight.set()
+            return
+        }
+        timelineEndOverlayView.isHandleHovered = false
         if let endpointHit = selectionEndpointHit(at: point) {
+            displayClipPropertyHover(nil)
+            displayHighlightedClipEdge(nil, renderCadence: .coalescedInteraction)
             displayHighlightedSelectionEndpoint(
                 endpointHit.endpoint,
                 renderCadence: .coalescedInteraction
@@ -2676,7 +3570,43 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         displayHighlightedSelectionEndpoint(nil, renderCadence: .coalescedInteraction)
+        if let propertyHit = clipPropertyHit(at: point) {
+            displayClipPropertyHover(TimelineClipPropertyHover(
+                trackID: propertyHit.request.trackID,
+                clipID: propertyHit.request.clipID,
+                control: propertyHit.control
+            ))
+            displayHighlightedClipEdge(nil, renderCadence: .coalescedInteraction)
+            NSCursor.resizeLeftRight.set()
+            return
+        }
+        displayClipPropertyHover(nil)
+        if let hit = clipHit(at: point), hit.edge != nil {
+            displayClipPropertyHover(nil)
+            displayHighlightedClipEdge(hit, renderCadence: .coalescedInteraction)
+            NSCursor.resizeLeftRight.set()
+            return
+        }
+        if let hit = clipHit(at: point), hit.isHeader {
+            displayClipPropertyHover(nil)
+            displayHighlightedClipEdge(nil, renderCadence: .coalescedInteraction)
+            NSCursor.openHand.set()
+            return
+        }
+        displayHighlightedClipEdge(nil, renderCadence: .coalescedInteraction)
+        displayClipPropertyHover(nil)
         super.cursorUpdate(with: event)
+    }
+
+    private func isFrontmostPointerOwner(for event: NSEvent) -> Bool {
+        guard let window, let contentView = window.contentView else {
+            return true
+        }
+        let point = contentView.convert(event.locationInWindow, from: nil)
+        guard let hitView = contentView.hitTest(point) else {
+            return false
+        }
+        return hitView === self || hitView.isDescendant(of: self)
     }
 
     private func addTranscriptCursorRects() {
@@ -2698,17 +3628,56 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         )
     }
 
+    private func addClipCursorRects() {
+        guard timelineDuration > 0, viewport.durationProgress > 0 else {
+            return
+        }
+        let layout = resolvedTrackLayoutForCurrentBounds()
+        for (trackIndex, track) in currentRenderTracks.enumerated() {
+            guard let lane = layout.laneFrame(forTrackIndex: trackIndex), lane.isVisible else {
+                continue
+            }
+            let duration = track.durationHint ?? track.waveformOverview?.duration ?? 0
+            guard duration > 0 else {
+                continue
+            }
+            let scale = duration / timelineDuration
+            let bottom = bounds.height - CGFloat(lane.bottom) * bounds.height
+            let height = CGFloat(lane.height) * bounds.height
+            let headerHeight = min(22, height)
+            for clip in track.clipRanges where !clip.isSilent {
+                let start = Float(clip.startProgress * scale)
+                let end = Float(clip.endProgress * scale)
+                let startX = CGFloat((start - viewport.startProgress) / viewport.durationProgress) * bounds.width
+                let endX = CGFloat((end - viewport.startProgress) / viewport.durationProgress) * bounds.width
+                for x in [startX, endX] where x >= -10 && x <= bounds.width + 10 {
+                    addCursorRect(
+                        NSRect(x: x - 8, y: bottom, width: 16, height: height),
+                        cursor: .resizeLeftRight
+                    )
+                }
+                let headerRect = NSRect(
+                    x: max(startX + 8, 0),
+                    y: bottom + height - headerHeight,
+                    width: max(min(endX - 8, bounds.width) - max(startX + 8, 0), 0),
+                    height: headerHeight
+                )
+                if headerRect.width > 2 {
+                    addCursorRect(headerRect, cursor: .openHand)
+                }
+            }
+        }
+    }
+
     private func addLoopHandleCursorRects() {
-        let rulerRect = rulerLaneRect()
-        guard rulerRect.width > 0, rulerRect.height > 0 else {
+        let loopBandRect = loopInteractionBandRect()
+        guard loopBandRect.width > 0, loopBandRect.height > 0 else {
             return
         }
 
-        addCursorRect(rulerRect, cursor: .pointingHand)
-        if
-            isLoopRangeEnabled,
-            let loopRegionRect = loopRegionRect()
-        {
+        addCursorRect(rulerSeekBandRect(), cursor: .pointingHand)
+        addCursorRect(loopBandRect, cursor: .pointingHand)
+        if let loopRegionRect = loopRegionRect() {
             addCursorRect(loopRegionRect, cursor: .openHand)
         }
         for endpoint in [TimelineLoopEndpoint.start, .end] {
@@ -2799,6 +3768,107 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onToggleDebugTools?()
     }
 
+    @objc func toggleAutomationMode(_ sender: Any?) {
+        if let onToggleAutomationModeRequested {
+            onToggleAutomationModeRequested()
+            return
+        }
+        setAutomationModeVisible(!isAutomationModeVisible)
+    }
+
+    func setAutomationModeVisible(_ isVisible: Bool) {
+        guard isAutomationModeVisible != isVisible else {
+            let displayedParameterID = isVisible ? displayedAutomationParameterID : nil
+            updateTimelineRendererImmediately { renderer in
+                renderer.displayAutomationParameter(displayedParameterID)
+            }
+            requestTimelineRender()
+            return
+        }
+
+        isAutomationModeVisible = isVisible
+        if !isAutomationModeVisible {
+            activeAutomationHit = nil
+            activeAutomationPoints.removeAll(keepingCapacity: true)
+            activeAutomationDidDrag = false
+            activeAutomationMouseDownModifierFlags = []
+            setAutomationSelection(.empty)
+        }
+        let displayedParameterID = isAutomationModeVisible ? displayedAutomationParameterID : nil
+        updateTimelineRendererImmediately { renderer in
+            renderer.displayAutomationParameter(displayedParameterID)
+            renderer.displayAutomationHover(nil)
+            renderer.displayAutomationPreview(nil)
+        }
+        invalidateTimelineCursorRects()
+        requestTimelineRender()
+    }
+
+    func setDisplayedAutomationParameter(_ parameterID: TimelineAutomationParameterID) {
+        guard
+            parameterID != automationParameterID,
+            TimelineAutomationParameterRegistry.descriptor(for: parameterID)?.supportedOwners.contains(.track) == true
+        else {
+            return
+        }
+        displayedAutomationParameterID = parameterID.rawValue
+        setAutomationSelection(.empty)
+        activeAutomationHit = nil
+        activeAutomationPoints.removeAll(keepingCapacity: true)
+        let renderedParameterID = isAutomationModeVisible ? parameterID.rawValue : nil
+        updateTimelineRendererImmediately { renderer in
+            renderer.displayAutomationParameter(renderedParameterID)
+            renderer.displayAutomationHover(nil)
+            renderer.displayAutomationPreview(nil)
+        }
+        invalidateTimelineCursorRects()
+        requestTimelineRender()
+    }
+
+    @objc func selectAutomationPointTool(_ sender: Any?) {
+        automationTool = .point
+        if !isAutomationModeVisible {
+            toggleAutomationMode(nil)
+        }
+    }
+
+    @objc func selectAutomationCurveTool(_ sender: Any?) {
+        automationTool = .curve
+        if !isAutomationModeVisible {
+            toggleAutomationMode(nil)
+        }
+    }
+
+    @objc func selectAutomationPencilTool(_ sender: Any?) { selectAutomationTool(.pencil) }
+    @objc func selectAutomationRampTool(_ sender: Any?) { selectAutomationTool(.ramp) }
+    @objc func selectAutomationEraserTool(_ sender: Any?) { selectAutomationTool(.eraser) }
+
+    private func selectAutomationTool(_ tool: TimelineAutomationTool) {
+        automationTool = tool
+        if !isAutomationModeVisible { toggleAutomationMode(nil) }
+        invalidateTimelineCursorRects()
+    }
+
+    @objc func setAutomationCurveLinear(_ sender: Any?) { setSelectedAutomationCurvePreset(.linear) }
+    @objc func setAutomationCurveEaseIn(_ sender: Any?) { setSelectedAutomationCurvePreset(.easeIn) }
+    @objc func setAutomationCurveEaseOut(_ sender: Any?) { setSelectedAutomationCurvePreset(.easeOut) }
+    @objc func setAutomationCurveSCurve(_ sender: Any?) { setSelectedAutomationCurvePreset(.sCurve) }
+    @objc func setAutomationCurveStepped(_ sender: Any?) { setSelectedAutomationCurvePreset(.stepped) }
+
+    private func setSelectedAutomationCurvePreset(_ preset: TimelineAutomationCurvePreset) {
+        guard
+            isAutomationModeVisible,
+            let address = automationSelection.address,
+            case let .track(trackID) = address.owner,
+            !automationSelection.pointIDs.isEmpty
+        else { return }
+        onAutomationEditRequested?(TimelineAutomationEditRequest(
+            trackID: trackID,
+            parameterID: address.parameterID.rawValue,
+            action: .setCurvePreset(pointIDs: automationSelection.pointIDs, preset: preset)
+        ))
+    }
+
     @objc func undoTimelineEdit(_ sender: Any?) {
         onUndo?()
     }
@@ -2808,6 +3878,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     @objc func cutTimelineSelection(_ sender: Any?) {
+        if requestAutomationClipboardAction(isCut: true) { return }
         onCutSelection?()
     }
 
@@ -2816,6 +3887,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     @objc func copyTimelineSelection(_ sender: Any?) {
+        if requestAutomationClipboardAction(isCut: false) { return }
         onCopySelection?()
     }
 
@@ -2824,7 +3896,36 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     @objc func pasteTimelineAudio(_ sender: Any?) {
+        if
+            isAutomationModeVisible,
+            let address = automationSelection.address,
+            case let .track(trackID) = address.owner
+        {
+            onAutomationEditRequested?(TimelineAutomationEditRequest(
+                trackID: trackID,
+                parameterID: address.parameterID.rawValue,
+                action: .paste(frameProgress: Double(currentPresentationPlayheadProgress()))
+            ))
+            return
+        }
         onPasteAudio?()
+    }
+
+    private func requestAutomationClipboardAction(isCut: Bool) -> Bool {
+        guard
+            isAutomationModeVisible,
+            let address = automationSelection.address,
+            case let .track(trackID) = address.owner,
+            !automationSelection.pointIDs.isEmpty
+        else { return false }
+        onAutomationEditRequested?(TimelineAutomationEditRequest(
+            trackID: trackID,
+            parameterID: address.parameterID.rawValue,
+            action: isCut ? .cut(pointIDs: automationSelection.pointIDs) :
+                .copy(pointIDs: automationSelection.pointIDs)
+        ))
+        if isCut { setAutomationSelection(.empty) }
+        return true
     }
 
     @objc func paste(_ sender: Any?) {
@@ -2885,6 +3986,25 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onSlipClipContentsRequested?(1)
     }
 
+    @objc func selectPreviousClip(_ sender: Any?) {
+        onSelectAdjacentClipRequested?(-1, false)
+    }
+
+    @objc func selectNextClip(_ sender: Any?) {
+        onSelectAdjacentClipRequested?(1, false)
+    }
+
+    @objc func toggleSelectedClipMute(_ sender: Any?) { onToggleSelectedClipMuteRequested?() }
+    @objc func toggleSelectedClipLock(_ sender: Any?) { onToggleSelectedClipLockRequested?() }
+    @objc func groupSelectedClips(_ sender: Any?) { onGroupSelectedClipsRequested?() }
+    @objc func ungroupSelectedClips(_ sender: Any?) { onUngroupSelectedClipsRequested?() }
+    @objc func repeatSelectedClips(_ sender: Any?) { onRepeatSelectedClipsRequested?() }
+    @objc func crossfadeSelectedClips(_ sender: Any?) { onCrossfadeSelectedClipsRequested?() }
+    @objc func toggleClipSnapping(_ sender: Any?) {
+        isClipSnappingEnabled.toggle()
+        activeClipSnapGuideProgress = nil
+    }
+
     @objc func snapSelectionToPlayheadEdgesOrSilence(_ sender: Any?) {
         onSnapSelectionRequested?()
     }
@@ -2895,6 +4015,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     @objc func selectAllClipsOnTrack(_ sender: Any?) {
         onSelectAllClipsOnTrackRequested?()
+    }
+
+    @objc func selectFollowingClips(_ sender: Any?) {
+        onSelectFollowingClipsRequested?()
+    }
+
+    @objc func selectClipsInTimeSelection(_ sender: Any?) {
+        onSelectClipsInTimeSelectionRequested?()
     }
 
     @objc func zoomToSelection(_ sender: Any?) {
@@ -2999,6 +4127,62 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onReapplyLastEffect?()
     }
 
+    @objc func closeFocusedClipInspector(_ sender: Any?) {
+        onCloseFocusedClipRequested?()
+    }
+
+    @objc func splitFocusedClipAtPlayhead(_ sender: Any?) {
+        onSplitFocusedClipRequested?()
+    }
+
+    @objc func trimFocusedClipStartToPlayhead(_ sender: Any?) {
+        onTrimFocusedClipStartRequested?()
+    }
+
+    @objc func trimFocusedClipEndToPlayhead(_ sender: Any?) {
+        onTrimFocusedClipEndRequested?()
+    }
+
+    @objc func moveFocusedClipEarlier(_ sender: Any?) {
+        onMoveFocusedClipEarlierRequested?()
+    }
+
+    @objc func moveFocusedClipLater(_ sender: Any?) {
+        onMoveFocusedClipLaterRequested?()
+    }
+
+    @objc func duplicateFocusedClip(_ sender: Any?) {
+        onDuplicateFocusedClipRequested?()
+    }
+
+    @objc func renameFocusedClip(_ sender: Any?) {
+        onRenameFocusedClipRequested?()
+    }
+
+    @objc func deleteFocusedClip(_ sender: Any?) {
+        onDeleteFocusedClipRequested?()
+    }
+
+    @objc func openSelectedClipInspector(_ sender: Any?) {
+        onOpenSelectedClipInspectorRequested?()
+    }
+
+    @objc func moveSelectedClipsToTrackAbove(_ sender: Any?) {
+        onMoveSelectedClipsAcrossTracksRequested?(-1)
+    }
+
+    @objc func moveSelectedClipsToTrackBelow(_ sender: Any?) {
+        onMoveSelectedClipsAcrossTracksRequested?(1)
+    }
+
+    @objc func relinkMissingMedia(_ sender: Any?) {
+        onRelinkMissingMediaRequested?()
+    }
+
+    @objc func cancelMissingMediaRelink(_ sender: Any?) {
+        onCancelMissingMediaRelinkRequested?()
+    }
+
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         switch menuItem.action {
         case #selector(showGainEffect(_:)):
@@ -3037,15 +4221,53 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return currentSelection?.durationProgress ?? 0 > 0
         case #selector(slipClipContentsLeft(_:)),
              #selector(slipClipContentsRight(_:)):
-            return canSplitAtPlayhead
+            return clipCommandContext.isEnabled(.slip)
+        case #selector(selectPreviousClip(_:)), #selector(selectNextClip(_:)):
+            return clipCommandContext.isEnabled(.selectPreviousOrNext)
+        case #selector(toggleSelectedClipMute(_:)),
+             #selector(toggleSelectedClipLock(_:)),
+             #selector(groupSelectedClips(_:)),
+             #selector(ungroupSelectedClips(_:)):
+            return clipCommandContext.isEnabled(.mute)
+        case #selector(repeatSelectedClips(_:)):
+            return clipCommandContext.isEnabled(.repeatClips)
+        case #selector(crossfadeSelectedClips(_:)):
+            return clipCommandContext.isEnabled(.crossfade)
+        case #selector(toggleClipSnapping(_:)):
+            menuItem.state = isClipSnappingEnabled ? .on : .off
+            return true
         case #selector(snapSelectionToPlayheadEdgesOrSilence(_:)):
             return currentSelection?.durationProgress ?? 0 > 0 || canUseDeadAirCandidate
         case #selector(selectTimeAcrossLinkedTracks(_:)):
             return currentSelection?.durationProgress ?? 0 > 0
         case #selector(selectAllClipsOnTrack(_:)):
-            return canSplitAtPlayhead
+            return clipCommandContext.isEnabled(.selectAllOnTrack)
+        case #selector(selectFollowingClips(_:)):
+            return clipCommandContext.isEnabled(.selectFollowing)
+        case #selector(selectClipsInTimeSelection(_:)):
+            return clipCommandContext.isEnabled(.selectInTimeRange)
+        case #selector(openSelectedClipInspector(_:)):
+            return clipCommandContext.isEnabled(.openInspector)
+        case #selector(moveSelectedClipsToTrackAbove(_:)):
+            return clipCommandContext.isEnabled(.moveToTrackAbove)
+        case #selector(moveSelectedClipsToTrackBelow(_:)):
+            return clipCommandContext.isEnabled(.moveToTrackBelow)
         case #selector(reapplyLastEffect(_:)):
             return canReapplyLastEffect
+        case #selector(closeFocusedClipInspector(_:)),
+             #selector(splitFocusedClipAtPlayhead(_:)),
+             #selector(trimFocusedClipStartToPlayhead(_:)),
+             #selector(trimFocusedClipEndToPlayhead(_:)),
+             #selector(moveFocusedClipEarlier(_:)),
+             #selector(moveFocusedClipLater(_:)),
+             #selector(duplicateFocusedClip(_:)),
+             #selector(renameFocusedClip(_:)),
+             #selector(deleteFocusedClip(_:)):
+            return canUseFocusedClipCommands
+        case #selector(relinkMissingMedia(_:)):
+            return clipCommandContext.isEnabled(.relinkMissingMedia)
+        case #selector(cancelMissingMediaRelink(_:)):
+            return clipCommandContext.isEnabled(.cancelMediaRelink)
         case #selector(exportSelectedRegion(_:)), #selector(exportSelectionFromContextMenu(_:)):
             return currentSelection?.durationProgress ?? 0 > 0
         case #selector(deleteTimelineSelection(_:)):
@@ -3055,13 +4277,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         case #selector(clearTimelineSelection(_:)):
             return canClearSelection
         case #selector(cutTimelineSelection(_:)), #selector(cut(_:)):
-            return canCutSelection
+            return canCutSelection || (isAutomationModeVisible && !automationSelection.pointIDs.isEmpty)
         case #selector(copyTimelineSelection(_:)), #selector(copy(_:)):
-            return canCopySelection
+            return canCopySelection || (isAutomationModeVisible && !automationSelection.pointIDs.isEmpty)
         case #selector(duplicateTimelineRegion(_:)):
             return canCopySelection
         case #selector(pasteTimelineAudio(_:)), #selector(paste(_:)):
-            return canPasteAudio
+            return canPasteAudio || (isAutomationModeVisible && automationSelection.address != nil)
         case #selector(splitAtPlayhead(_:)):
             return canSplitAtPlayhead
         case #selector(insertSilenceAtPlayhead(_:)):
@@ -3069,7 +4291,31 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         case #selector(healAdjacentClips(_:)):
             return canSplitAtPlayhead
         case #selector(zoomToSelection(_:)):
-            return currentSelection?.durationProgress ?? 0 > 0
+            return zoomFocusSelection() != nil
+        case #selector(toggleAutomationMode(_:)):
+            menuItem.state = isAutomationModeVisible ? .on : .off
+            return true
+        case #selector(selectAutomationPointTool(_:)):
+            menuItem.state = automationTool == .point ? .on : .off
+            return isAutomationModeVisible
+        case #selector(selectAutomationCurveTool(_:)):
+            menuItem.state = automationTool == .curve ? .on : .off
+            return isAutomationModeVisible
+        case #selector(selectAutomationPencilTool(_:)):
+            menuItem.state = automationTool == .pencil ? .on : .off
+            return isAutomationModeVisible
+        case #selector(selectAutomationRampTool(_:)):
+            menuItem.state = automationTool == .ramp ? .on : .off
+            return isAutomationModeVisible
+        case #selector(selectAutomationEraserTool(_:)):
+            menuItem.state = automationTool == .eraser ? .on : .off
+            return isAutomationModeVisible
+        case #selector(setAutomationCurveLinear(_:)),
+             #selector(setAutomationCurveEaseIn(_:)),
+             #selector(setAutomationCurveEaseOut(_:)),
+             #selector(setAutomationCurveSCurve(_:)),
+             #selector(setAutomationCurveStepped(_:)):
+            return isAutomationModeVisible && !automationSelection.pointIDs.isEmpty
         case #selector(toggleDebugTools(_:)):
             menuItem.state = isDebugToolsVisible ? .on : .off
             return true
@@ -3079,15 +4325,25 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     override func mouseEntered(with event: NSEvent) {
-        guard !isInteractionSuppressed else {
+        guard !isInteractionSuppressed, isFrontmostPointerOwner(for: event) else {
             return
         }
 
+        onPointerPresenceChanged?(true)
         PerformanceSampler.shared.recordTimelineInputEvent(kind: "mouse-entered", at: event.timestamp)
+        if updateTimelineEndHover(for: event) {
+            return
+        }
         if updateLoopHover(for: event) {
             return
         }
+        if updateAutomationHover(for: event) {
+            return
+        }
         if updateSelectionEdgeHover(for: event) {
+            return
+        }
+        if updateClipHover(for: event) {
             return
         }
         if updateTranscriptHover(for: event) {
@@ -3097,23 +4353,39 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     override func mouseMoved(with event: NSEvent) {
-        guard !isInteractionSuppressed else {
+        guard !isInteractionSuppressed, isFrontmostPointerOwner(for: event) else {
             return
         }
 
         PerformanceSampler.shared.recordTimelineInputEvent(kind: "mouse-moved", at: event.timestamp)
         if areEmbeddedScrollbarsEnabled, updateScrollbarHover(for: event) {
+            displayClipPropertyHover(nil)
+            return
+        }
+        if updateTimelineEndHover(for: event) {
+            displayClipPropertyHover(nil)
             return
         }
         if updateLoopHover(for: event) {
+            displayClipPropertyHover(nil)
+            return
+        }
+        if updateAutomationHover(for: event) {
+            displayClipPropertyHover(nil)
             return
         }
         if updateSelectionEdgeHover(for: event) {
+            displayClipPropertyHover(nil)
+            return
+        }
+        if updateClipHover(for: event) {
             return
         }
         if updateTranscriptHover(for: event) {
+            displayClipPropertyHover(nil)
             return
         }
+        displayClipPropertyHover(nil)
         updateHoverGuide(for: event)
     }
 
@@ -3122,11 +4394,16 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        onPointerPresenceChanged?(false)
         PerformanceSampler.shared.recordTimelineInputEvent(kind: "mouse-exited", at: event.timestamp)
         displayHoverProgress(nil)
         displayHighlightedSelectionEndpoint(nil)
+        displayHighlightedClipEdge(nil)
+        displayClipPropertyHover(nil)
         displayHighlightedLoopEndpoint(nil)
         displayHighlightedLoopRegion(false)
+        displayAutomationHover(for: nil)
+        timelineEndOverlayView.isHandleHovered = false
         setHoveredScrollbarAxis(nil)
         updateTranscriptHover(nil)
     }
@@ -3161,12 +4438,53 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             }
         }
 
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let horizontalDelta = event.scrollingDeltaX
         let verticalDelta = event.scrollingDeltaY
         guard horizontalDelta != 0 || verticalDelta != 0 else {
             return
         }
+
+        if modifiers.contains(.command) {
+            scrollGestureMode = .zoom
+            displayHoverProgress(nil, renderCadence: .coalescedInteraction)
+            stopRightPanMomentum()
+            let logScaleDelta = TimelineNavigationWheelGeometry.commandZoomLogScaleDelta(
+                scrollingDeltaX: horizontalDelta,
+                scrollingDeltaY: verticalDelta,
+                hasPreciseScrollingDeltas: event.hasPreciseScrollingDeltas
+            )
+            guard logScaleDelta != 0 else {
+                return
+            }
+            let anchorProgress = progress(for: convert(event.locationInWindow, from: nil))
+            applyCommandWheelZoomMomentumInput(
+                logScaleDelta: logScaleDelta,
+                anchorProgress: anchorProgress,
+                timestamp: event.timestamp
+            )
+            onNavigationScrollActivity?(.horizontal)
+            return
+        }
+
+        let effectiveHorizontalDelta = modifiers.contains(.shift) ?
+            TimelineNavigationWheelGeometry.shiftedHorizontalDelta(
+                scrollingDeltaX: horizontalDelta,
+                scrollingDeltaY: verticalDelta
+            ) : horizontalDelta
+        let effectiveVerticalDelta = modifiers.contains(.shift) ? 0 : verticalDelta
         scrollGestureMode = .pan
+
+        if modifiers.contains(.shift), !event.hasPreciseScrollingDeltas {
+            displayHoverProgress(nil, renderCadence: .coalescedInteraction)
+            stopZoomMomentum()
+            applyShiftWheelPanMomentumInput(
+                horizontalDeltaPixels: effectiveHorizontalDelta
+            )
+            onNavigationScrollActivity?(.horizontal)
+            return
+        }
+
         let elapsedTime: TimeInterval
         if let trackpadPanPreviousTime {
             elapsedTime = min(max(event.timestamp - trackpadPanPreviousTime, 1 / 240), 1 / 12)
@@ -3174,7 +4492,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             elapsedTime = 1 / 120
         }
         let horizontalProgressDelta = TimelineNavigationPanGeometry.horizontalProgressDelta(
-            scrollingDeltaX: horizontalDelta,
+            scrollingDeltaX: effectiveHorizontalDelta,
             viewportWidth: bounds.width,
             viewportDurationProgress: settledViewport.durationProgress
         )
@@ -3185,8 +4503,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         displayHoverProgress(nil, renderCadence: .coalescedInteraction)
         stopRightPanMomentum()
         applyTwoDimensionalPan(
-            horizontalDeltaPixels: horizontalDelta,
-            verticalDeltaPixels: verticalDelta
+            horizontalDeltaPixels: effectiveHorizontalDelta,
+            verticalDeltaPixels: effectiveVerticalDelta
         )
     }
 
@@ -3280,6 +4598,16 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         displayLoopMoveGuides(false)
         let point = convert(event.locationInWindow, from: nil)
         let timelineProgress = progress(for: point)
+        if timelineEndHandleHit(at: point) {
+            activeDragMode = .timelineEnd
+            selectionAnchorProgress = Double(timelineProgress)
+            selectionAnchorPoint = point
+            selectionAnchorTrackID = nil
+            startTimelineDisplayLink()
+            timelineEndOverlayView.isHandleHovered = true
+            NSCursor.resizeLeftRight.set()
+            return
+        }
         if areEmbeddedScrollbarsEnabled, let scrollbarAxis = currentScrollbarGeometry().axis(at: point) {
             let geometry = currentScrollbarGeometry()
             activeScrollbarAxis = scrollbarAxis
@@ -3295,10 +4623,21 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
         if let loopDragMode = loopDragMode(for: point) {
-            displayHoverProgress(nil)
+            if loopDragMode == .loopRegion, !loopRegionContains(point) {
+                displayHoverProgress(
+                    timelineProgress,
+                    isArmed: true,
+                    guideSpan: hoverGuideSpan(for: loopInteractionBandRect())
+                )
+            } else {
+                displayHoverProgress(nil)
+            }
             if let endpoint = loopEndpoint(for: loopDragMode) {
                 displayHighlightedLoopEndpoint(endpoint)
                 let handleProgress = endpoint == .start ? loopRange.startProgress : loopRange.endProgress
+                activeLoopResizeFixedProgress = endpoint == .start ?
+                    loopRange.endProgress :
+                    loopRange.startProgress
                 if let handleX = loopHandleX(forTimelineProgress: handleProgress) {
                     activeLoopDragOffsetX = point.x - handleX
                 } else {
@@ -3306,6 +4645,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                 }
             } else {
                 activeLoopDragOffsetX = 0
+                activeLoopResizeFixedProgress = nil
                 displayHighlightedLoopEndpoint(nil)
                 displayHighlightedLoopRegion(loopRegionContains(point))
                 if loopDragMode == .moveLoopRegion {
@@ -3324,9 +4664,143 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
         activeLoopDragOffsetX = 0
+        activeLoopResizeFixedProgress = nil
         activeLoopMoveInitialRange = nil
         displayHighlightedLoopEndpoint(nil)
         displayHighlightedLoopRegion(false)
+
+        if let gutter = seekGutterHit(at: point) {
+            activeDragMode = .seek
+            selectionAnchorProgress = Double(timelineProgress)
+            selectionAnchorPoint = point
+            selectionAnchorTrackID = nil
+            isDraggingSelection = false
+            isDraggingLoop = false
+            displayHoverProgress(
+                timelineProgress,
+                isArmed: true,
+                guideSpan: gutter.span
+            )
+            return
+        }
+
+        if isAutomationModeVisible, let hit = automationHit(at: point) {
+            activeAutomationHit = hit
+            activeAutomationPoints = hit.points
+            activeAutomationDidDrag = false
+            activeAutomationMouseDownModifierFlags = event.modifierFlags.intersection(
+                .deviceIndependentFlagsMask
+            )
+            selectionAnchorProgress = hit.projectProgress
+            selectionAnchorPoint = point
+            selectionAnchorTrackID = hit.trackID
+            isDraggingSelection = false
+            isDraggingLoop = false
+            if event.modifierFlags.contains(.command) {
+                switch hit.kind {
+                case .point:
+                    break
+                case .segment, .fence, .lane:
+                    let address = TimelineAutomationAddress.track(
+                        hit.trackID,
+                        parameterID: TimelineAutomationParameterID(rawValue: hit.parameterID)
+                    )
+                    automationMarqueeBaseSelection = automationSelection.address == address ?
+                        automationSelection : .empty
+                    activeDragMode = .automationMarquee
+                    displayAutomationMarquee(from: point, to: point)
+                    NSCursor.crosshair.set()
+                    displayHoverProgress(nil)
+                    return
+                }
+            }
+            switch automationTool {
+            case .pencil:
+                activeDragMode = .automationPencil
+                activeAutomationDrawSamples = [TimelineAutomationDrawPresentationSample(
+                    frameProgress: hit.projectProgress,
+                    normalizedValue: hit.normalizedValue
+                )]
+                lastAutomationDrawPoint = point
+                displayAutomationPreview(points: automationDrawingPreviewPoints(for: hit), hit: hit)
+                NSCursor.crosshair.set()
+                displayHoverProgress(nil)
+                return
+            case .ramp:
+                activeDragMode = .automationRamp
+                activeAutomationDrawSamples = [TimelineAutomationDrawPresentationSample(
+                    frameProgress: hit.projectProgress,
+                    normalizedValue: hit.normalizedValue
+                )]
+                lastAutomationDrawPoint = point
+                displayAutomationPreview(points: automationDrawingPreviewPoints(for: hit), hit: hit)
+                NSCursor.crosshair.set()
+                displayHoverProgress(nil)
+                return
+            case .eraser:
+                activeDragMode = .automationEraser
+                activeAutomationErasedPointIDs.removeAll(keepingCapacity: true)
+                if case let .point(pointID) = hit.kind { activeAutomationErasedPointIDs.insert(pointID) }
+                displayAutomationPreview(
+                    points: hit.points.filter { !activeAutomationErasedPointIDs.contains($0.id) },
+                    hit: hit
+                )
+                NSCursor.disappearingItem.set()
+                displayHoverProgress(nil)
+                return
+            case .point, .curve:
+                break
+            }
+            switch hit.kind {
+            case let .point(pointID):
+                updateAutomationSelection(
+                    pointID: pointID,
+                    hit: hit,
+                    modifierFlags: event.modifierFlags
+                )
+                activeDragMode = .automationPoint
+                NSCursor.pointingHand.set()
+            case let .segment(pointID) where automationTool == .curve:
+                if event.clickCount >= 2 {
+                    onAutomationEditRequested?(TimelineAutomationEditRequest(
+                        trackID: hit.trackID,
+                        parameterID: hit.parameterID,
+                        action: .setCurvePreset(pointIDs: [pointID], preset: .linear)
+                    ))
+                    activeAutomationHit = nil
+                    activeAutomationPoints.removeAll(keepingCapacity: true)
+                    selectionAnchorPoint = nil
+                    return
+                }
+                activeDragMode = .automationCurve
+                NSCursor.resizeUpDown.set()
+            case .segment, .fence, .lane:
+                activeDragMode = .automationPoint
+                displayAutomationPreview(points: pointsAddingAutomationPoint(from: hit), hit: hit)
+                NSCursor.crosshair.set()
+            }
+            displayHoverProgress(nil)
+            return
+        }
+
+        if event.clickCount >= 2, let request = clipFocusRequest(at: point) {
+            if !request.trackLocalRange.isSelected {
+                onClipSelected?(request, .replace)
+            }
+            displayHoverProgress(nil)
+            displayHighlightedSelectionEndpoint(nil)
+            selectionAnchorProgress = nil
+            selectionAnchorPoint = nil
+            selectionAnchorTrackID = nil
+            activeDragMode = nil
+            activeSelectionDragOffsetX = 0
+            activeClipRequest = nil
+            activeClipRequests = []
+            isDraggingSelection = false
+            isDraggingLoop = false
+            onClipDoubleClicked?(request)
+            return
+        }
 
         if
             let selection = currentSelection,
@@ -3352,6 +4826,72 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         activeSelectionDragOffsetX = 0
         displayHighlightedSelectionEndpoint(nil)
 
+        let togglesClipSelection = event.modifierFlags.contains(.command)
+        let extendsClipSelection = event.modifierFlags.contains(.shift)
+        if let propertyHit = clipPropertyHit(at: point) {
+            if !propertyHit.request.trackLocalRange.isSelected {
+                onClipSelected?(propertyHit.request, .replace)
+            }
+            activeClipRequest = propertyHit.request
+            activeClipRequests = [propertyHit.request]
+            activeClipPropertyControl = propertyHit.control
+            activeClipPropertyPreview = propertyHit.preview
+            activeDragMode = propertyHit.control == .fadeIn ? .clipFadeIn : .clipFadeOut
+            selectionAnchorProgress = Double(timelineProgress)
+            selectionAnchorPoint = point
+            selectionAnchorTrackID = propertyHit.request.trackID
+            isDraggingSelection = false
+            NSCursor.resizeLeftRight.set()
+            displayHoverProgress(nil)
+            return
+        }
+        if let clipHit = clipHit(at: point) {
+            let key = TimelineClipSelectionKey(clipHit.request)
+            let wasSelected = clipHit.request.trackLocalRange.isSelected
+            if togglesClipSelection || extendsClipSelection || !wasSelected {
+                onClipSelected?(
+                    clipHit.request,
+                    togglesClipSelection ? .toggle : (extendsClipSelection ? .range : .replace)
+                )
+            }
+            if togglesClipSelection, wasSelected {
+                selectionAnchorProgress = nil
+                selectionAnchorPoint = nil
+                selectionAnchorTrackID = nil
+                activeDragMode = nil
+                activeClipRequest = nil
+                activeClipRequests = []
+                displayHoverProgress(nil)
+                return
+            }
+            activeClipRequest = clipHit.request
+            selectionAnchorProgress = Double(timelineProgress)
+            selectionAnchorPoint = point
+            selectionAnchorTrackID = clipHit.request.trackID
+            isDraggingSelection = false
+            isDraggingLoop = false
+            if let edge = clipHit.edge {
+                activeClipRequests = [clipHit.request]
+                activeClipDragOffsetProgress = 0
+                activeDragMode = edge == .leading ? .trimClipStart : .trimClipEnd
+                NSCursor.resizeLeftRight.set()
+            } else {
+                var requests = selectedClipFocusRequests()
+                if !wasSelected && !togglesClipSelection && !extendsClipSelection {
+                    requests = [clipHit.request]
+                } else if !requests.contains(where: { TimelineClipSelectionKey($0) == key }) {
+                    requests.append(clipHit.request)
+                }
+                activeClipRequests = requests.isEmpty ? [clipHit.request] : requests
+                activeClipDragOffsetProgress = timelineProgress - clipHit.request.projectStartProgress
+                activeClipDragDuplicates = event.modifierFlags.contains(.option)
+                activeDragMode = .moveClip
+                NSCursor.closedHand.set()
+            }
+            displayHoverProgress(nil)
+            return
+        }
+
         if beginTranscriptInteraction(with: event, at: point) {
             return
         }
@@ -3367,10 +4907,20 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             activeSelectionDragOffsetX = 0
             isDraggingSelection = false
             isDraggingLoop = false
-            onPlayFromProgress?(timelineProgress)
             return
         }
 
+        if event.modifierFlags.contains(.command) {
+            activeDragMode = .clipMarquee
+            selectionAnchorProgress = Double(timelineProgress)
+            selectionAnchorPoint = point
+            selectionAnchorTrackID = nil
+            isDraggingSelection = false
+            displayHoverProgress(nil)
+            return
+        }
+
+        onClipSelected?(nil, .replace)
         activeDragMode = .selection
         selectionAnchorProgress = preciseProgress(for: point)
         selectionAnchorPoint = point
@@ -3378,7 +4928,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         resetSelectionDragVelocity(at: point, timestamp: CACurrentMediaTime())
         isDraggingSelection = false
         isDraggingLoop = false
-        displayHoverProgress(timelineProgress, isArmed: true)
+        displayHoverProgress(nil)
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -3386,7 +4936,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
-        PerformanceSampler.shared.recordTimelineInputEvent(kind: "mouse-dragged", at: event.timestamp)
+        let usesDisplayPacedPointerSampling = isDraggingSelection || isDraggingLoop || isAutomationDragActive
+        if !usesDisplayPacedPointerSampling {
+            PerformanceSampler.shared.recordTimelineInputEvent(kind: "mouse-dragged", at: event.timestamp)
+        }
         if let activeTranscriptDrag {
             updateTranscriptDrag(activeTranscriptDrag, with: currentDragPoint(for: event))
             return
@@ -3394,13 +4947,77 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         guard
             isSelectionEnabled,
-            let selectionAnchorProgress
+            selectionAnchorProgress != nil
         else {
             super.mouseDragged(with: event)
             return
         }
 
         let point = currentDragPoint(for: event)
+        if activeDragMode == .seek {
+            let guideSpan = selectionAnchorPoint.flatMap { seekGutterHit(at: $0)?.span }
+            displayHoverProgress(
+                progress(for: point),
+                isArmed: true,
+                guideSpan: guideSpan,
+                renderCadence: .coalescedInteraction
+            )
+            return
+        }
+        if isAutomationDragActive {
+            if didMovePastSelectionThreshold(to: point) {
+                activeAutomationDidDrag = true
+            }
+            // Drag events can arrive several times per display refresh. Keep
+            // only the latest pointer position and let the display link build
+            // one preview for each frame that can actually be presented.
+            wakeDisplayPacedInteractionSampler()
+            return
+        }
+        if activeDragMode == .timelineEnd {
+            updateTimelineEndDrag(to: point)
+            timelineEndOverlayView.isHandleHovered = true
+            NSCursor.resizeLeftRight.set()
+            return
+        }
+        if
+            activeDragMode == .moveClip ||
+                activeDragMode == .trimClipStart ||
+                activeDragMode == .trimClipEnd
+        {
+            if didMovePastSelectionThreshold(to: point) {
+                isDraggingSelection = true
+                updateClipDragPreview(to: point)
+                if activeDragMode == .moveClip {
+                    (activeClipPlacementIsAllowed ? NSCursor.closedHand : NSCursor.operationNotAllowed).set()
+                } else {
+                    NSCursor.resizeLeftRight.set()
+                }
+            }
+            return
+        }
+        if activeDragMode == .clipMarquee {
+            if !isDraggingSelection, didMovePastSelectionThreshold(to: point) {
+                isDraggingSelection = true
+            }
+            if isDraggingSelection {
+                displayClipMarquee(from: selectionAnchorPoint, to: point)
+            }
+            return
+        }
+        if
+            activeDragMode == .clipFadeIn ||
+                activeDragMode == .clipFadeOut
+        {
+            if didMovePastSelectionThreshold(to: point) {
+                isDraggingSelection = true
+            }
+            if isDraggingSelection {
+                updateClipPropertyPreview(to: point)
+                NSCursor.resizeLeftRight.set()
+            }
+            return
+        }
         if activeDragMode == .horizontalScrollbar || activeDragMode == .verticalScrollbar {
             updateScrollbarDrag(to: point)
             NSCursor.closedHand.set()
@@ -3420,12 +5037,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                 didMovePastSelectionThreshold(to: point)
             if !isDraggingLoop, crossedLoopDragThreshold {
                 isDraggingLoop = true
+                startTimelineDisplayLink()
                 if activeDragMode == .loopStart || activeDragMode == .loopEnd {
                     edgeAutoPanLastTimestamp = nil
-                    startTimelineDisplayLink()
+                }
+                if activeDragMode == .loopRegion {
+                    setLoopRangeEnabled(true, notifyChange: true)
                 }
                 if activeDragMode == .loopRegion || activeDragMode == .moveLoopRegion {
-                    setLoopRangeEnabled(true, notifyChange: true)
                     displayHighlightedLoopRegion(true, renderCadence: .coalescedInteraction)
                     displayLoopMoveGuides(
                         activeDragMode == .moveLoopRegion,
@@ -3434,51 +5053,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                 }
             }
 
-            if let activeDragMode {
-                let dragProgress = progress(for: loopDragProgressPoint(from: point), followsVisualFisheye: false)
-                if activeDragMode == .loopRegion {
-                    if isDraggingLoop {
-                        updateLoopRegionRange(
-                            from: Float(selectionAnchorProgress),
-                            to: dragProgress,
-                            renderCadence: .coalescedInteraction,
-                            invalidatesCursorRects: false
-                        )
-                        displayHoverProgress(dragProgress, isArmed: true, renderCadence: .coalescedInteraction)
-                    }
-                } else if
-                    activeDragMode == .moveLoopRegion,
-                    isDraggingLoop,
-                    let activeLoopMoveInitialRange
-                {
-                    NSCursor.closedHand.set()
-                    updateMovingLoopRange(
-                        initialRange: activeLoopMoveInitialRange,
-                        anchorProgress: Float(selectionAnchorProgress),
-                        currentProgress: dragProgress,
-                        renderCadence: .coalescedInteraction,
-                        invalidatesCursorRects: false
-                    )
-                    displayHoverProgress(nil, renderCadence: .coalescedInteraction)
-                } else if isDraggingLoop {
-                    updateLoopRange(
-                        for: activeDragMode,
-                        progress: dragProgress,
-                        renderCadence: .coalescedInteraction,
-                        invalidatesCursorRects: false
-                    )
-                    if let endpoint = loopEndpoint(for: activeDragMode) {
-                        let boundaryProgress = endpoint == .start ?
-                            loopRange.startProgress :
-                            loopRange.endProgress
-                        displayHoverProgress(
-                            boundaryProgress,
-                            isArmed: true,
-                            renderCadence: .coalescedInteraction
-                        )
-                    }
-                }
-            }
+            // The display link samples the physical pointer and publishes one loop update per
+            // presentable frame. Mouse hardware can otherwise flood this path far above 144 Hz.
+            wakeDisplayPacedInteractionSampler()
             return
         }
 
@@ -3490,40 +5067,29 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             if !isDraggingSelection, didMovePastSelectionThreshold(to: point) {
                 isDraggingSelection = true
                 edgeAutoPanLastTimestamp = nil
+                resetSelectionDragVelocity(at: point, timestamp: CACurrentMediaTime())
                 startTimelineDisplayLink()
             }
 
             if isDraggingSelection {
-                updateSelectionResizeDrag(
-                    to: point,
-                    timestamp: CACurrentMediaTime(),
-                    schedulesRender: true
-                )
+                // Selection geometry is sampled once at display cadence. Publishing both here and
+                // from the display link causes lock contention and unstable velocity samples.
+                wakeDisplayPacedInteractionSampler()
             }
             return
         }
 
         if !isDraggingSelection, didMovePastRegionCreationThreshold(to: point) {
             isDraggingSelection = true
+            resetSelectionDragVelocity(at: point, timestamp: CACurrentMediaTime())
+            startTimelineDisplayLink()
             displayHoverProgress(nil, renderCadence: .coalescedInteraction)
         }
 
         if isDraggingSelection {
-            let timestamp = CACurrentMediaTime()
-            let dragVelocity = updateSelectionDragVelocity(to: point, timestamp: timestamp)
-            let dragProgress = preciseProgress(for: point)
-            updateSelection(
-                from: selectionAnchorProgress,
-                to: dragProgress,
-                notifyChange: false,
-                liveLeadingProgress: dragProgress,
-                liveVelocityPixelsPerSecond: dragVelocity.speed,
-                liveDirection: dragVelocity.direction,
-                liveTimestamp: timestamp,
-                schedulesRender: true
-            )
+            wakeDisplayPacedInteractionSampler()
         } else {
-            displayHoverProgress(progress(for: point), isArmed: true, renderCadence: .coalescedInteraction)
+            displayHoverProgress(nil, renderCadence: .coalescedInteraction)
         }
     }
 
@@ -3557,7 +5123,60 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         let point = currentDragPoint(for: event)
         let timelineProgress = progress(for: point)
-        if activeDragMode == .horizontalScrollbar || activeDragMode == .verticalScrollbar {
+        if activeDragMode == .seek {
+            onSeekRequested?(timelineProgress)
+            let guideSpan = selectionAnchorPoint.flatMap { seekGutterHit(at: $0)?.span }
+            displayHoverProgress(
+                timelineProgress,
+                guideSpan: guideSpan
+            )
+        } else if activeDragMode == .automationPoint ||
+            activeDragMode == .automationCurve ||
+            activeDragMode == .automationMarquee {
+            finishAutomationInteraction(at: point)
+        } else if activeDragMode == .timelineEnd {
+            updateTimelineEndDrag(to: point)
+            NSCursor.resizeLeftRight.set()
+        } else if
+            let request = activeClipRequest,
+            (activeDragMode == .moveClip ||
+                activeDragMode == .trimClipStart ||
+                activeDragMode == .trimClipEnd)
+        {
+            if isDraggingSelection {
+                if activeDragMode == .moveClip, activeClipPlacementIsAllowed {
+                    onClipDragCommitted?(activeClipDragPreviews, activeClipDragDuplicates)
+                } else {
+                    let destination = activeDragMode == .trimClipStart ?
+                        activeClipDragPreviews.first?.presentedStartProjectProgress :
+                        activeClipDragPreviews.first?.presentedEndProjectProgress
+                    onClipTrimmed?(
+                        request,
+                        activeDragMode == .trimClipStart ? .leading : .trailing,
+                        destination ?? progress(for: point, followsVisualFisheye: false)
+                    )
+                }
+            }
+            displayClipDragPreviews([])
+            activeClipSnapGuideProgress = nil
+            activeClipPlacementIsAllowed = true
+            displayHoverProgress(nil)
+        } else if activeDragMode == .clipMarquee {
+            if isDraggingSelection {
+                let requests = clipFocusRequests(intersecting: marqueeRect(from: selectionAnchorPoint, to: point))
+                onClipMarqueeSelected?(requests, .additive)
+            }
+            displayClipMarquee(from: nil, to: nil)
+        } else if
+            let request = activeClipRequest,
+            activeDragMode == .clipFadeIn ||
+                activeDragMode == .clipFadeOut
+        {
+            if isDraggingSelection, let preview = activeClipPropertyPreview {
+                onClipPropertiesChanged?(request, preview)
+            }
+            displayClipPropertyPreview(nil)
+        } else if activeDragMode == .horizontalScrollbar || activeDragMode == .verticalScrollbar {
             updateScrollbarDrag(to: point)
             activeScrollbarAxis = nil
             activeScrollbarDragOffset = 0
@@ -3580,12 +5199,12 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                     if isDraggingLoop {
                         updateLoopRegionRange(
                             from: Float(selectionAnchorProgress),
-                            to: dragProgress
+                            to: dragProgress,
+                            notifiesChange: false
                         )
+                        onLoopRangeChanged?(loopRange)
                     } else if loopRegionContains(point) {
                         setLoopRangeEnabled(!isLoopRangeEnabled, notifyChange: true)
-                    } else {
-                        onSeekRequested?(timelineProgress)
                     }
                     displayHoverProgress(nil)
                 } else if activeDragMode == .moveLoopRegion {
@@ -3593,17 +5212,22 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                         updateMovingLoopRange(
                             initialRange: activeLoopMoveInitialRange,
                             anchorProgress: Float(selectionAnchorProgress),
-                            currentProgress: dragProgress
+                            currentProgress: dragProgress,
+                            notifiesChange: false
                         )
+                        onLoopRangeChanged?(loopRange)
                     } else if loopRegionContains(point) {
                         setLoopRangeEnabled(!isLoopRangeEnabled, notifyChange: true)
                     }
                     displayHoverProgress(nil)
                 } else {
-                    updateLoopRange(
+                    _ = updateLoopRange(
                         for: activeDragMode,
-                        progress: dragProgress
+                        progress: dragProgress,
+                        enforcesMinimumDuration: true,
+                        notifiesChange: false
                     )
+                    onLoopRangeChanged?(loopRange)
                 }
             }
         } else if
@@ -3625,15 +5249,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         } else {
             displaySelection(nil)
             onSelectionChanged?(nil)
-            onSeekRequested?(timelineProgress)
         }
 
         if activeDragMode == .moveLoopRegion {
             if loopRegionEndpointNear(point) != nil {
                 NSCursor.resizeLeftRight.set()
-            } else if isLoopRangeEnabled, loopRegionContains(point) {
+            } else if loopRegionContains(point) {
                 NSCursor.openHand.set()
-            } else if rulerLaneRect().contains(point) {
+            } else if loopInteractionBandRect().contains(point) {
                 NSCursor.pointingHand.set()
             } else {
                 NSCursor.arrow.set()
@@ -3654,15 +5277,31 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         resetSelectionDragVelocity()
         activeDragMode = nil
         activeSelectionDragOffsetX = 0
+        displayClipDragPreviews([])
+        activeClipPlacementIsAllowed = true
+        activeClipRequest = nil
+        activeClipRequests = []
+        activeClipDragOffsetProgress = 0
+        activeClipDragDuplicates = false
+        activeClipPropertyControl = nil
+        activeClipPropertyPreview = nil
+        displayClipMarquee(from: nil, to: nil)
         edgeAutoPanLastTimestamp = nil
         isDraggingSelection = false
         isDraggingLoop = false
         activeLoopDragOffsetX = 0
+        activeLoopResizeFixedProgress = nil
         activeLoopMoveInitialRange = nil
         displayLoopMoveGuides(false)
         edgeAutoPanLastTimestamp = nil
         flushPendingCursorRectInvalidationIfNeeded()
-        if !updateLoopHover(for: event), !updateSelectionEdgeHover(for: event) {
+        if
+            !updateTimelineEndHover(for: event),
+            !updateLoopHover(for: event),
+            !updateAutomationHover(for: event),
+            !updateSelectionEdgeHover(for: event),
+            !updateClipHover(for: event)
+        {
             updateHoverGuide(for: event)
         }
         stopTimelineDisplayLinkIfIdle()
@@ -3691,6 +5330,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         rightPanVelocityProgressPerSecond = 0
         isRightPanGestureActive = false
         isSelectionContextMenuArmed = shouldShowSelectionContextMenu(at: point)
+        armedClipContextRequest = isSelectionContextMenuArmed ? nil : clipHit(at: point)?.request
         selectionAnchorProgress = nil
         selectionAnchorPoint = nil
         selectionAnchorTrackID = nil
@@ -3756,6 +5396,111 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         onSelectionRegionContextExportRequested?()
     }
 
+    private func showClipContextMenu(
+        for request: TimelineClipFocusRequest,
+        at point: CGPoint
+    ) {
+        contextMenuClipRequest = request
+        let menu = NSMenu(title: "Clip")
+        let actions: [(String, Selector, String)] = [
+            ("Open Clip Inspector", #selector(openClipFromContextMenu(_:)), ""),
+            ("Export Clip as WAV...", #selector(exportClipWAVFromContextMenu(_:)), ""),
+            ("Rename Clip...", #selector(renameClipFromContextMenu(_:)), ""),
+            ("Duplicate Clip", #selector(duplicateClipFromContextMenu(_:)), ""),
+            ("Repeat Selected Clips", #selector(repeatClipsFromContextMenu(_:)), ""),
+            ("Mute / Unmute Selected Clips", #selector(toggleMuteFromContextMenu(_:)), ""),
+            ("Lock / Unlock Selected Clips", #selector(toggleLockFromContextMenu(_:)), ""),
+            ("Group Selected Clips", #selector(groupClipsFromContextMenu(_:)), ""),
+            ("Ungroup Selected Clips", #selector(ungroupClipsFromContextMenu(_:)), ""),
+            (
+                request.trackLocalRange.fadeInProgress > 0 ? "Disable Crossfade In" : "Enable Crossfade In",
+                #selector(toggleCrossfadeInFromContextMenu(_:)),
+                ""
+            ),
+            (
+                request.trackLocalRange.fadeOutProgress > 0 ? "Disable Crossfade Out" : "Enable Crossfade Out",
+                #selector(toggleCrossfadeOutFromContextMenu(_:)),
+                ""
+            ),
+            ("Crossfade Selected Clips", #selector(crossfadeClipsFromContextMenu(_:)), ""),
+            ("Split at Playhead", #selector(splitClipFromContextMenu(_:)), ""),
+            ("Delete Clip", #selector(deleteClipFromContextMenu(_:)), "")
+        ]
+        for (index, action) in actions.enumerated() {
+            if index == actions.count - 1 {
+                menu.addItem(.separator())
+            }
+            let item = NSMenuItem(title: action.0, action: action.1, keyEquivalent: action.2)
+            item.target = self
+            menu.addItem(item)
+        }
+        menu.popUp(positioning: nil, at: point, in: self)
+        contextMenuClipRequest = nil
+    }
+
+    private func performClipContextAction(_ action: TimelineClipContextAction) {
+        guard let request = contextMenuClipRequest else {
+            return
+        }
+        onClipContextAction?(request, action)
+    }
+
+    @objc private func openClipFromContextMenu(_ sender: Any?) {
+        performClipContextAction(.open)
+    }
+
+    @objc private func exportClipWAVFromContextMenu(_ sender: Any?) {
+        performClipContextAction(.exportWAV)
+    }
+
+    @objc private func renameClipFromContextMenu(_ sender: Any?) {
+        performClipContextAction(.rename)
+    }
+
+    @objc private func duplicateClipFromContextMenu(_ sender: Any?) {
+        performClipContextAction(.duplicate)
+    }
+
+    @objc private func repeatClipsFromContextMenu(_ sender: Any?) {
+        performClipContextAction(.repeatClips)
+    }
+
+    @objc private func toggleMuteFromContextMenu(_ sender: Any?) {
+        performClipContextAction(.toggleMute)
+    }
+
+    @objc private func toggleLockFromContextMenu(_ sender: Any?) {
+        performClipContextAction(.toggleLock)
+    }
+
+    @objc private func groupClipsFromContextMenu(_ sender: Any?) {
+        performClipContextAction(.group)
+    }
+
+    @objc private func ungroupClipsFromContextMenu(_ sender: Any?) {
+        performClipContextAction(.ungroup)
+    }
+
+    @objc private func toggleCrossfadeInFromContextMenu(_ sender: Any?) {
+        performClipContextAction(.toggleCrossfadeIn)
+    }
+
+    @objc private func toggleCrossfadeOutFromContextMenu(_ sender: Any?) {
+        performClipContextAction(.toggleCrossfadeOut)
+    }
+
+    @objc private func crossfadeClipsFromContextMenu(_ sender: Any?) {
+        performClipContextAction(.crossfade)
+    }
+
+    @objc private func splitClipFromContextMenu(_ sender: Any?) {
+        performClipContextAction(.splitAtPlayhead)
+    }
+
+    @objc private func deleteClipFromContextMenu(_ sender: Any?) {
+        performClipContextAction(.delete)
+    }
+
     override func rightMouseDragged(with event: NSEvent) {
         guard !isInteractionSuppressed else {
             return
@@ -3783,6 +5528,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
             isRightPanGestureActive = true
             isSelectionContextMenuArmed = false
+            armedClipContextRequest = nil
             onTimelineInteractionBegan?()
         }
 
@@ -3836,6 +5582,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                 didPan: didPan
             ) &&
             shouldShowSelectionContextMenu(at: point)
+        let clipContextRequest = didPan ? nil : armedClipContextRequest
 
         if didPan, let lastMovementTime = rightPanLastMovementTime {
             let idleTime = max(event.timestamp - lastMovementTime, 0)
@@ -3854,6 +5601,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         updateHoverGuide(for: event)
         if shouldPresentContextMenu {
             showSelectionContextMenu(at: point)
+        } else if let clipContextRequest {
+            showClipContextMenu(for: clipContextRequest, at: point)
         }
     }
 
@@ -3864,6 +5613,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         rightPanLastMovementTime = nil
         isRightPanGestureActive = false
         isSelectionContextMenuArmed = false
+        armedClipContextRequest = nil
     }
 
     private func startRightPanMomentumIfNeeded() {
@@ -3888,6 +5638,31 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         rightPanMomentumTimer = timer
         RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func applyShiftWheelPanMomentumInput(
+        horizontalDeltaPixels: CGFloat
+    ) {
+        guard bounds.width > 0, horizontalDeltaPixels != 0 else {
+            return
+        }
+
+        activeCameraTransition = nil
+        settledViewport = viewport
+        stopRightPanMomentum(clearVelocity: false)
+
+        let progressDelta = TimelineNavigationPanGeometry.horizontalProgressDelta(
+            scrollingDeltaX: horizontalDeltaPixels,
+            viewportWidth: bounds.width,
+            viewportDurationProgress: viewport.durationProgress
+        )
+        rightPanVelocityProgressPerSecond +=
+            TimelineNavigationWheelGeometry.shiftedPanVelocityImpulse(
+                progressDelta: progressDelta,
+                momentumDecayRate: rightPanMomentumDecayRate
+            )
+        rightPanLastMovementTime = CACurrentMediaTime()
+        startRightPanMomentumIfNeeded()
     }
 
     private func stepRightPanMomentum() {
@@ -3974,6 +5749,37 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         )
         zoomPreviousTime = timestamp
         zoomLastInputTime = timestamp
+    }
+
+    private func applyCommandWheelZoomMomentumInput(
+        logScaleDelta: Float,
+        anchorProgress: Float,
+        timestamp: TimeInterval
+    ) {
+        guard logScaleDelta != 0 else {
+            return
+        }
+
+        activeCameraTransition = nil
+        settledViewport = viewport
+        zoomMomentumAnchorProgress = anchorProgress
+        let velocityImpulse = TimelineNavigationWheelGeometry.commandZoomVelocityImpulse(
+            logScaleDelta: logScaleDelta,
+            momentumDecayRate: zoomMomentumDecayRate
+        )
+        zoomVelocityLogScalePerSecond = min(
+            max(
+                zoomVelocityLogScalePerSecond + velocityImpulse,
+                -zoomMomentumMaximumVelocity
+            ),
+            zoomMomentumMaximumVelocity
+        )
+        zoomPreviousTime = timestamp
+        zoomLastInputTime = timestamp
+
+        if zoomMomentumTimer == nil {
+            startZoomMomentumIfNeeded()
+        }
     }
 
     private func startZoomMomentumIfNeeded() {
@@ -4204,6 +6010,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
         viewport = nextViewport
         updateBootstrapWaveformView()
+        updateClipLabelOverlay()
+        updateTimelineEndOverlay()
         updateOffscreenPlayheadButtons()
         onNavigationPresentationChanged?()
         if notifiesChange {
@@ -4363,14 +6171,56 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     }
 
     private func zoomToSelection() {
-        guard
-            let selection = currentSelection,
-            selection.durationProgress > 0
-        else {
+        guard let selection = zoomFocusSelection() else {
             return
         }
 
         focusSelection(selection)
+    }
+
+    private func zoomFocusSelection() -> TimelineSelection? {
+        Self.zoomFocusSelection(
+            timeSelection: currentSelection,
+            selectedClips: selectedClipFocusRequests(),
+            trackOrder: currentTrackIDs
+        )
+    }
+
+    static func zoomFocusSelection(
+        timeSelection: TimelineSelection?,
+        selectedClips: [TimelineClipFocusRequest],
+        trackOrder: [UUID]
+    ) -> TimelineSelection? {
+        if let timeSelection, timeSelection.durationProgress > 0 {
+            return timeSelection
+        }
+
+        guard
+            let startProgress = selectedClips.map(\.projectStartProgress).min(),
+            let endProgress = selectedClips.map(\.projectEndProgress).max(),
+            endProgress > startProgress
+        else {
+            return nil
+        }
+
+        let selectedTrackIndices = Set(selectedClips.compactMap { clip in
+            trackOrder.firstIndex(of: clip.trackID)
+        })
+        let focusTrackID: UUID?
+        if
+            let minimumTrackIndex = selectedTrackIndices.min(),
+            let maximumTrackIndex = selectedTrackIndices.max()
+        {
+            focusTrackID = trackOrder[(minimumTrackIndex + maximumTrackIndex) / 2]
+        } else {
+            focusTrackID = selectedClips.first?.trackID
+        }
+
+        return TimelineSelection(
+            startProgress: Double(startProgress),
+            endProgress: Double(endProgress),
+            trackID: focusTrackID
+        )
     }
 
     func focusSelection(_ selection: TimelineSelection) {
@@ -4497,6 +6347,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
         updateTrackLayoutForCurrentBounds(requestRender: false)
         updateTranscriptOverlay()
+        updateClipLabelOverlay()
         publishScrollbarPresentation()
         requestTimelineRender()
     }
@@ -4982,6 +6833,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         trackLayout = clampedLayout
         updateBootstrapWaveformView()
         let resolvedLayout = resolvedTrackLayoutForCurrentBounds()
+        clipLabelOverlayView.displayTrackLayout(resolvedLayout)
         if lastPublishedTrackLayout != resolvedLayout {
             lastPublishedTrackLayout = resolvedLayout
             onTrackLaneLayoutChanged?(resolvedLayout)
@@ -4998,6 +6850,10 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         if requestRender {
             requestTimelineRender()
         }
+    }
+
+    var clipLabelTrackLayoutForTesting: ResolvedTimelineTrackLayout? {
+        clipLabelOverlayView.displayedTrackLayoutForTesting
     }
 
     private func easeInOutCubic(_ progress: Float) -> Float {
@@ -5035,6 +6891,170 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         if requestRender {
             requestTimelineRender()
         }
+    }
+
+    private func updateClipLabelOverlay() {
+        clipLabelOverlayView.configure(
+            tracks: currentRenderTracks,
+            timelineDuration: timelineDuration,
+            viewport: viewport,
+            trackLayout: resolvedTrackLayoutForCurrentBounds()
+        )
+    }
+
+    private func updateClipAccessibilityElements() {
+        guard let window, timelineDuration > 0, viewport.durationProgress > 0 else {
+            clipAccessibilityElements = []
+            return
+        }
+        let layout = resolvedTrackLayoutForCurrentBounds()
+        var elements: [NSAccessibilityElement] = []
+        elements.reserveCapacity(min(currentRenderTracks.reduce(0) { $0 + $1.clipRanges.count }, 256))
+        for (trackIndex, track) in currentRenderTracks.enumerated() {
+            guard let lane = layout.laneFrame(forTrackIndex: trackIndex) else { continue }
+            let laneTop = CGFloat(lane.top) * bounds.height
+            let laneBottom = CGFloat(lane.bottom) * bounds.height
+            guard laneBottom > 0, laneTop < bounds.height else { continue }
+            let trackDuration = track.durationHint ?? track.waveformOverview?.duration ?? 0
+            guard trackDuration > 0 else { continue }
+            let projectScale = trackDuration / timelineDuration
+            for clip in track.clipRanges where !clip.isSilent {
+                let projectStart = clip.startProgress * projectScale
+                let projectEnd = clip.endProgress * projectScale
+                guard projectEnd >= Double(viewport.startProgress),
+                      projectStart <= Double(viewport.endProgress) else { continue }
+                let startX = CGFloat((Float(projectStart) - viewport.startProgress) / viewport.durationProgress) * bounds.width
+                let endX = CGFloat((Float(projectEnd) - viewport.startProgress) / viewport.durationProgress) * bounds.width
+                let localRect = NSRect(
+                    x: max(startX, 0),
+                    y: max(bounds.height - laneBottom, 0),
+                    width: max(min(endX, bounds.width) - max(startX, 0), 1),
+                    height: max(min(laneBottom, bounds.height) - max(laneTop, 0), 1)
+                )
+                let windowRect = convert(localRect, to: nil)
+                let screenRect = window.convertToScreen(windowRect)
+                let request = TimelineClipFocusRequest(
+                    clipID: clip.id,
+                    trackID: track.id,
+                    trackLocalRange: clip,
+                    projectStartProgress: Float(projectStart),
+                    projectEndProgress: Float(projectEnd)
+                )
+                let element = TimelineClipAccessibilityElement { [weak self] in
+                    self?.onClipSelected?(request, .replace)
+                }
+                element.setAccessibilityParent(self)
+                element.setAccessibilityRole(.button)
+                element.setAccessibilityLabel(clip.name?.isEmpty == false ? clip.name! : "Audio clip")
+                var state: [String] = []
+                if clip.isSelected { state.append("selected") }
+                if clip.isMissingMedia { state.append("missing media") }
+                let startSeconds = projectStart * timelineDuration
+                let endSeconds = projectEnd * timelineDuration
+                state.append(String(format: "%.3f to %.3f seconds", startSeconds, endSeconds))
+                element.setAccessibilityValue(state.joined(separator: ", "))
+                element.setAccessibilityHelp(
+                    clip.isMissingMedia ?
+                        "Use Clip, Relink Missing Media to locate this clip's audio file." :
+                        "Press to select this clip. Use the Clip menu for editing commands."
+                )
+                element.setAccessibilitySelected(clip.isSelected)
+                element.setAccessibilityFrame(screenRect)
+                element.setAccessibilityIdentifier("timeline.clip.\(clip.id.rawValue.uuidString.lowercased())")
+                elements.append(element)
+            }
+        }
+        clipAccessibilityElements = elements
+    }
+
+    private func updateAutomationAccessibilityElements() {
+        guard
+            isAutomationModeVisible,
+            let window,
+            timelineDuration > 0,
+            viewport.durationProgress > 0
+        else {
+            automationAccessibilityElements = []
+            return
+        }
+        let layout = resolvedTrackLayoutForCurrentBounds()
+        let parameterID = TimelineAutomationParameterID(rawValue: displayedAutomationParameterID)
+        let descriptor = TimelineAutomationParameterRegistry.descriptor(for: parameterID)
+        var elements: [NSAccessibilityElement] = []
+        for (trackIndex, track) in currentRenderTracks.enumerated() {
+            guard
+                let laneFrame = layout.laneFrame(forTrackIndex: trackIndex),
+                let lane = track.automationLanes.first(where: {
+                    $0.parameterID == displayedAutomationParameterID && $0.isEnabled
+                })
+            else { continue }
+            let height = Float(max(bounds.height, 1))
+            let laneTop = laneFrame.top * height
+            let laneBottom = laneFrame.bottom * height
+            let range = TimelineClipChromeMetrics.automationRange(
+                laneTop: laneTop,
+                laneBottom: laneBottom,
+                viewportHeight: height
+            )
+            for point in lane.points where
+                point.projectProgress >= Double(viewport.startProgress) &&
+                point.projectProgress <= Double(viewport.endProgress) {
+                let position = automationPointPosition(
+                    point,
+                    curveTop: range.top,
+                    curveBottom: range.bottom
+                )
+                let localRect = NSRect(x: position.x - 9, y: position.y - 9, width: 18, height: 18)
+                let screenRect = window.convertToScreen(convert(localRect, to: nil))
+                let address = TimelineAutomationAddress.track(track.id, parameterID: parameterID)
+                let element = TimelineAutomationPointAccessibilityElement(
+                    selectHandler: { [weak self] in
+                        self?.setAutomationSelection(TimelineAutomationSelection(
+                            address: address,
+                            pointIDs: [point.id],
+                            anchorPointID: point.id
+                        ))
+                    },
+                    adjustmentHandler: { [weak self] frameDelta, valueDelta in
+                        self?.onAutomationEditRequested?(TimelineAutomationEditRequest(
+                            trackID: track.id,
+                            parameterID: parameterID.rawValue,
+                            action: .nudge(
+                                pointIDs: [point.id],
+                                frameDelta: frameDelta,
+                                normalizedValueDelta: valueDelta
+                            )
+                        ))
+                    }
+                )
+                element.setAccessibilityParent(self)
+                element.setAccessibilityRole(.slider)
+                element.setAccessibilityLabel("\(descriptor?.displayName ?? parameterID.rawValue) automation point")
+                let seconds = point.projectProgress * timelineDuration
+                element.setAccessibilityValue(
+                    "\(descriptor?.formattedValue(normalizedValue: point.normalizedValue) ?? String(format: "%.3f", point.normalizedValue)), \(String(format: "%.3f seconds", seconds))"
+                )
+                element.setAccessibilityHelp(
+                    "Press to select. Use increment and decrement to adjust the value, or the Automation menu for editing commands."
+                )
+                element.setAccessibilitySelected(
+                    automationSelection.address == address && automationSelection.pointIDs.contains(point.id)
+                )
+                element.setAccessibilityFrame(screenRect)
+                element.setAccessibilityIdentifier("timeline.automation.\(point.id.uuidString.lowercased())")
+                elements.append(element)
+            }
+        }
+        automationAccessibilityElements = elements
+    }
+
+    override func accessibilityChildren() -> [Any]? {
+        // Accessibility is a query-driven projection. Building clip elements in
+        // the viewport hot path allocates AppKit objects and formatted strings
+        // during every drag/zoom frame even when no assistive client is active.
+        updateClipAccessibilityElements()
+        updateAutomationAccessibilityElements()
+        return clipAccessibilityElements + automationAccessibilityElements
     }
 
     private func updateTranscriptOverlay(cadence: TimelineRenderCadence = .immediate) {
@@ -5208,13 +7228,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         let availableTrackHeight = max(bounds.height - CGFloat(trackLayout.rulerLaneHeight), controlSize.height)
         let originY = max((availableTrackHeight - controlSize.height) * 0.5, 0)
         leftOffscreenPlayheadButton.frame = CGRect(
-            x: 8,
+            x: 0,
             y: originY,
             width: controlSize.width,
             height: controlSize.height
         )
         rightOffscreenPlayheadButton.frame = CGRect(
-            x: max(bounds.width - controlSize.width - 8, 0),
+            x: max(bounds.width - controlSize.width, 0),
             y: originY,
             width: controlSize.width,
             height: controlSize.height
@@ -5318,8 +7338,18 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
+        guard let gutter = seekGutterHit(at: point) else {
+            NSCursor.arrow.set()
+            displayHoverProgress(nil, renderCadence: .coalescedInteraction)
+            return
+        }
+
         NSCursor.arrow.set()
-        displayHoverProgress(progress(for: point), renderCadence: .coalescedInteraction)
+        displayHoverProgress(
+            progress(for: point),
+            guideSpan: gutter.span,
+            renderCadence: .coalescedInteraction
+        )
     }
 
     private func updateTranscriptHover(for event: NSEvent) -> Bool {
@@ -5495,17 +7525,56 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return false
         }
 
-        guard rulerLaneRect().contains(point) else {
+        guard loopInteractionBandRect().contains(point) else {
             displayHighlightedLoopEndpoint(nil, renderCadence: .coalescedInteraction)
             displayHighlightedLoopRegion(false, renderCadence: .coalescedInteraction)
             return false
         }
 
-        displayHoverProgress(nil, renderCadence: .coalescedInteraction)
         displayHighlightedSelectionEndpoint(nil, renderCadence: .coalescedInteraction)
+        displayHighlightedClipEdge(nil, renderCadence: .coalescedInteraction)
         let hoveredEndpoint = loopRegionEndpointNear(point)
+        let isInsideLoopRegion = loopRegionContains(point)
+        if hoveredEndpoint == nil, !isInsideLoopRegion {
+            displayHoverProgress(
+                progress(for: point),
+                guideSpan: hoverGuideSpan(for: loopInteractionBandRect()),
+                renderCadence: .coalescedInteraction
+            )
+        } else {
+            displayHoverProgress(nil, renderCadence: .coalescedInteraction)
+        }
         displayHighlightedLoopEndpoint(hoveredEndpoint, renderCadence: .coalescedInteraction)
-        displayHighlightedLoopRegion(loopRegionContains(point), renderCadence: .coalescedInteraction)
+        displayHighlightedLoopRegion(isInsideLoopRegion, renderCadence: .coalescedInteraction)
+        return true
+    }
+
+    private func updateTimelineEndHover(for event: NSEvent) -> Bool {
+        guard
+            !isInteractionSuppressed,
+            isSelectionEnabled,
+            activeDragMode == nil
+        else {
+            if activeDragMode != .timelineEnd {
+                timelineEndOverlayView.isHandleHovered = false
+            }
+            return false
+        }
+
+        let point = convert(event.locationInWindow, from: nil)
+        let isHovered = bounds.contains(point) && timelineEndHandleHit(at: point)
+        timelineEndOverlayView.isHandleHovered = isHovered
+        guard isHovered else {
+            return false
+        }
+
+        displayHoverProgress(nil, renderCadence: .coalescedInteraction)
+        displayHighlightedLoopEndpoint(nil, renderCadence: .coalescedInteraction)
+        displayHighlightedLoopRegion(false, renderCadence: .coalescedInteraction)
+        displayHighlightedSelectionEndpoint(nil, renderCadence: .coalescedInteraction)
+        displayHighlightedClipEdge(nil, renderCadence: .coalescedInteraction)
+        updateTranscriptHover(nil)
+        NSCursor.resizeLeftRight.set()
         return true
     }
 
@@ -5536,6 +7605,54 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         NSCursor.resizeLeftRight.set()
         updateTranscriptHover(nil)
         return true
+    }
+
+    private func updateClipHover(for event: NSEvent) -> Bool {
+        guard
+            !isInteractionSuppressed,
+            isSelectionEnabled,
+            activeDragMode == nil
+        else {
+            displayHighlightedClipEdge(nil, renderCadence: .coalescedInteraction)
+            displayClipPropertyHover(nil)
+            return false
+        }
+
+        let point = convert(event.locationInWindow, from: nil)
+        if let propertyHit = clipPropertyHit(at: point) {
+            displayClipPropertyHover(TimelineClipPropertyHover(
+                trackID: propertyHit.request.trackID,
+                clipID: propertyHit.request.clipID,
+                control: propertyHit.control
+            ))
+            displayHoverProgress(nil, renderCadence: .coalescedInteraction)
+            displayHighlightedClipEdge(nil, renderCadence: .coalescedInteraction)
+            NSCursor.resizeLeftRight.set()
+            updateTranscriptHover(nil)
+            return true
+        }
+        displayClipPropertyHover(nil)
+        guard bounds.contains(point), let hit = clipHit(at: point) else {
+            displayHighlightedClipEdge(nil, renderCadence: .coalescedInteraction)
+            return false
+        }
+
+        if hit.edge != nil {
+            displayHoverProgress(nil, renderCadence: .coalescedInteraction)
+            displayHighlightedClipEdge(hit, renderCadence: .coalescedInteraction)
+            NSCursor.resizeLeftRight.set()
+            updateTranscriptHover(nil)
+            return true
+        }
+
+        displayHighlightedClipEdge(nil, renderCadence: .coalescedInteraction)
+        if hit.isHeader {
+            displayHoverProgress(nil, renderCadence: .coalescedInteraction)
+            NSCursor.openHand.set()
+            updateTranscriptHover(nil)
+            return true
+        }
+        return false
     }
 
     private func updateSelection(
@@ -5587,7 +7704,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         let dragProgress = preciseProgress(for: selectionResizeProgressPoint(from: point))
         displayHighlightedSelectionEndpoint(
             dragProgress <= selectionAnchorProgress ? .start : .end,
-            renderCadence: .coalescedInteraction
+            renderCadence: schedulesRender ? .coalescedInteraction : .none
         )
         updateSelection(
             from: selectionAnchorProgress,
@@ -5601,31 +7718,79 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         )
     }
 
-    private func updateLoopEndpointDrag(to point: CGPoint) {
+    @discardableResult
+    private func updateActiveLoopDrag(
+        to point: CGPoint,
+        renderCadence: TimelineRenderCadence,
+        notifiesChange: Bool
+    ) -> Bool {
         guard
+            isDraggingLoop,
             let activeDragMode,
-            activeDragMode == .loopStart || activeDragMode == .loopEnd
+            let selectionAnchorProgress
         else {
-            return
+            return false
         }
 
+        let previousRange = loopRange
         let dragProgress = progress(
             for: loopDragProgressPoint(from: point),
             followsVisualFisheye: false
         )
-        updateLoopRange(
-            for: activeDragMode,
-            progress: dragProgress,
-            renderCadence: .coalescedInteraction,
-            invalidatesCursorRects: false
-        )
-        if let endpoint = loopEndpoint(for: activeDragMode) {
-            displayHoverProgress(
-                endpoint == .start ? loopRange.startProgress : loopRange.endProgress,
-                isArmed: true,
-                renderCadence: .coalescedInteraction
+        switch activeDragMode {
+        case .loopRegion:
+            updateLoopRegionRange(
+                from: Float(selectionAnchorProgress),
+                to: dragProgress,
+                renderCadence: renderCadence,
+                invalidatesCursorRects: false,
+                notifiesChange: notifiesChange
             )
+            displayHoverProgress(
+                dragProgress,
+                isArmed: true,
+                renderCadence: renderCadence
+            )
+        case .moveLoopRegion:
+            guard let activeLoopMoveInitialRange else {
+                return false
+            }
+            updateMovingLoopRange(
+                initialRange: activeLoopMoveInitialRange,
+                anchorProgress: Float(selectionAnchorProgress),
+                currentProgress: dragProgress,
+                renderCadence: renderCadence,
+                invalidatesCursorRects: false,
+                notifiesChange: notifiesChange
+            )
+            displayHoverProgress(nil, renderCadence: renderCadence)
+        case .loopStart, .loopEnd:
+            let draggedEndpoint = updateLoopRange(
+                for: activeDragMode,
+                progress: dragProgress,
+                enforcesMinimumDuration: false,
+                renderCadence: renderCadence,
+                invalidatesCursorRects: false,
+                notifiesChange: notifiesChange
+            )
+            if let draggedEndpoint {
+                displayHighlightedLoopEndpoint(
+                    draggedEndpoint,
+                    renderCadence: renderCadence
+                )
+                let boundaryProgress = draggedEndpoint == .start ?
+                    loopRange.startProgress :
+                    loopRange.endProgress
+                displayHoverProgress(
+                    boundaryProgress,
+                    isArmed: true,
+                    renderCadence: renderCadence
+                )
+            }
+        default:
+            return false
         }
+        return loopRange != previousRange
     }
 
     private func resetSelectionDragVelocity(
@@ -5694,7 +7859,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         from anchorProgress: Float,
         to currentProgress: Float,
         renderCadence: TimelineRenderCadence = .immediate,
-        invalidatesCursorRects: Bool = true
+        invalidatesCursorRects: Bool = true,
+        notifiesChange: Bool = true
     ) {
         let minimumDuration = minimumLoopDurationProgress()
         let clampedAnchor = min(max(anchorProgress, 0), 1)
@@ -5722,43 +7888,72 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         loopRange = nextRange
-        if renderCadence == .coalescedInteraction {
-            timelineRenderer?.publishInteractionLoopRange(nextRange)
-        } else {
+        if renderCadence == .immediate {
             updateTimelineRendererImmediately { renderer in
                 renderer.displayLoopRange(nextRange)
             }
+        } else {
+            timelineRenderer?.publishInteractionLoopRange(nextRange)
         }
         if invalidatesCursorRects {
             invalidateTimelineCursorRects()
         }
-        onLoopRangeChanged?(nextRange)
+        if notifiesChange {
+            onLoopRangeChanged?(nextRange)
+        }
         requestRender(cadence: renderCadence)
     }
 
+    @discardableResult
     private func updateLoopRange(
         for dragMode: TimelineDragMode,
         progress: Float,
+        enforcesMinimumDuration: Bool = true,
         renderCadence: TimelineRenderCadence = .immediate,
-        invalidatesCursorRects: Bool = true
-    ) {
-        let minimumDuration = minimumLoopDurationProgress()
-        let nextRange: TimelineLoopRange
+        invalidatesCursorRects: Bool = true,
+        notifiesChange: Bool = true
+    ) -> TimelineLoopEndpoint? {
+        let fallbackEndpoint: TimelineLoopEndpoint
+        let fallbackFixedProgress: Float
         switch dragMode {
         case .loopStart:
-            nextRange = loopRange.movingStart(to: progress, minimumDuration: minimumDuration)
+            fallbackEndpoint = .start
+            fallbackFixedProgress = loopRange.endProgress
         case .loopEnd:
-            nextRange = loopRange.movingEnd(to: progress, minimumDuration: minimumDuration)
+            fallbackEndpoint = .end
+            fallbackFixedProgress = loopRange.startProgress
         case .loopRegion, .moveLoopRegion:
-            return
+            return nil
         case
+            .seek,
             .selection,
             .resizeSelectionStart,
             .resizeSelectionEnd,
             .horizontalScrollbar,
-            .verticalScrollbar:
-            return
+            .verticalScrollbar,
+            .timelineEnd,
+            .moveClip,
+            .trimClipStart,
+            .trimClipEnd,
+            .clipMarquee,
+            .clipFadeIn,
+            .clipFadeOut,
+            .automationPoint,
+            .automationCurve,
+            .automationMarquee,
+            .automationPencil,
+            .automationRamp,
+            .automationEraser:
+            return nil
         }
+
+        let result = TimelineLoopEdgeResizeInteraction.resize(
+            fixedProgress: activeLoopResizeFixedProgress ?? fallbackFixedProgress,
+            draggedProgress: progress,
+            fallbackEndpoint: fallbackEndpoint,
+            minimumDuration: enforcesMinimumDuration ? minimumLoopDurationProgress() : 0
+        )
+        let nextRange = result.range
 
         guard nextRange != loopRange else {
             if renderCadence == .immediate {
@@ -5766,22 +7961,25 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                     renderer.displayLoopRange(nextRange)
                 }
             }
-            return
+            return result.draggedEndpoint
         }
 
         loopRange = nextRange
-        if renderCadence == .coalescedInteraction {
-            timelineRenderer?.publishInteractionLoopRange(nextRange)
-        } else {
+        if renderCadence == .immediate {
             updateTimelineRendererImmediately { renderer in
                 renderer.displayLoopRange(nextRange)
             }
+        } else {
+            timelineRenderer?.publishInteractionLoopRange(nextRange)
         }
         if invalidatesCursorRects {
             invalidateTimelineCursorRects()
         }
-        onLoopRangeChanged?(nextRange)
+        if notifiesChange {
+            onLoopRangeChanged?(nextRange)
+        }
         requestRender(cadence: renderCadence)
+        return result.draggedEndpoint
     }
 
     private func updateMovingLoopRange(
@@ -5789,7 +7987,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         anchorProgress: Float,
         currentProgress: Float,
         renderCadence: TimelineRenderCadence = .immediate,
-        invalidatesCursorRects: Bool = true
+        invalidatesCursorRects: Bool = true,
+        notifiesChange: Bool = true
     ) {
         let nextRange = initialRange.moving(by: currentProgress - anchorProgress)
         guard nextRange != loopRange else {
@@ -5802,17 +8001,19 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         }
 
         loopRange = nextRange
-        if renderCadence == .coalescedInteraction {
-            timelineRenderer?.publishInteractionLoopRange(nextRange)
-        } else {
+        if renderCadence == .immediate {
             updateTimelineRendererImmediately { renderer in
                 renderer.displayLoopRange(nextRange)
             }
+        } else {
+            timelineRenderer?.publishInteractionLoopRange(nextRange)
         }
         if invalidatesCursorRects {
             invalidateTimelineCursorRects()
         }
-        onLoopRangeChanged?(nextRange)
+        if notifiesChange {
+            onLoopRangeChanged?(nextRange)
+        }
         requestRender(cadence: renderCadence)
     }
 
@@ -5826,7 +8027,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private func loopDragMode(for point: CGPoint) -> TimelineDragMode? {
         guard
             bounds.width > 0,
-            rulerLaneRect().contains(point)
+            loopInteractionBandRect().contains(point)
         else {
             return nil
         }
@@ -5835,7 +8036,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return endpoint == .start ? .loopStart : .loopEnd
         }
 
-        if isLoopRangeEnabled, loopRegionContains(point) {
+        if loopRegionContains(point) {
             return .moveLoopRegion
         }
 
@@ -5845,7 +8046,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private func legacyLoopEndpointDragMode(for point: CGPoint) -> TimelineDragMode? {
         guard
             bounds.width > 0,
-            rulerLaneRect().contains(point)
+            loopInteractionBandRect().contains(point)
         else {
             return nil
         }
@@ -5880,13 +8081,27 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         case .loopEnd:
             return .end
         case
+            .seek,
             .selection,
             .resizeSelectionStart,
             .resizeSelectionEnd,
             .loopRegion,
             .moveLoopRegion,
             .horizontalScrollbar,
-            .verticalScrollbar:
+            .verticalScrollbar,
+            .timelineEnd,
+            .moveClip,
+            .trimClipStart,
+            .trimClipEnd,
+            .clipMarquee,
+            .clipFadeIn,
+            .clipFadeOut,
+            .automationPoint,
+            .automationCurve,
+            .automationMarquee,
+            .automationPencil,
+            .automationRamp,
+            .automationEraser:
             return nil
         }
     }
@@ -6076,7 +8291,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return nil
         }
 
-        let rulerRect = rulerLaneRect()
+        let rulerRect = loopInteractionBandRect()
         let startX = CGFloat(viewport.viewportProgress(
             forTimelineProgress: loopRange.startProgress
         )) * bounds.width
@@ -6099,7 +8314,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
 
     private func loopRegionEndpointNear(_ point: CGPoint) -> TimelineLoopEndpoint? {
         guard
-            rulerLaneRect().contains(point),
+            loopInteractionBandRect().contains(point),
             loopRange.durationProgress < 0.999
         else {
             return nil
@@ -6137,7 +8352,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return nil
         }
 
-        let rulerRect = rulerLaneRect()
+        let rulerRect = loopInteractionBandRect()
         guard rulerRect.width > 0, rulerRect.height > 0 else {
             return nil
         }
@@ -6160,7 +8375,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return nil
         }
 
-        let rulerRect = rulerLaneRect()
+        let rulerRect = loopInteractionBandRect()
         guard rulerRect.width > 0, rulerRect.height > 0 else {
             return nil
         }
@@ -6207,6 +8422,188 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         )
     }
 
+    private func loopInteractionBandRect() -> NSRect {
+        let rulerRect = rulerLaneRect()
+        let loopHeight = min(
+            CGFloat(TimelineRulerLaneGeometry.loopBandHeight(for: Float(rulerRect.height))),
+            rulerRect.height
+        )
+        return NSRect(
+            x: rulerRect.minX,
+            y: rulerRect.maxY - loopHeight,
+            width: rulerRect.width,
+            height: loopHeight
+        )
+    }
+
+    private func rulerSeekBandRect() -> NSRect {
+        let rulerRect = rulerLaneRect()
+        let loopRect = loopInteractionBandRect()
+        return NSRect(
+            x: rulerRect.minX,
+            y: rulerRect.minY,
+            width: rulerRect.width,
+            height: max(loopRect.minY - rulerRect.minY, 0)
+        )
+    }
+
+    private enum SeekGutter {
+        case ruler
+        case bottom
+    }
+
+    private struct SeekGutterHit {
+        let gutter: SeekGutter
+        let span: TimelineHoverGuideSpan
+    }
+
+    private func hoverGuideSpan(for rect: NSRect) -> TimelineHoverGuideSpan? {
+        guard bounds.height > 0, rect.height > 0 else {
+            return nil
+        }
+        return TimelineHoverGuideSpan(
+            normalizedTop: Float((bounds.height - rect.maxY) / bounds.height),
+            normalizedBottom: Float((bounds.height - rect.minY) / bounds.height)
+        )
+    }
+
+    private func seekGutterHit(at point: CGPoint) -> SeekGutterHit? {
+        guard bounds.contains(point), bounds.height > 0 else {
+            return nil
+        }
+
+        let seekRect = rulerSeekBandRect()
+        if seekRect.contains(point), let span = hoverGuideSpan(for: seekRect) {
+            return SeekGutterHit(
+                gutter: .ruler,
+                span: span
+            )
+        }
+
+        guard let span = bottomSeekGutterSpan() else {
+            return nil
+        }
+        let bottomGutterHeight = CGFloat(1 - span.normalizedTop) * bounds.height
+        guard point.y <= bottomGutterHeight else {
+            return nil
+        }
+        return SeekGutterHit(gutter: .bottom, span: span)
+    }
+
+    private func bottomSeekGutterSpan() -> TimelineHoverGuideSpan? {
+        guard bounds.height > 0 else {
+            return nil
+        }
+
+        let layout = resolvedTrackLayoutForCurrentBounds()
+        let contentBottom = (0..<layout.totalTrackCount).reduce(
+            layout.rulerLaneHeight / Float(bounds.height)
+        ) { currentBottom, trackIndex in
+            max(currentBottom, layout.laneFrame(forTrackIndex: trackIndex)?.bottom ?? currentBottom)
+        }
+        let normalizedTop = min(max(contentBottom, 0), 1)
+        guard normalizedTop < 0.998 else {
+            return nil
+        }
+        return TimelineHoverGuideSpan(normalizedTop: normalizedTop, normalizedBottom: 1)
+    }
+
+    var seekGutterSpansForTesting: (ruler: TimelineHoverGuideSpan, bottom: TimelineHoverGuideSpan?) {
+        let seekRect = rulerSeekBandRect()
+        return (
+            hoverGuideSpan(for: seekRect) ?? TimelineHoverGuideSpan(normalizedTop: 0, normalizedBottom: 0),
+            bottomSeekGutterSpan()
+        )
+    }
+
+    var rulerInteractionRectsForTesting: (loop: NSRect, seek: NSRect) {
+        (loopInteractionBandRect(), rulerSeekBandRect())
+    }
+
+    func loopBodyStartsMoveForTesting(at point: CGPoint) -> Bool {
+        loopDragMode(for: point) == .moveLoopRegion
+    }
+
+    func loopCreationStartsForTesting(at point: CGPoint) -> Bool {
+        loopDragMode(for: point) == .loopRegion
+    }
+
+    var onHoverGuideStatePublishedForTesting: ((
+        _ progress: Float?,
+        _ isArmed: Bool,
+        _ guideSpan: TimelineHoverGuideSpan?
+    ) -> Void)?
+
+    private func projectTime(atRawX x: CGFloat) -> TimeInterval {
+        guard timelineDuration > 0, bounds.width > 0 else { return 0 }
+        let visibleStart = Double(viewport.startProgress) * timelineDuration
+        let visibleDuration = Double(viewport.durationProgress) * timelineDuration
+        return max(visibleStart + Double(x / bounds.width) * visibleDuration, 0)
+    }
+
+    private func timelineEndMarkerX() -> CGFloat? {
+        guard
+            let timelineEndTime,
+            timelineDuration > 0,
+            viewport.durationProgress > 0
+        else { return nil }
+        let progress = Float(timelineEndTime / timelineDuration)
+        let viewportProgress = viewport.viewportProgress(forTimelineProgress: progress)
+        guard viewportProgress >= 0, viewportProgress <= 1 else { return nil }
+        return CGFloat(viewportProgress) * bounds.width
+    }
+
+    private func timelineEndHandleHit(at point: CGPoint) -> Bool {
+        guard let markerX = timelineEndMarkerX(), rulerLaneRect().contains(point) else {
+            return false
+        }
+        return point.x >= markerX - 6 &&
+            point.x <= markerX + TimelineEndOverlayView.handleSideLength + 4
+    }
+
+    private func updateTimelineEndDrag(to point: CGPoint) {
+        let nextEnd = projectTime(atRawX: point.x)
+        timelineEndTime = nextEnd
+        let nextDuration = max(contentDuration, nextEnd)
+        if nextDuration != timelineDuration {
+            let previousDuration = timelineDuration
+            timelineDuration = nextDuration
+            if previousDuration > 0, nextDuration > 0, !viewport.isFull {
+                let preservedViewport = viewport.preservingAbsoluteTimes(
+                    previousDuration: previousDuration,
+                    nextDuration: nextDuration
+                )
+                viewport = preservedViewport
+                settledViewport = preservedViewport
+                updateTimelineRendererImmediately { renderer in
+                    renderer.displayViewport(preservedViewport)
+                }
+            }
+            updateTimelineRendererImmediately { renderer in
+                renderer.displayProjectDuration(nextDuration)
+            }
+        }
+        updateTimelineEndOverlay()
+        onTimelineEndChanged?(nextEnd)
+        requestTimelineRender()
+    }
+
+    private func updateTimelineEndOverlay() {
+        timelineEndOverlayView.rulerHeight = CGFloat(
+            resolvedTrackLayoutForCurrentBounds().rulerLaneHeight
+        )
+        guard let timelineEndTime, timelineDuration > 0 else {
+            timelineEndOverlayView.markerX = nil
+            timelineEndOverlayView.dimsEntireViewport = false
+            return
+        }
+        let progress = Float(timelineEndTime / timelineDuration)
+        let viewportProgress = viewport.viewportProgress(forTimelineProgress: progress)
+        timelineEndOverlayView.dimsEntireViewport = viewportProgress < 0
+        timelineEndOverlayView.markerX = (0...1).contains(viewportProgress) ?
+            CGFloat(viewportProgress) * bounds.width : nil
+    }
+
     private func didMovePastSelectionThreshold(to point: CGPoint) -> Bool {
         guard let selectionAnchorPoint else {
             return false
@@ -6243,5 +8640,1053 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return nil
         }
         return currentTrackIDs[trackIndex]
+    }
+
+    private func updateAutomationHover(for event: NSEvent) -> Bool {
+        guard isAutomationModeVisible else {
+            displayAutomationHover(for: nil)
+            return false
+        }
+        let point = convert(event.locationInWindow, from: nil)
+        guard let hit = automationHit(at: point) else {
+            displayAutomationHover(for: nil)
+            return false
+        }
+        displayAutomationHover(for: hit)
+        switch hit.kind {
+        case .point:
+            NSCursor.pointingHand.set()
+        case .segment where automationTool == .curve:
+            NSCursor.resizeUpDown.set()
+        case .segment, .fence, .lane:
+            NSCursor.crosshair.set()
+        }
+        return true
+    }
+
+    private func displayAutomationHover(for hit: AutomationHit?) {
+        let hover: TimelineAutomationHover?
+        if let hit {
+            switch hit.kind {
+            case let .point(pointID):
+                hover = TimelineAutomationHover(
+                    trackID: hit.trackID,
+                    pointID: pointID,
+                    segmentLeadingPointID: nil,
+                    isLineHovered: false
+                )
+            case let .segment(pointID):
+                hover = TimelineAutomationHover(
+                    trackID: hit.trackID,
+                    pointID: nil,
+                    segmentLeadingPointID: pointID,
+                    isLineHovered: true
+                )
+            case let .fence(leadingPointID):
+                hover = TimelineAutomationHover(
+                    trackID: hit.trackID,
+                    pointID: nil,
+                    segmentLeadingPointID: leadingPointID,
+                    isLineHovered: true
+                )
+            case .lane:
+                hover = nil
+            }
+        } else {
+            hover = nil
+        }
+        timelineRenderer?.publishInteractionAutomationHover(hover)
+        requestRender(cadence: .coalescedInteraction)
+    }
+
+    private func displayAutomationPreview(
+        points: [TimelineRenderState.Track.AutomationPoint]?,
+        hit: AutomationHit?
+    ) {
+        let preview = points.flatMap { points in
+            hit.map {
+                TimelineAutomationPreview(
+                    trackID: $0.trackID,
+                    parameterID: $0.parameterID,
+                    points: points
+                )
+            }
+        }
+        timelineRenderer?.publishInteractionAutomationPreview(preview)
+        requestRender(cadence: .coalescedInteraction)
+    }
+
+    private func setAutomationSelection(_ selection: TimelineAutomationSelection) {
+        automationSelection = selection
+        let presentation: TimelineAutomationSelectionPresentation?
+        if
+            let address = selection.address,
+            case let .track(trackID) = address.owner,
+            !selection.pointIDs.isEmpty
+        {
+            presentation = TimelineAutomationSelectionPresentation(
+                trackID: trackID,
+                parameterID: address.parameterID.rawValue,
+                pointIDs: selection.pointIDs
+            )
+        } else {
+            presentation = nil
+        }
+        timelineRenderer?.displayAutomationSelection(presentation)
+        requestRender(cadence: .coalescedInteraction)
+    }
+
+    private func updateAutomationSelection(
+        pointID: UUID,
+        hit: AutomationHit,
+        modifierFlags: NSEvent.ModifierFlags
+    ) {
+        let address = TimelineAutomationAddress.track(
+            hit.trackID,
+            parameterID: TimelineAutomationParameterID(rawValue: hit.parameterID)
+        )
+        let isSameLane = automationSelection.address == address
+        let usesToggle = modifierFlags.contains(.command)
+        let usesRange = modifierFlags.contains(.shift)
+
+        if usesRange, isSameLane, let anchor = automationSelection.anchorPointID,
+           let anchorIndex = hit.points.firstIndex(where: { $0.id == anchor }),
+           let pointIndex = hit.points.firstIndex(where: { $0.id == pointID }) {
+            let range = min(anchorIndex, pointIndex) ... max(anchorIndex, pointIndex)
+            setAutomationSelection(TimelineAutomationSelection(
+                address: address,
+                pointIDs: Set(hit.points[range].map(\.id)),
+                anchorPointID: anchor
+            ))
+            return
+        }
+
+        if usesToggle, isSameLane {
+            var pointIDs = automationSelection.pointIDs
+            if !pointIDs.insert(pointID).inserted {
+                pointIDs.remove(pointID)
+            }
+            setAutomationSelection(TimelineAutomationSelection(
+                address: pointIDs.isEmpty ? nil : address,
+                pointIDs: pointIDs,
+                anchorPointID: pointIDs.contains(pointID) ? pointID : pointIDs.first
+            ))
+            return
+        }
+
+        if isSameLane, automationSelection.pointIDs.contains(pointID) {
+            return
+        }
+        setAutomationSelection(TimelineAutomationSelection(
+            address: address,
+            pointIDs: [pointID],
+            anchorPointID: pointID
+        ))
+    }
+
+    private func automationHit(at point: CGPoint) -> AutomationHit? {
+        guard
+            isAutomationModeVisible,
+            let trackID = trackID(at: point),
+            let trackIndex = currentTrackIDs.firstIndex(of: trackID),
+            currentRenderTracks.indices.contains(trackIndex),
+            let laneFrame = resolvedTrackLayoutForCurrentBounds().laneFrame(forTrackIndex: trackIndex)
+        else { return nil }
+
+        let track = currentRenderTracks[trackIndex]
+        guard let lane = track.automationLanes.first(where: {
+            $0.parameterID == displayedAutomationParameterID
+        }) else { return nil }
+
+        let height = Float(max(bounds.height, 1))
+        let yFromTop = Float(bounds.height - point.y)
+        let layout = resolvedTrackLayoutForCurrentBounds()
+        let laneTop = laneFrame.top * height
+        let laneBottom = laneFrame.bottom * height
+        let visibleTop = max(laneTop, layout.rulerLaneHeight)
+        let visibleBottom = min(laneBottom, height)
+        guard yFromTop >= visibleTop, yFromTop <= visibleBottom, laneBottom - laneTop > 8 else { return nil }
+        let automationRange = TimelineClipChromeMetrics.automationRange(
+            laneTop: laneTop,
+            laneBottom: laneBottom,
+            viewportHeight: height
+        )
+        let curveTop = automationRange.top
+        let curveBottom = automationRange.bottom
+        let projectProgress = preciseProgress(for: point, followsVisualFisheye: false)
+        let normalizedValue = min(max((curveBottom - yFromTop) / max(curveBottom - curveTop, 1), 0), 1)
+        let sortedPoints = lane.points.sorted {
+            if $0.projectProgress == $1.projectProgress { return $0.id.uuidString < $1.id.uuidString }
+            return $0.projectProgress < $1.projectProgress
+        }
+
+        let pointRadius: CGFloat = 9
+        for automationPoint in sortedPoints {
+            let center = automationPointPosition(
+                automationPoint,
+                curveTop: curveTop,
+                curveBottom: curveBottom
+            )
+            if hypot(point.x - center.x, point.y - center.y) <= pointRadius {
+                return AutomationHit(
+                    kind: .point(automationPoint.id),
+                    trackID: trackID,
+                    parameterID: lane.parameterID,
+                    projectProgress: projectProgress,
+                    normalizedValue: normalizedValue,
+                    points: sortedPoints,
+                    initialCurve: automationPoint.curveToNext
+                )
+            }
+        }
+
+        if sortedPoints.count > 1 {
+            for index in 0..<(sortedPoints.count - 1) {
+                let left = sortedPoints[index]
+                let right = sortedPoints[index + 1]
+                guard projectProgress >= left.projectProgress, projectProgress <= right.projectProgress else { continue }
+                let curveValue = automationValue(
+                    between: left,
+                    and: right,
+                    at: projectProgress
+                )
+                let lineYFromTop = curveBottom - curveValue * max(curveBottom - curveTop, 1)
+                let lineY = bounds.height - CGFloat(lineYFromTop)
+                if abs(point.y - lineY) <= 7 {
+                    return AutomationHit(
+                        kind: .segment(left.id),
+                        trackID: trackID,
+                        parameterID: lane.parameterID,
+                        projectProgress: projectProgress,
+                        normalizedValue: normalizedValue,
+                        points: sortedPoints,
+                        initialCurve: left.curveToNext
+                    )
+                }
+            }
+        }
+
+        let heldLine: (value: Float, leadingPointID: UUID?)?
+        if let first = sortedPoints.first, projectProgress < first.projectProgress {
+            heldLine = (first.normalizedValue, nil)
+        } else if let last = sortedPoints.last, projectProgress > last.projectProgress {
+            heldLine = (last.normalizedValue, last.id)
+        } else if sortedPoints.isEmpty {
+            heldLine = (lane.defaultNormalizedValue, nil)
+        } else {
+            heldLine = nil
+        }
+        if let heldLine {
+            let lineYFromTop = curveBottom - heldLine.value * max(curveBottom - curveTop, 1)
+            let lineY = bounds.height - CGFloat(lineYFromTop)
+            if abs(point.y - lineY) <= 7 {
+                return AutomationHit(
+                    kind: .fence(heldLine.leadingPointID),
+                    trackID: trackID,
+                    parameterID: lane.parameterID,
+                    projectProgress: projectProgress,
+                    normalizedValue: normalizedValue,
+                    points: sortedPoints,
+                    initialCurve: 0
+                )
+            }
+        }
+
+        return AutomationHit(
+            kind: .lane,
+            trackID: trackID,
+            parameterID: lane.parameterID,
+            projectProgress: projectProgress,
+            normalizedValue: normalizedValue,
+            points: sortedPoints,
+            initialCurve: 0
+        )
+    }
+
+    private func automationPointPosition(
+        _ point: TimelineRenderState.Track.AutomationPoint,
+        curveTop: Float,
+        curveBottom: Float
+    ) -> CGPoint {
+        let viewportProgress = viewport.viewportProgress(forTimelineProgress: Float(point.projectProgress))
+        let x = CGFloat(viewportProgress) * bounds.width
+        let yFromTop = curveBottom - point.normalizedValue * max(curveBottom - curveTop, 1)
+        return CGPoint(x: x, y: bounds.height - CGFloat(yFromTop))
+    }
+
+    private func automationValue(
+        between left: TimelineRenderState.Track.AutomationPoint,
+        and right: TimelineRenderState.Track.AutomationPoint,
+        at progress: Double
+    ) -> Float {
+        let duration = right.projectProgress - left.projectProgress
+        guard duration > 0 else { return right.normalizedValue }
+        let linear = Float(min(max((progress - left.projectProgress) / duration, 0), 1))
+        let curved = TimelineAutomationCurve.progress(linear, curve: left.curveToNext)
+        return left.normalizedValue + (right.normalizedValue - left.normalizedValue) * curved
+    }
+
+    private func pointsAddingAutomationPoint(
+        from hit: AutomationHit
+    ) -> [TimelineRenderState.Track.AutomationPoint] {
+        var points = hit.points
+        points.append(TimelineRenderState.Track.AutomationPoint(
+            id: UUID(),
+            projectProgress: hit.projectProgress,
+            normalizedValue: hit.normalizedValue,
+            curveToNext: 0
+        ))
+        return points.sorted { $0.projectProgress < $1.projectProgress }
+    }
+
+    private func updateAutomationDrag(to point: CGPoint) {
+        guard let hit = activeAutomationHit else { return }
+        let crossedThreshold = didMovePastSelectionThreshold(to: point)
+        if crossedThreshold { activeAutomationDidDrag = true }
+        guard activeAutomationDidDrag else { return }
+
+        switch activeDragMode {
+        case .automationPoint:
+            guard case let .point(pointID) = hit.kind else { return }
+            guard let nextHit = constrainedAutomationDestination(for: hit, at: point) else { return }
+            let address = TimelineAutomationAddress.track(
+                hit.trackID,
+                parameterID: TimelineAutomationParameterID(rawValue: hit.parameterID)
+            )
+            let selectedPointIDs = automationSelection.address == address &&
+                automationSelection.pointIDs.contains(pointID) ?
+                automationSelection.pointIDs : [pointID]
+            guard
+                let anchorPoint = activeAutomationPoints.first(where: { $0.id == pointID })
+            else { return }
+            let selectedPoints = activeAutomationPoints.filter { selectedPointIDs.contains($0.id) }
+            let minimumProgress = selectedPoints.map(\.projectProgress).min() ?? anchorPoint.projectProgress
+            let maximumProgress = selectedPoints.map(\.projectProgress).max() ?? anchorPoint.projectProgress
+            let minimumValue = selectedPoints.map(\.normalizedValue).min() ?? anchorPoint.normalizedValue
+            let maximumValue = selectedPoints.map(\.normalizedValue).max() ?? anchorPoint.normalizedValue
+            var progressDelta = min(
+                max(nextHit.projectProgress - anchorPoint.projectProgress, -minimumProgress),
+                1 - maximumProgress
+            )
+            if !NSEvent.modifierFlags.contains(.option) {
+                let desiredAnchorProgress = anchorPoint.projectProgress + progressDelta
+                let snappedAnchorProgress = snappedAutomationProgress(
+                    desiredAnchorProgress,
+                    trackID: hit.trackID,
+                    excluding: selectedPointIDs
+                )
+                progressDelta = min(
+                    max(snappedAnchorProgress - anchorPoint.projectProgress, -minimumProgress),
+                    1 - maximumProgress
+                )
+            }
+            let valueDelta = min(
+                max(nextHit.normalizedValue - anchorPoint.normalizedValue, -minimumValue),
+                1 - maximumValue
+            )
+            let points = activeAutomationPoints.map { existing in
+                guard selectedPointIDs.contains(existing.id) else { return existing }
+                return TimelineRenderState.Track.AutomationPoint(
+                    id: existing.id,
+                    projectProgress: existing.projectProgress + progressDelta,
+                    normalizedValue: existing.normalizedValue + valueDelta,
+                    curveToNext: existing.curveToNext
+                )
+            }.sorted { $0.projectProgress < $1.projectProgress }
+            displayAutomationPreview(points: points, hit: hit)
+            NSCursor.closedHand.set()
+        case .automationCurve:
+            guard
+                case let .segment(pointID) = hit.kind,
+                let anchor = selectionAnchorPoint
+            else { return }
+            let nextCurve = min(max(hit.initialCurve + Float((point.y - anchor.y) / 80), -1), 1)
+            let points = activeAutomationPoints.map { existing in
+                guard existing.id == pointID else { return existing }
+                return TimelineRenderState.Track.AutomationPoint(
+                    id: existing.id,
+                    projectProgress: existing.projectProgress,
+                    normalizedValue: existing.normalizedValue,
+                    curveToNext: nextCurve
+                )
+            }
+            displayAutomationPreview(points: points, hit: hit)
+            NSCursor.resizeUpDown.set()
+        case .automationMarquee:
+            guard let anchor = selectionAnchorPoint else { return }
+            let rect = marqueeRect(from: anchor, to: point)
+            displayAutomationMarquee(from: anchor, to: point)
+            let address = TimelineAutomationAddress.track(
+                hit.trackID,
+                parameterID: TimelineAutomationParameterID(rawValue: hit.parameterID)
+            )
+            var pointIDs = automationPointIDs(in: rect, for: hit)
+            if automationMarqueeBaseSelection.address == address {
+                pointIDs.formUnion(automationMarqueeBaseSelection.pointIDs)
+            }
+            setAutomationSelection(TimelineAutomationSelection(
+                address: pointIDs.isEmpty ? nil : address,
+                pointIDs: pointIDs,
+                anchorPointID: pointIDs.first
+            ))
+            NSCursor.crosshair.set()
+        case .automationPencil:
+            guard let destination = automationHitForTrack(
+                hit,
+                at: point,
+                projectProgress: preciseProgress(for: point, followsVisualFisheye: false)
+            ) else { return }
+            if let lastAutomationDrawPoint,
+               hypot(point.x - lastAutomationDrawPoint.x, point.y - lastAutomationDrawPoint.y) < 2 {
+                return
+            }
+            activeAutomationDrawSamples.append(TimelineAutomationDrawPresentationSample(
+                frameProgress: destination.projectProgress,
+                normalizedValue: destination.normalizedValue
+            ))
+            lastAutomationDrawPoint = point
+            displayAutomationPreview(points: automationDrawingPreviewPoints(for: hit), hit: hit)
+            NSCursor.crosshair.set()
+        case .automationRamp:
+            guard let destination = automationHitForTrack(
+                hit,
+                at: point,
+                projectProgress: preciseProgress(for: point, followsVisualFisheye: false)
+            ), let first = activeAutomationDrawSamples.first else { return }
+            activeAutomationDrawSamples = [first, TimelineAutomationDrawPresentationSample(
+                frameProgress: destination.projectProgress,
+                normalizedValue: destination.normalizedValue
+            )]
+            displayAutomationPreview(points: automationDrawingPreviewPoints(for: hit), hit: hit)
+            NSCursor.crosshair.set()
+        case .automationEraser:
+            if let current = automationHit(at: point),
+               current.trackID == hit.trackID,
+               current.parameterID == hit.parameterID,
+               case let .point(pointID) = current.kind {
+                activeAutomationErasedPointIDs.insert(pointID)
+            }
+            displayAutomationPreview(
+                points: hit.points.filter { !activeAutomationErasedPointIDs.contains($0.id) },
+                hit: hit
+            )
+            NSCursor.disappearingItem.set()
+        default:
+            break
+        }
+    }
+
+    private func automationDrawingPreviewPoints(
+        for hit: AutomationHit
+    ) -> [TimelineRenderState.Track.AutomationPoint] {
+        guard !activeAutomationDrawSamples.isEmpty else { return hit.points }
+        let minimum = activeAutomationDrawSamples.map(\.frameProgress).min() ?? 0
+        let maximum = activeAutomationDrawSamples.map(\.frameProgress).max() ?? minimum
+        var points = hit.points.filter { $0.projectProgress < minimum || $0.projectProgress > maximum }
+        points.append(contentsOf: activeAutomationDrawSamples.map { sample in
+            TimelineRenderState.Track.AutomationPoint(
+                id: sample.id,
+                projectProgress: sample.frameProgress,
+                normalizedValue: sample.normalizedValue,
+                curveToNext: 0
+            )
+        })
+        return points.sorted { $0.projectProgress < $1.projectProgress }
+    }
+
+    private func constrainedAutomationDestination(
+        for hit: AutomationHit,
+        at point: CGPoint
+    ) -> AutomationHit? {
+        let progress = preciseProgress(for: point, followsVisualFisheye: false)
+        guard let destination = automationHitForTrack(hit, at: point, projectProgress: progress) else {
+            return nil
+        }
+        let anchorPoint: TimelineRenderState.Track.AutomationPoint?
+        if case let .point(pointID) = hit.kind {
+            anchorPoint = activeAutomationPoints.first(where: { $0.id == pointID })
+        } else {
+            anchorPoint = nil
+        }
+        let flags = NSEvent.modifierFlags
+        return AutomationHit(
+            kind: destination.kind,
+            trackID: destination.trackID,
+            parameterID: destination.parameterID,
+            projectProgress: flags.contains(.option) ?
+                (anchorPoint?.projectProgress ?? destination.projectProgress) : destination.projectProgress,
+            normalizedValue: flags.contains(.shift) ?
+                (anchorPoint?.normalizedValue ?? destination.normalizedValue) : destination.normalizedValue,
+            points: destination.points,
+            initialCurve: destination.initialCurve
+        )
+    }
+
+    private func snappedAutomationProgress(
+        _ progress: Double,
+        trackID: UUID,
+        excluding pointIDs: Set<UUID>
+    ) -> Double {
+        let threshold = Double(max(viewport.durationProgress, 0.000_001)) * 7 / Double(max(bounds.width, 1))
+        var targets: [Double] = [0, 1, Double(currentPresentationPlayheadProgress())]
+        targets.append(contentsOf: activeAutomationPoints.compactMap {
+            pointIDs.contains($0.id) ? nil : $0.projectProgress
+        })
+        if let track = currentRenderTracks.first(where: { $0.id == trackID }) {
+            for range in track.clipRanges {
+                targets.append(Double(range.startProgress))
+                targets.append(Double(range.endProgress))
+            }
+        }
+        guard let nearest = targets.min(by: { abs($0 - progress) < abs($1 - progress) }),
+              abs(nearest - progress) <= threshold else {
+            return progress
+        }
+        return nearest
+    }
+
+    private func automationPointIDs(in rect: CGRect, for hit: AutomationHit) -> Set<UUID> {
+        guard
+            let trackIndex = currentTrackIDs.firstIndex(of: hit.trackID),
+            let laneFrame = resolvedTrackLayoutForCurrentBounds().laneFrame(forTrackIndex: trackIndex)
+        else { return [] }
+        let height = Float(max(bounds.height, 1))
+        let laneTop = laneFrame.top * height
+        let laneBottom = laneFrame.bottom * height
+        let automationRange = TimelineClipChromeMetrics.automationRange(
+            laneTop: laneTop,
+            laneBottom: laneBottom,
+            viewportHeight: height
+        )
+        return Set(hit.points.compactMap { point in
+            rect.contains(automationPointPosition(
+                point,
+                curveTop: automationRange.top,
+                curveBottom: automationRange.bottom
+            )) ? point.id : nil
+        })
+    }
+
+    /// AppKit may coalesce drag events independently of the display refresh.
+    /// Sampling from the display link keeps the preview attached to the pointer
+    /// on every presented frame without committing graph edits during the drag.
+    private func refreshLiveAutomationFromCurrentMouse() -> Bool {
+        guard
+            isAutomationDragActive,
+            activeAutomationHit != nil,
+            let point = currentMousePointInTimeline()
+        else {
+            return false
+        }
+
+        let wasDragging = activeAutomationDidDrag
+        updateAutomationDrag(to: point)
+        return wasDragging || activeAutomationDidDrag
+    }
+
+    private func automationHitForTrack(
+        _ hit: AutomationHit,
+        at point: CGPoint,
+        projectProgress: Double
+    ) -> AutomationHit? {
+        guard
+            let trackIndex = currentTrackIDs.firstIndex(of: hit.trackID),
+            let laneFrame = resolvedTrackLayoutForCurrentBounds().laneFrame(forTrackIndex: trackIndex)
+        else { return nil }
+        let height = Float(max(bounds.height, 1))
+        let laneTop = laneFrame.top * height
+        let laneBottom = laneFrame.bottom * height
+        let automationRange = TimelineClipChromeMetrics.automationRange(
+            laneTop: laneTop,
+            laneBottom: laneBottom,
+            viewportHeight: height
+        )
+        let curveTop = automationRange.top
+        let curveBottom = automationRange.bottom
+        let yFromTop = Float(bounds.height - point.y)
+        let value = min(max((curveBottom - yFromTop) / max(curveBottom - curveTop, 1), 0), 1)
+        return AutomationHit(
+            kind: hit.kind,
+            trackID: hit.trackID,
+            parameterID: hit.parameterID,
+            projectProgress: min(max(projectProgress, 0), 1),
+            normalizedValue: value,
+            points: hit.points,
+            initialCurve: hit.initialCurve
+        )
+    }
+
+    private func finishAutomationInteraction(at point: CGPoint) {
+        guard let hit = activeAutomationHit else { return }
+        switch (activeDragMode, hit.kind) {
+        case (.automationMarquee, _):
+            displayAutomationMarquee(from: nil, to: nil)
+            automationMarqueeBaseSelection = .empty
+        case (.automationPencil, _), (.automationRamp, _):
+            if let minimum = activeAutomationDrawSamples.map(\.frameProgress).min(),
+               let maximum = activeAutomationDrawSamples.map(\.frameProgress).max(),
+               !activeAutomationDrawSamples.isEmpty {
+                onAutomationEditRequested?(TimelineAutomationEditRequest(
+                    trackID: hit.trackID,
+                    parameterID: hit.parameterID,
+                    action: .replaceRange(
+                        startProgress: minimum,
+                        endProgress: maximum,
+                        samples: activeAutomationDrawSamples
+                    )
+                ))
+            }
+        case (.automationEraser, _):
+            if !activeAutomationErasedPointIDs.isEmpty {
+                onAutomationEditRequested?(TimelineAutomationEditRequest(
+                    trackID: hit.trackID,
+                    parameterID: hit.parameterID,
+                    action: .remove(pointIDs: activeAutomationErasedPointIDs)
+                ))
+                setAutomationSelection(.empty)
+            }
+        case (.automationPoint, let .point(pointID)):
+            if activeAutomationDidDrag,
+               let unconstrainedDestination = constrainedAutomationDestination(for: hit, at: point) {
+                let address = TimelineAutomationAddress.track(
+                    hit.trackID,
+                    parameterID: TimelineAutomationParameterID(rawValue: hit.parameterID)
+                )
+                let pointIDs = automationSelection.address == address &&
+                    automationSelection.pointIDs.contains(pointID) ?
+                    automationSelection.pointIDs : [pointID]
+                let destinationProgress = NSEvent.modifierFlags.contains(.option) ?
+                    unconstrainedDestination.projectProgress :
+                    snappedAutomationProgress(
+                        unconstrainedDestination.projectProgress,
+                        trackID: hit.trackID,
+                        excluding: pointIDs
+                    )
+                onAutomationEditRequested?(TimelineAutomationEditRequest(
+                    trackID: hit.trackID,
+                    parameterID: hit.parameterID,
+                    action: .move(
+                        pointIDs: pointIDs,
+                        anchorPointID: pointID,
+                        frameProgress: destinationProgress,
+                        normalizedValue: unconstrainedDestination.normalizedValue
+                    )
+                ))
+            } else if Self.shouldDeleteAutomationPointOnClick(
+                didDrag: activeAutomationDidDrag,
+                modifierFlags: activeAutomationMouseDownModifierFlags
+            ) {
+                onAutomationEditRequested?(TimelineAutomationEditRequest(
+                    trackID: hit.trackID,
+                    parameterID: hit.parameterID,
+                    action: .remove(pointIDs: [pointID])
+                ))
+                setAutomationSelection(.empty)
+            }
+        case (.automationPoint, .segment), (.automationPoint, .fence), (.automationPoint, .lane):
+            let pointID = UUID()
+            onAutomationEditRequested?(TimelineAutomationEditRequest(
+                trackID: hit.trackID,
+                parameterID: hit.parameterID,
+                action: .add(
+                    pointID: pointID,
+                    frameProgress: hit.projectProgress,
+                    normalizedValue: hit.normalizedValue
+                )
+            ))
+            setAutomationSelection(TimelineAutomationSelection(
+                address: .track(
+                    hit.trackID,
+                    parameterID: TimelineAutomationParameterID(rawValue: hit.parameterID)
+                ),
+                pointIDs: [pointID],
+                anchorPointID: pointID
+            ))
+        case (.automationCurve, let .segment(pointID)):
+            let curve: Float
+            if let anchor = selectionAnchorPoint {
+                curve = min(max(hit.initialCurve + Float((point.y - anchor.y) / 80), -1), 1)
+            } else {
+                curve = hit.initialCurve
+            }
+            onAutomationEditRequested?(TimelineAutomationEditRequest(
+                trackID: hit.trackID,
+                parameterID: hit.parameterID,
+                action: .setCurve(leavingPointID: pointID, curve: curve)
+            ))
+        default:
+            break
+        }
+        displayAutomationPreview(points: nil, hit: nil)
+        activeAutomationHit = nil
+        activeAutomationPoints.removeAll(keepingCapacity: true)
+        activeAutomationDidDrag = false
+        activeAutomationMouseDownModifierFlags = []
+        activeAutomationDrawSamples.removeAll(keepingCapacity: true)
+        activeAutomationErasedPointIDs.removeAll(keepingCapacity: true)
+        lastAutomationDrawPoint = nil
+    }
+
+    static func shouldDeleteAutomationPointOnClick(
+        didDrag: Bool,
+        modifierFlags: NSEvent.ModifierFlags
+    ) -> Bool {
+        guard !didDrag else { return false }
+        let selectionModifiers: NSEvent.ModifierFlags = [.command, .shift, .option, .control]
+        return modifierFlags.intersection(selectionModifiers).isEmpty
+    }
+
+    private func cycleDisplayedAutomationParameter() {
+        let choices = [
+            TimelineAutomationParameterID.volume.rawValue,
+            TimelineAutomationParameterID.pan.rawValue,
+            TimelineAutomationParameterID.mute.rawValue,
+        ]
+        let index = choices.firstIndex(of: displayedAutomationParameterID) ?? 0
+        setDisplayedAutomationParameter(TimelineAutomationParameterID(
+            rawValue: choices[(index + 1) % choices.count]
+        ))
+    }
+
+    private struct ClipHit {
+        let request: TimelineClipFocusRequest
+        let edge: TimelineClipEdge?
+        let isHeader: Bool
+    }
+
+    private struct ClipPropertyHit {
+        let request: TimelineClipFocusRequest
+        let control: TimelineClipPropertyControl
+        let preview: TimelineClipPropertyPreview
+    }
+
+    private struct ClipPropertyGeometry {
+        let startX: CGFloat
+        let endX: CGFloat
+        let bodyLowerY: CGFloat
+        let bodyUpperY: CGFloat
+        let fadeInPoint: CGPoint
+        let fadeOutPoint: CGPoint
+    }
+
+    private func marqueeRect(from anchor: CGPoint?, to point: CGPoint) -> CGRect {
+        guard let anchor else { return .zero }
+        return CGRect(
+            x: min(anchor.x, point.x),
+            y: min(anchor.y, point.y),
+            width: abs(point.x - anchor.x),
+            height: abs(point.y - anchor.y)
+        )
+    }
+
+    private func clipFocusRequests(intersecting rect: CGRect) -> [TimelineClipFocusRequest] {
+        guard !rect.isEmpty, timelineDuration > 0 else { return [] }
+        let layout = resolvedTrackLayoutForCurrentBounds()
+        var requests: [TimelineClipFocusRequest] = []
+        for (trackIndex, track) in currentRenderTracks.enumerated() {
+            guard
+                let lane = layout.laneFrame(forTrackIndex: trackIndex),
+                currentTrackIDs.indices.contains(trackIndex)
+            else { continue }
+            let trackDuration = track.durationHint ?? track.waveformOverview?.duration ?? 0
+            guard trackDuration > 0 else { continue }
+            let scale = trackDuration / timelineDuration
+            let laneRect = CGRect(
+                x: 0,
+                y: bounds.height - CGFloat(lane.bottom) * bounds.height,
+                width: bounds.width,
+                height: CGFloat(lane.height) * bounds.height
+            )
+            guard laneRect.intersects(rect) else { continue }
+            for range in track.clipRanges where !range.isSilent {
+                let start = Float(range.startProgress * scale)
+                let end = Float(range.endProgress * scale)
+                let clipRect = CGRect(
+                    x: CGFloat(viewport.viewportProgress(forTimelineProgress: start)) * bounds.width,
+                    y: laneRect.minY,
+                    width: CGFloat((end - start) / viewport.durationProgress) * bounds.width,
+                    height: laneRect.height
+                )
+                guard clipRect.intersects(rect) else { continue }
+                requests.append(TimelineClipFocusRequest(
+                    clipID: range.id,
+                    trackID: track.id,
+                    trackLocalRange: range,
+                    projectStartProgress: start,
+                    projectEndProgress: end
+                ))
+            }
+        }
+        return requests
+    }
+
+    private func clipPropertyHit(at point: CGPoint) -> ClipPropertyHit? {
+        guard let hit = clipHit(at: point), hit.request.trackLocalRange.isSelected else { return nil }
+        let request = hit.request
+        guard
+            let trackIndex = currentTrackIDs.firstIndex(of: request.trackID),
+            let lane = resolvedTrackLayoutForCurrentBounds().laneFrame(forTrackIndex: trackIndex),
+            let geometry = clipPropertyGeometry(for: request, lane: lane)
+        else { return nil }
+        let range = request.trackLocalRange
+        var handleCandidates: [(TimelineClipPropertyControl, CGPoint)] = []
+        if range.fadeInProgress > 0 {
+            handleCandidates.append((.fadeIn, geometry.fadeInPoint))
+        }
+        if range.fadeOutProgress > 0 {
+            handleCandidates.append((.fadeOut, geometry.fadeOutPoint))
+        }
+        if let handle = handleCandidates
+            .map({ (control: $0.0, distance: hypot(point.x - $0.1.x, point.y - $0.1.y)) })
+            .filter({ $0.distance <= 14 })
+            .min(by: { $0.distance < $1.distance })
+        {
+            return ClipPropertyHit(
+                request: request,
+                control: handle.control,
+                preview: TimelineClipPropertyPreview(
+                    trackID: request.trackID,
+                    clipID: request.clipID,
+                    gain: range.gain,
+                    fadeInProgress: range.fadeInProgress,
+                    fadeOutProgress: range.fadeOutProgress
+                )
+            )
+        }
+
+        var lineCandidates: [(TimelineClipPropertyControl, CGFloat)] = []
+        if range.fadeInProgress > 0 {
+            lineCandidates.append((
+                .fadeIn,
+                distance(
+                    from: point,
+                    toSegmentFrom: CGPoint(x: geometry.startX, y: geometry.bodyLowerY),
+                    to: geometry.fadeInPoint
+                )
+            ))
+        }
+        if range.fadeOutProgress > 0 {
+            lineCandidates.append((
+                .fadeOut,
+                distance(
+                    from: point,
+                    toSegmentFrom: geometry.fadeOutPoint,
+                    to: CGPoint(x: geometry.endX, y: geometry.bodyLowerY)
+                )
+            ))
+        }
+        guard let best = lineCandidates.filter({ $0.1 <= 7 }).min(by: { $0.1 < $1.1 }) else {
+            return nil
+        }
+        return ClipPropertyHit(
+            request: request,
+            control: best.0,
+            preview: TimelineClipPropertyPreview(
+                trackID: request.trackID,
+                clipID: request.clipID,
+                gain: range.gain,
+                fadeInProgress: range.fadeInProgress,
+                fadeOutProgress: range.fadeOutProgress
+            )
+        )
+    }
+
+    private func clipPropertyGeometry(
+        for request: TimelineClipFocusRequest,
+        lane: TimelineTrackLaneFrame
+    ) -> ClipPropertyGeometry? {
+        let startX = CGFloat(viewport.viewportProgress(forTimelineProgress: request.projectStartProgress)) * bounds.width
+        let endX = CGFloat(viewport.viewportProgress(forTimelineProgress: request.projectEndProgress)) * bounds.width
+        let width = endX - startX
+        guard width >= 36 else { return nil }
+
+        let chromeGeometry = TimelineClipChromeMetrics.verticalGeometry(
+            laneTop: Float(lane.top) * Float(bounds.height),
+            laneBottom: Float(lane.bottom) * Float(bounds.height),
+            viewportHeight: Float(bounds.height)
+        )
+        // Chrome metrics use top-down Metal coordinates; pointer geometry uses
+        // AppKit's bottom-up coordinates.
+        let clipTopY = bounds.height - CGFloat(chromeGeometry.clipTop)
+        let clipBottomY = bounds.height - CGFloat(chromeGeometry.clipBottom)
+        let headerHeight = CGFloat(chromeGeometry.headerHeight)
+        let bodyUpperY = max(clipTopY - headerHeight, clipBottomY)
+        let range = request.trackLocalRange
+        let fadeInX = startX + width * CGFloat(range.fadeInProgress)
+        let fadeOutX = endX - width * CGFloat(range.fadeOutProgress)
+        return ClipPropertyGeometry(
+            startX: startX,
+            endX: endX,
+            bodyLowerY: clipBottomY,
+            bodyUpperY: bodyUpperY,
+            fadeInPoint: CGPoint(x: fadeInX, y: bodyUpperY),
+            fadeOutPoint: CGPoint(x: fadeOutX, y: bodyUpperY)
+        )
+    }
+
+    private func distance(from point: CGPoint, toSegmentFrom start: CGPoint, to end: CGPoint) -> CGFloat {
+        let delta = CGPoint(x: end.x - start.x, y: end.y - start.y)
+        let lengthSquared = delta.x * delta.x + delta.y * delta.y
+        guard lengthSquared > 0 else {
+            return hypot(point.x - start.x, point.y - start.y)
+        }
+        let projection = ((point.x - start.x) * delta.x + (point.y - start.y) * delta.y) / lengthSquared
+        let unit = min(max(projection, 0), 1)
+        let closest = CGPoint(x: start.x + delta.x * unit, y: start.y + delta.y * unit)
+        return hypot(point.x - closest.x, point.y - closest.y)
+    }
+
+    private func updateClipPropertyPreview(to point: CGPoint) {
+        guard
+            let request = activeClipRequest,
+            let control = activeClipPropertyControl,
+            var preview = activeClipPropertyPreview
+        else { return }
+        switch control {
+        case .fadeIn:
+            let progress = progress(for: point, followsVisualFisheye: false)
+            preview = TimelineClipPropertyPreview(
+                trackID: preview.trackID,
+                clipID: preview.clipID,
+                gain: preview.gain,
+                fadeInProgress: Double(min(max((progress - request.projectStartProgress) / max(request.projectEndProgress - request.projectStartProgress, 0.000_001), 0), Float(1 - preview.fadeOutProgress))),
+                fadeOutProgress: preview.fadeOutProgress
+            )
+        case .fadeOut:
+            let progress = progress(for: point, followsVisualFisheye: false)
+            preview = TimelineClipPropertyPreview(
+                trackID: preview.trackID,
+                clipID: preview.clipID,
+                gain: preview.gain,
+                fadeInProgress: preview.fadeInProgress,
+                fadeOutProgress: Double(min(max((request.projectEndProgress - progress) / max(request.projectEndProgress - request.projectStartProgress, 0.000_001), 0), Float(1 - preview.fadeInProgress)))
+            )
+        }
+        displayClipPropertyPreview(preview)
+    }
+
+    private func clipHit(at point: CGPoint) -> ClipHit? {
+        guard
+            timelineDuration > 0,
+            let trackID = trackID(at: point),
+            let trackIndex = currentTrackIDs.firstIndex(of: trackID),
+            let track = currentRenderTracks.first(where: { $0.id == trackID }),
+            let lane = resolvedTrackLayoutForCurrentBounds().laneFrame(forTrackIndex: trackIndex)
+        else {
+            return nil
+        }
+        let trackDuration = track.durationHint ?? track.waveformOverview?.duration ?? 0
+        guard trackDuration > 0 else {
+            return nil
+        }
+        let trackDurationProgress = min(max(trackDuration / timelineDuration, 0), 1)
+        let projectProgress = Double(progress(for: point, followsVisualFisheye: false))
+        let edgeTolerance = max(7 / max(bounds.width, 1) * CGFloat(viewport.durationProgress), 0.000_001)
+        let yFromTop = bounds.height - point.y
+        let laneTopPixels = CGFloat(lane.top) * bounds.height
+        let isHeader = yFromTop >= laneTopPixels && yFromTop <= laneTopPixels + min(22, CGFloat(lane.height) * bounds.height)
+
+        var best: (range: TimelineRenderState.ClipRange, edge: TimelineClipEdge?, distance: Double)?
+        for range in track.clipRanges where !range.isSilent {
+            let start = range.startProgress * trackDurationProgress
+            let end = range.endProgress * trackDurationProgress
+            let startDistance = abs(projectProgress - start)
+            let endDistance = abs(projectProgress - end)
+            let edge: TimelineClipEdge?
+            let distance: Double
+            if startDistance <= endDistance, startDistance <= Double(edgeTolerance) {
+                edge = .leading
+                distance = startDistance
+            } else if endDistance < startDistance, endDistance <= Double(edgeTolerance) {
+                edge = .trailing
+                distance = endDistance
+            } else if projectProgress >= start, projectProgress <= end {
+                edge = nil
+                distance = 0
+            } else {
+                continue
+            }
+            if best == nil || distance < best!.distance {
+                best = (range, edge, distance)
+            }
+        }
+        guard let best else {
+            return nil
+        }
+        let request = TimelineClipFocusRequest(
+            clipID: best.range.id,
+            trackID: trackID,
+            trackLocalRange: best.range,
+            projectStartProgress: Float(best.range.startProgress * trackDurationProgress),
+            projectEndProgress: Float(best.range.endProgress * trackDurationProgress)
+        )
+        return ClipHit(request: request, edge: best.edge, isHeader: isHeader)
+    }
+
+    private func clipFocusRequest(at point: CGPoint) -> TimelineClipFocusRequest? {
+        if let hit = clipHit(at: point) {
+            return hit.request
+        }
+        guard
+            timelineDuration > 0,
+            let trackID = trackID(at: point),
+            let track = currentRenderTracks.first(where: { $0.id == trackID })
+        else {
+            return nil
+        }
+
+        let trackDuration = track.durationHint ?? track.waveformOverview?.duration ?? 0
+        guard trackDuration > 0 else {
+            return nil
+        }
+
+        let trackDurationProgress = min(max(trackDuration / timelineDuration, 0), 1)
+        guard trackDurationProgress > 0 else {
+            return nil
+        }
+
+        let projectProgress = Double(progress(for: point))
+        let localProgress = min(max(projectProgress / trackDurationProgress, 0), 1)
+        let epsilon = max(Double(viewport.durationProgress) / Double(max(bounds.width, 1)) * 2, 0.000_001)
+        guard let clipRange = track.clipRanges.first(where: { range in
+            !range.isSilent &&
+            localProgress >= range.startProgress - epsilon &&
+                localProgress <= range.endProgress + epsilon
+        }) else {
+            return nil
+        }
+
+        return TimelineClipFocusRequest(
+            clipID: clipRange.id,
+            trackID: trackID,
+            trackLocalRange: clipRange,
+            projectStartProgress: Float(clipRange.startProgress * trackDurationProgress),
+            projectEndProgress: Float(clipRange.endProgress * trackDurationProgress)
+        )
+    }
+
+    private func selectedClipFocusRequests() -> [TimelineClipFocusRequest] {
+        guard timelineDuration > 0 else {
+            return []
+        }
+        return currentRenderTracks.flatMap { track -> [TimelineClipFocusRequest] in
+            let trackDuration = track.durationHint ?? track.waveformOverview?.duration ?? 0
+            guard trackDuration > 0 else {
+                return []
+            }
+            let trackDurationProgress = min(max(trackDuration / timelineDuration, 0), 1)
+            return track.clipRanges.compactMap { range in
+                guard range.isSelected, !range.isSilent else {
+                    return nil
+                }
+                return TimelineClipFocusRequest(
+                    clipID: range.id,
+                    trackID: track.id,
+                    trackLocalRange: range,
+                    projectStartProgress: Float(range.startProgress * trackDurationProgress),
+                    projectEndProgress: Float(range.endProgress * trackDurationProgress)
+                )
+            }
+        }
     }
 }

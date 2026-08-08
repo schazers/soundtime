@@ -5,6 +5,49 @@ enum TimelineLoopEndpoint: Sendable, Equatable {
     case end
 }
 
+struct TimelineLoopEdgeResizeResult: Sendable, Equatable {
+    let range: TimelineLoopRange
+    let draggedEndpoint: TimelineLoopEndpoint
+}
+
+enum TimelineLoopEdgeResizeInteraction {
+    static func resize(
+        fixedProgress: Float,
+        draggedProgress: Float,
+        fallbackEndpoint: TimelineLoopEndpoint,
+        minimumDuration: Float = 0
+    ) -> TimelineLoopEdgeResizeResult {
+        let fixed = min(max(fixedProgress, 0), 1)
+        let pointer = min(max(draggedProgress, 0), 1)
+
+        let endpoint: TimelineLoopEndpoint
+        if pointer < fixed {
+            endpoint = .start
+        } else if pointer > fixed {
+            endpoint = .end
+        } else {
+            endpoint = fallbackEndpoint
+        }
+
+        let minimum = min(max(minimumDuration, 0), 1)
+        let adjustedPointer: Float
+        switch endpoint {
+        case .start:
+            adjustedPointer = min(pointer, max(fixed - minimum, 0))
+        case .end:
+            adjustedPointer = max(pointer, min(fixed + minimum, 1))
+        }
+
+        return TimelineLoopEdgeResizeResult(
+            range: TimelineLoopRange(
+                startProgress: fixed,
+                endProgress: adjustedPointer
+            ),
+            draggedEndpoint: endpoint
+        )
+    }
+}
+
 enum TimelineLoopRegionStyleAnimation {
     static let duration: CFTimeInterval = 0.060
     static let renderPulseDuration: CFTimeInterval = duration + (1.0 / 60.0)
@@ -132,6 +175,58 @@ struct TimelineLoopRange: Sendable, Equatable {
             rawLeft: rawLeft,
             rawRight: rawRight,
             viewportWidth: 1
+        )
+    }
+}
+
+enum TimelineLoopRangeProjection {
+    static func localRange(
+        forProjectRange projectRange: TimelineLoopRange,
+        projectDuration: TimeInterval,
+        localDuration: TimeInterval
+    ) -> TimelineLoopRange? {
+        guard
+            projectDuration.isFinite,
+            localDuration.isFinite,
+            projectDuration > 0,
+            localDuration > 0
+        else {
+            return nil
+        }
+
+        let projectStartTime = TimeInterval(projectRange.startProgress) * projectDuration
+        let projectEndTime = TimeInterval(projectRange.endProgress) * projectDuration
+        let visibleStartTime = min(max(projectStartTime, 0), localDuration)
+        let visibleEndTime = min(max(projectEndTime, 0), localDuration)
+        guard visibleEndTime > visibleStartTime else {
+            return nil
+        }
+
+        return TimelineLoopRange(
+            startProgress: Float(visibleStartTime / localDuration),
+            endProgress: Float(visibleEndTime / localDuration)
+        )
+    }
+
+    static func projectRange(
+        forLocalRange localRange: TimelineLoopRange,
+        localDuration: TimeInterval,
+        projectDuration: TimeInterval
+    ) -> TimelineLoopRange? {
+        guard
+            localDuration.isFinite,
+            projectDuration.isFinite,
+            localDuration > 0,
+            projectDuration > 0
+        else {
+            return nil
+        }
+
+        let startTime = TimeInterval(localRange.startProgress) * localDuration
+        let endTime = TimeInterval(localRange.endProgress) * localDuration
+        return TimelineLoopRange(
+            startProgress: Float(startTime / projectDuration),
+            endProgress: Float(endTime / projectDuration)
         )
     }
 }

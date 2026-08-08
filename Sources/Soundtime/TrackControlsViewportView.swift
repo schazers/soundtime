@@ -3,6 +3,16 @@ import AppKit
 final class TrackControlsViewportView: NSView {
     var onVerticalScroll: ((Float) -> Void)?
 
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configureViewportClipping()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configureViewportClipping()
+    }
+
     override var mouseDownCanMoveWindow: Bool {
         false
     }
@@ -14,5 +24,10 @@ final class TrackControlsViewportView: NSView {
         }
 
         onVerticalScroll?(Float(-event.scrollingDeltaY))
+    }
+
+    private func configureViewportClipping() {
+        wantsLayer = true
+        layer?.masksToBounds = true
     }
 }

@@ -23,6 +23,51 @@ enum TimelineNavigationPanGeometry {
     }
 }
 
+enum TimelineNavigationWheelGeometry {
+    static let shiftedHorizontalPanMultiplier: CGFloat = 4
+    private static let preciseZoomSensitivity: CGFloat = 0.012
+    private static let discreteZoomSensitivity: CGFloat = 0.055
+    private static let maximumZoomStepLogScale: Float = 0.35
+
+    static func shiftedHorizontalDelta(
+        scrollingDeltaX: CGFloat,
+        scrollingDeltaY: CGFloat
+    ) -> CGFloat {
+        let sourceDelta = abs(scrollingDeltaX) > 0.000_1 ?
+            scrollingDeltaX : scrollingDeltaY
+        return sourceDelta * shiftedHorizontalPanMultiplier
+    }
+
+    static func commandZoomLogScaleDelta(
+        scrollingDeltaX: CGFloat,
+        scrollingDeltaY: CGFloat,
+        hasPreciseScrollingDeltas: Bool
+    ) -> Float {
+        let sourceDelta = abs(scrollingDeltaY) >= abs(scrollingDeltaX) ?
+            scrollingDeltaY : scrollingDeltaX
+        let sensitivity = hasPreciseScrollingDeltas ?
+            preciseZoomSensitivity : discreteZoomSensitivity
+        return min(
+            max(Float(sourceDelta * sensitivity), -maximumZoomStepLogScale),
+            maximumZoomStepLogScale
+        )
+    }
+
+    static func commandZoomVelocityImpulse(
+        logScaleDelta: Float,
+        momentumDecayRate: Double
+    ) -> Float {
+        logScaleDelta * Float(max(momentumDecayRate, 0))
+    }
+
+    static func shiftedPanVelocityImpulse(
+        progressDelta: Float,
+        momentumDecayRate: Double
+    ) -> Float {
+        progressDelta * Float(max(momentumDecayRate, 0))
+    }
+}
+
 enum TimelineNavigationScrollbarDragGeometry {
     static let interactionFramesPerSecond = 144
 

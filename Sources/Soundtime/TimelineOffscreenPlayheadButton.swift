@@ -130,8 +130,8 @@ final class TimelineOffscreenPlayheadButton: NSButton {
         let travel: CGFloat = direction == .left ? -3.5 : 3.5
         let animation = CAKeyframeAnimation(keyPath: "transform.translation.x")
         animation.values = [0, travel, 0]
-        animation.keyTimes = [0, 0.46, 1]
-        animation.duration = 0.82
+        animation.keyTimes = [0, 0.40, 1]
+        animation.duration = 0.48
         animation.repeatCount = .infinity
         animation.timingFunctions = [
             CAMediaTimingFunction(name: .easeOut),
@@ -151,8 +151,9 @@ enum TimelineOffscreenPlayheadIndicatorGeometry {
         direction: TimelineOffscreenPlayheadDirection,
         in rect: CGRect
     ) -> [CGPoint] {
-        let halfWidth: CGFloat = 9
-        let halfHeight: CGFloat = 7
+        let sideLength: CGFloat = 18
+        let halfHeight = sideLength * 0.5
+        let halfWidth = sideLength * sqrt(3) * 0.25
         let directionSign: CGFloat = direction == .left ? -1 : 1
         let tip = CGPoint(
             x: rect.midX + directionSign * halfWidth,

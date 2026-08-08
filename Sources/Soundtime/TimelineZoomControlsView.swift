@@ -81,7 +81,13 @@ final class TimelineZoomControlsView: NSView {
         icon.translatesAutoresizingMaskIntoConstraints = false
         slider.toolTip = tooltip
         slider.translatesAutoresizingMaskIntoConstraints = false
+        slider.setAccessibilityElement(true)
+        slider.setAccessibilityRole(.slider)
         slider.setAccessibilityLabel(tooltip)
+        slider.setAccessibilityHelp("Use Left and Right Arrow to adjust this zoom level.")
+        slider.setAccessibilityMinValue(0)
+        slider.setAccessibilityMaxValue(1)
+        slider.setAccessibilityValue(0)
 
         let row = NSStackView(views: [icon, slider])
         row.orientation = .horizontal
@@ -130,6 +136,7 @@ private final class TimelineZoomSlider: NSView {
             return
         }
         self.value = nextValue
+        setAccessibilityValue(Double(nextValue))
         needsDisplay = true
         window?.invalidateCursorRects(for: self)
     }
@@ -293,6 +300,7 @@ private final class TimelineZoomSlider: NSView {
             return
         }
         self.value = nextValue
+        setAccessibilityValue(Double(nextValue))
         needsDisplay = true
         window?.invalidateCursorRects(for: self)
         if publishes {
