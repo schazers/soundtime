@@ -50,6 +50,11 @@ enum RealtimeGraphPublishSmokeHarness {
             sourceFrameCount: sourceFrameCount,
             renderBlockFrameCount: renderBlockFrameCount
         )
+        try runTrackMeterGraphRevisionSmoke(
+            sampleRate: sampleRate,
+            sourceFrameCount: sourceFrameCount,
+            renderBlockFrameCount: renderBlockFrameCount
+        )
         try runPlayingRippleDeleteContinuitySmoke(
             sampleRate: sampleRate,
             sourceFrameCount: sourceFrameCount,
@@ -213,6 +218,7 @@ enum RealtimeGraphPublishSmokeHarness {
                 "duplicate memory-backed tracks render sample-synchronously",
                 "duplicate file-backed tracks render sample-synchronously",
                 "visual clock snapshots stay synchronized with realtime render",
+                "track meters survive mix graph revision publication",
                 "lazy file output refresh reconfigures the output device",
                 "graph publishing overlaps render blocks without dropped commands",
                 "file-backed graph edits overlap render blocks within budget",
@@ -237,6 +243,61 @@ enum RealtimeGraphPublishSmokeHarness {
         ) {
             print("wrote stability report: \(reportURL.path)")
         }
+    }
+
+    private static func runTrackMeterGraphRevisionSmoke(
+        sampleRate: Double,
+        sourceFrameCount: Int,
+        renderBlockFrameCount: Int
+    ) throws {
+        let outputDevice = RealtimeGraphPublishSmokeOutputDevice()
+        guard let playbackEngine = RealtimeCorePlaybackEngine(outputDevice: outputDevice) else {
+            throw SmokeError.failed("could not create track-meter revision engine")
+        }
+        let trackID = UUID(uuidString: "00000000-0000-4000-a000-000000000001")!
+        let sourceBuffer = syntheticAudioBuffer(frameCount: sourceFrameCount, sampleRate: sampleRate)
+        let timeline = AudioEditTimeline(sourceBuffer: sourceBuffer)
+        try playbackEngine.loadProjectTracks(projectTracks(
+            ids: [trackID],
+            timelines: [timeline],
+            sourceRevisions: [0],
+            iteration: 1
+        ))
+        playbackEngine.setTrackMeteringEnabled(true)
+        try playbackEngine.play()
+
+        // Mix changes publish a fresh immutable render graph. Its runtime slots
+        // must retain the logical track identity used by the mixer UI.
+        playbackEngine.updateProjectTrackMix([
+            ProjectPlaybackTrackMix(
+                id: trackID,
+                volume: 0.73,
+                pan: -0.2,
+                isMuted: false,
+                isSoloed: false
+            ),
+        ])
+        guard let corePointer = outputDevice.corePointer else {
+            throw SmokeError.failed("track-meter revision engine was not configured")
+        }
+        render(
+            corePointer: corePointer,
+            blockCount: 6,
+            frameCount: renderBlockFrameCount,
+            sampleRate: sampleRate
+        )
+        guard let packet = playbackEngine.drainTrackMeterPackets().last else {
+            throw SmokeError.failed("mix graph revision discarded every track-meter packet")
+        }
+        try require(
+            packet.levels.contains(where: { $0.trackID == trackID }),
+            "track-meter packet lost its logical track identity after mix publication"
+        )
+        try require(
+            playbackEngine.trackMeterDiagnostics().stalePacketCount == 0,
+            "mix graph revision produced a stale track-meter packet"
+        )
+        playbackEngine.pause()
     }
 
     private static func runDuplicateTrackPhaseSmoke(

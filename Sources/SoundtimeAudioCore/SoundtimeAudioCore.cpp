@@ -16,6 +16,8 @@
 namespace {
 
 constexpr size_t maximumRealtimeTrackCount = 4096;
+constexpr size_t maximumRealtimeOutputChannelCount = 32;
+constexpr double maximumSeekDeclickDurationSeconds = 0.005;
 
 struct AudioSource {
     enum class Storage {
@@ -48,13 +50,25 @@ struct RenderSegment {
     float gainEnd = 1;
 };
 
+struct RenderAutomationPoint {
+    uint64_t frame = 0;
+    float value = 1;
+    float curveToNext = 0;
+};
+
 struct RenderTrack {
     std::shared_ptr<const AudioSource> source;
     std::vector<RenderSegment> segments;
+    std::vector<RenderAutomationPoint> volumeAutomationPoints;
+    std::vector<RenderAutomationPoint> panAutomationPoints;
+    std::vector<RenderAutomationPoint> muteAutomationPoints;
     float gain = 1;
+    float pan = 0;
+    uint32_t channelCount = 0;
 };
 
 struct RenderGraph {
+    uint64_t revision = 0;
     uint64_t frameCount = 0;
     uint32_t channelCount = 0;
     double sampleRate = 0;
@@ -79,11 +93,19 @@ struct TrackGainRamp {
     uint64_t rampFramesRemaining = 0;
 };
 
+struct AutomationCursor {
+    const RenderTrack* track = nullptr;
+    uint64_t lastFrame = 0;
+    size_t rightIndex = 0;
+    bool isValid = false;
+};
+
 enum class EngineCommandType : uint8_t {
     play,
     pause,
     pauseAt,
     seek,
+    seekExact,
 };
 
 struct EngineCommand {
@@ -110,6 +132,24 @@ struct MeterSample {
     float rightPeak = 0;
     float leftClipPeak = 0;
     float rightClipPeak = 0;
+};
+
+struct TrackMeterLevel {
+    uint32_t runtimeTrackSlot = 0;
+    uint32_t channelCount = 0;
+    float leftRMS = 0;
+    float rightRMS = 0;
+    float leftPeak = 0;
+    float rightPeak = 0;
+};
+
+struct TrackMeterPacket {
+    uint64_t graphRevision = 0;
+    uint64_t sequence = 0;
+    uint64_t renderedFrameCount = 0;
+    double hostTimestamp = 0;
+    uint32_t trackCount = 0;
+    std::array<TrackMeterLevel, maximumRealtimeTrackCount> levels{};
 };
 
 template <typename T, size_t Capacity>
@@ -140,6 +180,32 @@ public:
         return true;
     }
 
+    [[nodiscard]] T* beginPush() {
+        const auto writeIndex = writeIndex_.load(std::memory_order_relaxed);
+        if (increment(writeIndex) == readIndex_.load(std::memory_order_acquire)) {
+            return nullptr;
+        }
+        return &storage_[writeIndex];
+    }
+
+    void commitPush() {
+        const auto writeIndex = writeIndex_.load(std::memory_order_relaxed);
+        writeIndex_.store(increment(writeIndex), std::memory_order_release);
+    }
+
+    [[nodiscard]] const T* front() const {
+        const auto readIndex = readIndex_.load(std::memory_order_relaxed);
+        if (readIndex == writeIndex_.load(std::memory_order_acquire)) {
+            return nullptr;
+        }
+        return &storage_[readIndex];
+    }
+
+    void popFront() {
+        const auto readIndex = readIndex_.load(std::memory_order_relaxed);
+        readIndex_.store(increment(readIndex), std::memory_order_release);
+    }
+
     void clear() {
         readIndex_.store(writeIndex_.load(std::memory_order_acquire), std::memory_order_release);
     }
@@ -159,6 +225,12 @@ private:
 struct SoundtimeAudioCoreEngine {
     SoundtimeAudioCoreEngine() {
         trackGainRamps.resize(maximumRealtimeTrackCount);
+        automationCursors.resize(maximumRealtimeTrackCount);
+        panAutomationCursors.resize(maximumRealtimeTrackCount);
+        muteAutomationCursors.resize(maximumRealtimeTrackCount);
+        for (auto& pan : liveTrackPans) {
+            pan.store(0, std::memory_order_relaxed);
+        }
         mach_timebase_info(&renderTimingTimebase);
         if (renderTimingTimebase.denom == 0) {
             renderTimingTimebase.numer = 1;
@@ -198,6 +270,18 @@ struct SoundtimeAudioCoreEngine {
     SPSCQueue<EngineCommand, 256> commandQueue;
     SPSCQueue<ClockSample, 1024> clockSamples;
     SPSCQueue<MeterSample, 1024> meterSamples;
+    SPSCQueue<TrackMeterPacket, 4> trackMeterPackets;
+    std::atomic<bool> trackMeteringEnabled{false};
+    bool trackMeteringWasEnabledOnRenderThread = false;
+    std::atomic<uint64_t> nextGraphRevision{1};
+    std::atomic<uint64_t> currentGraphRevision{0};
+    std::atomic<uint64_t> droppedTrackMeterPacketCount{0};
+    std::atomic<uint64_t> trackMeterWorkNanoseconds{0};
+    uint64_t trackMeterSequence = 0;
+    uint64_t trackMeterAccumulationGraphRevision = 0;
+    uint64_t trackMeterAccumulatedFrames = 0;
+    std::array<double, maximumRealtimeTrackCount * 2> trackMeterSquareSums{};
+    std::array<float, maximumRealtimeTrackCount * 2> trackMeterPeaks{};
     float transportGain = 1;
     float transportGainTarget = 1;
     float transportGainStep = 0;
@@ -205,10 +289,20 @@ struct SoundtimeAudioCoreEngine {
     bool stopWhenTransportRampCompletes = false;
     uint64_t transportPauseFrameIndex = 0;
     bool hasTransportPauseFrameIndex = false;
+    std::array<float, maximumRealtimeOutputChannelCount> lastOutputSamples{};
+    std::array<float, maximumRealtimeOutputChannelCount> seekDeclickStartSamples{};
+    uint32_t lastOutputChannelCount = 0;
+    uint64_t seekDeclickTotalFrames = 0;
+    uint64_t seekDeclickFramesRemaining = 0;
     mach_timebase_info_data_t renderTimingTimebase{1, 1};
     const RenderGraph* trackGainRampGraph = nullptr;
     size_t trackGainRampCount = 0;
     std::vector<TrackGainRamp> trackGainRamps;
+    std::vector<AutomationCursor> automationCursors;
+    std::vector<AutomationCursor> panAutomationCursors;
+    std::vector<AutomationCursor> muteAutomationCursors;
+    std::array<std::atomic<float>, maximumRealtimeTrackCount> liveTrackPans{};
+    std::array<float, maximumRealtimeTrackCount> renderTrackPans{};
 };
 
 struct SoundtimeAudioCoreSource {
@@ -287,6 +381,86 @@ float next_transport_gain(SoundtimeAudioCoreEngine& engine, bool& completedTrans
     }
 
     return engine.transportGain;
+}
+
+void begin_seek_declick(
+    SoundtimeAudioCoreEngine& engine,
+    const AudioRenderConfig& config
+) {
+    const auto durationSeconds = std::min(
+        config.transportRampDurationSeconds,
+        maximumSeekDeclickDurationSeconds
+    );
+    const auto rampFrames = durationSeconds > 0 && config.sampleRate > 0 ?
+        static_cast<uint64_t>(durationSeconds * config.sampleRate + 0.5) :
+        uint64_t{0};
+    if (rampFrames == 0 || engine.lastOutputChannelCount == 0) {
+        engine.seekDeclickTotalFrames = 0;
+        engine.seekDeclickFramesRemaining = 0;
+        return;
+    }
+
+    engine.seekDeclickStartSamples = engine.lastOutputSamples;
+    engine.seekDeclickTotalFrames = rampFrames;
+    engine.seekDeclickFramesRemaining = rampFrames;
+}
+
+void apply_seek_declick(
+    SoundtimeAudioCoreEngine& engine,
+    float* const* outputs,
+    uint32_t channelCount,
+    uint64_t frameOffset
+) {
+    if (engine.seekDeclickFramesRemaining == 0 || engine.seekDeclickTotalFrames == 0) {
+        return;
+    }
+
+    const auto completedFrames = engine.seekDeclickTotalFrames - engine.seekDeclickFramesRemaining + 1;
+    const auto progress = std::clamp(
+        static_cast<float>(completedFrames) / static_cast<float>(engine.seekDeclickTotalFrames),
+        0.0f,
+        1.0f
+    );
+    const auto smoothedChannelCount = std::min<uint32_t>(
+        channelCount,
+        static_cast<uint32_t>(maximumRealtimeOutputChannelCount)
+    );
+    for (uint32_t channelIndex = 0; channelIndex < smoothedChannelCount; channelIndex++) {
+        auto* output = outputs[channelIndex];
+        if (output == nullptr) {
+            continue;
+        }
+        const auto previousSample = channelIndex < engine.lastOutputChannelCount ?
+            engine.seekDeclickStartSamples[channelIndex] :
+            0.0f;
+        output[frameOffset] = previousSample + (output[frameOffset] - previousSample) * progress;
+    }
+
+    engine.seekDeclickFramesRemaining--;
+    if (engine.seekDeclickFramesRemaining == 0) {
+        engine.seekDeclickTotalFrames = 0;
+    }
+}
+
+void remember_last_output_samples(
+    SoundtimeAudioCoreEngine& engine,
+    float* const* outputs,
+    uint32_t channelCount,
+    uint32_t frameCount
+) {
+    if (outputs == nullptr || frameCount == 0) {
+        return;
+    }
+
+    const auto rememberedChannelCount = std::min<uint32_t>(
+        channelCount,
+        static_cast<uint32_t>(maximumRealtimeOutputChannelCount)
+    );
+    for (uint32_t channelIndex = 0; channelIndex < rememberedChannelCount; channelIndex++) {
+        const auto* output = outputs[channelIndex];
+        engine.lastOutputSamples[channelIndex] = output != nullptr ? output[frameCount - 1] : 0.0f;
+    }
+    engine.lastOutputChannelCount = rememberedChannelCount;
 }
 
 uint64_t track_gain_ramp_frame_count(const AudioRenderConfig& config) {
@@ -569,6 +743,236 @@ void mark_splice_fades(RenderTrack& track) {
     }
 }
 
+float automation_curve_progress(float progress, float curve) {
+    progress = std::clamp(progress, 0.0f, 1.0f);
+    if (curve >= 2.75f) {
+        return progress < 1.0f ? 0.0f : 1.0f;
+    }
+    if (curve >= 1.75f) {
+        return progress * progress * (3.0f - 2.0f * progress);
+    }
+    curve = std::clamp(curve, -1.0f, 1.0f);
+    if (std::fabs(curve) <= 0.0001f) {
+        return progress;
+    }
+    const auto strength = std::fabs(curve);
+    const auto control1 = curve > 0 ?
+        (1.0f - strength) / 3.0f :
+        1.0f / 3.0f + 2.0f * strength / 3.0f;
+    const auto control2 = curve > 0 ?
+        2.0f * (1.0f - strength) / 3.0f :
+        2.0f / 3.0f + strength / 3.0f;
+    const auto inverse = 1.0f - progress;
+    return 3.0f * inverse * inverse * progress * control1 +
+        3.0f * inverse * progress * progress * control2 +
+        progress * progress * progress;
+}
+
+float automation_gain_between(
+    const RenderAutomationPoint& left,
+    const RenderAutomationPoint& right,
+    uint64_t frame
+) {
+    if (right.frame <= left.frame) {
+        return std::max(right.value, 0.0f);
+    }
+    const auto progress = static_cast<float>(
+        static_cast<double>(frame - left.frame) /
+        static_cast<double>(right.frame - left.frame)
+    );
+    const auto curved = automation_curve_progress(progress, left.curveToNext);
+    return std::max(left.value + (right.value - left.value) * curved, 0.0f);
+}
+
+float automation_gain_at(const RenderTrack& track, uint64_t frame) {
+    const auto& points = track.volumeAutomationPoints;
+    if (points.empty()) {
+        return 1.0f;
+    }
+    if (frame <= points.front().frame) {
+        return std::max(points.front().value, 0.0f);
+    }
+    if (frame >= points.back().frame) {
+        return std::max(points.back().value, 0.0f);
+    }
+    const auto right = std::upper_bound(
+        points.begin(),
+        points.end(),
+        frame,
+        [](uint64_t value, const RenderAutomationPoint& point) {
+            return value < point.frame;
+        }
+    );
+    return automation_gain_between(*(right - 1), *right, frame);
+}
+
+float automation_pan_at(const RenderTrack& track, uint64_t frame) {
+    const auto& points = track.panAutomationPoints;
+    if (points.empty()) {
+        return std::clamp(track.pan, -1.0f, 1.0f);
+    }
+    if (frame <= points.front().frame) {
+        return std::clamp(points.front().value * 2.0f - 1.0f, -1.0f, 1.0f);
+    }
+    if (frame >= points.back().frame) {
+        return std::clamp(points.back().value * 2.0f - 1.0f, -1.0f, 1.0f);
+    }
+    const auto right = std::upper_bound(
+        points.begin(), points.end(), frame,
+        [](uint64_t value, const RenderAutomationPoint& point) { return value < point.frame; }
+    );
+    return std::clamp(automation_gain_between(*(right - 1), *right, frame) * 2.0f - 1.0f, -1.0f, 1.0f);
+}
+
+float next_automation_pan(AutomationCursor& cursor, const RenderTrack& track, uint64_t frame) {
+    const auto& points = track.panAutomationPoints;
+    if (points.empty()) {
+        return std::clamp(track.pan, -1.0f, 1.0f);
+    }
+    const auto isSequential = cursor.isValid && cursor.track == &track && frame == cursor.lastFrame + 1;
+    if (!isSequential) {
+        cursor.track = &track;
+        cursor.rightIndex = static_cast<size_t>(std::upper_bound(
+            points.begin(), points.end(), frame,
+            [](uint64_t value, const RenderAutomationPoint& point) { return value < point.frame; }
+        ) - points.begin());
+        cursor.isValid = true;
+    } else {
+        while (cursor.rightIndex < points.size() && points[cursor.rightIndex].frame <= frame) {
+            cursor.rightIndex++;
+        }
+    }
+    cursor.lastFrame = frame;
+    float normalized = 0.5f;
+    if (cursor.rightIndex == 0) {
+        normalized = points.front().value;
+    } else if (cursor.rightIndex >= points.size()) {
+        normalized = points.back().value;
+    } else {
+        normalized = automation_gain_between(points[cursor.rightIndex - 1], points[cursor.rightIndex], frame);
+    }
+    return std::clamp(normalized * 2.0f - 1.0f, -1.0f, 1.0f);
+}
+
+float mute_gain_for_position(
+    const std::vector<RenderAutomationPoint>& points,
+    size_t rightIndex,
+    uint64_t frame
+) {
+    if (points.empty()) {
+        return 1.0f;
+    }
+    if (rightIndex == 0) {
+        return points.front().value >= 0.5f ? 1.0f : 0.0f;
+    }
+    const auto currentIndex = std::min(rightIndex - 1, points.size() - 1);
+    const auto currentGain = points[currentIndex].value >= 0.5f ? 1.0f : 0.0f;
+    if (currentIndex == 0) {
+        return currentGain;
+    }
+    const auto previousGain = points[currentIndex - 1].value >= 0.5f ? 1.0f : 0.0f;
+    constexpr uint64_t rampFrameCount = 64;
+    const auto rampStart = points[currentIndex].frame;
+    if (frame >= rampStart + rampFrameCount) {
+        return currentGain;
+    }
+    const auto progress = static_cast<float>(frame - rampStart) /
+        static_cast<float>(rampFrameCount);
+    return previousGain + (currentGain - previousGain) * std::clamp(progress, 0.0f, 1.0f);
+}
+
+float automation_mute_gain_at(const RenderTrack& track, uint64_t frame) {
+    const auto& points = track.muteAutomationPoints;
+    const auto rightIndex = static_cast<size_t>(std::upper_bound(
+        points.begin(), points.end(), frame,
+        [](uint64_t value, const RenderAutomationPoint& point) { return value < point.frame; }
+    ) - points.begin());
+    return mute_gain_for_position(points, rightIndex, frame);
+}
+
+float next_automation_mute_gain(AutomationCursor& cursor, const RenderTrack& track, uint64_t frame) {
+    const auto& points = track.muteAutomationPoints;
+    if (points.empty()) {
+        return 1.0f;
+    }
+    const auto isSequential = cursor.isValid && cursor.track == &track && frame == cursor.lastFrame + 1;
+    if (!isSequential) {
+        cursor.track = &track;
+        cursor.rightIndex = static_cast<size_t>(std::upper_bound(
+            points.begin(), points.end(), frame,
+            [](uint64_t value, const RenderAutomationPoint& point) { return value < point.frame; }
+        ) - points.begin());
+        cursor.isValid = true;
+    } else {
+        while (cursor.rightIndex < points.size() && points[cursor.rightIndex].frame <= frame) {
+            cursor.rightIndex++;
+        }
+    }
+    cursor.lastFrame = frame;
+    return mute_gain_for_position(points, cursor.rightIndex, frame);
+}
+
+struct TrackFrameMix {
+    float gain = 1;
+    float pan = 0;
+};
+
+float pan_channel_gain(float pan, uint32_t outputChannel, uint32_t channelCount) {
+    if (channelCount < 2 || outputChannel > 1) {
+        return 1.0f;
+    }
+    constexpr float halfPi = 1.5707963267948966f;
+    if (outputChannel == 0) {
+        return pan <= 0 ? 1.0f : std::cos(pan * halfPi);
+    }
+    return pan >= 0 ? 1.0f : std::cos(-pan * halfPi);
+}
+
+float next_automation_gain(
+    AutomationCursor& cursor,
+    const RenderTrack& track,
+    uint64_t frame
+) {
+    const auto& points = track.volumeAutomationPoints;
+    if (points.empty()) {
+        return 1.0f;
+    }
+
+    const auto isSequential = cursor.isValid &&
+        cursor.track == &track &&
+        frame == cursor.lastFrame + 1;
+    if (!isSequential) {
+        cursor.track = &track;
+        cursor.rightIndex = static_cast<size_t>(std::upper_bound(
+            points.begin(),
+            points.end(),
+            frame,
+            [](uint64_t value, const RenderAutomationPoint& point) {
+                return value < point.frame;
+            }
+        ) - points.begin());
+        cursor.isValid = true;
+    } else {
+        while (cursor.rightIndex < points.size() &&
+               points[cursor.rightIndex].frame <= frame) {
+            cursor.rightIndex++;
+        }
+    }
+    cursor.lastFrame = frame;
+
+    if (cursor.rightIndex == 0) {
+        return std::max(points.front().value, 0.0f);
+    }
+    if (cursor.rightIndex >= points.size()) {
+        return std::max(points.back().value, 0.0f);
+    }
+    return automation_gain_between(
+        points[cursor.rightIndex - 1],
+        points[cursor.rightIndex],
+        frame
+    );
+}
+
 template <typename TrackGainProvider>
 void mix_render_graph_frame(
     const RenderGraph& graph,
@@ -578,13 +982,15 @@ void mix_render_graph_frame(
     float* const* outputs,
     uint32_t channelCount,
     uint64_t outputFrameOffset,
-    TrackGainProvider trackGainProvider
+    TrackGainProvider trackGainProvider,
+    SoundtimeAudioCoreEngine* meterEngine = nullptr,
+    float meterGainBase = 0
 ) {
     for (size_t trackIndex = 0; trackIndex < graph.tracks.size(); trackIndex++) {
         const auto& track = graph.tracks[trackIndex];
         const auto* source = track.source.get();
-        const auto trackGain = trackGainProvider(trackIndex, track);
-        if (!source || trackGain <= 0) {
+        const auto trackMix = trackGainProvider(trackIndex, track);
+        if (!source || trackMix.gain <= 0) {
             continue;
         }
 
@@ -599,7 +1005,7 @@ void mix_render_graph_frame(
             const auto segmentFrameOffset = outputFrameIndex - segment.outputStartFrame;
             const auto sourceChannelCount = source->channelCount;
             const auto outputGain = outputGainBase *
-                trackGain *
+                trackMix.gain *
                 segment_gain(segment, segmentFrameOffset) *
                 segment_splice_gain(segment, segmentFrameOffset, config);
             for (uint32_t outputChannel = 0; outputChannel < channelCount; outputChannel++) {
@@ -627,7 +1033,20 @@ void mix_render_graph_frame(
                             static_cast<double>(segmentFrameOffset) * segment.sourceFrameScale,
                         sourceChannel
                     );
-                output[outputFrameOffset] += sourceSample * outputGain;
+                const auto panGain = pan_channel_gain(trackMix.pan, outputChannel, channelCount);
+                output[outputFrameOffset] += sourceSample * outputGain * panGain;
+                if (meterEngine != nullptr && outputChannel < 2) {
+                    const auto meterSample = sourceSample * meterGainBase *
+                        trackMix.gain * segment_gain(segment, segmentFrameOffset) *
+                        segment_splice_gain(segment, segmentFrameOffset, config) * panGain;
+                    const auto meterIndex = trackIndex * 2 + outputChannel;
+                    meterEngine->trackMeterSquareSums[meterIndex] +=
+                        static_cast<double>(meterSample) * static_cast<double>(meterSample);
+                    meterEngine->trackMeterPeaks[meterIndex] = std::max(
+                        meterEngine->trackMeterPeaks[meterIndex],
+                        std::fabs(meterSample)
+                    );
+                }
             }
             break;
         }
@@ -667,6 +1086,9 @@ void reconcile_track_gain_ramps(
     const auto rampFrames = track_gain_ramp_frame_count(config);
     const auto previousRampCount = engine.trackGainRampCount;
     for (size_t trackIndex = 0; trackIndex < trackCount; trackIndex++) {
+        engine.automationCursors[trackIndex].isValid = false;
+        engine.panAutomationCursors[trackIndex].isValid = false;
+        engine.muteAutomationCursors[trackIndex].isValid = false;
         const auto& track = graph.tracks[trackIndex];
         auto& ramp = engine.trackGainRamps[trackIndex];
         const auto targetGain = std::max(track.gain, 0.0f);
@@ -719,6 +1141,11 @@ void process_commands(SoundtimeAudioCoreEngine& engine, const AudioRenderConfig&
             begin_transport_ramp(engine, 0, config, true);
             break;
         case EngineCommandType::seek:
+            if (engine.isPlaying.load(std::memory_order_acquire)) {
+                begin_seek_declick(engine, config);
+            }
+            [[fallthrough]];
+        case EngineCommandType::seekExact:
             engine.hasTransportPauseFrameIndex = false;
             engine.frameIndex.store(
                 std::min(command.frameIndex, config.frameCount),
@@ -734,6 +1161,11 @@ void reset_engine_runtime(SoundtimeAudioCoreEngine& engine) {
     engine.renderedFrameCount.store(0, std::memory_order_release);
     engine.hostTimestamp.store(0, std::memory_order_release);
     engine.isPlaying.store(false, std::memory_order_release);
+    engine.lastOutputSamples.fill(0);
+    engine.seekDeclickStartSamples.fill(0);
+    engine.lastOutputChannelCount = 0;
+    engine.seekDeclickTotalFrames = 0;
+    engine.seekDeclickFramesRemaining = 0;
     engine.underrunCount.store(0, std::memory_order_release);
     engine.droppedCommandCount.store(0, std::memory_order_release);
     engine.callbackCount.store(0, std::memory_order_release);
@@ -759,6 +1191,66 @@ void reset_engine_runtime(SoundtimeAudioCoreEngine& engine) {
     engine.commandQueue.clear();
     engine.clockSamples.clear();
     engine.meterSamples.clear();
+    engine.trackMeterPackets.clear();
+    engine.trackMeteringWasEnabledOnRenderThread = false;
+    engine.trackMeterAccumulationGraphRevision = 0;
+    engine.trackMeterAccumulatedFrames = 0;
+    engine.trackMeterSquareSums.fill(0);
+    engine.trackMeterPeaks.fill(0);
+}
+
+void publish_track_meter_packet(
+    SoundtimeAudioCoreEngine& engine,
+    const RenderGraph& graph,
+    uint64_t renderedFrameCount,
+    double hostTimestamp
+) {
+    if (!engine.trackMeteringEnabled.load(std::memory_order_relaxed) ||
+        engine.trackMeterAccumulatedFrames == 0) {
+        return;
+    }
+    if (engine.trackMeterAccumulationGraphRevision != graph.revision) {
+        engine.trackMeterAccumulationGraphRevision = graph.revision;
+        engine.trackMeterAccumulatedFrames = 0;
+        engine.trackMeterSquareSums.fill(0);
+        engine.trackMeterPeaks.fill(0);
+        return;
+    }
+    const auto targetFrames = static_cast<uint64_t>(std::max(graph.sampleRate / 60.0, 1.0));
+    if (engine.trackMeterAccumulatedFrames < targetFrames) {
+        return;
+    }
+
+    auto* packet = engine.trackMeterPackets.beginPush();
+    if (packet == nullptr) {
+        engine.droppedTrackMeterPacketCount.fetch_add(1, std::memory_order_relaxed);
+        engine.trackMeterAccumulatedFrames = 0;
+        engine.trackMeterSquareSums.fill(0);
+        engine.trackMeterPeaks.fill(0);
+        return;
+    }
+    packet->graphRevision = graph.revision;
+    packet->sequence = ++engine.trackMeterSequence;
+    packet->renderedFrameCount = renderedFrameCount;
+    packet->hostTimestamp = hostTimestamp;
+    packet->trackCount = static_cast<uint32_t>(std::min(graph.tracks.size(), maximumRealtimeTrackCount));
+    const auto denominator = static_cast<double>(engine.trackMeterAccumulatedFrames);
+    for (uint32_t index = 0; index < packet->trackCount; index++) {
+        const auto leftIndex = static_cast<size_t>(index) * 2;
+        const auto rightIndex = leftIndex + 1;
+        packet->levels[index] = TrackMeterLevel{
+            .runtimeTrackSlot = index,
+            .channelCount = graph.tracks[index].channelCount,
+            .leftRMS = static_cast<float>(std::sqrt(engine.trackMeterSquareSums[leftIndex] / denominator)),
+            .rightRMS = static_cast<float>(std::sqrt(engine.trackMeterSquareSums[rightIndex] / denominator)),
+            .leftPeak = engine.trackMeterPeaks[leftIndex],
+            .rightPeak = engine.trackMeterPeaks[rightIndex],
+        };
+    }
+    engine.trackMeterPackets.commitPush();
+    engine.trackMeterAccumulatedFrames = 0;
+    engine.trackMeterSquareSums.fill(0);
+    engine.trackMeterPeaks.fill(0);
 }
 
 uint64_t ticks_to_nanoseconds(const SoundtimeAudioCoreEngine& engine, uint64_t ticks) {
@@ -879,6 +1371,15 @@ void publish_render_config(
 ) {
     std::lock_guard lock(engine.graphLifetimeMutex);
 
+    if (graph) {
+        for (size_t index = 0; index < graph->tracks.size(); index++) {
+            engine.liveTrackPans[index].store(
+                std::clamp(graph->tracks[index].pan, -1.0f, 1.0f),
+                std::memory_order_release
+            );
+        }
+    }
+
     auto previousGraph = std::move(engine.currentGraphOwner);
     engine.currentGraphOwner = std::move(graph);
     if (previousGraph) {
@@ -959,12 +1460,14 @@ AudioRenderConfig make_audio_render_config(
 
 void publish_graph(
     SoundtimeAudioCoreEngine& engine,
-    std::shared_ptr<const RenderGraph> graph,
+    std::shared_ptr<RenderGraph> graph,
     bool resetRuntime
 ) {
     if (resetRuntime) {
         reset_engine_runtime(engine);
     }
+    graph->revision = engine.nextGraphRevision.fetch_add(1, std::memory_order_relaxed);
+    engine.currentGraphRevision.store(graph->revision, std::memory_order_release);
     publish_render_config(
         engine,
         graph->frameCount,
@@ -1016,8 +1519,14 @@ std::shared_ptr<RenderGraph> make_graph_from_track_configs(
         auto track = RenderTrack{
             .source = source,
             .segments = {},
+            .volumeAutomationPoints = {},
+            .panAutomationPoints = {},
+            .muteAutomationPoints = {},
             .gain = std::max(trackConfig.gain, 0.0f),
+            .pan = 0,
+            .channelCount = source->channelCount,
         };
+
         if (outputFrameCount > 0) {
             const auto sourceFrameScale = source->sampleRate / sampleRate;
             track.segments.push_back(RenderSegment{
@@ -1030,6 +1539,7 @@ std::shared_ptr<RenderGraph> make_graph_from_track_configs(
                 .gainEnd = 1,
             });
         }
+
         graph->tracks.push_back(std::move(track));
     }
 
@@ -1083,8 +1593,75 @@ std::shared_ptr<RenderGraph> make_graph_from_segmented_track_configs(
         auto track = RenderTrack{
             .source = source,
             .segments = {},
+            .volumeAutomationPoints = {},
+            .panAutomationPoints = {},
+            .muteAutomationPoints = {},
             .gain = std::max(trackConfig.gain, 0.0f),
+            .pan = std::clamp(trackConfig.pan, -1.0f, 1.0f),
+            .channelCount = source->channelCount,
         };
+
+        if (trackConfig.volumeAutomationPointCount > 0) {
+            if (trackConfig.volumeAutomationPoints == nullptr) {
+                return nullptr;
+            }
+            track.volumeAutomationPoints.reserve(trackConfig.volumeAutomationPointCount);
+            uint64_t previousFrame = 0;
+            for (uint32_t pointIndex = 0;
+                 pointIndex < trackConfig.volumeAutomationPointCount;
+                 pointIndex++) {
+                const auto& point = trackConfig.volumeAutomationPoints[pointIndex];
+                if (pointIndex > 0 && point.frame <= previousFrame) {
+                    return nullptr;
+                }
+                previousFrame = point.frame;
+                track.volumeAutomationPoints.push_back(RenderAutomationPoint{
+                    .frame = point.frame,
+                    .value = std::clamp(point.value, 0.0f, 1.0f),
+                    .curveToNext = point.curveToNext,
+                });
+            }
+        }
+
+        if (trackConfig.panAutomationPointCount > 0) {
+            if (trackConfig.panAutomationPoints == nullptr) {
+                return nullptr;
+            }
+            track.panAutomationPoints.reserve(trackConfig.panAutomationPointCount);
+            uint64_t previousFrame = 0;
+            for (uint32_t pointIndex = 0; pointIndex < trackConfig.panAutomationPointCount; pointIndex++) {
+                const auto& point = trackConfig.panAutomationPoints[pointIndex];
+                if (pointIndex > 0 && point.frame <= previousFrame) {
+                    return nullptr;
+                }
+                previousFrame = point.frame;
+                track.panAutomationPoints.push_back(RenderAutomationPoint{
+                    .frame = point.frame,
+                    .value = std::clamp(point.value, 0.0f, 1.0f),
+                    .curveToNext = point.curveToNext,
+                });
+            }
+        }
+
+        if (trackConfig.muteAutomationPointCount > 0) {
+            if (trackConfig.muteAutomationPoints == nullptr) {
+                return nullptr;
+            }
+            track.muteAutomationPoints.reserve(trackConfig.muteAutomationPointCount);
+            uint64_t previousFrame = 0;
+            for (uint32_t pointIndex = 0; pointIndex < trackConfig.muteAutomationPointCount; pointIndex++) {
+                const auto& point = trackConfig.muteAutomationPoints[pointIndex];
+                if (pointIndex > 0 && point.frame <= previousFrame) {
+                    return nullptr;
+                }
+                previousFrame = point.frame;
+                track.muteAutomationPoints.push_back(RenderAutomationPoint{
+                    .frame = point.frame,
+                    .value = point.value >= 0.5f ? 1.0f : 0.0f,
+                    .curveToNext = 3.0f,
+                });
+            }
+        }
 
         if (trackConfig.segmentCount == 0 || trackConfig.segments == nullptr) {
             const auto outputFrameCount = output_frame_count_for_source(*source, sampleRate);
@@ -1148,6 +1725,7 @@ void publish_source(SoundtimeAudioCoreEngine& engine, std::shared_ptr<const Audi
         .source = source,
         .segments = {},
         .gain = 1,
+        .channelCount = source->channelCount,
     };
     if (source->frameCount > 0) {
         track.segments.push_back(RenderSegment{
@@ -1582,12 +2160,39 @@ void soundtime_audio_core_seek(SoundtimeAudioCoreEngine* engine, uint64_t frameI
     });
 }
 
+void soundtime_audio_core_seek_exactly(SoundtimeAudioCoreEngine* engine, uint64_t frameIndex) {
+    if (engine == nullptr) {
+        return;
+    }
+
+    submit_command(*engine, EngineCommand{
+        .type = EngineCommandType::seekExact,
+        .frameIndex = frameIndex,
+    });
+}
+
 void soundtime_audio_core_set_gain(SoundtimeAudioCoreEngine* engine, float gain) {
     if (engine == nullptr) {
         return;
     }
 
     engine->configGain.store(std::max(gain, 0.0f), std::memory_order_release);
+}
+
+bool soundtime_audio_core_set_track_pan(
+    SoundtimeAudioCoreEngine* engine,
+    uint32_t trackIndex,
+    float pan
+) {
+    if (engine == nullptr || trackIndex >= maximumRealtimeTrackCount) {
+        return false;
+    }
+
+    engine->liveTrackPans[trackIndex].store(
+        std::clamp(pan, -1.0f, 1.0f),
+        std::memory_order_release
+    );
+    return true;
 }
 
 void soundtime_audio_core_set_transport_ramp_duration(
@@ -1690,6 +2295,76 @@ bool soundtime_audio_core_pop_meter_sample(
     sample->leftClipPeak = meterSample.leftClipPeak;
     sample->rightClipPeak = meterSample.rightClipPeak;
     return true;
+}
+
+void soundtime_audio_core_set_track_metering_enabled(
+    SoundtimeAudioCoreEngine* engine,
+    bool isEnabled
+) {
+    if (engine == nullptr) {
+        return;
+    }
+    if (isEnabled) {
+        engine->trackMeterPackets.clear();
+        engine->trackMeteringEnabled.store(true, std::memory_order_release);
+    } else {
+        engine->trackMeteringEnabled.store(false, std::memory_order_release);
+        engine->trackMeterPackets.clear();
+    }
+}
+
+uint64_t soundtime_audio_core_current_graph_revision(
+    const SoundtimeAudioCoreEngine* engine
+) {
+    return engine == nullptr ? 0 :
+        engine->currentGraphRevision.load(std::memory_order_acquire);
+}
+
+bool soundtime_audio_core_pop_track_meter_packet(
+    SoundtimeAudioCoreEngine* engine,
+    SoundtimeAudioCoreTrackMeterPacketHeader* header,
+    SoundtimeAudioCoreTrackMeterLevel* levels,
+    uint32_t levelCapacity
+) {
+    if (engine == nullptr || header == nullptr || levels == nullptr) {
+        return false;
+    }
+    const auto* packet = engine->trackMeterPackets.front();
+    if (packet == nullptr || levelCapacity < packet->trackCount) {
+        return false;
+    }
+    header->graphRevision = packet->graphRevision;
+    header->sequence = packet->sequence;
+    header->renderedFrameCount = packet->renderedFrameCount;
+    header->hostTimestamp = packet->hostTimestamp;
+    header->trackCount = packet->trackCount;
+    for (uint32_t index = 0; index < packet->trackCount; index++) {
+        const auto& source = packet->levels[index];
+        levels[index] = SoundtimeAudioCoreTrackMeterLevel{
+            .runtimeTrackSlot = source.runtimeTrackSlot,
+            .channelCount = source.channelCount,
+            .leftRMS = source.leftRMS,
+            .rightRMS = source.rightRMS,
+            .leftPeak = source.leftPeak,
+            .rightPeak = source.rightPeak,
+        };
+    }
+    engine->trackMeterPackets.popFront();
+    return true;
+}
+
+uint64_t soundtime_audio_core_dropped_track_meter_packet_count(
+    const SoundtimeAudioCoreEngine* engine
+) {
+    return engine == nullptr ? 0 :
+        engine->droppedTrackMeterPacketCount.load(std::memory_order_acquire);
+}
+
+uint64_t soundtime_audio_core_track_meter_work_nanoseconds(
+    const SoundtimeAudioCoreEngine* engine
+) {
+    return engine == nullptr ? 0 :
+        engine->trackMeterWorkNanoseconds.load(std::memory_order_acquire);
 }
 
 void soundtime_audio_core_render_silence(
@@ -1803,6 +2478,7 @@ void soundtime_audio_core_render_at_host_time(
     }
 
     if (!engine->isPlaying.load(std::memory_order_acquire)) {
+        remember_last_output_samples(*engine, outputs, channelCount, frameCount);
         publish_meter_sample(
             *engine,
             outputs,
@@ -1824,6 +2500,17 @@ void soundtime_audio_core_render_at_host_time(
         return;
     }
 
+    const auto isTrackMeteringEnabled = engine->trackMeteringEnabled.load(
+        std::memory_order_relaxed
+    );
+    if (isTrackMeteringEnabled != engine->trackMeteringWasEnabledOnRenderThread) {
+        engine->trackMeteringWasEnabledOnRenderThread = isTrackMeteringEnabled;
+        engine->trackMeterAccumulationGraphRevision = graph == nullptr ? 0 : graph->revision;
+        engine->trackMeterAccumulatedFrames = 0;
+        engine->trackMeterSquareSums.fill(0);
+        engine->trackMeterPeaks.fill(0);
+    }
+
     const auto sourceFrameCount = config.frameCount;
     const auto currentFrameIndex = blockStartFrameIndex;
     const auto renderableFrameCount = sourceFrameCount > currentFrameIndex ?
@@ -1832,7 +2519,23 @@ void soundtime_audio_core_render_at_host_time(
     uint64_t advancedFrameCount = 0;
     bool completedTransportStop = false;
     if (graph != nullptr && !graph->tracks.empty()) {
+        const auto meterStartTicks = isTrackMeteringEnabled ?
+            mach_absolute_time() : uint64_t{0};
+        if (
+            isTrackMeteringEnabled &&
+            engine->trackMeterAccumulationGraphRevision != graph->revision
+        ) {
+            engine->trackMeterAccumulationGraphRevision = graph->revision;
+            engine->trackMeterAccumulatedFrames = 0;
+            engine->trackMeterSquareSums.fill(0);
+            engine->trackMeterPeaks.fill(0);
+        }
         reconcile_track_gain_ramps(*engine, config, *graph);
+        for (size_t trackIndex = 0; trackIndex < graph->tracks.size(); trackIndex++) {
+            engine->renderTrackPans[trackIndex] = engine->liveTrackPans[trackIndex].load(
+                std::memory_order_acquire
+            );
+        }
         for (uint64_t frameOffset = 0; frameOffset < renderableFrameCount; frameOffset++) {
             const auto transportGain = next_transport_gain(*engine, completedTransportStop);
             const auto outputFrameIndex = currentFrameIndex + frameOffset;
@@ -1848,16 +2551,51 @@ void soundtime_audio_core_render_at_host_time(
                 channelCount,
                 frameOffset,
                 [&](size_t trackIndex, const RenderTrack&) {
-                    return next_track_gain(engine->trackGainRamps[trackIndex]);
-                }
+                    const auto& track = graph->tracks[trackIndex];
+                    return TrackFrameMix{
+                        .gain = next_track_gain(engine->trackGainRamps[trackIndex]) * next_automation_gain(
+                            engine->automationCursors[trackIndex],
+                            track,
+                            outputFrameIndex
+                        ) * next_automation_mute_gain(
+                            engine->muteAutomationCursors[trackIndex],
+                            track,
+                            outputFrameIndex
+                        ),
+                        .pan = track.panAutomationPoints.empty() ?
+                            engine->renderTrackPans[trackIndex] :
+                            next_automation_pan(
+                                engine->panAutomationCursors[trackIndex],
+                                track,
+                                outputFrameIndex
+                            ),
+                    };
+                },
+                isTrackMeteringEnabled ? engine : nullptr,
+                transportGain
             );
+            apply_seek_declick(*engine, outputs, channelCount, frameOffset);
             if (!engine->isPlaying.load(std::memory_order_acquire)) {
                 break;
             }
         }
+        if (isTrackMeteringEnabled) {
+            engine->trackMeterAccumulatedFrames += advancedFrameCount;
+            publish_track_meter_packet(
+                *engine,
+                *graph,
+                engine->renderedFrameCount.load(std::memory_order_relaxed),
+                hostTimestamp
+            );
+            engine->trackMeterWorkNanoseconds.store(
+                ticks_to_nanoseconds(*engine, mach_absolute_time() - meterStartTicks),
+                std::memory_order_relaxed
+            );
+        }
     } else {
         for (uint64_t frameOffset = 0; frameOffset < renderableFrameCount; frameOffset++) {
             next_transport_gain(*engine, completedTransportStop);
+            apply_seek_declick(*engine, outputs, channelCount, frameOffset);
             advancedFrameCount++;
             if (!engine->isPlaying.load(std::memory_order_acquire)) {
                 break;
@@ -1882,6 +2620,7 @@ void soundtime_audio_core_render_at_host_time(
     } else {
         engine->hostTimestamp.store(finalHostTimestamp, std::memory_order_release);
     }
+    remember_last_output_samples(*engine, outputs, channelCount, frameCount);
     publish_meter_sample(
         *engine,
         outputs,
@@ -1945,8 +2684,11 @@ bool soundtime_audio_core_render_offline(
             outputs,
             channelCount,
             frameOffset,
-            [](size_t, const RenderTrack& track) {
-                return track.gain;
+            [frame = startFrameIndex + frameOffset](size_t, const RenderTrack& track) {
+                return TrackFrameMix{
+                    .gain = track.gain * automation_gain_at(track, frame) * automation_mute_gain_at(track, frame),
+                    .pan = automation_pan_at(track, frame),
+                };
             }
         );
     }

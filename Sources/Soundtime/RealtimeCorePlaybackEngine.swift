@@ -5,7 +5,10 @@ import QuartzCore
 final class RealtimeCorePlaybackEngine: PlaybackEngine {
     private struct PreparedProjectTrack {
         let id: UUID
+        let logicalTrackID: UUID
+        let logicalChannelCount: Int
         let sourceRevision: Int
+        var timelineDurationHint: TimeInterval?
         let sourceIdentity: String?
         let sourceID: UUID?
         let source: PreparedRealtimeAudioSource
@@ -14,8 +17,12 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         let zeroCrossingIndex: AudioZeroCrossingIndex?
         let zeroCrossingProbe: WAVZeroCrossingProbe?
         var volume: Float
+        var pan: Float
         var isMuted: Bool
         var isSoloed: Bool
+        var volumeAutomation: [TimelinePlaybackAutomationPoint]
+        var panAutomation: [TimelinePlaybackAutomationPoint]
+        var muteAutomation: [TimelinePlaybackAutomationPoint]
     }
 
     private let core: RealtimeAudioCore
@@ -35,6 +42,13 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
     private var latestClockSample: RealtimeAudioClockSample?
     private var previousClockRenderedFrameCount: Int?
     private var clockProjectionFrameLimit = 0
+    private struct TrackMeterIdentity {
+        let trackID: UUID
+        let channelCount: Int
+    }
+
+    private var trackMeterIdentitiesByGraphRevision: [UInt64: [TrackMeterIdentity]] = [:]
+    private var staleTrackMeterPacketCount: UInt64 = 0
 
     var isPlaying: Bool {
         snapshot().isPlaying
@@ -129,7 +143,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
 
         let preparedTracks = try prepareProjectTracks(tracks)
 
-        let sampleRate = preparedTracks[0].source.sampleRate
+        let sampleRate = projectSampleRate(for: preparedTracks)
         guard sampleRate > 0, preparedTracks.allSatisfy({ $0.source.sampleRate > 0 }) else {
             throw PlaybackError.invalidFormat
         }
@@ -151,6 +165,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         pendingCommandRenderedFrameCount = nil
         resetClockMirror()
         preparedProjectTracks = preparedTracks
+        rememberTrackMeterIdentityMap(for: preparedTracks)
         let referenceTrack = zeroCrossingReferenceTrack(in: preparedTracks)
         zeroCrossingIndex = referenceTrack?.zeroCrossingIndex
         zeroCrossingProbe = referenceTrack?.zeroCrossingProbe
@@ -173,7 +188,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         let previousSnapshot = snapshot()
         let preparedTracks = try prepareProjectTracks(tracks)
 
-        let sampleRate = preparedTracks[0].source.sampleRate
+        let sampleRate = projectSampleRate(for: preparedTracks)
         guard sampleRate > 0, preparedTracks.allSatisfy({ $0.source.sampleRate > 0 }) else {
             throw PlaybackError.invalidFormat
         }
@@ -205,6 +220,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         mirroredFrameIndex = min(max(mirroredFrameIndex, 0), frameCount)
         mirroredFrameCount = frameCount
         preparedProjectTracks = preparedTracks
+        rememberTrackMeterIdentityMap(for: preparedTracks)
         let referenceTrack = zeroCrossingReferenceTrack(in: preparedTracks)
         zeroCrossingIndex = referenceTrack?.zeroCrossingIndex
         zeroCrossingProbe = referenceTrack?.zeroCrossingProbe
@@ -399,7 +415,11 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         mirroredFrameCount = frameCount
         mirroredHostTimestamp = CACurrentMediaTime()
         pendingCommandRenderedFrameCount = detailedSnapshot.renderedFrameCount
-        core.seek(toFrame: snappedTargetFrame)
+        if snapsToZeroCrossing {
+            core.seek(toFrame: snappedTargetFrame)
+        } else {
+            core.seekExactly(toFrame: snappedTargetFrame)
+        }
     }
 
     func updateProjectTrackMix(_ tracks: [ProjectPlaybackTrackMix]) {
@@ -408,17 +428,16 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         }
 
         var updatedPreparedTracks = preparedProjectTracks
-        let indicesByID = Dictionary(uniqueKeysWithValues: updatedPreparedTracks.enumerated().map { index, track in
-            (track.id, index)
-        })
-        for track in tracks {
-            guard let preparedTrackIndex = indicesByID[track.id] else {
+        let mixesByLogicalTrackID = Dictionary(uniqueKeysWithValues: tracks.map { ($0.id, $0) })
+        for index in updatedPreparedTracks.indices {
+            guard let mix = mixesByLogicalTrackID[updatedPreparedTracks[index].logicalTrackID] else {
                 continue
             }
 
-            updatedPreparedTracks[preparedTrackIndex].volume = track.volume
-            updatedPreparedTracks[preparedTrackIndex].isMuted = track.isMuted
-            updatedPreparedTracks[preparedTrackIndex].isSoloed = track.isSoloed
+            updatedPreparedTracks[index].volume = mix.volume
+            updatedPreparedTracks[index].pan = mix.pan
+            updatedPreparedTracks[index].isMuted = mix.isMuted
+            updatedPreparedTracks[index].isSoloed = mix.isSoloed
         }
 
         let didPublish = core.updatePreparedTracks(
@@ -426,6 +445,17 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         )
         if didPublish {
             preparedProjectTracks = updatedPreparedTracks
+            rememberTrackMeterIdentityMap(for: updatedPreparedTracks)
+        }
+    }
+
+    func previewProjectTrackPan(trackID: UUID, pan: Float) {
+        let clampedPan = min(max(pan, -1), 1)
+        for index in preparedProjectTracks.indices where
+            preparedProjectTracks[index].logicalTrackID == trackID
+        {
+            preparedProjectTracks[index].pan = clampedPan
+            _ = core.setTrackPan(at: index, pan: clampedPan)
         }
     }
 
@@ -536,6 +566,62 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         return []
     }
 
+    func setTrackMeteringEnabled(_ isEnabled: Bool) {
+        core.setTrackMeteringEnabled(isEnabled)
+    }
+
+    func drainTrackMeterPackets() -> [PlaybackTrackMeterPacket] {
+        var newest: PlaybackTrackMeterPacket?
+        while let packet = core.popTrackMeterPacket() {
+            guard let identities = trackMeterIdentitiesByGraphRevision[packet.graphRevision] else {
+                staleTrackMeterPacketCount &+= 1
+                continue
+            }
+            var aggregate: [UUID: PlaybackTrackMeterLevel] = [:]
+            for level in packet.levels {
+                guard identities.indices.contains(level.runtimeTrackSlot) else { continue }
+                let identity = identities[level.runtimeTrackSlot]
+                let trackID = identity.trackID
+                let incomingLevel = PlaybackTrackMeterLevel(
+                    trackID: trackID,
+                    channelCount: identity.channelCount,
+                    leftRMS: level.leftRMS,
+                    rightRMS: level.rightRMS,
+                    leftPeak: level.leftPeak,
+                    rightPeak: level.rightPeak
+                )
+                if let existing = aggregate[trackID] {
+                    aggregate[trackID] = PlaybackTrackMeterLevel(
+                        trackID: trackID,
+                        channelCount: max(existing.channelCount, incomingLevel.channelCount),
+                        leftRMS: hypot(existing.leftRMS, incomingLevel.leftRMS),
+                        rightRMS: hypot(existing.rightRMS, incomingLevel.rightRMS),
+                        leftPeak: max(existing.leftPeak, incomingLevel.leftPeak),
+                        rightPeak: max(existing.rightPeak, incomingLevel.rightPeak)
+                    )
+                } else {
+                    aggregate[trackID] = incomingLevel
+                }
+            }
+            newest = PlaybackTrackMeterPacket(
+                graphRevision: packet.graphRevision,
+                sequence: packet.sequence,
+                renderedFrameCount: packet.renderedFrameCount,
+                hostTimestamp: packet.hostTimestamp,
+                levels: aggregate.values.map { $0.normalizedForMixerDisplay() }
+            )
+        }
+        return newest.map { [$0] } ?? []
+    }
+
+    func trackMeterDiagnostics() -> PlaybackTrackMeterDiagnostics {
+        PlaybackTrackMeterDiagnostics(
+            droppedPacketCount: core.droppedTrackMeterPacketCount,
+            stalePacketCount: staleTrackMeterPacketCount,
+            realtimeWorkNanoseconds: core.trackMeterWorkNanoseconds
+        )
+    }
+
     private func currentProjectedFrameIndex(
         detailedSnapshot: RealtimeAudioCoreSnapshot,
         at timestamp: TimeInterval
@@ -629,6 +715,22 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         while core.popClockSample() != nil {}
     }
 
+    private func rememberTrackMeterIdentityMap(for tracks: [PreparedProjectTrack]) {
+        let revision = core.currentGraphRevision
+        guard revision > 0 else { return }
+        trackMeterIdentitiesByGraphRevision[revision] = tracks.map {
+            TrackMeterIdentity(
+                trackID: $0.logicalTrackID,
+                channelCount: $0.logicalChannelCount
+            )
+        }
+        if trackMeterIdentitiesByGraphRevision.count > 8 {
+            for oldRevision in trackMeterIdentitiesByGraphRevision.keys.sorted().dropLast(8) {
+                trackMeterIdentitiesByGraphRevision.removeValue(forKey: oldRevision)
+            }
+        }
+    }
+
     private func configureOutputDevice(sampleRate: Double) throws {
         guard let corePointer = core.enginePointer else {
             throw PlaybackError.invalidFormat
@@ -646,10 +748,34 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             PreparedRealtimeAudioTrack(
                 source: preparedTrack.source,
                 gain: effectiveTrackGain(preparedTrack, anySoloedTrack: anySoloedTrack),
+                pan: preparedTrack.pan,
                 segments: projectSegments(
                     for: preparedTrack,
                     projectSampleRate: projectSampleRate
-                )
+                ),
+                volumeAutomation: preparedTrack.volumeAutomation.map { point in
+                    return PreparedRealtimeAutomationPoint(
+                        frame: point.frame,
+                        gain: TimelineAutomationParameterRegistry.trackVolume.domainValue(
+                            fromNormalized: point.normalizedValue
+                        ),
+                        curveToNext: point.curveToNext
+                    )
+                },
+                panAutomation: preparedTrack.panAutomation.map { point in
+                    PreparedRealtimeAutomationPoint(
+                        frame: point.frame,
+                        gain: point.normalizedValue,
+                        curveToNext: point.curveToNext
+                    )
+                },
+                muteAutomation: preparedTrack.muteAutomation.map { point in
+                    PreparedRealtimeAutomationPoint(
+                        frame: point.frame,
+                        gain: point.normalizedValue >= 0.5 ? 0 : 1,
+                        curveToNext: TimelineAutomationCurve.stepped
+                    )
+                }
             )
         }
     }
@@ -735,7 +861,40 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
                     gainEnd: segment.gainEnd
                 )
             }
-            segmentTimelineSampleRate = audioFileTimeline.sourceSampleRate
+            segmentTimelineSampleRate = audioFileTimeline.timelineSampleRate
+            zeroCrossingIndex = nil
+            zeroCrossingProbe = sourceZeroCrossingProbe
+        case let .fileSegments(
+            url,
+            _,
+            _,
+            timelineSampleRate,
+            playbackSegments,
+            sourceZeroCrossingProbe
+        ):
+            if
+                let existingPreparedTrack,
+                existingPreparedTrack.sourceIdentity == stableSourceIdentity &&
+                    existingPreparedTrack.source.frameCount > 0
+            {
+                preparedSource = existingPreparedTrack.source
+            } else {
+                guard let source = try PreparedRealtimeAudioSource.makeMappedWAV(url: url) else {
+                    throw PlaybackError.invalidFormat
+                }
+                preparedSource = source
+            }
+            segments = playbackSegments.map { segment in
+                PreparedRealtimeAudioSegment(
+                    outputStartFrame: segment.outputStartFrame,
+                    sourceStartFrame: segment.sourceStartFrame,
+                    frameCount: segment.frameCount,
+                    sourceFrameScale: segment.sourceFrameScale,
+                    gainStart: segment.gainStart,
+                    gainEnd: segment.gainEnd
+                )
+            }
+            segmentTimelineSampleRate = timelineSampleRate
             zeroCrossingIndex = nil
             zeroCrossingProbe = sourceZeroCrossingProbe
         case let .timeline(audioTimeline, sourceZeroCrossingIndex):
@@ -771,7 +930,10 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
 
         return PreparedProjectTrack(
             id: track.id,
+            logicalTrackID: track.logicalTrackID,
+            logicalChannelCount: track.logicalChannelCount,
             sourceRevision: track.sourceRevision,
+            timelineDurationHint: track.timelineDurationHint,
             sourceIdentity: stableSourceIdentity,
             sourceID: sourceID(for: track.source),
             source: preparedSource,
@@ -780,8 +942,12 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             zeroCrossingIndex: zeroCrossingIndex,
             zeroCrossingProbe: zeroCrossingProbe,
             volume: track.volume,
+            pan: track.pan,
             isMuted: track.isMuted,
-            isSoloed: track.isSoloed
+            isSoloed: track.isSoloed,
+            volumeAutomation: track.volumeAutomation,
+            panAutomation: track.panAutomation,
+            muteAutomation: track.muteAutomation
         )
     }
 
@@ -803,7 +969,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
                 preparedTrack.source.frameCount == buffer.frameCount &&
                 preparedTrack.source.channelCount == buffer.channelCount &&
                 preparedTrack.source.sampleRate == buffer.sampleRate
-        case .file, .fileTimeline:
+        case .file, .fileTimeline, .fileSegments:
             return preparedTrack.sourceIdentity == sourceIdentity(for: track.source)
         case let .timeline(audioTimeline, _):
             return preparedTrack.sourceID == audioTimeline.sourceID
@@ -815,9 +981,14 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         with track: ProjectPlaybackTrack
     ) -> PreparedProjectTrack {
         var result = preparedTrack
+        result.timelineDurationHint = track.timelineDurationHint
         result.volume = track.volume
+        result.pan = track.pan
         result.isMuted = track.isMuted
         result.isSoloed = track.isSoloed
+        result.volumeAutomation = track.volumeAutomation
+        result.panAutomation = track.panAutomation
+        result.muteAutomation = track.muteAutomation
         return result
     }
 
@@ -875,7 +1046,9 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         switch source {
         case .decoded:
             return nil
-        case let .file(url, _), let .fileTimeline(url, _, _):
+        case let .file(url, _),
+             let .fileTimeline(url, _, _),
+             let .fileSegments(url, _, _, _, _, _):
             return "file:\(url.standardizedFileURL.path)"
         case let .timeline(audioTimeline, _):
             return "timeline:\(audioTimeline.sourceID.uuidString)"
@@ -897,6 +1070,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
             return 0
         }
 
+        guard track.volumeAutomation.isEmpty else { return 1 }
         let clampedVolume = min(max(track.volume, 0), 1)
         return clampedVolume * clampedVolume
     }
@@ -910,6 +1084,7 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         }
 
         let duration = tracks.reduce(0.0) { longestDuration, track in
+            let hintedDuration = track.timelineDurationHint ?? 0
             let projectSegments = projectSegments(
                 for: track,
                 projectSampleRate: sampleRate
@@ -918,14 +1093,14 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
                 max(result, segment.outputStartFrame + segment.frameCount)
             }
             if segmentedFrameCount > 0 {
-                return max(longestDuration, Double(segmentedFrameCount) / sampleRate)
+                return max(longestDuration, hintedDuration, Double(segmentedFrameCount) / sampleRate)
             }
 
             guard track.source.sampleRate.isFinite, track.source.sampleRate > 0 else {
-                return longestDuration
+                return max(longestDuration, hintedDuration)
             }
 
-            return max(longestDuration, Double(track.source.frameCount) / track.source.sampleRate)
+            return max(longestDuration, hintedDuration, Double(track.source.frameCount) / track.source.sampleRate)
         }
 
         guard duration.isFinite, duration > 0 else {
@@ -933,6 +1108,12 @@ final class RealtimeCorePlaybackEngine: PlaybackEngine {
         }
 
         return Int((duration * sampleRate).rounded(.up))
+    }
+
+    private func projectSampleRate(for tracks: [PreparedProjectTrack]) -> Double {
+        tracks.first(where: { !$0.segments.isEmpty })?.segmentTimelineSampleRate ??
+            tracks.first?.source.sampleRate ??
+            0
     }
 
     private func zeroCrossingReferenceTrack(in tracks: [PreparedProjectTrack]) -> PreparedProjectTrack? {

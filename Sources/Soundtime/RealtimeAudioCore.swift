@@ -39,6 +39,23 @@ struct RealtimeAudioMeterSample {
     }
 }
 
+struct RealtimeTrackMeterLevel: Sendable {
+    let runtimeTrackSlot: Int
+    let channelCount: Int
+    let leftRMS: Float
+    let rightRMS: Float
+    let leftPeak: Float
+    let rightPeak: Float
+}
+
+struct RealtimeTrackMeterPacket: Sendable {
+    let graphRevision: UInt64
+    let sequence: UInt64
+    let renderedFrameCount: Int
+    let hostTimestamp: TimeInterval
+    let levels: [RealtimeTrackMeterLevel]
+}
+
 struct RealtimeAudioCoreSnapshot {
     let frameIndex: Int
     let frameCount: Int
@@ -161,26 +178,49 @@ struct PreparedRealtimeAudioSegment: Sendable {
     let gainEnd: Float
 }
 
+struct PreparedRealtimeAutomationPoint: Sendable {
+    let frame: Int
+    let gain: Float
+    let curveToNext: Float
+}
+
 struct PreparedRealtimeAudioTrack: Sendable {
     let source: PreparedRealtimeAudioSource
     let gain: Float
+    let pan: Float
     let segments: [PreparedRealtimeAudioSegment]
+    let volumeAutomation: [PreparedRealtimeAutomationPoint]
+    let panAutomation: [PreparedRealtimeAutomationPoint]
+    let muteAutomation: [PreparedRealtimeAutomationPoint]
 
     init(
         source: PreparedRealtimeAudioSource,
         gain: Float,
-        segments: [PreparedRealtimeAudioSegment] = []
+        pan: Float = 0,
+        segments: [PreparedRealtimeAudioSegment] = [],
+        volumeAutomation: [PreparedRealtimeAutomationPoint] = [],
+        panAutomation: [PreparedRealtimeAutomationPoint] = [],
+        muteAutomation: [PreparedRealtimeAutomationPoint] = []
     ) {
         self.source = source
         self.gain = gain
+        self.pan = min(max(pan, -1), 1)
         self.segments = segments
+        self.volumeAutomation = volumeAutomation
+        self.panAutomation = panAutomation
+        self.muteAutomation = muteAutomation
     }
 }
 
 final class RealtimeAudioCore {
     private var engine: OpaquePointer?
     private var segmentConfigScratch: [SoundtimeAudioCoreSegmentConfig] = []
+    private var automationPointConfigScratch: [SoundtimeAudioCoreAutomationPointConfig] = []
     private var segmentedTrackConfigScratch: [SoundtimeAudioCoreSegmentedTrackConfig] = []
+    private var trackMeterLevelScratch = Array(
+        repeating: SoundtimeAudioCoreTrackMeterLevel(),
+        count: 4_096
+    )
 
     var enginePointer: OpaquePointer? {
         engine
@@ -312,6 +352,9 @@ final class RealtimeAudioCore {
         let totalSegmentCount = tracks.reduce(0) { result, track in
             result + track.segments.count
         }
+        let totalAutomationPointCount = tracks.reduce(0) { result, track in
+            result + track.volumeAutomation.count + track.panAutomation.count + track.muteAutomation.count
+        }
         segmentConfigScratch.removeAll(keepingCapacity: true)
         segmentConfigScratch.reserveCapacity(totalSegmentCount)
         for track in tracks {
@@ -327,8 +370,36 @@ final class RealtimeAudioCore {
             }
         }
 
+        automationPointConfigScratch.removeAll(keepingCapacity: true)
+        automationPointConfigScratch.reserveCapacity(totalAutomationPointCount)
+        for track in tracks {
+            for point in track.volumeAutomation {
+                automationPointConfigScratch.append(SoundtimeAudioCoreAutomationPointConfig(
+                    frame: UInt64(max(point.frame, 0)),
+                    value: min(max(point.gain, 0), 1),
+                    curveToNext: point.curveToNext
+                ))
+            }
+            for point in track.panAutomation {
+                automationPointConfigScratch.append(SoundtimeAudioCoreAutomationPointConfig(
+                    frame: UInt64(max(point.frame, 0)),
+                    value: min(max(point.gain, 0), 1),
+                    curveToNext: point.curveToNext
+                ))
+            }
+            for point in track.muteAutomation {
+                automationPointConfigScratch.append(SoundtimeAudioCoreAutomationPointConfig(
+                    frame: UInt64(max(point.frame, 0)),
+                    value: min(max(point.gain, 0), 1),
+                    curveToNext: TimelineAutomationCurve.stepped
+                ))
+            }
+        }
+
         return segmentConfigScratch.withUnsafeBufferPointer { segmentBuffer in
+            automationPointConfigScratch.withUnsafeBufferPointer { automationBuffer in
             var segmentOffset = 0
+            var automationOffset = 0
             segmentedTrackConfigScratch.removeAll(keepingCapacity: true)
             segmentedTrackConfigScratch.reserveCapacity(tracks.count)
             for track in tracks {
@@ -337,15 +408,38 @@ final class RealtimeAudioCore {
                     segmentBuffer.baseAddress?.advanced(by: segmentOffset) :
                     nil
                 segmentOffset += segmentCount
+                let automationPointCount = track.volumeAutomation.count
+                let automationPointer = automationPointCount > 0 ?
+                    automationBuffer.baseAddress?.advanced(by: automationOffset) :
+                    nil
+                automationOffset += automationPointCount
+                let panAutomationPointCount = track.panAutomation.count
+                let panAutomationPointer = panAutomationPointCount > 0 ?
+                    automationBuffer.baseAddress?.advanced(by: automationOffset) :
+                    nil
+                automationOffset += panAutomationPointCount
+                let muteAutomationPointCount = track.muteAutomation.count
+                let muteAutomationPointer = muteAutomationPointCount > 0 ?
+                    automationBuffer.baseAddress?.advanced(by: automationOffset) :
+                    nil
+                automationOffset += muteAutomationPointCount
                 segmentedTrackConfigScratch.append(SoundtimeAudioCoreSegmentedTrackConfig(
                     source: track.source.sourcePointer,
                     segments: segmentPointer,
                     segmentCount: UInt32(max(segmentCount, 0)),
-                    gain: max(track.gain, 0)
+                    volumeAutomationPoints: automationPointer,
+                    volumeAutomationPointCount: UInt32(max(automationPointCount, 0)),
+                    panAutomationPoints: panAutomationPointer,
+                    panAutomationPointCount: UInt32(max(panAutomationPointCount, 0)),
+                    muteAutomationPoints: muteAutomationPointer,
+                    muteAutomationPointCount: UInt32(max(muteAutomationPointCount, 0)),
+                    gain: max(track.gain, 0),
+                    pan: min(max(track.pan, -1), 1)
                 ))
             }
 
             return segmentedTrackConfigScratch.withUnsafeBufferPointer(body)
+            }
         }
     }
 
@@ -395,12 +489,33 @@ final class RealtimeAudioCore {
         soundtime_audio_core_seek(engine, UInt64(max(frameIndex, 0)))
     }
 
+    func seekExactly(toFrame frameIndex: Int) {
+        guard let engine else {
+            return
+        }
+
+        soundtime_audio_core_seek_exactly(engine, UInt64(max(frameIndex, 0)))
+    }
+
     func setGain(_ gain: Float) {
         guard let engine else {
             return
         }
 
         soundtime_audio_core_set_gain(engine, gain)
+    }
+
+    @discardableResult
+    func setTrackPan(at index: Int, pan: Float) -> Bool {
+        guard let engine, index >= 0 else {
+            return false
+        }
+
+        return soundtime_audio_core_set_track_pan(
+            engine,
+            UInt32(index),
+            min(max(pan, -1), 1)
+        )
     }
 
     func setTransportRampDuration(_ duration: TimeInterval) {
@@ -556,6 +671,57 @@ final class RealtimeAudioCore {
             leftClipPeak: sample.leftClipPeak,
             rightClipPeak: sample.rightClipPeak
         )
+    }
+
+    func setTrackMeteringEnabled(_ isEnabled: Bool) {
+        guard let engine else { return }
+        soundtime_audio_core_set_track_metering_enabled(engine, isEnabled)
+    }
+
+    var currentGraphRevision: UInt64 {
+        guard let engine else { return 0 }
+        return soundtime_audio_core_current_graph_revision(engine)
+    }
+
+    func popTrackMeterPacket() -> RealtimeTrackMeterPacket? {
+        guard let engine else { return nil }
+        var header = SoundtimeAudioCoreTrackMeterPacketHeader()
+        let didPop = trackMeterLevelScratch.withUnsafeMutableBufferPointer { buffer in
+            soundtime_audio_core_pop_track_meter_packet(
+                engine,
+                &header,
+                buffer.baseAddress,
+                UInt32(buffer.count)
+            )
+        }
+        guard didPop else { return nil }
+        let levels = trackMeterLevelScratch.prefix(Int(header.trackCount)).map { level in
+            RealtimeTrackMeterLevel(
+                runtimeTrackSlot: Int(level.runtimeTrackSlot),
+                channelCount: Int(level.channelCount),
+                leftRMS: level.leftRMS,
+                rightRMS: level.rightRMS,
+                leftPeak: level.leftPeak,
+                rightPeak: level.rightPeak
+            )
+        }
+        return RealtimeTrackMeterPacket(
+            graphRevision: header.graphRevision,
+            sequence: header.sequence,
+            renderedFrameCount: Int(min(header.renderedFrameCount, UInt64(Int.max))),
+            hostTimestamp: header.hostTimestamp,
+            levels: levels
+        )
+    }
+
+    var droppedTrackMeterPacketCount: UInt64 {
+        guard let engine else { return 0 }
+        return soundtime_audio_core_dropped_track_meter_packet_count(engine)
+    }
+
+    var trackMeterWorkNanoseconds: UInt64 {
+        guard let engine else { return 0 }
+        return soundtime_audio_core_track_meter_work_nanoseconds(engine)
     }
 
 }

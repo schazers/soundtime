@@ -77,11 +77,51 @@ struct PlaybackMeterSample: Sendable {
     let rightClipPeak: Float
 }
 
+struct PlaybackTrackMeterLevel: Sendable, Equatable {
+    let trackID: UUID
+    let channelCount: Int
+    let leftRMS: Float
+    let rightRMS: Float
+    let leftPeak: Float
+    let rightPeak: Float
+
+    /// A mono strip has one meter even though pan can distribute that source
+    /// across both output channels. Keep that one meter truthful at every pan
+    /// position by displaying the louder post-pan contribution.
+    func normalizedForMixerDisplay() -> PlaybackTrackMeterLevel {
+        guard channelCount <= 1 else { return self }
+        return PlaybackTrackMeterLevel(
+            trackID: trackID,
+            channelCount: 1,
+            leftRMS: max(leftRMS, rightRMS),
+            rightRMS: 0,
+            leftPeak: max(leftPeak, rightPeak),
+            rightPeak: 0
+        )
+    }
+}
+
+struct PlaybackTrackMeterPacket: Sendable, Equatable {
+    let graphRevision: UInt64
+    let sequence: UInt64
+    let renderedFrameCount: Int
+    let hostTimestamp: TimeInterval
+    let levels: [PlaybackTrackMeterLevel]
+}
+
+struct PlaybackTrackMeterDiagnostics: Sendable, Equatable {
+    let droppedPacketCount: UInt64
+    let stalePacketCount: UInt64
+    let realtimeWorkNanoseconds: UInt64
+}
+
 enum PlaybackError: LocalizedError {
     case noAudioLoaded
     case invalidFormat
     case bufferCreationFailed
     case outputDeviceFailed(OSStatus)
+    case unsupportedProjectArrangement
+    case automationRequiresRealtimeEngine
 
     var errorDescription: String? {
         switch self {
@@ -93,6 +133,10 @@ enum PlaybackError: LocalizedError {
             "Could not create the playback buffer."
         case let .outputDeviceFailed(status):
             "The audio output device failed with status \(status)."
+        case .unsupportedProjectArrangement:
+            "This playback engine cannot preserve the project's clip arrangement."
+        case .automationRequiresRealtimeEngine:
+            "Track automation requires Soundtime's realtime playback engine."
         }
     }
 }
@@ -112,6 +156,14 @@ struct ProjectPlaybackTrack: Sendable {
             timeline: AudioFileEditTimeline,
             zeroCrossingProbe: WAVZeroCrossingProbe?
         )
+        case fileSegments(
+            url: URL,
+            sourceFrameCount: Int,
+            sourceSampleRate: Double,
+            timelineSampleRate: Double,
+            segments: [AudioTimelinePlaybackSegment],
+            zeroCrossingProbe: WAVZeroCrossingProbe?
+        )
         case timeline(
             audioTimeline: AudioEditTimeline,
             zeroCrossingIndex: AudioZeroCrossingIndex?
@@ -119,18 +171,71 @@ struct ProjectPlaybackTrack: Sendable {
     }
 
     let id: UUID
+    /// Multiple source lanes can belong to one logical track. Mix controls are
+    /// addressed through this stable logical identity.
+    let logicalTrackID: UUID
+    /// Channel layout of the logical strip, independent of this runtime
+    /// source lane's media channel count.
+    let logicalChannelCount: Int
     let source: Source
     let sourceRevision: Int
+    /// Authoritative duration of the immutable project snapshot that produced
+    /// this lane. Canonical clip-graph projections set this on every lane so
+    /// transport time continues through implicit trailing gaps.
+    let timelineDurationHint: TimeInterval?
     let volume: Float
+    let pan: Float
     let isMuted: Bool
     let isSoloed: Bool
+    let volumeAutomation: [TimelinePlaybackAutomationPoint]
+    let panAutomation: [TimelinePlaybackAutomationPoint]
+    let muteAutomation: [TimelinePlaybackAutomationPoint]
+
+    init(
+        id: UUID,
+        logicalTrackID: UUID? = nil,
+        logicalChannelCount: Int = 2,
+        source: Source,
+        sourceRevision: Int,
+        timelineDurationHint: TimeInterval? = nil,
+        volume: Float,
+        pan: Float = 0,
+        isMuted: Bool,
+        isSoloed: Bool,
+        volumeAutomation: [TimelinePlaybackAutomationPoint] = [],
+        panAutomation: [TimelinePlaybackAutomationPoint] = [],
+        muteAutomation: [TimelinePlaybackAutomationPoint] = []
+    ) {
+        self.id = id
+        self.logicalTrackID = logicalTrackID ?? id
+        self.logicalChannelCount = logicalChannelCount <= 1 ? 1 : 2
+        self.source = source
+        self.sourceRevision = sourceRevision
+        self.timelineDurationHint = timelineDurationHint
+        self.volume = volume
+        self.pan = min(max(pan, -1), 1)
+        self.isMuted = isMuted
+        self.isSoloed = isSoloed
+        self.volumeAutomation = volumeAutomation
+        self.panAutomation = panAutomation
+        self.muteAutomation = muteAutomation
+    }
 }
 
 struct ProjectPlaybackTrackMix: Sendable {
     let id: UUID
     let volume: Float
+    let pan: Float
     let isMuted: Bool
     let isSoloed: Bool
+
+    init(id: UUID, volume: Float, pan: Float = 0, isMuted: Bool, isSoloed: Bool) {
+        self.id = id
+        self.volume = volume
+        self.pan = min(max(pan, -1), 1)
+        self.isMuted = isMuted
+        self.isSoloed = isSoloed
+    }
 }
 
 @MainActor
@@ -155,6 +260,7 @@ protocol PlaybackEngine: AnyObject {
     func clear()
     func updateZeroCrossingIndex(_ zeroCrossingIndex: AudioZeroCrossingIndex?)
     func updateProjectTrackMix(_ tracks: [ProjectPlaybackTrackMix])
+    func previewProjectTrackPan(trackID: UUID, pan: Float)
     @discardableResult
     func togglePlayback() throws -> Bool
     func play() throws
@@ -164,6 +270,9 @@ protocol PlaybackEngine: AnyObject {
     func seekExactly(toProgress progress: Float) throws
     func snapshot() -> PlaybackSnapshot
     func drainMeterSamples() -> [PlaybackMeterSample]
+    func setTrackMeteringEnabled(_ isEnabled: Bool)
+    func drainTrackMeterPackets() -> [PlaybackTrackMeterPacket]
+    func trackMeterDiagnostics() -> PlaybackTrackMeterDiagnostics
 }
 
 @MainActor
@@ -179,14 +288,16 @@ extension PlaybackEngine {
             try load(decodedAudioBuffer, zeroCrossingIndex: zeroCrossingIndex)
         case let .file(url, zeroCrossingProbe):
             try loadFile(at: url, zeroCrossingProbe: zeroCrossingProbe)
-        case let .fileTimeline(url, _, zeroCrossingProbe):
-            try loadFile(at: url, zeroCrossingProbe: zeroCrossingProbe)
+        case .fileTimeline, .fileSegments:
+            throw PlaybackError.unsupportedProjectArrangement
         case let .timeline(audioTimeline, zeroCrossingIndex):
             try load(audioTimeline.render(), zeroCrossingIndex: zeroCrossingIndex)
         }
     }
 
     func updateProjectTrackMix(_ tracks: [ProjectPlaybackTrackMix]) {}
+
+    func previewProjectTrackPan(trackID: UUID, pan: Float) {}
 
     func updateProjectTracks(_ tracks: [ProjectPlaybackTrack]) throws {
         try loadProjectTracks(tracks)
@@ -206,5 +317,17 @@ extension PlaybackEngine {
 
     func drainMeterSamples() -> [PlaybackMeterSample] {
         []
+    }
+
+    func setTrackMeteringEnabled(_ isEnabled: Bool) {}
+
+    func drainTrackMeterPackets() -> [PlaybackTrackMeterPacket] { [] }
+
+    func trackMeterDiagnostics() -> PlaybackTrackMeterDiagnostics {
+        PlaybackTrackMeterDiagnostics(
+            droppedPacketCount: 0,
+            stalePacketCount: 0,
+            realtimeWorkNanoseconds: 0
+        )
     }
 }

@@ -4,7 +4,10 @@ import Foundation
 enum PlaybackEngineFactory {
     static func makeDefault() -> PlaybackEngine {
         if ProcessInfo.processInfo.environment["SOUNDTIME_LEGACY_PLAYBACK"] == "1" {
-            return AudioPlaybackController()
+            // The single-file preview engine cannot represent clip gaps or
+            // source remapping. Keep the legacy AVFoundation backend without
+            // silently flattening a project arrangement into the whole file.
+            return MultitrackPlaybackController()
         }
 
         if

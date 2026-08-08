@@ -13,6 +13,7 @@ final class HybridPlaybackEngine: PlaybackEngine {
     private let realtimeEngine: RealtimeCorePlaybackEngine?
     private var activeEngine: ActiveEngine = .preview
     private var perceptualVolume: Float = 1
+    private var isTrackMeteringEnabled = false
     private var sourcePreparationTask: Task<Void, Never>?
     private var sourcePreparationID = UUID()
 
@@ -59,6 +60,7 @@ final class HybridPlaybackEngine: PlaybackEngine {
             previewEngine.clear()
             try realtimeEngine.load(decodedAudioBuffer, zeroCrossingIndex: zeroCrossingIndex)
             realtimeEngine.setPerceptualVolume(perceptualVolume)
+            realtimeEngine.setTrackMeteringEnabled(isTrackMeteringEnabled)
             activeEngine = .realtime
         } else {
             try previewEngine.load(decodedAudioBuffer, zeroCrossingIndex: zeroCrossingIndex)
@@ -145,11 +147,18 @@ final class HybridPlaybackEngine: PlaybackEngine {
             do {
                 try realtimeEngine.loadProjectTracks(tracks)
                 realtimeEngine.setPerceptualVolume(perceptualVolume)
+                realtimeEngine.setTrackMeteringEnabled(isTrackMeteringEnabled)
                 activeEngine = .realtime
                 return
             } catch {
                 realtimeEngine.clear()
             }
+        }
+
+        guard tracks.allSatisfy({
+            $0.volumeAutomation.isEmpty && $0.panAutomation.isEmpty && $0.muteAutomation.isEmpty
+        }) else {
+            throw PlaybackError.automationRequiresRealtimeEngine
         }
 
         try multitrackEngine.loadProjectTracks(tracks)
@@ -168,6 +177,7 @@ final class HybridPlaybackEngine: PlaybackEngine {
             do {
                 try realtimeEngine.updateProjectTracks(tracks)
                 realtimeEngine.setPerceptualVolume(perceptualVolume)
+                realtimeEngine.setTrackMeteringEnabled(isTrackMeteringEnabled)
                 return
             } catch {
                 realtimeEngine.clear()
@@ -181,6 +191,7 @@ final class HybridPlaybackEngine: PlaybackEngine {
             do {
                 try realtimeEngine.loadProjectTracks(tracks)
                 realtimeEngine.setPerceptualVolume(perceptualVolume)
+                realtimeEngine.setTrackMeteringEnabled(isTrackMeteringEnabled)
                 try realtimeEngine.seekExactly(
                     toProgress: realtimeEngine.snapshot().progressPreservingProjectTime(
                         from: previousSnapshot
@@ -213,6 +224,10 @@ final class HybridPlaybackEngine: PlaybackEngine {
         case .preview:
             break
         }
+    }
+
+    func previewProjectTrackPan(trackID: UUID, pan: Float) {
+        currentEngine.previewProjectTrackPan(trackID: trackID, pan: pan)
     }
 
     func warmOutputForLowLatencyPlayback() throws {
@@ -252,6 +267,19 @@ final class HybridPlaybackEngine: PlaybackEngine {
         currentEngine.drainMeterSamples()
     }
 
+    func setTrackMeteringEnabled(_ isEnabled: Bool) {
+        isTrackMeteringEnabled = isEnabled
+        realtimeEngine?.setTrackMeteringEnabled(isEnabled)
+    }
+
+    func drainTrackMeterPackets() -> [PlaybackTrackMeterPacket] {
+        currentEngine.drainTrackMeterPackets()
+    }
+
+    func trackMeterDiagnostics() -> PlaybackTrackMeterDiagnostics {
+        currentEngine.trackMeterDiagnostics()
+    }
+
     private func activatePreparedRealtimeSource(
         _ preparedSource: PreparedRealtimeAudioSource,
         zeroCrossingIndex: AudioZeroCrossingIndex?
@@ -269,6 +297,7 @@ final class HybridPlaybackEngine: PlaybackEngine {
                 zeroCrossingIndex: zeroCrossingIndex
             )
             realtimeEngine.setPerceptualVolume(perceptualVolume)
+            realtimeEngine.setTrackMeteringEnabled(isTrackMeteringEnabled)
             try realtimeEngine.seekExactly(
                 toProgress: realtimeEngine.snapshot().progressPreservingProjectTime(
                     from: previousSnapshot

@@ -53,6 +53,23 @@ typedef struct SoundtimeAudioCoreMeterSample {
     float rightClipPeak;
 } SoundtimeAudioCoreMeterSample;
 
+typedef struct SoundtimeAudioCoreTrackMeterPacketHeader {
+    uint64_t graphRevision;
+    uint64_t sequence;
+    uint64_t renderedFrameCount;
+    double hostTimestamp;
+    uint32_t trackCount;
+} SoundtimeAudioCoreTrackMeterPacketHeader;
+
+typedef struct SoundtimeAudioCoreTrackMeterLevel {
+    uint32_t runtimeTrackSlot;
+    uint32_t channelCount;
+    float leftRMS;
+    float rightRMS;
+    float leftPeak;
+    float rightPeak;
+} SoundtimeAudioCoreTrackMeterLevel;
+
 typedef struct SoundtimeAudioCoreTrackConfig {
     const SoundtimeAudioCoreSource* source;
     float gain;
@@ -67,11 +84,24 @@ typedef struct SoundtimeAudioCoreSegmentConfig {
     float gainEnd;
 } SoundtimeAudioCoreSegmentConfig;
 
+typedef struct SoundtimeAudioCoreAutomationPointConfig {
+    uint64_t frame;
+    float value;
+    float curveToNext;
+} SoundtimeAudioCoreAutomationPointConfig;
+
 typedef struct SoundtimeAudioCoreSegmentedTrackConfig {
     const SoundtimeAudioCoreSource* source;
     const SoundtimeAudioCoreSegmentConfig* segments;
     uint32_t segmentCount;
+    const SoundtimeAudioCoreAutomationPointConfig* volumeAutomationPoints;
+    uint32_t volumeAutomationPointCount;
+    const SoundtimeAudioCoreAutomationPointConfig* panAutomationPoints;
+    uint32_t panAutomationPointCount;
+    const SoundtimeAudioCoreAutomationPointConfig* muteAutomationPoints;
+    uint32_t muteAutomationPointCount;
     float gain;
+    float pan;
 } SoundtimeAudioCoreSegmentedTrackConfig;
 
 SoundtimeAudioCoreEngine* soundtime_audio_core_create(void);
@@ -153,7 +183,13 @@ void soundtime_audio_core_play(SoundtimeAudioCoreEngine* engine);
 void soundtime_audio_core_pause(SoundtimeAudioCoreEngine* engine);
 void soundtime_audio_core_pause_at(SoundtimeAudioCoreEngine* engine, uint64_t frameIndex);
 void soundtime_audio_core_seek(SoundtimeAudioCoreEngine* engine, uint64_t frameIndex);
+void soundtime_audio_core_seek_exactly(SoundtimeAudioCoreEngine* engine, uint64_t frameIndex);
 void soundtime_audio_core_set_gain(SoundtimeAudioCoreEngine* engine, float gain);
+bool soundtime_audio_core_set_track_pan(
+    SoundtimeAudioCoreEngine* engine,
+    uint32_t trackIndex,
+    float pan
+);
 void soundtime_audio_core_set_transport_ramp_duration(
     SoundtimeAudioCoreEngine* engine,
     double durationSeconds
@@ -170,6 +206,25 @@ bool soundtime_audio_core_pop_clock_sample(
 bool soundtime_audio_core_pop_meter_sample(
     SoundtimeAudioCoreEngine* engine,
     SoundtimeAudioCoreMeterSample* sample
+);
+void soundtime_audio_core_set_track_metering_enabled(
+    SoundtimeAudioCoreEngine* engine,
+    bool isEnabled
+);
+uint64_t soundtime_audio_core_current_graph_revision(
+    const SoundtimeAudioCoreEngine* engine
+);
+bool soundtime_audio_core_pop_track_meter_packet(
+    SoundtimeAudioCoreEngine* engine,
+    SoundtimeAudioCoreTrackMeterPacketHeader* header,
+    SoundtimeAudioCoreTrackMeterLevel* levels,
+    uint32_t levelCapacity
+);
+uint64_t soundtime_audio_core_dropped_track_meter_packet_count(
+    const SoundtimeAudioCoreEngine* engine
+);
+uint64_t soundtime_audio_core_track_meter_work_nanoseconds(
+    const SoundtimeAudioCoreEngine* engine
 );
 void soundtime_audio_core_render_silence(
     SoundtimeAudioCoreEngine* engine,

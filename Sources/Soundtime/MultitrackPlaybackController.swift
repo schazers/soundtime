@@ -21,8 +21,8 @@ final class MultitrackPlaybackController: PlaybackEngine {
             switch self {
             case let .decoded(decodedAudioBuffer):
                 decodedAudioBuffer.sampleRate
-            case let .file(audioFile, _):
-                audioFile.processingFormat.sampleRate
+            case let .file(audioFile, timeline):
+                timeline?.timelineSampleRate ?? audioFile.processingFormat.sampleRate
             }
         }
 
@@ -123,6 +123,11 @@ final class MultitrackPlaybackController: PlaybackEngine {
     }
 
     func loadProjectTracks(_ tracks: [ProjectPlaybackTrack]) throws {
+        guard tracks.allSatisfy({
+            $0.volumeAutomation.isEmpty && $0.panAutomation.isEmpty
+        }) else {
+            throw PlaybackError.automationRequiresRealtimeEngine
+        }
         clear()
 
         do {
@@ -186,24 +191,56 @@ final class MultitrackPlaybackController: PlaybackEngine {
     func updateZeroCrossingIndex(_ zeroCrossingIndex: AudioZeroCrossingIndex?) {}
 
     func updateProjectTrackMix(_ tracks: [ProjectPlaybackTrackMix]) {
-        for trackMix in tracks {
-            guard var player = trackPlayers[trackMix.id] else {
+        let mixesByLogicalTrackID = Dictionary(uniqueKeysWithValues: tracks.map { ($0.id, $0) })
+        for playerID in trackOrder {
+            guard var player = trackPlayers[playerID],
+                  let trackMix = mixesByLogicalTrackID[player.track.logicalTrackID] else {
                 continue
             }
 
             player.track = ProjectPlaybackTrack(
                 id: player.track.id,
+                logicalTrackID: player.track.logicalTrackID,
                 source: player.track.source,
                 sourceRevision: player.track.sourceRevision,
+                timelineDurationHint: player.track.timelineDurationHint,
                 volume: trackMix.volume,
+                pan: trackMix.pan,
                 isMuted: trackMix.isMuted,
-                isSoloed: trackMix.isSoloed
+                isSoloed: trackMix.isSoloed,
+                volumeAutomation: player.track.volumeAutomation,
+                panAutomation: player.track.panAutomation
             )
-            trackPlayers[trackMix.id] = player
+            trackPlayers[playerID] = player
         }
 
         applyTrackVolumes()
         applyOutputVolume()
+    }
+
+    func previewProjectTrackPan(trackID: UUID, pan: Float) {
+        let clampedPan = min(max(pan, -1), 1)
+        for playerID in trackOrder {
+            guard var player = trackPlayers[playerID], player.track.logicalTrackID == trackID else {
+                continue
+            }
+            player.track = ProjectPlaybackTrack(
+                id: player.track.id,
+                logicalTrackID: player.track.logicalTrackID,
+                source: player.track.source,
+                sourceRevision: player.track.sourceRevision,
+                timelineDurationHint: player.track.timelineDurationHint,
+                volume: player.track.volume,
+                pan: clampedPan,
+                isMuted: player.track.isMuted,
+                isSoloed: player.track.isSoloed,
+                volumeAutomation: player.track.volumeAutomation,
+                panAutomation: player.track.panAutomation,
+                muteAutomation: player.track.muteAutomation
+            )
+            player.playerNode.pan = clampedPan
+            trackPlayers[playerID] = player
+        }
     }
 
     @discardableResult
@@ -434,6 +471,27 @@ final class MultitrackPlaybackController: PlaybackEngine {
             zeroCrossingProbe = sourceZeroCrossingProbe
         case let .fileTimeline(url, timeline, sourceZeroCrossingProbe):
             let audioFile = try AVAudioFile(forReading: url)
+            source = .file(audioFile, timeline: timeline)
+            format = audioFile.processingFormat
+            zeroCrossingIndex = nil
+            zeroCrossingProbe = sourceZeroCrossingProbe
+        case let .fileSegments(
+            url,
+            sourceFrameCount,
+            sourceSampleRate,
+            timelineSampleRate,
+            segments,
+            sourceZeroCrossingProbe
+        ):
+            let audioFile = try AVAudioFile(forReading: url)
+            guard let timeline = AudioFileEditTimeline(
+                sourceFrameCount: sourceFrameCount,
+                sourceSampleRate: sourceSampleRate,
+                timelineSampleRate: timelineSampleRate,
+                playbackSegments: segments
+            ) else {
+                throw PlaybackError.invalidFormat
+            }
             source = .file(audioFile, timeline: timeline)
             format = audioFile.processingFormat
             zeroCrossingIndex = nil
@@ -747,6 +805,7 @@ final class MultitrackPlaybackController: PlaybackEngine {
             let shouldPlayTrack = isTrackAudible(player.track, anySoloedTrack: anySoloedTrack)
             let clampedTrackVolume = min(max(player.track.volume, 0), 1)
             player.playerNode.volume = shouldPlayTrack ? clampedTrackVolume * clampedTrackVolume : 0
+            player.playerNode.pan = min(max(player.track.pan, -1), 1)
         }
     }
 
@@ -831,7 +890,9 @@ final class MultitrackPlaybackController: PlaybackEngine {
     }
 
     private func projectDuration() -> TimeInterval {
-        trackPlayers.values.reduce(TimeInterval(0)) { max($0, $1.duration) }
+        trackPlayers.values.reduce(TimeInterval(0)) { longestDuration, player in
+            max(longestDuration, player.duration, player.track.timelineDurationHint ?? 0)
+        }
     }
 
     private func projectFrameCount() -> Int {

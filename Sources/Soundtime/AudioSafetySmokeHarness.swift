@@ -178,6 +178,7 @@ enum AudioSafetySmokeHarness {
         try verifySeekFramePosition(metrics: &metrics)
         try verifyTransportClockDoesNotRunAhead(metrics: &metrics)
         try verifyMixedRateTrackEndpointAlignment(metrics: &metrics)
+        try verifyLogicalTrackMixTargetsEverySourceLane(metrics: &metrics)
         try verifyLoopWrapSampleConsistency(metrics: &metrics)
         try verifyEditGraphSwapSafety(mode: mode, metrics: &metrics)
         if coreOnly {
@@ -202,6 +203,7 @@ enum AudioSafetySmokeHarness {
             "seek lands on expected frame position",
             "visual transport clock cannot outrun rendered audio callbacks",
             "mixed-rate track audio ends at its canonical visual endpoint",
+            "logical track mute reaches every canonical source lane",
             "loop wrap returns sample-consistently to loop start",
             "edit graph swaps do not block realtime render",
         ]
@@ -493,6 +495,80 @@ enum AudioSafetySmokeHarness {
         try require(
             longerTrackPeak > 0.001,
             "longer mixed-rate track ended before its visual endpoint (peak \(longerTrackPeak))"
+        )
+        playbackEngine.pause()
+        metrics.absorb(playbackEngine.realtimeSnapshotForSafetySmoke())
+    }
+
+    private static func verifyLogicalTrackMixTargetsEverySourceLane(
+        metrics: inout SafetyMetrics
+    ) throws {
+        let outputDevice = AudioSafetySmokeOutputDevice()
+        guard let playbackEngine = RealtimeCorePlaybackEngine(outputDevice: outputDevice) else {
+            throw SmokeError.failed("could not create realtime playback engine for logical track mix safety")
+        }
+
+        let sampleRate = 48_000.0
+        let logicalTrackID = stableUUID("00000000-0000-4000-a210-%012d", 1)
+        let sourceLanes = [1, 2].map { laneIndex in
+            ProjectPlaybackTrack(
+                id: stableUUID("00000000-0000-4000-a211-%012d", laneIndex),
+                logicalTrackID: logicalTrackID,
+                source: .timeline(
+                    audioTimeline: AudioEditTimeline(sourceBuffer: syntheticAudioBuffer(
+                        frameCount: Int(sampleRate * 2),
+                        sampleRate: sampleRate
+                    )),
+                    zeroCrossingIndex: nil
+                ),
+                sourceRevision: laneIndex,
+                volume: 1,
+                isMuted: false,
+                isSoloed: false
+            )
+        }
+
+        try playbackEngine.loadProjectTracks(sourceLanes)
+        let corePointer = try requireValue(
+            outputDevice.corePointer,
+            "logical track mix output device did not receive core pointer"
+        )
+        try playbackEngine.play()
+        let audible = renderCaptured(
+            corePointer: corePointer,
+            blockCount: 8,
+            frameCount: 256,
+            sampleRate: sampleRate
+        )
+        let audiblePeak = max(
+            audible.left.map { Swift.abs($0) }.max() ?? 0,
+            audible.right.map { Swift.abs($0) }.max() ?? 0
+        )
+        try require(audiblePeak > 0.001, "logical track source lanes were silent before mute")
+
+        playbackEngine.updateProjectTrackMix([
+            ProjectPlaybackTrackMix(
+                id: logicalTrackID,
+                volume: 1,
+                isMuted: true,
+                isSoloed: false
+            ),
+        ])
+        // Track gain changes intentionally ramp for 3 ms to avoid clicks.
+        render(corePointer: corePointer, blockCount: 2, frameCount: 256, sampleRate: sampleRate)
+        let muted = renderCaptured(
+            corePointer: corePointer,
+            blockCount: 8,
+            frameCount: 256,
+            sampleRate: sampleRate
+        )
+        let mutedPeak = max(
+            muted.left.map { Swift.abs($0) }.max() ?? 0,
+            muted.right.map { Swift.abs($0) }.max() ?? 0
+        )
+        try require(
+            mutedPeak <= 0.000_001,
+            "logical track mute left a canonical source lane audible (peak \(mutedPeak))"
         )
         playbackEngine.pause()
         metrics.absorb(playbackEngine.realtimeSnapshotForSafetySmoke())
