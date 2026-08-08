@@ -1,11 +1,13 @@
 import AppKit
 import QuartzCore
+import Darwin
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowControllers: [MainWindowController] = []
     private weak var openRecentMenu: NSMenu?
     private weak var checkForUpdatesMenuItem: NSMenuItem?
+    private var terminationSignalSources: [DispatchSourceSignal] = []
     private let updateCoordinator = ApplicationUpdateCoordinator()
     private lazy var audioPreferencesWindowController = AudioDevicePreferencesWindowController(
         updateService: updateCoordinator.service
@@ -13,6 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         LaunchStartupTrace.shared.mark(.appDelegateDidFinishLaunching)
+        installGracefulTerminationSignalHandlers()
         SoundtimeProjectStore.removeAutomationArtifactsFromUserHistory()
         configureMainMenu()
 
@@ -26,6 +29,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.windowControllers.last?.window
         }
         updateCoordinator.startAfterLaunchSettles()
+        offerPreviousDiagnosticsIfNeeded()
+    }
+
+    private func installGracefulTerminationSignalHandlers() {
+        for signalNumber in [SIGINT, SIGTERM] {
+            Darwin.signal(signalNumber, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: .main)
+            source.setEventHandler {
+                NSApplication.shared.terminate(nil)
+            }
+            source.resume()
+            terminationSignalSources.append(source)
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -65,6 +81,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 "firstFramePacketWrite": "false",
             ]
         )
+        SoundtimeDiagnostics.shared.finishSession()
     }
 
     @objc private func newProject(_ sender: Any?) {
@@ -140,6 +157,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainMenu.addItem(editMenuItem)
         editMenuItem.submenu = makeEditMenu()
 
+        let clipMenuItem = NSMenuItem(title: "Clip", action: nil, keyEquivalent: "")
+        mainMenu.addItem(clipMenuItem)
+        clipMenuItem.submenu = makeClipMenu()
+
         let viewMenuItem = NSMenuItem(title: "View", action: nil, keyEquivalent: "")
         mainMenu.addItem(viewMenuItem)
         viewMenuItem.submenu = makeViewMenu()
@@ -148,7 +169,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainMenu.addItem(effectsMenuItem)
         effectsMenuItem.submenu = makeEffectsMenu()
 
+        let helpMenuItem = NSMenuItem(title: "Help", action: nil, keyEquivalent: "")
+        mainMenu.addItem(helpMenuItem)
+        helpMenuItem.submenu = makeHelpMenu()
+
         NSApplication.shared.mainMenu = mainMenu
+    }
+
+    private func makeHelpMenu() -> NSMenu {
+        let menu = NSMenu(title: "Help")
+        let mark = NSMenuItem(title: "Mark Diagnostic Incident", action: #selector(markDiagnosticIncident(_:)), keyEquivalent: "")
+        mark.target = self; menu.addItem(mark)
+        let reveal = NSMenuItem(title: "Reveal Logs", action: #selector(revealDiagnosticLogs(_:)), keyEquivalent: "")
+        reveal.target = self; menu.addItem(reveal)
+        let export = NSMenuItem(title: "Export Diagnostic Bundle...", action: #selector(exportDiagnosticBundle(_:)), keyEquivalent: "")
+        export.target = self; menu.addItem(export)
+        return menu
+    }
+
+    @objc private func markDiagnosticIncident(_ sender: Any?) {
+        _ = SoundtimeDiagnostics.shared.markIncident()
+    }
+
+    @objc private func revealDiagnosticLogs(_ sender: Any?) {
+        NSWorkspace.shared.open(SoundtimeDiagnostics.shared.logsDirectoryURL)
+    }
+
+    @objc private func exportDiagnosticBundle(_ sender: Any?) {
+        if let url = SoundtimeDiagnostics.shared.exportDiagnosticBundle() {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        }
+    }
+
+    private func offerPreviousDiagnosticsIfNeeded() {
+        let incompleteSessionIDs = SoundtimeDiagnostics.shared.unacknowledgedIncompleteSessionIDs
+        guard let newestIncompleteSessionID = incompleteSessionIDs.first,
+              ProcessInfo.processInfo.environment["SOUNDTIME_AUTOMATION"] != "1" else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            let alert = NSAlert()
+            alert.messageText = "Soundtime did not finish its previous session"
+            alert.informativeText = "A diagnostic session is available. Exporting it can help investigate a crash or forced quit."
+            alert.addButton(withTitle: "Export Diagnostics")
+            alert.addButton(withTitle: "Not Now")
+            let response = alert.runModal()
+            if response == .alertFirstButtonReturn,
+               let url = SoundtimeDiagnostics.shared.exportIncompleteSessionBundle(
+                   sessionID: newestIncompleteSessionID
+               ) {
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+            }
+            for sessionID in incompleteSessionIDs {
+                _ = SoundtimeDiagnostics.shared.acknowledgeRecoveryPrompt(for: sessionID)
+            }
+        }
     }
 
     private func makeApplicationMenu() -> NSMenu {
@@ -410,6 +483,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: ""
         ))
         menu.addItem(NSMenuItem(
+            title: "Select Previous Clip",
+            action: #selector(TimelineView.selectPreviousClip(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Select Next Clip",
+            action: #selector(TimelineView.selectNextClip(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(
+            title: "Mute/Unmute Selected Clips",
+            action: #selector(TimelineView.toggleSelectedClipMute(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Lock/Unlock Selected Clips",
+            action: #selector(TimelineView.toggleSelectedClipLock(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Group Selected Clips",
+            action: #selector(TimelineView.groupSelectedClips(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Ungroup Selected Clips",
+            action: #selector(TimelineView.ungroupSelectedClips(_:)),
+            keyEquivalent: ""
+        ))
+        let repeatClipsItem = NSMenuItem(
+            title: "Repeat Selected Clips",
+            action: #selector(TimelineView.repeatSelectedClips(_:)),
+            keyEquivalent: "r"
+        )
+        repeatClipsItem.keyEquivalentModifierMask = [.command]
+        menu.addItem(repeatClipsItem)
+        menu.addItem(NSMenuItem(
+            title: "Crossfade Selected Clips",
+            action: #selector(TimelineView.crossfadeSelectedClips(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Snap Clips",
+            action: #selector(TimelineView.toggleClipSnapping(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
             title: "Snap Selection to Playhead/Edges/Silence",
             action: #selector(TimelineView.snapSelectionToPlayheadEdgesOrSilence(_:)),
             keyEquivalent: ""
@@ -424,11 +545,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             action: #selector(TimelineView.selectAllClipsOnTrack(_:)),
             keyEquivalent: ""
         ))
+        menu.addItem(NSMenuItem(
+            title: "Select Following Clips on Track",
+            action: #selector(TimelineView.selectFollowingClips(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Select Clips in Time Selection",
+            action: #selector(TimelineView.selectClipsInTimeSelection(_:)),
+            keyEquivalent: ""
+        ))
         return menu
     }
 
     private func makeViewMenu() -> NSMenu {
         let menu = NSMenu(title: "View")
+        let mixerItem = NSMenuItem(
+            title: MixerCommandContract.menuTitle,
+            action: #selector(WorkspaceView.toggleMixer(_:)),
+            keyEquivalent: MixerCommandContract.keyEquivalent
+        )
+        mixerItem.keyEquivalentModifierMask = MixerCommandContract.keyEquivalentModifierMask
+        menu.addItem(mixerItem)
+        menu.addItem(.separator())
         let zoomToSelectedRegionItem = NSMenuItem(
             title: "Zoom to Selected Region",
             action: #selector(TimelineView.zoomToSelection(_:)),
@@ -436,17 +575,147 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         zoomToSelectedRegionItem.keyEquivalentModifierMask = []
         menu.addItem(zoomToSelectedRegionItem)
+        menu.addItem(.separator())
+        let automationItem = NSMenuItem(
+            title: "Show Track Automation",
+            action: #selector(WorkspaceView.toggleTrackAutomation(_:)),
+            keyEquivalent: "a"
+        )
+        automationItem.keyEquivalentModifierMask = []
+        menu.addItem(automationItem)
+        let pointToolItem = NSMenuItem(
+            title: "Automation Point Tool",
+            action: #selector(TimelineView.selectAutomationPointTool(_:)),
+            keyEquivalent: ""
+        )
+        menu.addItem(pointToolItem)
+        let curveToolItem = NSMenuItem(
+            title: "Automation Curve Tool",
+            action: #selector(TimelineView.selectAutomationCurveTool(_:)),
+            keyEquivalent: "c"
+        )
+        curveToolItem.keyEquivalentModifierMask = []
+        menu.addItem(curveToolItem)
+        for (title, action, key) in [
+            ("Automation Pencil Tool", #selector(TimelineView.selectAutomationPencilTool(_:)), "p"),
+            ("Automation Ramp Tool", #selector(TimelineView.selectAutomationRampTool(_:)), "r"),
+            ("Automation Eraser Tool", #selector(TimelineView.selectAutomationEraserTool(_:)), "e"),
+        ] {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+            item.keyEquivalentModifierMask = [.control]
+            menu.addItem(item)
+        }
+        let curvePresets = NSMenu(title: "Automation Curve Preset")
+        for (title, action) in [
+            ("Linear", #selector(TimelineView.setAutomationCurveLinear(_:))),
+            ("Ease In", #selector(TimelineView.setAutomationCurveEaseIn(_:))),
+            ("Ease Out", #selector(TimelineView.setAutomationCurveEaseOut(_:))),
+            ("S-Curve", #selector(TimelineView.setAutomationCurveSCurve(_:))),
+            ("Stepped", #selector(TimelineView.setAutomationCurveStepped(_:))),
+        ] {
+            curvePresets.addItem(NSMenuItem(title: title, action: action, keyEquivalent: ""))
+        }
+        let curvePresetItem = NSMenuItem(title: "Automation Curve Preset", action: nil, keyEquivalent: "")
+        curvePresetItem.submenu = curvePresets
+        menu.addItem(curvePresetItem)
+        return menu
+    }
+
+    private func makeClipMenu() -> NSMenu {
+        let menu = NSMenu(title: "Clip")
+        menu.addItem(NSMenuItem(
+            title: "Relink Missing Media...",
+            action: #selector(TimelineView.relinkMissingMedia(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Cancel Media Relink",
+            action: #selector(TimelineView.cancelMissingMediaRelink(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(.separator())
+        let openInspector = NSMenuItem(
+            title: "Open Selected Clip in Track Inspector",
+            action: #selector(TimelineView.openSelectedClipInspector(_:)),
+            keyEquivalent: "i"
+        )
+        openInspector.keyEquivalentModifierMask = [.command, .option]
+        menu.addItem(openInspector)
+        let moveAbove = NSMenuItem(
+            title: "Move Selected Clips to Track Above",
+            action: #selector(TimelineView.moveSelectedClipsToTrackAbove(_:)),
+            keyEquivalent: String(UnicodeScalar(NSUpArrowFunctionKey)!)
+        )
+        moveAbove.keyEquivalentModifierMask = [.command, .option]
+        menu.addItem(moveAbove)
+        let moveBelow = NSMenuItem(
+            title: "Move Selected Clips to Track Below",
+            action: #selector(TimelineView.moveSelectedClipsToTrackBelow(_:)),
+            keyEquivalent: String(UnicodeScalar(NSDownArrowFunctionKey)!)
+        )
+        moveBelow.keyEquivalentModifierMask = [.command, .option]
+        menu.addItem(moveBelow)
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(
+            title: "Split Focused Clip at Playhead",
+            action: #selector(TimelineView.splitFocusedClipAtPlayhead(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Trim Focused Clip Start to Playhead",
+            action: #selector(TimelineView.trimFocusedClipStartToPlayhead(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Trim Focused Clip End to Playhead",
+            action: #selector(TimelineView.trimFocusedClipEndToPlayhead(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(
+            title: "Move Focused Clip Earlier",
+            action: #selector(TimelineView.moveFocusedClipEarlier(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Move Focused Clip Later",
+            action: #selector(TimelineView.moveFocusedClipLater(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Duplicate Focused Clip",
+            action: #selector(TimelineView.duplicateFocusedClip(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Rename Focused Clip...",
+            action: #selector(TimelineView.renameFocusedClip(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Delete Focused Clip",
+            action: #selector(TimelineView.deleteFocusedClip(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(
+            title: "Close Clip Inspector",
+            action: #selector(TimelineView.closeFocusedClipInspector(_:)),
+            keyEquivalent: ""
+        ))
         return menu
     }
 
     private func makeEffectsMenu() -> NSMenu {
         let menu = NSMenu(title: "Effects")
 
-        menu.addItem(NSMenuItem(
+        let reapplyEffectItem = NSMenuItem(
             title: "Reapply last effect",
             action: #selector(TimelineView.reapplyLastEffect(_:)),
             keyEquivalent: "r"
-        ))
+        )
+        reapplyEffectItem.keyEquivalentModifierMask = [.command, .shift]
+        menu.addItem(reapplyEffectItem)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(
             title: "Gain...",
