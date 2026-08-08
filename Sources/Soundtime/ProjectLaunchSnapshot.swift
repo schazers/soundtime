@@ -1,7 +1,7 @@
 import Foundation
 
 struct ProjectLaunchSnapshot: Codable, Sendable {
-    static let currentSchemaVersion = 2
+    static let currentSchemaVersion = 3
     static let maximumOverviewBinCount = 32_768
 
     struct ProjectFileMetadata: Codable, Sendable, Equatable {
@@ -159,6 +159,7 @@ struct ProjectLaunchSnapshot: Codable, Sendable {
     var timelineViewport: SoundtimeProject.TimelineViewport?
     var masterVolume: Float?
     var transcriptDisplayMode: TranscriptTimelineDisplayMode?
+    var clipGraphDocument: TimelineClipGraphDocument?
     var tracks: [Track]
 
     init(
@@ -171,6 +172,7 @@ struct ProjectLaunchSnapshot: Codable, Sendable {
         timelineViewport: SoundtimeProject.TimelineViewport?,
         masterVolume: Float?,
         transcriptDisplayMode: TranscriptTimelineDisplayMode?,
+        clipGraphDocument: TimelineClipGraphDocument? = nil,
         tracks: [TrackDraft]
     ) {
         schemaVersion = Self.currentSchemaVersion
@@ -183,12 +185,14 @@ struct ProjectLaunchSnapshot: Codable, Sendable {
         self.launchStateRevision = launchStateRevision
         visualFingerprint = ProjectLaunchVisualFingerprint.make(
             projectPath: projectPath,
+            clipGraphDocument: clipGraphDocument,
             tracks: tracks
         )
         self.windowLayout = windowLayout
         self.timelineViewport = timelineViewport
         self.masterVolume = masterVolume
         self.transcriptDisplayMode = transcriptDisplayMode
+        self.clipGraphDocument = clipGraphDocument
         self.tracks = tracks.map { draft in
             let sourceOverview = OverviewPayload(draft.sourceWaveformOverview)
             let displayOverview = OverviewPayload(
@@ -231,6 +235,7 @@ struct ProjectLaunchSnapshot: Codable, Sendable {
         timelineViewport: SoundtimeProject.TimelineViewport?,
         masterVolume: Float?,
         transcriptDisplayMode: TranscriptTimelineDisplayMode?,
+        clipGraphDocument: TimelineClipGraphDocument? = nil,
         tracks: [Track]
     ) {
         self.schemaVersion = schemaVersion
@@ -246,6 +251,7 @@ struct ProjectLaunchSnapshot: Codable, Sendable {
         self.timelineViewport = timelineViewport
         self.masterVolume = masterVolume
         self.transcriptDisplayMode = transcriptDisplayMode
+        self.clipGraphDocument = clipGraphDocument
         self.tracks = tracks
     }
 
@@ -451,6 +457,7 @@ enum ProjectLaunchSnapshotBinaryCodec {
         var timelineViewport: SoundtimeProject.TimelineViewport?
         var masterVolume: Float?
         var transcriptDisplayMode: TranscriptTimelineDisplayMode?
+        var clipGraphDocument: TimelineClipGraphDocument?
         var tracks: [TrackManifest]
     }
 
@@ -496,6 +503,7 @@ enum ProjectLaunchSnapshotBinaryCodec {
             timelineViewport: snapshot.timelineViewport,
             masterVolume: snapshot.masterVolume,
             transcriptDisplayMode: snapshot.transcriptDisplayMode,
+            clipGraphDocument: snapshot.clipGraphDocument,
             tracks: trackManifests
         )
         let manifestData = try JSONEncoder().encode(manifest)
@@ -572,6 +580,7 @@ enum ProjectLaunchSnapshotBinaryCodec {
             timelineViewport: manifest.timelineViewport,
             masterVolume: manifest.masterVolume,
             transcriptDisplayMode: manifest.transcriptDisplayMode,
+            clipGraphDocument: manifest.clipGraphDocument,
             tracks: tracks
         )
     }
@@ -637,6 +646,7 @@ enum ProjectLaunchSnapshotBinaryCodec {
             timelineViewport: manifest.timelineViewport,
             masterVolume: manifest.masterVolume,
             transcriptDisplayMode: manifest.transcriptDisplayMode,
+            clipGraphDocument: manifest.clipGraphDocument,
             tracks: tracks
         )
     }

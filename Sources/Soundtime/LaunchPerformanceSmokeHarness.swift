@@ -93,6 +93,42 @@ enum LaunchPerformanceSmokeHarness {
                 isSoloed: index == 2
             )
         }
+        let launchClipGraph = try TimelineClipGraph(
+            sources: tracks.enumerated().map { index, track in
+                TimelineMediaSource(
+                    id: TimelineMediaSourceID(rawValue: "launch-source-\(index)"),
+                    absolutePath: track.filePath,
+                    frameCount: sourceFrameCount,
+                    sampleRate: sampleRate,
+                    channelCount: 2
+                )
+            },
+            tracks: tracks.enumerated().map { index, track in
+                TimelineTrack(
+                    id: track.id,
+                    name: track.name,
+                    clips: [
+                        TimelineClip(
+                            sourceID: TimelineMediaSourceID(rawValue: "launch-source-\(index)"),
+                            timelineRange: TimelineFrameRange(
+                                startFrame: (index + 1) * 12_000,
+                                frameCount: sourceFrameCount
+                            ),
+                            sourceRange: TimelineFrameRange(
+                                startFrame: 0,
+                                frameCount: sourceFrameCount
+                            ),
+                            name: "Offset Launch Clip \(index + 1)"
+                        ),
+                    ],
+                    volume: track.volume,
+                    isMuted: track.isMuted,
+                    isSoloed: track.isSoloed
+                )
+            },
+            timelineSampleRate: sampleRate
+        )
+        let launchClipGraphDocument = try TimelineClipGraphDocument(graph: launchClipGraph)
 
         let snapshot = ProjectLaunchSnapshot(
             projectURL: projectURL,
@@ -100,6 +136,7 @@ enum LaunchPerformanceSmokeHarness {
             timelineViewport: SoundtimeProject.TimelineViewport(startProgress: 0.21, durationProgress: 0.18),
             masterVolume: 0.82,
             transcriptDisplayMode: .hidden,
+            clipGraphDocument: launchClipGraphDocument,
             tracks: tracks
         )
         let snapshotReadiness = ProjectLaunchReadinessClassifier.summarize(snapshot: snapshot)
@@ -402,6 +439,7 @@ enum LaunchPerformanceSmokeHarness {
             timelineViewport: snapshot.timelineViewport,
             masterVolume: snapshot.masterVolume,
             transcriptDisplayMode: snapshot.transcriptDisplayMode,
+            clipGraphDocument: launchClipGraphDocument,
             tracks: tracks
         )
         try ProjectFirstFrameWaveformPacketStore.save(firstFramePacket, for: projectURL)
@@ -429,12 +467,17 @@ enum LaunchPerformanceSmokeHarness {
             loadedFirstFramePacket.tracks[2].isSoloed,
             "first-frame packet dropped soloed track state"
         )
+        try require(
+            loadedFirstFramePacket.clipGraphDocument?.graph.tracks.first?.clips.first?.timelineRange.startFrame == 12_000,
+            "first-frame packet dropped the first clip's nonzero launch position"
+        )
         let launchManifest = ProjectLaunchManifest(
             projectURL: projectURL,
             windowLayout: snapshot.windowLayout,
             timelineViewport: snapshot.timelineViewport,
             masterVolume: snapshot.masterVolume,
             transcriptDisplayMode: snapshot.transcriptDisplayMode,
+            clipGraphDocument: launchClipGraphDocument,
             tracks: tracks,
             snapshotByteCount: Self.fileByteCount(ProjectLaunchSnapshotStore.snapshotURL(for: projectURL)),
             firstFramePacketByteCount: Self.fileByteCount(ProjectFirstFrameWaveformPacketStore.packetURL(for: projectURL)),
@@ -635,6 +678,12 @@ enum LaunchPerformanceSmokeHarness {
         try require(
             coordinatorFirstFrame.windowLayout?.width == 1440,
             "launch coordinator did not apply lightweight window layout overlay"
+        )
+        try require(
+            coordinatorFirstFrame.clipGraphDocument?.graph.tracks.enumerated().allSatisfy { index, track in
+                track.clips.first?.timelineRange.startFrame == (index + 1) * 12_000
+            } == true,
+            "launch coordinator first frame did not preserve canonical clip positions"
         )
         SoundtimeProjectStore.rememberLastProjectURL(projectURL)
         let rememberedProjectPlan = ProjectLaunchCoordinator.resolveLaunchPlan(restoresLastProject: true)
@@ -843,6 +892,10 @@ enum LaunchPerformanceSmokeHarness {
             try require(snapshotShell.tracks.count == trackCount, "snapshot shell track count mismatch")
             try require(snapshotShell.tracks[1].isMuted, "snapshot shell dropped muted track state")
             try require(snapshotShell.tracks[2].isSoloed, "snapshot shell dropped soloed track state")
+            try require(
+                snapshotShell.clipGraphDocument?.graph.tracks.first?.clips.first?.timelineRange.startFrame == 12_000,
+                "snapshot shell dropped canonical clip placement geometry"
+            )
             try require(
                 snapshotShell.tracks.allSatisfy { $0.displayOverview == nil && $0.sourceOverview == nil },
                 "snapshot shell should not decode waveform payloads"

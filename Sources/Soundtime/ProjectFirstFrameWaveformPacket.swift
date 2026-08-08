@@ -1,7 +1,7 @@
 import Foundation
 
 struct ProjectFirstFrameWaveformPacket: Codable, Sendable {
-    static let currentSchemaVersion = 2
+    static let currentSchemaVersion = 3
     static let targetFirstPaintSynchronousByteLimit = 8 * 1_024 * 1_024
     static let maximumOverviewBinCount = ProjectLaunchSnapshot.maximumOverviewBinCount
     static let minimumOverviewBinCount = 2_048
@@ -42,6 +42,7 @@ struct ProjectFirstFrameWaveformPacket: Codable, Sendable {
     var timelineViewport: SoundtimeProject.TimelineViewport?
     var masterVolume: Float?
     var transcriptDisplayMode: TranscriptTimelineDisplayMode?
+    var clipGraphDocument: TimelineClipGraphDocument?
     var tracks: [Track]
 
     init(
@@ -54,6 +55,7 @@ struct ProjectFirstFrameWaveformPacket: Codable, Sendable {
         timelineViewport: SoundtimeProject.TimelineViewport?,
         masterVolume: Float?,
         transcriptDisplayMode: TranscriptTimelineDisplayMode?,
+        clipGraphDocument: TimelineClipGraphDocument? = nil,
         tracks: [ProjectLaunchSnapshot.TrackDraft]
     ) {
         schemaVersion = Self.currentSchemaVersion
@@ -66,12 +68,14 @@ struct ProjectFirstFrameWaveformPacket: Codable, Sendable {
         self.launchStateRevision = launchStateRevision
         visualFingerprint = ProjectLaunchVisualFingerprint.make(
             projectPath: projectPath,
+            clipGraphDocument: clipGraphDocument,
             tracks: tracks
         )
         self.windowLayout = windowLayout
         self.timelineViewport = timelineViewport
         self.masterVolume = masterVolume
         self.transcriptDisplayMode = transcriptDisplayMode
+        self.clipGraphDocument = clipGraphDocument
         let maximumFirstPaintBinCount = Self.maximumOverviewBinCount(forTrackCount: tracks.count)
         self.tracks = tracks.map { draft in
             let displayOverview = ProjectLaunchSnapshot.OverviewPayload(
@@ -117,6 +121,7 @@ struct ProjectFirstFrameWaveformPacket: Codable, Sendable {
         timelineViewport: SoundtimeProject.TimelineViewport?,
         masterVolume: Float?,
         transcriptDisplayMode: TranscriptTimelineDisplayMode?,
+        clipGraphDocument: TimelineClipGraphDocument? = nil,
         tracks: [Track]
     ) {
         self.schemaVersion = schemaVersion
@@ -132,6 +137,7 @@ struct ProjectFirstFrameWaveformPacket: Codable, Sendable {
         self.timelineViewport = timelineViewport
         self.masterVolume = masterVolume
         self.transcriptDisplayMode = transcriptDisplayMode
+        self.clipGraphDocument = clipGraphDocument
         self.tracks = tracks
     }
 
@@ -334,6 +340,7 @@ enum ProjectFirstFrameWaveformPacketBinaryCodec {
         var timelineViewport: SoundtimeProject.TimelineViewport?
         var masterVolume: Float?
         var transcriptDisplayMode: TranscriptTimelineDisplayMode?
+        var clipGraphDocument: TimelineClipGraphDocument?
         var tracks: [TrackManifest]
     }
 
@@ -376,6 +383,7 @@ enum ProjectFirstFrameWaveformPacketBinaryCodec {
             timelineViewport: packet.timelineViewport,
             masterVolume: packet.masterVolume,
             transcriptDisplayMode: packet.transcriptDisplayMode,
+            clipGraphDocument: packet.clipGraphDocument,
             tracks: trackManifests
         )
         let manifestData = try JSONEncoder().encode(manifest)
@@ -451,6 +459,7 @@ enum ProjectFirstFrameWaveformPacketBinaryCodec {
             timelineViewport: manifest.timelineViewport,
             masterVolume: manifest.masterVolume,
             transcriptDisplayMode: manifest.transcriptDisplayMode,
+            clipGraphDocument: manifest.clipGraphDocument,
             tracks: tracks
         )
     }
@@ -513,6 +522,7 @@ enum ProjectFirstFrameWaveformPacketBinaryCodec {
             timelineViewport: manifest.timelineViewport,
             masterVolume: manifest.masterVolume,
             transcriptDisplayMode: manifest.transcriptDisplayMode,
+            clipGraphDocument: manifest.clipGraphDocument,
             tracks: tracks
         )
     }

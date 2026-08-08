@@ -90,7 +90,7 @@ enum ProjectClipGraphBridge {
         )
     }
 
-    private static func resolvingMediaPaths(
+    static func resolvingMediaPaths(
         in graph: TimelineClipGraph,
         projectURL: URL
     ) throws -> TimelineClipGraph {

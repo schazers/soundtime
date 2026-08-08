@@ -103,6 +103,7 @@ struct ProjectLaunchFirstFrame: Sendable {
     var timelineViewport: SoundtimeProject.TimelineViewport?
     var masterVolume: Float?
     var transcriptDisplayMode: TranscriptTimelineDisplayMode?
+    var clipGraphDocument: TimelineClipGraphDocument?
     var tracks: [Track]
     var summary: ProjectLaunchVisualReadinessSummary
 
@@ -623,7 +624,7 @@ enum ProjectLaunchCoordinator {
         loadMilliseconds: Double,
         summary: ProjectLaunchVisualReadinessSummary
     ) -> ProjectLaunchFirstFrame {
-        ProjectLaunchFirstFrame(
+        return ProjectLaunchFirstFrame(
             projectURL: projectURL,
             source: source,
             loadMilliseconds: loadMilliseconds,
@@ -635,6 +636,7 @@ enum ProjectLaunchCoordinator {
             timelineViewport: packet.timelineViewport,
             masterVolume: packet.masterVolume,
             transcriptDisplayMode: packet.transcriptDisplayMode,
+            clipGraphDocument: packet.clipGraphDocument,
             tracks: packet.tracks.map(track(from:)),
             summary: summary
         )
@@ -660,6 +662,7 @@ enum ProjectLaunchCoordinator {
             timelineViewport: snapshot.timelineViewport,
             masterVolume: snapshot.masterVolume,
             transcriptDisplayMode: snapshot.transcriptDisplayMode,
+            clipGraphDocument: snapshot.clipGraphDocument,
             tracks: snapshot.tracks.map(track(from:)),
             summary: summary
         )
@@ -685,6 +688,7 @@ enum ProjectLaunchCoordinator {
             timelineViewport: manifest.timelineViewport,
             masterVolume: manifest.masterVolume,
             transcriptDisplayMode: manifest.transcriptDisplayMode,
+            clipGraphDocument: manifest.clipGraphDocument,
             tracks: manifest.tracks.map(track(from:)),
             summary: summary
         )
@@ -698,7 +702,10 @@ enum ProjectLaunchCoordinator {
         loadMilliseconds: Double,
         summary: ProjectLaunchVisualReadinessSummary
     ) -> ProjectLaunchFirstFrame {
-        ProjectLaunchFirstFrame(
+        let clipGraphDocument = try? TimelineClipGraphDocument(
+            graph: ProjectClipGraphBridge.graph(for: project, projectURL: projectURL)
+        )
+        return ProjectLaunchFirstFrame(
             projectURL: projectURL,
             source: source,
             loadMilliseconds: loadMilliseconds,
@@ -710,6 +717,7 @@ enum ProjectLaunchCoordinator {
             timelineViewport: project.timelineViewport,
             masterVolume: project.masterVolume,
             transcriptDisplayMode: project.transcriptDisplayMode,
+            clipGraphDocument: clipGraphDocument,
             tracks: project.tracks.map(track(from:)),
             summary: summary
         )

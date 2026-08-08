@@ -6835,8 +6835,36 @@ final class WorkspaceView: NSView, NSMenuItemValidation {
                 firstFrame.windowLayout
         )
 
-        projectTracks = firstFrame.tracks.map { track in
+        let launchPreviewTracks = firstFrame.tracks.map { track in
             launchPreviewTrack(from: track)
+        }
+        if let clipGraphDocument = firstFrame.clipGraphDocument {
+            do {
+                let resolvedGraph = try ProjectClipGraphBridge.resolvingMediaPaths(
+                    in: clipGraphDocument.graph,
+                    projectURL: stateProjectURL
+                )
+                try projectSession.installClipGraph(resolvedGraph)
+                projectTracks = ProjectClipGraphBridge.applyingPresentation(
+                    from: resolvedGraph,
+                    to: launchPreviewTracks
+                )
+                refreshWaveformSourceRenderResources()
+            } catch {
+                projectTracks = launchPreviewTracks
+                SoundtimeDiagnostics.shared.record(
+                    category: .system,
+                    severity: .warning,
+                    name: "launch-first-frame-clip-graph-rejected",
+                    message: "Cached clip placement geometry was invalid and was not used for first paint.",
+                    fields: [
+                        "file": stateProjectURL.lastPathComponent,
+                        "error": error.localizedDescription,
+                    ]
+                )
+            }
+        } else {
+            projectTracks = launchPreviewTracks
         }
         normalizeLoadedProjectEditGroups(reason: firstFrame.source.recordSourceName)
         LaunchStartupTrace.shared.mark(
@@ -21550,6 +21578,7 @@ final class WorkspaceView: NSView, NSMenuItemValidation {
                     timelineViewport: draft.timelineViewport,
                     masterVolume: draft.masterVolume,
                     transcriptDisplayMode: draft.transcriptDisplayMode,
+                    clipGraphDocument: draft.clipGraphDocument,
                     tracks: draft.tracks
                 )
                 let packet = ProjectFirstFrameWaveformPacket(
@@ -21562,6 +21591,7 @@ final class WorkspaceView: NSView, NSMenuItemValidation {
                     timelineViewport: draft.timelineViewport,
                     masterVolume: draft.masterVolume,
                     transcriptDisplayMode: draft.transcriptDisplayMode,
+                    clipGraphDocument: draft.clipGraphDocument,
                     tracks: draft.tracks
                 )
                 let snapshotData = try ProjectLaunchSnapshotBinaryCodec.encode(snapshot)
@@ -21577,6 +21607,7 @@ final class WorkspaceView: NSView, NSMenuItemValidation {
                     timelineViewport: draft.timelineViewport,
                     masterVolume: draft.masterVolume,
                     transcriptDisplayMode: draft.transcriptDisplayMode,
+                    clipGraphDocument: draft.clipGraphDocument,
                     tracks: draft.tracks,
                     snapshotByteCount: snapshotData.count,
                     firstFramePacketByteCount: packetData.count,
@@ -21710,6 +21741,7 @@ final class WorkspaceView: NSView, NSMenuItemValidation {
         var timelineViewport: SoundtimeProject.TimelineViewport?
         var masterVolume: Float?
         var transcriptDisplayMode: TranscriptTimelineDisplayMode?
+        var clipGraphDocument: TimelineClipGraphDocument?
         var tracks: [ProjectLaunchSnapshot.TrackDraft]
     }
 
@@ -21733,6 +21765,7 @@ final class WorkspaceView: NSView, NSMenuItemValidation {
             timelineViewport: currentTimelineViewport(),
             masterVolume: volumeControl.perceptualVolume,
             transcriptDisplayMode: isTranscriptLayerVisible ? .waveformOverlay : .hidden,
+            clipGraphDocument: projectSession.clipGraphDocument,
             tracks: projectTracks.map { track in
                 ProjectLaunchSnapshot.TrackDraft(
                     id: track.id,

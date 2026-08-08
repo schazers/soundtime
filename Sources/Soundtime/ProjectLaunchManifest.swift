@@ -1,7 +1,7 @@
 import Foundation
 
 struct ProjectLaunchVisualFingerprint: Codable, Equatable, Sendable {
-    static let algorithm = "soundtime-launch-visual-fnv1a-v1"
+    static let algorithm = "soundtime-launch-visual-fnv1a-v2"
 
     var algorithm: String
     var value: String
@@ -13,6 +13,7 @@ struct ProjectLaunchVisualFingerprint: Codable, Equatable, Sendable {
 
     static func make(
         projectPath: String,
+        clipGraphDocument: TimelineClipGraphDocument? = nil,
         tracks: [ProjectLaunchSnapshot.TrackDraft]
     ) -> ProjectLaunchVisualFingerprint {
         var hasher = FNV1A64()
@@ -29,6 +30,7 @@ struct ProjectLaunchVisualFingerprint: Codable, Equatable, Sendable {
             append(timeline: track.editTimeline, to: &hasher)
             append(editableSource: track.editableSource, to: &hasher)
         }
+        append(clipGraphDocument: clipGraphDocument, to: &hasher)
         return ProjectLaunchVisualFingerprint(value: hasher.hexDigest)
     }
 
@@ -47,6 +49,7 @@ struct ProjectLaunchVisualFingerprint: Codable, Equatable, Sendable {
             append(timeline: track.editTimeline, to: &hasher)
             append(editableSource: track.editableSource, to: &hasher)
         }
+        append(clipGraphDocument: snapshot.clipGraphDocument, to: &hasher)
         return ProjectLaunchVisualFingerprint(value: hasher.hexDigest)
     }
 
@@ -65,7 +68,50 @@ struct ProjectLaunchVisualFingerprint: Codable, Equatable, Sendable {
             append(timeline: track.editTimeline, to: &hasher)
             append(editableSource: track.editableSource, to: &hasher)
         }
+        append(clipGraphDocument: packet.clipGraphDocument, to: &hasher)
         return ProjectLaunchVisualFingerprint(value: hasher.hexDigest)
+    }
+
+    private static func append(
+        clipGraphDocument: TimelineClipGraphDocument?,
+        to hasher: inout FNV1A64
+    ) {
+        guard let clipGraphDocument else {
+            hasher.append("clip-graph:nil")
+            return
+        }
+
+        let graph = clipGraphDocument.graph
+        hasher.append("clip-graph-schema:\(clipGraphDocument.schemaVersion)")
+        hasher.append("clip-graph-revision:\(graph.revision)")
+        hasher.append("clip-graph-rate:\(rounded(graph.timelineSampleRate))")
+        hasher.append("clip-graph-end:\(graph.explicitEndFrame.map(String.init) ?? "nil")")
+        for source in graph.sources.values.sorted(by: { $0.id < $1.id }) {
+            hasher.append("source-id:\(source.id.rawValue)")
+            hasher.append("source-relative:\(source.relativePath ?? "nil")")
+            hasher.append("source-absolute:\(source.absolutePath ?? "nil")")
+            hasher.append("source-fingerprint:\(source.fingerprint ?? "nil")")
+            hasher.append("source-frames:\(source.frameCount)")
+            hasher.append("source-rate:\(rounded(source.sampleRate))")
+            hasher.append("source-channels:\(source.channelCount)")
+        }
+        for (trackIndex, track) in graph.tracks.enumerated() {
+            hasher.append("clip-track-index:\(trackIndex)")
+            hasher.append("clip-track-id:\(track.id.uuidString)")
+            hasher.append("clip-track-count:\(track.clips.count)")
+            for clip in track.clips {
+                hasher.append("clip-id:\(clip.id.rawValue.uuidString.lowercased())")
+                hasher.append("clip-source:\(clip.sourceID.rawValue)")
+                hasher.append("clip-timeline-start:\(clip.timelineRange.startFrame)")
+                hasher.append("clip-timeline-count:\(clip.timelineRange.frameCount)")
+                hasher.append("clip-source-start:\(clip.sourceRange.startFrame)")
+                hasher.append("clip-source-count:\(clip.sourceRange.frameCount)")
+                hasher.append("clip-gain:\(rounded(clip.gain))")
+                hasher.append("clip-fade-in:\(clip.fades.fadeInFrames)")
+                hasher.append("clip-fade-out:\(clip.fades.fadeOutFrames)")
+                hasher.append("clip-muted:\(clip.isMuted)")
+            }
+        }
     }
 
     private static func append(
@@ -122,7 +168,7 @@ struct ProjectLaunchVisualFingerprint: Codable, Equatable, Sendable {
 }
 
 struct ProjectLaunchManifest: Codable, Sendable {
-    static let currentSchemaVersion = 1
+    static let currentSchemaVersion = 2
 
     struct TrackShell: Codable, Sendable {
         var id: UUID
@@ -148,6 +194,7 @@ struct ProjectLaunchManifest: Codable, Sendable {
     var timelineViewport: SoundtimeProject.TimelineViewport?
     var masterVolume: Float?
     var transcriptDisplayMode: TranscriptTimelineDisplayMode?
+    var clipGraphDocument: TimelineClipGraphDocument?
     var tracks: [TrackShell]
     var snapshotByteCount: Int?
     var firstFramePacketByteCount: Int?
@@ -164,6 +211,7 @@ struct ProjectLaunchManifest: Codable, Sendable {
         timelineViewport: SoundtimeProject.TimelineViewport?,
         masterVolume: Float?,
         transcriptDisplayMode: TranscriptTimelineDisplayMode?,
+        clipGraphDocument: TimelineClipGraphDocument? = nil,
         tracks: [ProjectLaunchSnapshot.TrackDraft],
         snapshotByteCount: Int?,
         firstFramePacketByteCount: Int?,
@@ -181,12 +229,14 @@ struct ProjectLaunchManifest: Codable, Sendable {
         self.launchStateRevision = launchStateRevision
         visualFingerprint = ProjectLaunchVisualFingerprint.make(
             projectPath: standardizedProjectURL.path,
+            clipGraphDocument: clipGraphDocument,
             tracks: tracks
         )
         self.windowLayout = windowLayout
         self.timelineViewport = timelineViewport
         self.masterVolume = masterVolume
         self.transcriptDisplayMode = transcriptDisplayMode
+        self.clipGraphDocument = clipGraphDocument
         self.tracks = tracks.map { track in
             TrackShell(
                 id: track.id,
