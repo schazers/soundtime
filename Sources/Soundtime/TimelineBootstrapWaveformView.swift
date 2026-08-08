@@ -41,6 +41,17 @@ final class TimelineBootstrapWaveformView: NSView {
         let columnWidth = max(1 / max(scale, 1), 0.5)
 
         NSGraphicsContext.current?.shouldAntialias = false
+        NSGraphicsContext.current?.saveGraphicsState()
+        defer { NSGraphicsContext.current?.restoreGraphicsState() }
+        // This startup renderer is an AppKit overlay above Metal. Clip it to
+        // the same fixed track viewport so a scrolled launch snapshot cannot
+        // cover the ruler before the first Metal frame arrives.
+        NSBezierPath(rect: CGRect(
+            x: 0,
+            y: 0,
+            width: bounds.width,
+            height: max(bounds.height - CGFloat(resolvedLayout.rulerLaneHeight), 0)
+        )).addClip()
         for trackIndex in resolvedLayout.visibleTrackIndices(overscan: 0) {
             guard
                 let lane = resolvedLayout.laneFrame(forTrackIndex: trackIndex),

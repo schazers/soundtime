@@ -25,14 +25,18 @@ enum WaveformDiskCacheSmokeHarness {
         try verifyManifestRoundTrip(store: store)
         try verifyInvalidManifestRejection(store: store)
         try verifyScopedRemoval(store: store)
+        try verifyPeakOverviewRoundTrip(store: store, rootDirectory: rootDirectory)
         try verifyOverviewCacheRoundTrip(rootDirectory: rootDirectory)
+        try verifyCorruptOverviewRecovery(rootDirectory: rootDirectory)
         try verifyEditedOverviewCacheRoundTrip(rootDirectory: rootDirectory)
 
         let checks = [
             "manifest round trip",
             "invalid manifest rejection",
             "scoped cache removal",
+            "accurate peak overview round trip",
             "overview cache round trip",
+            "corrupt overview cache recovery",
             "edited overview cache round trip",
         ]
         if let reportURL = StabilityReportWriter.writePassedSuite(
@@ -121,6 +125,68 @@ enum WaveformDiskCacheSmokeHarness {
 
         try require(try store.loadManifest(for: firstFingerprint) == nil, "removed manifest still loaded")
         try require(try store.loadManifest(for: secondFingerprint) == secondManifest, "removing one cache removed another")
+    }
+
+    private static func verifyPeakOverviewRoundTrip(
+        store: WaveformDiskCacheStore,
+        rootDirectory: URL
+    ) throws {
+        let wavURL = rootDirectory.appendingPathComponent("PeakOverview.wav")
+        let byteCount = 44 + 2_048 * 4
+        try Data(repeating: 0, count: byteCount).write(to: wavURL, options: [.atomic])
+        let fileInfo = WAVFileInfo(
+            url: wavURL,
+            formatTag: 1,
+            channelCount: 2,
+            sampleRate: 48_000,
+            blockAlign: 4,
+            bitsPerSample: 16,
+            dataRange: 44..<byteCount
+        )
+        let fingerprint = try WaveformFileFingerprint(url: wavURL, wavFileInfo: fileInfo)
+        let sourceID = WaveformSourceID(fingerprint: fingerprint)
+        let descriptor = WaveformTileDescriptor(
+            address: WaveformTileAddress(
+                sourceID: sourceID,
+                kind: .peak,
+                channelMode: .monoMix,
+                level: 10,
+                tileIndex: 0
+            ),
+            frameRange: WaveformFrameRange(startFrame: 0, endFrame: 2_048),
+            framesPerBin: 1_024,
+            expectedBinCount: 2
+        )
+        let expected = WaveformOverview(
+            duration: fileInfo.duration,
+            bins: [
+                WaveformOverview.Bin(minimumSample: -0.25, maximumSample: 0.5, rmsSample: 0.2),
+                WaveformOverview.Bin(minimumSample: -0.75, maximumSample: 0.8, rmsSample: 0.4),
+            ]
+        )
+        let level = WaveformDiskCacheManifest.TileLevel(
+            kind: .peak,
+            channelMode: .monoMix,
+            level: 10,
+            framesPerBin: 1_024,
+            framesPerTile: 2_048,
+            tileCount: 1,
+            fileName: "peak-mono-l010.bin"
+        )
+        _ = try store.savePeakLevel(WaveformPeakLevelBuildResult(
+            sourceID: sourceID,
+            fingerprint: fingerprint,
+            fileInfo: fileInfo,
+            level: level,
+            tiles: [WaveformPeakTile(descriptor: descriptor, bins: expected.bins)]
+        ))
+
+        let loaded = try requireValue(
+            store.loadBestPeakOverview(for: wavURL, fileInfo: fileInfo),
+            "accurate peak overview cache did not load"
+        )
+        try require(loaded.level == level, "accurate peak overview chose the wrong level")
+        try requireOverviewsMatch(loaded.overview, expected)
     }
 
     private static func verifyOverviewCacheRoundTrip(rootDirectory: URL) throws {
@@ -218,6 +284,41 @@ enum WaveformDiskCacheSmokeHarness {
                 editTimeline: differentTimeline
             ) == nil,
             "edited overview cache loaded for a different edit timeline"
+        )
+    }
+
+    private static func verifyCorruptOverviewRecovery(rootDirectory: URL) throws {
+        let wavURL = rootDirectory.appendingPathComponent("Corrupt.wav")
+        let byteCount = 44 + 2_048 * 4
+        try Data(repeating: 0, count: byteCount).write(to: wavURL, options: [.atomic])
+        let fileInfo = WAVFileInfo(
+            url: wavURL,
+            formatTag: 1,
+            channelCount: 2,
+            sampleRate: 48_000,
+            blockAlign: 4,
+            bitsPerSample: 16,
+            dataRange: 44..<byteCount
+        )
+        let store = WaveformOverviewDiskCacheStore(rootDirectory: rootDirectory)
+        let overview = makeOverview(duration: fileInfo.duration, binCount: 128)
+        let manifest = try requireValue(
+            store.saveOverview(overview, targetBinCount: 128, samplesPerBin: 4, fileInfo: fileInfo),
+            "corruption smoke did not save an overview"
+        )
+        let level = try requireValue(manifest.levels.first, "corruption smoke manifest had no levels")
+        try Data([0x01, 0x02, 0x03]).write(
+            to: store.overviewLevelURL(for: manifest.fingerprint, level: level),
+            options: [.atomic]
+        )
+
+        try require(
+            try store.loadBestOverview(for: wavURL, fileInfo: fileInfo) == nil,
+            "corrupt overview was returned instead of invalidated"
+        )
+        try require(
+            !FileManager.default.fileExists(atPath: store.cacheDirectory(for: manifest.fingerprint).path),
+            "corrupt overview cache was not removed for rebuilding"
         )
     }
 

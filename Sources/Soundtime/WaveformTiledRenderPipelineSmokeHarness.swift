@@ -25,7 +25,9 @@ enum WaveformTiledRenderPipelineSmokeHarness {
         try verifyRawUltraZoomViewportBuildsUploadsAndSelects(rootDirectory: rootDirectory.appendingPathComponent("raw", isDirectory: true))
         try verifyMissingTileSkipsInsteadOfCPUFallback(rootDirectory: rootDirectory.appendingPathComponent("missing", isDirectory: true))
         try verifyAsyncFrameRequestsWorkWithoutInlineBuild(rootDirectory: rootDirectory.appendingPathComponent("async", isDirectory: true))
+        try verifyBroadViewportDefersToWholeOverview(rootDirectory: rootDirectory.appendingPathComponent("overview", isDirectory: true))
         try verifyLastGoodHoldsDuringPreferredTileMiss(rootDirectory: rootDirectory.appendingPathComponent("hold", isDirectory: true))
+        try verifyRenderOnlySelectionPreservesResidentWaveform(rootDirectory: rootDirectory.appendingPathComponent("render-only", isDirectory: true))
         try verifySegmentRemappedFrameBuildsSourceTiles(rootDirectory: rootDirectory.appendingPathComponent("segments", isDirectory: true))
         try verifyDrawBatchPlannerClipsTilesThroughSegments()
         try verifyDrawBatchPlannerIncludesPromotionLayers()
@@ -35,7 +37,9 @@ enum WaveformTiledRenderPipelineSmokeHarness {
             "raw ultra-zoom viewport builds uploads and selects",
             "missing tile skips instead of CPU fallback",
             "async frame requests work without inline build",
+            "broad viewport defers to whole overview",
             "last-good holds during preferred tile miss",
+            "render-only selection preserves resident waveform",
             "segment-remapped frame builds source tiles",
             "draw batch planner clips tiles through segments",
             "draw batch planner includes promotion layers",
@@ -230,6 +234,72 @@ enum WaveformTiledRenderPipelineSmokeHarness {
         try require(rawFrame.renderSelection.skippedCount < rawFrame.renderSelection.requestedCount, "last-good hold did not reduce skipped tiles")
     }
 
+    private static func verifyRenderOnlySelectionPreservesResidentWaveform(rootDirectory: URL) throws {
+        let fixture = try makeFixture(rootDirectory: rootDirectory)
+        let viewport = WaveformTileSchedulerViewport(
+            startTime: 0,
+            endTime: fixture.source.duration,
+            widthPixels: 32
+        )
+        let prepared = fixture.pipeline.prepareFrame(
+            source: fixture.source.metadata,
+            viewport: viewport,
+            timestamp: 0,
+            schedulerConfig: schedulerConfig(),
+            buildBatchLimit: 8,
+            uploadBudget: uploadBudget(),
+            upload: uploadResource
+        )
+        let selected = fixture.pipeline.selectResidentFrame(
+            source: fixture.source.metadata,
+            viewport: viewport,
+            timestamp: 1,
+            schedulerConfig: schedulerConfig()
+        )
+
+        try require(prepared.renderSelection.hasCompleteVisibleCoverage, "setup did not make the visible waveform resident")
+        try require(selected.buildSummary.dequeuedCount == 0, "render-only selection built waveform tiles")
+        try require(selected.uploadSummary.uploadedCount == 0, "render-only selection uploaded waveform tiles")
+        try require(selected.renderSelection.hasCompleteVisibleCoverage, "render-only selection lost resident coverage")
+        try require(
+            selected.renderSelection.tiles.map(\.selectedDescriptor.address) ==
+                prepared.renderSelection.tiles.map(\.selectedDescriptor.address),
+            "render-only selection changed the resident waveform representation"
+        )
+        try require(
+            selected.promotionPlan.tiles.map { $0.current.resource.id } ==
+                prepared.promotionPlan.tiles.map { $0.current.resource.id },
+            "render-only selection changed the resident GPU resources"
+        )
+    }
+
+    private static func verifyBroadViewportDefersToWholeOverview(rootDirectory: URL) throws {
+        let fixture = try makeFixture(rootDirectory: rootDirectory)
+        let longSource = WaveformTileSourceMetadata(
+            sourceID: fixture.source.sourceID,
+            duration: 7_436.85,
+            frameCount: 356_969_047,
+            sampleRate: 48_000,
+            channelMode: .monoMix
+        )
+        let frame = fixture.pipeline.prepareResidentFrame(
+            source: longSource,
+            viewport: WaveformTileSchedulerViewport(
+                startTime: 0,
+                endTime: longSource.duration,
+                widthPixels: 2_000
+            ),
+            timestamp: 0,
+            schedulerConfig: schedulerConfig(),
+            upload: uploadResource,
+            maximumVisibleTileCount: 128
+        )
+
+        try require(frame.deferredToWholeOverview, "broad viewport did not select whole-overview mode")
+        try require(frame.requestedTiles.isEmpty, "whole-overview mode still created tile requests")
+        try require(frame.promotionPlan.drawLayerCount == 0, "whole-overview mode rendered partial tile islands")
+    }
+
     private static func verifySegmentRemappedFrameBuildsSourceTiles(rootDirectory: URL) throws {
         let fixture = try makeFixture(rootDirectory: rootDirectory)
         let frame = fixture.pipeline.prepareFrame(
@@ -323,6 +393,7 @@ enum WaveformTiledRenderPipelineSmokeHarness {
 
     private static func verifyDrawBatchPlannerIncludesPromotionLayers() throws {
         let source = drawBatchSourceMetadata()
+        let trackID = UUID(uuidString: "00000000-0000-0000-0000-000000000102")!
         let currentDescriptor = drawBatchDescriptor(
             source: source,
             startFrame: 48_000,
@@ -338,7 +409,7 @@ enum WaveformTiledRenderPipelineSmokeHarness {
             framesPerBin: 16
         )
         let plan = WaveformTileDrawBatchPlanner.plan(
-            trackID: UUID(uuidString: "00000000-0000-0000-0000-000000000102")!,
+            trackID: trackID,
             trackIndex: 0,
             laneFrame: TimelineTrackLaneFrame(top: 0, bottom: 0.25),
             source: source,
@@ -386,6 +457,14 @@ enum WaveformTiledRenderPipelineSmokeHarness {
         try require(plan.instanceCount == 2, "promotion crossfade should produce current and previous instances")
         try require(plan.resourceCount == 2, "promotion crossfade should reference both resources")
         try require(roles == [.current, .previous], "promotion roles were not preserved: \(roles)")
+        try require(
+            !plan.shouldDrawOverviewBaseWaveform(trackID: trackID, sourceID: source.sourceID),
+            "resident coverage would be composited over the overview base waveform"
+        )
+        try require(
+            plan.shouldDrawOverviewBaseWaveform(trackID: UUID(), sourceID: source.sourceID),
+            "resident coverage suppressed the overview for an unrelated track"
+        )
     }
 
     private struct Fixture {

@@ -1,4 +1,5 @@
 import AVFoundation
+import AudioToolbox
 import Foundation
 
 enum AudioAssetFormat: String, Codable, Sendable {
@@ -186,6 +187,12 @@ enum AudioAssetImporter {
         case unsupportedDecodeFormat(AudioAssetFormat)
         case missingWAVFileInfo
         case unreadableNativeAudio(AudioAssetFormat)
+        case nativeAudioReadFailed(
+            format: AudioAssetFormat,
+            framePosition: Int64,
+            frameLength: Int64,
+            details: String
+        )
         case nativeAudioFileTooLarge
         case unsupportedNativePCMLayout
         case invalidSampleRate
@@ -201,6 +208,9 @@ enum AudioAssetImporter {
                 "The WAV fast path did not produce file information."
             case let .unreadableNativeAudio(format):
                 "\(format.displayName) could not be decoded by the system audio importer."
+            case let .nativeAudioReadFailed(format, framePosition, frameLength, details):
+                "\(format.displayName) decoding failed at frame \(framePosition) of " +
+                    "\(frameLength): \(details)"
             case .nativeAudioFileTooLarge:
                 "This audio file is too large to decode into an editable proxy in one pass."
             case .unsupportedNativePCMLayout:
@@ -477,6 +487,12 @@ enum AudioAssetImporter {
             )
         }
 
+        let sparsePreview = try? NativeAudioSparsePreviewBuilder.build(
+            sourceURL: url,
+            duration: originalInfo.duration ?? 0,
+            progress: progress
+        )
+
         let transaction = try AudioImportCacheStore.shared.beginTransaction(
             for: fingerprint
         )
@@ -491,6 +507,7 @@ enum AudioAssetImporter {
                 sourceURL: url,
                 destinationURL: transaction.stagedProxyURL,
                 targetSampleRate: targetSampleRate,
+                publishesProgressiveWaveforms: sparsePreview == nil,
                 progress: progress
             )
             try Task.checkCancellation()
@@ -560,15 +577,22 @@ enum AudioAssetImporter {
             let sampleRate = processingFormat.sampleRate.isFinite && processingFormat.sampleRate > 0 ?
                 processingFormat.sampleRate :
                 nil
-            let frameCount = file.length > 0 && file.length <= AVAudioFramePosition(Int.max) ?
+            let decoderFrameCount = file.length > 0 && file.length <= AVAudioFramePosition(Int.max) ?
                 Int(file.length) :
                 nil
-            let duration = sampleRate.flatMap { sampleRate -> TimeInterval? in
-                guard let frameCount else {
-                    return nil
-                }
-                return Double(frameCount) / sampleRate
+            let decoderDuration = sampleRate.flatMap { rate in
+                decoderFrameCount.map { Double($0) / rate }
             }
+            let containerDuration = estimatedContainerDuration(at: url)
+            let duration = preferredNativeDuration(
+                containerDuration: containerDuration,
+                decoderDuration: decoderDuration
+            )
+            let frameCount = canonicalNativeFrameCount(
+                sampleRate: sampleRate,
+                duration: duration,
+                decoderFrameCount: decoderFrameCount
+            )
             return NativeAudioInspection(
                 sampleRate: sampleRate,
                 channelCount: Int(processingFormat.channelCount),
@@ -579,6 +603,62 @@ enum AudioAssetImporter {
         } catch {
             throw ImportError.unreadableNativeAudio(format)
         }
+    }
+
+    /// Container duration is a fallback for formats whose decoder cannot expose
+    /// a frame length. It is not authoritative: packet-derived estimates (ADTS
+    /// AAC in particular) can differ materially from the PCM the decoder emits.
+    private static func estimatedContainerDuration(at url: URL) -> TimeInterval? {
+        var audioFile: AudioFileID?
+        guard AudioFileOpenURL(url as CFURL, .readPermission, 0, &audioFile) == noErr,
+              let audioFile else {
+            return nil
+        }
+        defer { AudioFileClose(audioFile) }
+
+        var duration = Float64.zero
+        var propertySize = UInt32(MemoryLayout<Float64>.size)
+        guard AudioFileGetProperty(
+            audioFile,
+            kAudioFilePropertyEstimatedDuration,
+            &propertySize,
+            &duration
+        ) == noErr,
+              duration.isFinite,
+              duration > 0
+        else {
+            return nil
+        }
+        return duration
+    }
+
+    static func preferredNativeDuration(
+        containerDuration: TimeInterval?,
+        decoderDuration: TimeInterval?
+    ) -> TimeInterval? {
+        if let decoderDuration, decoderDuration.isFinite, decoderDuration > 0 {
+            return decoderDuration
+        }
+        if let containerDuration, containerDuration.isFinite, containerDuration > 0 {
+            return containerDuration
+        }
+        return nil
+    }
+
+    static func canonicalNativeFrameCount(
+        sampleRate: Double?,
+        duration: TimeInterval?,
+        decoderFrameCount: Int?
+    ) -> Int? {
+        guard let sampleRate, sampleRate.isFinite, sampleRate > 0,
+              let duration, duration.isFinite, duration > 0 else {
+            return decoderFrameCount
+        }
+        let frames = duration * sampleRate
+        guard frames.isFinite, frames > 0, frames <= Double(Int.max) else {
+            return decoderFrameCount
+        }
+        return max(Int(frames.rounded()), 1)
     }
 
     private static func decodeNativeAudioSynchronously(

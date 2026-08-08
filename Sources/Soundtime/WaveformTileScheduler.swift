@@ -215,6 +215,47 @@ struct WaveformTileSchedulerConfig: Hashable, Sendable {
 }
 
 enum WaveformTileScheduler {
+    static func visibleTileCount(
+        for source: WaveformTileSourceMetadata,
+        viewport: WaveformTileSchedulerViewport,
+        segments: [WaveformTileSchedulerSegment] = [],
+        config: WaveformTileSchedulerConfig = WaveformTileSchedulerConfig()
+    ) -> Int {
+        let visibleViewports = segments.isEmpty ? [viewport] : segments.compactMap {
+            $0.sourceViewport(intersecting: viewport)
+        }
+        guard source.frameCount > 0, source.duration > 0 else { return 0 }
+
+        var addresses = Set<WaveformTileAddress>()
+        for visibleViewport in visibleViewports {
+            let shape = preferredTileShape(
+                source: source,
+                viewport: visibleViewport,
+                config: config
+            )
+            let frameRange = visibleViewport.frameRange(
+                sampleRate: source.sampleRate,
+                frameCount: source.frameCount
+            )
+            guard let span = tileSpan(
+                for: frameRange,
+                framesPerTile: shape.framesPerTile,
+                frameCount: source.frameCount
+            ) else { continue }
+            for tileIndex in span {
+                addresses.insert(WaveformTileAddress(
+                    sourceID: source.sourceID,
+                    editGraphID: source.editGraphID,
+                    kind: shape.kind,
+                    channelMode: source.channelMode,
+                    level: shape.level,
+                    tileIndex: tileIndex
+                ))
+            }
+        }
+        return addresses.count
+    }
+
     static func requests(
         for source: WaveformTileSourceMetadata,
         viewport: WaveformTileSchedulerViewport,

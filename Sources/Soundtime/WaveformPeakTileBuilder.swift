@@ -228,6 +228,41 @@ enum WaveformPeakTileBinaryCodec {
         return tiles
     }
 
+    static func decodeOverview(
+        data: Data,
+        duration: TimeInterval,
+        expectedBinCount: Int? = nil
+    ) throws -> WaveformOverview {
+        let byteStride = MemoryLayout<Float>.size * floatsPerBin
+        guard byteStride > 0, data.count % byteStride == 0 else {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: [],
+                debugDescription: "Peak overview data length is not aligned to bin stride."
+            ))
+        }
+
+        let binCount = data.count / byteStride
+        if let expectedBinCount, binCount != expectedBinCount {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: [],
+                debugDescription: "Peak overview bin count does not match its manifest."
+            ))
+        }
+        var bins: [WaveformOverview.Bin] = []
+        bins.reserveCapacity(binCount)
+        for binOffset in 0..<binCount {
+            bins.append(WaveformOverview.Bin(
+                minimumSample: readFloat(in: data, binOffset: binOffset, component: 0),
+                maximumSample: readFloat(in: data, binOffset: binOffset, component: 1),
+                rmsSample: readFloat(in: data, binOffset: binOffset, component: 2),
+                lowEnergy: readFloat(in: data, binOffset: binOffset, component: 3),
+                midEnergy: readFloat(in: data, binOffset: binOffset, component: 4),
+                highEnergy: readFloat(in: data, binOffset: binOffset, component: 5)
+            ))
+        }
+        return WaveformOverview(duration: duration, bins: bins)
+    }
+
     private static func appendFloat(_ value: Float, to data: inout Data) {
         var bitPattern = value.bitPattern.littleEndian
         withUnsafeBytes(of: &bitPattern) {

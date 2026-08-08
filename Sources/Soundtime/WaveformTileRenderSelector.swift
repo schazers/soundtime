@@ -24,6 +24,10 @@ struct WaveformTileRenderSelection: Equatable, Sendable {
     var selectedCount: Int {
         tiles.count
     }
+
+    var hasCompleteVisibleCoverage: Bool {
+        requestedCount > 0 && skippedCount == 0 && selectedCount == requestedCount
+    }
 }
 
 private struct WaveformTileRenderFallbackKey: Hashable {
@@ -89,6 +93,7 @@ final class WaveformTileRenderSelector: @unchecked Sendable {
         var coarserResidentCount = 0
         var lastGoodResidentCount = 0
         var skippedCount = 0
+        var residentAddressesByFallbackKey: [WaveformTileRenderFallbackKey: [WaveformTileAddress]]?
 
         for request in renderRequests {
             if let exact = exactResidentTile(for: request.descriptor) {
@@ -98,7 +103,16 @@ final class WaveformTileRenderSelector: @unchecked Sendable {
                 continue
             }
 
-            if let coarser = coarserResidentTile(for: request.descriptor) {
+            if residentAddressesByFallbackKey == nil {
+                residentAddressesByFallbackKey = Dictionary(
+                    grouping: residencyStore.unsortedAddressSnapshot(),
+                    by: WaveformTileRenderFallbackKey.init(address:)
+                )
+            }
+            if let coarser = coarserResidentTile(
+                for: request.descriptor,
+                residentAddressesByFallbackKey: residentAddressesByFallbackKey ?? [:]
+            ) {
                 rememberLastGood(coarser)
                 tiles.append(coarser)
                 coarserResidentCount += 1
@@ -153,11 +167,13 @@ final class WaveformTileRenderSelector: @unchecked Sendable {
         )
     }
 
-    private func coarserResidentTile(for descriptor: WaveformTileDescriptor) -> WaveformRenderableTile? {
+    private func coarserResidentTile(
+        for descriptor: WaveformTileDescriptor,
+        residentAddressesByFallbackKey: [WaveformTileRenderFallbackKey: [WaveformTileAddress]]
+    ) -> WaveformRenderableTile? {
         let key = WaveformTileRenderFallbackKey(address: descriptor.address)
-        let candidates = residencyStore.addresses().compactMap { address -> (descriptor: WaveformTileDescriptor, resource: WaveformTileGPUResource)? in
+        let candidates = (residentAddressesByFallbackKey[key] ?? []).compactMap { address -> (descriptor: WaveformTileDescriptor, resource: WaveformTileGPUResource)? in
             guard address != descriptor.address,
-                  WaveformTileRenderFallbackKey(address: address) == key,
                   address.level > descriptor.address.level,
                   let payload = tileStore.payload(for: address),
                   payload.descriptor.frameRange.intersects(descriptor.frameRange),

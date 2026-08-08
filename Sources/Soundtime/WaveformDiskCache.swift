@@ -71,6 +71,13 @@ enum WaveformDiskCacheError: Error, LocalizedError {
     }
 }
 
+struct WaveformPeakOverviewDiskCacheEntry: Sendable {
+    let fileInfo: WAVFileInfo
+    let fingerprint: WaveformFileFingerprint
+    let level: WaveformDiskCacheManifest.TileLevel
+    let overview: WaveformOverview
+}
+
 final class WaveformDiskCacheStore: @unchecked Sendable {
     private let rootDirectory: URL
     private let fileManager: FileManager
@@ -176,6 +183,46 @@ final class WaveformDiskCacheStore: @unchecked Sendable {
             data: data,
             level: level,
             sourceID: manifest.sourceID
+        )
+    }
+
+    func loadBestPeakOverview(
+        for url: URL,
+        fileInfo: WAVFileInfo,
+        maximumBinCount: Int = 262_144
+    ) throws -> WaveformPeakOverviewDiskCacheEntry? {
+        let fingerprint = try WaveformFileFingerprint(url: url, wavFileInfo: fileInfo)
+        guard let manifest = try loadManifest(for: fingerprint) else { return nil }
+        let candidateLevels = manifest.levels.filter { level in
+            guard level.kind == .peak, level.channelMode == .monoMix else { return false }
+            let estimatedBinCount = Int(
+                (manifest.frameCount + Int64(level.framesPerBin) - 1) /
+                    Int64(level.framesPerBin)
+            )
+            return estimatedBinCount <= max(maximumBinCount, 1)
+        }
+        guard let level = candidateLevels.min(by: { lhs, rhs in
+            if lhs.framesPerBin != rhs.framesPerBin {
+                return lhs.framesPerBin < rhs.framesPerBin
+            }
+            return lhs.level < rhs.level
+        }) else { return nil }
+
+        let data = try Data(contentsOf: tileLevelURL(for: fingerprint, level: level))
+        let expectedBinCount = Int(
+            (manifest.frameCount + Int64(level.framesPerBin) - 1) /
+                Int64(level.framesPerBin)
+        )
+        let overview = try WaveformPeakTileBinaryCodec.decodeOverview(
+            data: data,
+            duration: manifest.duration,
+            expectedBinCount: expectedBinCount
+        )
+        return WaveformPeakOverviewDiskCacheEntry(
+            fileInfo: fileInfo,
+            fingerprint: fingerprint,
+            level: level,
+            overview: overview
         )
     }
 
@@ -456,35 +503,54 @@ final class WaveformOverviewDiskCacheStore: @unchecked Sendable {
         maximumBinCount: Int? = maximumCachedBinCount
     ) throws -> WaveformOverviewDiskCacheEntry? {
         let fingerprint = try WaveformFileFingerprint(url: url, wavFileInfo: fileInfo)
-        let manifest: WaveformOverviewDiskCacheManifest
-        let level: WaveformOverviewDiskCacheManifest.Level
-        lock.lock()
         do {
-            guard
-                let loadedManifest = try loadManifestLocked(for: fingerprint),
-                let selectedLevel = loadedManifest.bestLevel(maximumBinCount: maximumBinCount)
-            else {
+            let manifest: WaveformOverviewDiskCacheManifest
+            let level: WaveformOverviewDiskCacheManifest.Level
+            lock.lock()
+            do {
+                guard
+                    let loadedManifest = try loadManifestLocked(for: fingerprint),
+                    let selectedLevel = loadedManifest.bestLevel(maximumBinCount: maximumBinCount)
+                else {
+                    lock.unlock()
+                    return nil
+                }
+                manifest = loadedManifest
+                level = selectedLevel
                 lock.unlock()
-                return nil
+            } catch {
+                lock.unlock()
+                throw error
             }
-            manifest = loadedManifest
-            level = selectedLevel
-            lock.unlock()
-        } catch {
-            lock.unlock()
-            throw error
-        }
 
-        let overview = try loadOverviewLocked(
-            manifest: manifest,
-            level: level
-        )
-        return WaveformOverviewDiskCacheEntry(
-            fileInfo: fileInfo,
-            fingerprint: fingerprint,
-            level: level,
-            overview: overview
-        )
+            let overview = try loadOverviewLocked(manifest: manifest, level: level)
+            return WaveformOverviewDiskCacheEntry(
+                fileInfo: fileInfo,
+                fingerprint: fingerprint,
+                level: level,
+                overview: overview
+            )
+        } catch {
+            guard Self.isRecoverableCorruption(error) else { throw error }
+            // Cache entries are disposable. Remove a broken source entry so a
+            // background request rebuilds it instead of repeatedly presenting
+            // a blank lane or failing every project launch.
+            try? removeCache(for: fingerprint)
+            return nil
+        }
+    }
+
+    private static func isRecoverableCorruption(_ error: Error) -> Bool {
+        if error is WaveformOverviewDiskCacheError || error is DecodingError {
+            return true
+        }
+        let cocoaError = error as NSError
+        guard cocoaError.domain == NSCocoaErrorDomain else { return false }
+        return [
+            NSFileNoSuchFileError,
+            NSFileReadCorruptFileError,
+            NSFileReadUnknownError,
+        ].contains(cocoaError.code)
     }
 
     func loadEditedOverview(

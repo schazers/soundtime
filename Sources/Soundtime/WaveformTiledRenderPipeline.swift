@@ -4,7 +4,8 @@ enum WaveformGPUResidentWaveformsFeatureFlags {
     private static let environmentKey = "SOUNDTIME_GPU_RESIDENT_WAVEFORMS"
 
     static var isEnabled: Bool {
-        environmentFlagIsTruthy(ProcessInfo.processInfo.environment[environmentKey])
+        let value = ProcessInfo.processInfo.environment[environmentKey]
+        return !environmentFlagIsFalsy(value)
     }
 
     static var isShadowModeEnabled: Bool {
@@ -13,7 +14,7 @@ enum WaveformGPUResidentWaveformsFeatureFlags {
 
     static var modeDescription: String {
         if isShadowModeEnabled {
-            return "gpu-resident-shadow"
+            return "gpu-resident"
         }
         if WaveformTiledRendererFeatureFlags.isLegacyEnabled {
             return "tiled-legacy"
@@ -31,6 +32,13 @@ enum WaveformGPUResidentWaveformsFeatureFlags {
             normalized == "yes" ||
             normalized == "on" ||
             normalized == "shadow"
+    }
+
+    private static func environmentFlagIsFalsy(_ value: String?) -> Bool {
+        guard let normalized = value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
+            return false
+        }
+        return normalized == "0" || normalized == "false" || normalized == "no" || normalized == "off"
     }
 }
 
@@ -52,10 +60,24 @@ struct WaveformTiledRenderFrame: Sendable {
     let uploadSummary: WaveformTileUploadBatchSummary
     let renderSelection: WaveformTileRenderSelection
     let promotionPlan: WaveformTilePromotionPlan
-    let residencySnapshot: WaveformTileGPUResidencySnapshot
+    let deferredToWholeOverview: Bool
 }
 
 final class WaveformTiledRenderPipeline: @unchecked Sendable {
+    private struct TileRequestCacheKey: Hashable {
+        let source: WaveformTileSourceMetadata
+        let viewport: WaveformTileSchedulerViewport
+        let segments: [WaveformTileSchedulerSegment]
+        let predictedViewport: WaveformTileSchedulerViewport?
+        let schedulerConfig: WaveformTileSchedulerConfig
+        let maximumVisibleTileCount: Int
+    }
+
+    private struct TileRequestPlan {
+        let visibleTileCount: Int
+        let requests: [WaveformTileRequest]
+    }
+
     private final class AsyncWorkCallbacks: @unchecked Sendable {
         let discardUpload: ((WaveformTileAddress, WaveformTileGPUResource) -> Void)?
         let evictUpload: (([WaveformTileAddress]) -> Void)?
@@ -84,6 +106,7 @@ final class WaveformTiledRenderPipeline: @unchecked Sendable {
     private let promotionPlanner: WaveformTilePromotionPlanner
     private let lock = NSLock()
     private var registeredSourceIDs = Set<WaveformSourceID>()
+    private var wholeOverviewSourceIDs = Set<WaveformSourceID>()
     private let workQueue = DispatchQueue(
         label: "Soundtime.waveform.tiles.pipeline",
         qos: .userInitiated
@@ -92,6 +115,9 @@ final class WaveformTiledRenderPipeline: @unchecked Sendable {
     private var pendingAsyncUploadPriorityAddresses: [WaveformTileAddress] = []
     private var completedAsyncBuildSummary = WaveformTileBuildWorkerBatchSummary()
     private var completedAsyncUploadSummary = WaveformTileUploadBatchSummary()
+    private var tileRequestCache: [TileRequestCacheKey: TileRequestPlan] = [:]
+    private var tileRequestCacheOrder: [TileRequestCacheKey] = []
+    private let maximumCachedTileRequests = 128
 
     init(
         diskCacheStore: WaveformDiskCacheStore = WaveformDiskCacheStore(),
@@ -146,6 +172,15 @@ final class WaveformTiledRenderPipeline: @unchecked Sendable {
             renderSelector.removeAll(for: sourceID)
             promotionPlanner.removeAll(for: sourceID)
         }
+        lock.lock()
+        wholeOverviewSourceIDs.subtract(staleSourceIDs)
+        tileRequestCache = tileRequestCache.filter { key, _ in
+            !staleSourceIDs.contains(key.source.sourceID)
+        }
+        tileRequestCacheOrder.removeAll { key in
+            staleSourceIDs.contains(key.source.sourceID)
+        }
+        lock.unlock()
         return staleSourceIDs
     }
 
@@ -164,13 +199,14 @@ final class WaveformTiledRenderPipeline: @unchecked Sendable {
         discardUpload: ((WaveformTileAddress, WaveformTileGPUResource) -> Void)? = nil,
         upload: WaveformTileUploadCoordinator.UploadHandler
     ) -> WaveformTiledRenderFrame {
-        let requests = tileRequests(
+        let requests = tileRequestPlan(
             source: source,
             viewport: viewport,
             segments: segments,
             predictedViewport: predictedViewport,
-            schedulerConfig: schedulerConfig
-        )
+            schedulerConfig: schedulerConfig,
+            maximumVisibleTileCount: .max
+        ).requests
         requestQueue.enqueue(requests)
         let buildSummary = buildWorker.processNextBatch(maxCount: buildBatchLimit)
 
@@ -196,7 +232,7 @@ final class WaveformTiledRenderPipeline: @unchecked Sendable {
             uploadSummary: uploadSummary,
             renderSelection: renderSelection,
             promotionPlan: promotionPlan,
-            residencySnapshot: residencyStore.snapshot()
+            deferredToWholeOverview: false
         )
     }
 
@@ -215,15 +251,50 @@ final class WaveformTiledRenderPipeline: @unchecked Sendable {
         discardUpload: ((WaveformTileAddress, WaveformTileGPUResource) -> Void)? = nil,
         evictUpload: (([WaveformTileAddress]) -> Void)? = nil,
         upload: @escaping WaveformTileUploadCoordinator.UploadHandler,
-        onWorkCompleted: (() -> Void)? = nil
+        onWorkCompleted: (() -> Void)? = nil,
+        maximumVisibleTileCount: Int = 128
     ) -> WaveformTiledRenderFrame {
-        let requests = tileRequests(
+        let requestPlan = tileRequestPlan(
             source: source,
             viewport: viewport,
             segments: segments,
             predictedViewport: predictedViewport,
-            schedulerConfig: schedulerConfig
+            schedulerConfig: schedulerConfig,
+            maximumVisibleTileCount: maximumVisibleTileCount
         )
+        if requestPlan.visibleTileCount > max(maximumVisibleTileCount, 1) {
+            lock.lock()
+            let enteredWholeOverviewMode = wholeOverviewSourceIDs.insert(source.sourceID).inserted
+            lock.unlock()
+            if enteredWholeOverviewMode {
+                requestQueue.removeAll(for: source.sourceID)
+                promotionPlanner.removeAll(for: source.sourceID)
+            }
+            return WaveformTiledRenderFrame(
+                requestedTiles: [],
+                buildSummary: WaveformTileBuildWorkerBatchSummary(),
+                uploadSummary: WaveformTileUploadBatchSummary(),
+                renderSelection: WaveformTileRenderSelection(
+                    tiles: [],
+                    requestedCount: 0,
+                    exactResidentCount: 0,
+                    coarserResidentCount: 0,
+                    lastGoodResidentCount: 0,
+                    skippedCount: 0
+                ),
+                promotionPlan: WaveformTilePromotionPlan(
+                    tiles: [],
+                    promotedCount: 0,
+                    transitioningCount: 0
+                ),
+                deferredToWholeOverview: true
+            )
+        }
+        lock.lock()
+        wholeOverviewSourceIDs.remove(source.sourceID)
+        lock.unlock()
+
+        let requests = requestPlan.requests
         requestQueue.enqueue(requests)
         scheduleAsyncWork(
             priorityAddresses: requests.map(\.descriptor.address),
@@ -236,10 +307,13 @@ final class WaveformTiledRenderPipeline: @unchecked Sendable {
         )
 
         let renderSelection = renderSelector.selectRenderableTiles(for: requests)
-        let promotionPlan = promotionPlanner.plan(
-            selection: renderSelection,
-            timestamp: timestamp
-        )
+        let promotionPlan = renderSelection.hasCompleteVisibleCoverage ?
+            promotionPlanner.plan(selection: renderSelection, timestamp: timestamp) :
+            WaveformTilePromotionPlan(
+                tiles: [],
+                promotedCount: 0,
+                transitioningCount: 0
+            )
 
         return WaveformTiledRenderFrame(
             requestedTiles: requests,
@@ -247,33 +321,140 @@ final class WaveformTiledRenderPipeline: @unchecked Sendable {
             uploadSummary: WaveformTileUploadBatchSummary(),
             renderSelection: renderSelection,
             promotionPlan: promotionPlan,
-            residencySnapshot: residencyStore.snapshot()
+            deferredToWholeOverview: false
         )
     }
 
-    private func tileRequests(
+    /// Selects only resources that are already GPU-resident. This is the render-hot
+    /// counterpart to `prepareResidentFrame`: it never enqueues, builds, or uploads
+    /// waveform data, so transport state cannot change the waveform representation.
+    func selectResidentFrame(
+        source: WaveformTileSourceMetadata,
+        viewport: WaveformTileSchedulerViewport,
+        segments: [WaveformTileSchedulerSegment] = [],
+        predictedViewport: WaveformTileSchedulerViewport? = nil,
+        timestamp: TimeInterval,
+        schedulerConfig: WaveformTileSchedulerConfig = WaveformTileSchedulerConfig(),
+        maximumVisibleTileCount: Int = 128
+    ) -> WaveformTiledRenderFrame {
+        let requestPlan = tileRequestPlan(
+            source: source,
+            viewport: viewport,
+            segments: segments,
+            predictedViewport: predictedViewport,
+            schedulerConfig: schedulerConfig,
+            maximumVisibleTileCount: maximumVisibleTileCount
+        )
+        if requestPlan.visibleTileCount > max(maximumVisibleTileCount, 1) {
+            return wholeOverviewFrame()
+        }
+
+        let requests = requestPlan.requests
+        let renderSelection = renderSelector.selectRenderableTiles(for: requests)
+        let promotionPlan = renderSelection.hasCompleteVisibleCoverage ?
+            promotionPlanner.plan(selection: renderSelection, timestamp: timestamp) :
+            WaveformTilePromotionPlan(
+                tiles: [],
+                promotedCount: 0,
+                transitioningCount: 0
+            )
+
+        return WaveformTiledRenderFrame(
+            requestedTiles: requests,
+            buildSummary: WaveformTileBuildWorkerBatchSummary(),
+            uploadSummary: WaveformTileUploadBatchSummary(),
+            renderSelection: renderSelection,
+            promotionPlan: promotionPlan,
+            deferredToWholeOverview: false
+        )
+    }
+
+    private func wholeOverviewFrame() -> WaveformTiledRenderFrame {
+        WaveformTiledRenderFrame(
+            requestedTiles: [],
+            buildSummary: WaveformTileBuildWorkerBatchSummary(),
+            uploadSummary: WaveformTileUploadBatchSummary(),
+            renderSelection: WaveformTileRenderSelection(
+                tiles: [],
+                requestedCount: 0,
+                exactResidentCount: 0,
+                coarserResidentCount: 0,
+                lastGoodResidentCount: 0,
+                skippedCount: 0
+            ),
+            promotionPlan: WaveformTilePromotionPlan(
+                tiles: [],
+                promotedCount: 0,
+                transitioningCount: 0
+            ),
+            deferredToWholeOverview: true
+        )
+    }
+
+    private func tileRequestPlan(
         source: WaveformTileSourceMetadata,
         viewport: WaveformTileSchedulerViewport,
         segments: [WaveformTileSchedulerSegment],
         predictedViewport: WaveformTileSchedulerViewport?,
-        schedulerConfig: WaveformTileSchedulerConfig
-    ) -> [WaveformTileRequest] {
-        if segments.isEmpty {
-            return WaveformTileScheduler.requests(
+        schedulerConfig: WaveformTileSchedulerConfig,
+        maximumVisibleTileCount: Int
+    ) -> TileRequestPlan {
+        let normalizedMaximumVisibleTileCount = max(maximumVisibleTileCount, 1)
+        let cacheKey = TileRequestCacheKey(
+            source: source,
+            viewport: viewport,
+            segments: segments,
+            predictedViewport: predictedViewport,
+            schedulerConfig: schedulerConfig,
+            maximumVisibleTileCount: normalizedMaximumVisibleTileCount
+        )
+        lock.lock()
+        if let cached = tileRequestCache[cacheKey] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+
+        let visibleTileCount = WaveformTileScheduler.visibleTileCount(
+            for: source,
+            viewport: viewport,
+            segments: segments,
+            config: schedulerConfig
+        )
+        let requests: [WaveformTileRequest]
+        if visibleTileCount > normalizedMaximumVisibleTileCount {
+            requests = []
+        } else if segments.isEmpty {
+            requests = WaveformTileScheduler.requests(
                 for: source,
                 viewport: viewport,
                 predictedViewport: predictedViewport,
                 config: schedulerConfig
             )
+        } else {
+            requests = WaveformTileScheduler.requests(
+                for: source,
+                viewport: viewport,
+                segments: segments,
+                predictedViewport: predictedViewport,
+                config: schedulerConfig
+            )
         }
 
-        return WaveformTileScheduler.requests(
-            for: source,
-            viewport: viewport,
-            segments: segments,
-            predictedViewport: predictedViewport,
-            config: schedulerConfig
+        let plan = TileRequestPlan(
+            visibleTileCount: visibleTileCount,
+            requests: requests
         )
+        lock.lock()
+        tileRequestCache[cacheKey] = plan
+        tileRequestCacheOrder.removeAll { $0 == cacheKey }
+        tileRequestCacheOrder.append(cacheKey)
+        while tileRequestCacheOrder.count > maximumCachedTileRequests {
+            let evicted = tileRequestCacheOrder.removeFirst()
+            tileRequestCache.removeValue(forKey: evicted)
+        }
+        lock.unlock()
+        return plan
     }
 
     func drainCompletedAsyncWork() -> (
@@ -293,6 +474,9 @@ final class WaveformTiledRenderPipeline: @unchecked Sendable {
         lock.lock()
         let sourceIDs = registeredSourceIDs
         registeredSourceIDs.removeAll()
+        wholeOverviewSourceIDs.removeAll()
+        tileRequestCache.removeAll()
+        tileRequestCacheOrder.removeAll()
         lock.unlock()
 
         for sourceID in sourceIDs {

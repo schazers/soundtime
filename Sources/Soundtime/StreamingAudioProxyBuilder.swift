@@ -41,6 +41,7 @@ enum StreamingAudioProxyBuilder {
         sourceURL: URL,
         destinationURL: URL,
         targetSampleRate: Double,
+        publishesProgressiveWaveforms: Bool = true,
         progress: (@Sendable (AudioImportProgress) -> Void)? = nil
     ) throws -> StreamingAudioProxyBuildResult {
         let sourceFile = try AVAudioFile(
@@ -100,6 +101,7 @@ enum StreamingAudioProxyBuilder {
                 analyzer: &analyzer,
                 progressPublisher: &progressPublisher,
                 peakWorkingSetBytes: &peakWorkingSetBytes,
+                publishesProgressiveWaveforms: publishesProgressiveWaveforms,
                 progress: progress
             )
         } else {
@@ -111,6 +113,7 @@ enum StreamingAudioProxyBuilder {
                 analyzer: &analyzer,
                 progressPublisher: &progressPublisher,
                 peakWorkingSetBytes: &peakWorkingSetBytes,
+                publishesProgressiveWaveforms: publishesProgressiveWaveforms,
                 progress: progress
             )
         }
@@ -142,6 +145,7 @@ enum StreamingAudioProxyBuilder {
         analyzer: inout StreamingAnalyzer,
         progressPublisher: inout StreamingProgressPublisher,
         peakWorkingSetBytes: inout Int,
+        publishesProgressiveWaveforms: Bool,
         progress: (@Sendable (AudioImportProgress) -> Void)?
     ) throws {
         while sourceFile.framePosition < sourceFile.length {
@@ -151,7 +155,23 @@ enum StreamingAudioProxyBuilder {
             guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: requested) else {
                 throw AudioAssetImporter.ImportError.unsupportedNativePCMLayout
             }
-            try sourceFile.read(into: buffer, frameCount: requested)
+            do {
+                try sourceFile.read(into: buffer, frameCount: requested)
+            } catch {
+                if isTolerableDecoderTail(
+                    framePosition: sourceFile.framePosition,
+                    frameLength: sourceFile.length,
+                    sampleRate: format.sampleRate
+                ) {
+                    break
+                }
+                throw AudioAssetImporter.ImportError.nativeAudioReadFailed(
+                    format: AudioAssetFormat.inferred(from: sourceFile.url),
+                    framePosition: Int64(sourceFile.framePosition),
+                    frameLength: Int64(sourceFile.length),
+                    details: String(describing: error)
+                )
+            }
             guard buffer.frameLength > 0 else {
                 break
             }
@@ -164,6 +184,7 @@ enum StreamingAudioProxyBuilder {
             publishProgress(
                 analyzer: analyzer,
                 publisher: &progressPublisher,
+                publishesProgressiveWaveforms: publishesProgressiveWaveforms,
                 progress: progress
             )
         }
@@ -177,6 +198,7 @@ enum StreamingAudioProxyBuilder {
         analyzer: inout StreamingAnalyzer,
         progressPublisher: inout StreamingProgressPublisher,
         peakWorkingSetBytes: inout Int,
+        publishesProgressiveWaveforms: Bool,
         progress: (@Sendable (AudioImportProgress) -> Void)?
     ) throws {
         guard let converter = AVAudioConverter(from: sourceFormat, to: outputFormat) else {
@@ -232,7 +254,20 @@ enum StreamingAudioProxyBuilder {
                     inputStatus.pointee = inputBuffer.frameLength > 0 ? .haveData : .endOfStream
                     return inputBuffer.frameLength > 0 ? inputBuffer : nil
                 } catch {
-                    inputState.store(error: error)
+                    if isTolerableDecoderTail(
+                        framePosition: sourceFile.framePosition,
+                        frameLength: sourceFile.length,
+                        sampleRate: sourceFormat.sampleRate
+                    ) {
+                        inputStatus.pointee = .endOfStream
+                        return nil
+                    }
+                    inputState.store(error: AudioAssetImporter.ImportError.nativeAudioReadFailed(
+                        format: AudioAssetFormat.inferred(from: sourceFile.url),
+                        framePosition: Int64(sourceFile.framePosition),
+                        frameLength: Int64(sourceFile.length),
+                        details: String(describing: error)
+                    ))
                     inputStatus.pointee = .noDataNow
                     return nil
                 }
@@ -256,6 +291,7 @@ enum StreamingAudioProxyBuilder {
                 publishProgress(
                     analyzer: analyzer,
                     publisher: &progressPublisher,
+                    publishesProgressiveWaveforms: publishesProgressiveWaveforms,
                     progress: progress
                 )
             }
@@ -278,9 +314,32 @@ enum StreamingAudioProxyBuilder {
         peakWorkingSetBytes = max(peakWorkingSetBytes, localPeakWorkingSetBytes)
     }
 
+    /// Some compressed containers advertise encoder-delay/padding frames that
+    /// AVAudioFile cannot return. AVAudioFile reports this as an opaque read
+    /// error instead of EOF, so accept only a tightly bounded tail mismatch.
+    static func isTolerableDecoderTail(
+        framePosition: AVAudioFramePosition,
+        frameLength: AVAudioFramePosition,
+        sampleRate: Double
+    ) -> Bool {
+        guard
+            frameLength > 0,
+            framePosition >= 0,
+            framePosition <= frameLength,
+            sampleRate.isFinite,
+            sampleRate > 0
+        else {
+            return false
+        }
+        let remainingFrames = frameLength - framePosition
+        let maximumPaddingFrames = AVAudioFramePosition((sampleRate * 0.1).rounded(.up))
+        return remainingFrames <= maximumPaddingFrames
+    }
+
     private static func publishProgress(
         analyzer: StreamingAnalyzer,
         publisher: inout StreamingProgressPublisher,
+        publishesProgressiveWaveforms: Bool,
         progress: (@Sendable (AudioImportProgress) -> Void)?
     ) {
         guard publisher.shouldPublish(
@@ -289,7 +348,7 @@ enum StreamingAudioProxyBuilder {
         ) else {
             return
         }
-        let previewOverview = publisher.shouldPublishWaveformPreview() ?
+        let previewOverview = publishesProgressiveWaveforms && publisher.shouldPublishWaveformPreview() ?
             analyzer.makePreview(maximumBinCount: progressWaveformBinCount) :
             nil
         progress?(AudioImportProgress(
@@ -324,10 +383,8 @@ private struct StreamingProgressPublisher {
             0
         guard
             lastPublishNanoseconds == 0 ||
-            (
-                now &- lastPublishNanoseconds >= Self.minimumIntervalNanoseconds &&
-                fraction - lastFraction >= Self.minimumFractionDelta
-            )
+            now &- lastPublishNanoseconds >= Self.minimumIntervalNanoseconds ||
+            fraction - lastFraction >= Self.minimumFractionDelta
         else {
             return false
         }

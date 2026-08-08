@@ -22,6 +22,7 @@ enum WaveformTileRenderSelectorSmokeHarness {
         try verifyLastGoodKeepsMultiplePreviouslyVisibleTiles()
         try verifyLastGoodCanHoldAcrossTileKinds()
         try verifySourceRemovalClearsLastGood()
+        try verifyLargeResidencyFallbackStaysFrameBounded()
 
         let checks = [
             "CPU committed tile skipped without residency",
@@ -31,6 +32,7 @@ enum WaveformTileRenderSelectorSmokeHarness {
             "last-good keeps multiple previously visible tiles",
             "last-good can hold across tile kinds",
             "source removal clears last-good",
+            "large residency fallback stays frame-bounded",
         ]
         if let reportURL = StabilityReportWriter.writePassedSuite(
             name: "waveform-tile-render-selector-smoke",
@@ -186,15 +188,55 @@ enum WaveformTileRenderSelectorSmokeHarness {
         try require(secondSelection.skippedCount == 1, "removed source skip was not counted")
     }
 
+    private static func verifyLargeResidencyFallbackStaysFrameBounded() throws {
+        let fixture = makeFixture(maximumResidentBytes: 2_000_000)
+        let requestedSourceID = WaveformSourceID(rawValue: "large-residency-visible-source")
+        let distractorSourceID = WaveformSourceID(rawValue: "large-residency-distractor-source")
+        let requestedTileCount = 128
+
+        for tileIndex in 0..<4_096 {
+            commitResident(
+                peakTile(sourceID: distractorSourceID, level: 8, tileIndex: tileIndex),
+                into: fixture
+            )
+        }
+        for tileIndex in 0..<requestedTileCount {
+            commitResident(
+                peakTile(sourceID: requestedSourceID, level: 8, tileIndex: tileIndex),
+                into: fixture
+            )
+        }
+        let requests = (0..<requestedTileCount).map { tileIndex in
+            request(for: peakTile(
+                sourceID: requestedSourceID,
+                level: 5,
+                tileIndex: tileIndex
+            ).descriptor)
+        }
+
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        let selection = fixture.selector.selectRenderableTiles(for: requests)
+        let elapsedMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000
+
+        try require(
+            selection.coarserResidentCount == requestedTileCount,
+            "large residency fallback did not resolve every visible tile"
+        )
+        try require(
+            elapsedMilliseconds < 100,
+            "large residency fallback took \(String(format: "%.2f", elapsedMilliseconds)) ms"
+        )
+    }
+
     private struct Fixture {
         let tileStore: WaveformTileStore
         let residencyStore: WaveformTileGPUResidencyStore
         let selector: WaveformTileRenderSelector
     }
 
-    private static func makeFixture() -> Fixture {
+    private static func makeFixture(maximumResidentBytes: Int = 1_000_000) -> Fixture {
         let tileStore = WaveformTileStore()
-        let residencyStore = WaveformTileGPUResidencyStore(maximumResidentBytes: 1_000_000)
+        let residencyStore = WaveformTileGPUResidencyStore(maximumResidentBytes: maximumResidentBytes)
         return Fixture(
             tileStore: tileStore,
             residencyStore: residencyStore,

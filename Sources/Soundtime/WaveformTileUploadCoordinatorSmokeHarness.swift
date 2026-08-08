@@ -19,6 +19,7 @@ enum WaveformTileUploadCoordinatorSmokeHarness {
         try verifyUploadBudgetLimitsBatch()
         try verifyResidentTilesAreSkipped()
         try verifyLRUEvictionReturnsTilesToCPUCommitted()
+        try verifySustainedResidencyPressureStaysBounded()
         try verifyStaleUploadDoesNotBecomeResident()
         try verifyRawSampleByteEstimate()
         try verifyMetalBufferStoreUploadIfAvailable()
@@ -27,6 +28,7 @@ enum WaveformTileUploadCoordinatorSmokeHarness {
             "upload budget limits batch",
             "resident tiles are skipped",
             "LRU eviction returns tiles to CPU committed",
+            "sustained residency pressure stays byte-bounded",
             "stale upload does not become resident",
             "raw sample byte estimate",
             "metal buffer store upload if available",
@@ -118,6 +120,39 @@ enum WaveformTileUploadCoordinatorSmokeHarness {
         try require(fixture.tileStore.state(for: first.descriptor.address) == .residentGPU, "recently touched tile should remain resident")
         try require(fixture.tileStore.state(for: second.descriptor.address) == .committedCPU, "least recently used tile should return to CPU committed")
         try require(fixture.tileStore.state(for: third.descriptor.address) == .residentGPU, "new tile should become resident")
+    }
+
+    private static func verifySustainedResidencyPressureStaysBounded() throws {
+        let bytesPerTile = 96
+        let residentTileCapacity = 32
+        let fixture = makeFixture(maximumResidentBytes: bytesPerTile * residentTileCapacity)
+        let tiles = (0..<2_048).map { peakTile(tileIndex: $0, binCount: 4) }
+        for tile in tiles {
+            fixture.tileStore.commit(.peak(tile))
+        }
+
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        var totalEvictions = 0
+        for chunkStart in stride(from: 0, to: tiles.count, by: 8) {
+            let chunk = tiles[chunkStart..<min(chunkStart + 8, tiles.count)]
+            let summary = fixture.coordinator.uploadNextBatch(
+                prioritizedAddresses: chunk.map(\.descriptor.address),
+                budget: WaveformTileUploadBudget(maximumBytesPerBatch: bytesPerTile * 8, maximumTilesPerBatch: 8),
+                upload: fakeUpload
+            )
+            totalEvictions += summary.evictedCount
+            let snapshot = fixture.residencyStore.snapshot()
+            try require(snapshot.residentBytes <= snapshot.maximumResidentBytes, "residency exceeded its byte budget during churn")
+            try require(snapshot.residentCount <= residentTileCapacity, "residency exceeded its tile capacity during churn")
+        }
+
+        let elapsedMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000
+        let snapshot = fixture.residencyStore.snapshot()
+        let expectedTail = Set(tiles.suffix(residentTileCapacity).map(\.descriptor.address))
+        try require(snapshot.residentBytes == bytesPerTile * residentTileCapacity, "pressure test did not settle at the configured byte budget")
+        try require(Set(snapshot.residentTiles.map(\.address)) == expectedTail, "LRU pressure did not retain the newest resident working set")
+        try require(totalEvictions == tiles.count - residentTileCapacity, "pressure test eviction count was not deterministic")
+        try require(elapsedMilliseconds <= 500, String(format: "residency pressure churn took %.2fms", elapsedMilliseconds))
     }
 
     private static func verifyStaleUploadDoesNotBecomeResident() throws {

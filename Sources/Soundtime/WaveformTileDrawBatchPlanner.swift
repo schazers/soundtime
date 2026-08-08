@@ -29,6 +29,8 @@ struct WaveformTileDrawInstance: Hashable, Sendable {
     let outputEndTime: TimeInterval
     let sourceStartTime: TimeInterval
     let sourceEndTime: TimeInterval
+    let sourceDuration: TimeInterval
+    let sourceSampleRate: Double
     let requestedDescriptor: WaveformTileDescriptor
     let tileDescriptor: WaveformTileDescriptor
     let resource: WaveformTileGPUResource
@@ -62,6 +64,17 @@ struct WaveformTileDrawBatchPlan: Equatable, Sendable {
 
     var logicalDrawCallCount: Int {
         batchCount
+    }
+
+    /// Resident plans are emitted only after the selector has complete visible coverage.
+    /// Once present, they replace the overview base instead of blending on top of it.
+    func shouldDrawOverviewBaseWaveform(trackID: UUID, sourceID: WaveformSourceID) -> Bool {
+        !batches.contains { batch in
+            batch.instances.contains { instance in
+                instance.trackID == trackID &&
+                    instance.tileDescriptor.address.sourceID == sourceID
+            }
+        }
     }
 
     mutating func append(_ other: WaveformTileDrawBatchPlan) {
@@ -230,6 +243,8 @@ enum WaveformTileDrawBatchPlanner {
                 outputEndTime: outputEndTime,
                 sourceStartTime: sourceOverlapStart,
                 sourceEndTime: sourceOverlapEnd,
+                sourceDuration: source.duration,
+                sourceSampleRate: source.sampleRate,
                 requestedDescriptor: requestedDescriptor,
                 tileDescriptor: layer.descriptor,
                 resource: layer.resource,

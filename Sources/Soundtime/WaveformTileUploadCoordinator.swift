@@ -150,6 +150,14 @@ final class WaveformTileGPUResidencyStore: @unchecked Sendable {
         return recordsByAddress.keys.sorted()
     }
 
+    func unsortedAddressSnapshot() -> [WaveformTileAddress] {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        return Array(recordsByAddress.keys)
+    }
+
     func record(for address: WaveformTileAddress) -> WaveformTileGPUResidencyRecord? {
         lock.lock()
         defer {

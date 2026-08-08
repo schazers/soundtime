@@ -238,6 +238,8 @@ enum AudioImportPerformanceContract {
     static let admittedMilliseconds = 50.0
     static let cachedPreviewMilliseconds = 100.0
     static let firstProgressiveWaveformMilliseconds = 250.0
+    static let firstLargeCompressedWaveformMilliseconds = 300.0
+    static let largeCompressedRefinedWaveformMilliseconds = 1_500.0
     static let coldScreenDetailMilliseconds = 2_000.0
     static let playbackReadyMilliseconds = 500.0
     static let maximumWorkingSetBytes = 32 * 1_024 * 1_024

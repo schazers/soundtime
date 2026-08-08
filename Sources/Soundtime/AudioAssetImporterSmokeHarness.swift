@@ -85,7 +85,9 @@ enum AudioAssetImporterSmokeHarness {
         }
 
         try verifyCommonFormatRecognition()
+        try verifyCompressedDurationAndPromotionContracts()
         try verifyWAVImmediatePreviewContract()
+        try verifyLargeCompressedSamplingContract()
         try verifyWAVFacadeRoundTrip(rootDirectory: rootDirectory)
         let longWAVMetrics = try verifyFourMinuteWAVPreviewPerformance(rootDirectory: rootDirectory)
         let nativeMetrics = try verifyNativeEditableProxyImport(rootDirectory: rootDirectory)
@@ -98,7 +100,9 @@ enum AudioAssetImporterSmokeHarness {
 
         let checks = [
             "common audio format recognition",
+            "compressed admission and proxy promotion preserve full duration",
             "dropped WAV immediate-preview work stays bounded",
+            "multi-hour compressed preview work stays fixed and covers the full duration",
             "wav importer facade preview/decode round trip",
             "four-minute WAV first preview and bounded refinement",
             "native audio streaming proxy and cache reuse",
@@ -174,6 +178,156 @@ enum AudioAssetImporterSmokeHarness {
         print("Soundtime audio asset importer smoke passed")
     }
 
+    static func runLargeFileFromCommandLine(arguments: [String]) throws {
+        let path: String?
+        if let flagIndex = arguments.firstIndex(of: "--large-audio-import-smoke"),
+           arguments.indices.contains(flagIndex + 1) {
+            path = arguments[flagIndex + 1]
+        } else {
+            path = ProcessInfo.processInfo.environment["SOUNDTIME_IMPORT_BENCHMARK_FILE"]
+        }
+        guard let path, !path.isEmpty else {
+            throw SmokeError.failed(
+                "pass a compressed audio path after --large-audio-import-smoke"
+            )
+        }
+
+        let sourceURL = URL(fileURLWithPath: path).standardizedFileURL
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        let assetInfo = try AudioAssetImporter.inspectSynchronously(url: sourceURL)
+        let admissionMilliseconds = elapsedMilliseconds(since: startedAt)
+        let probe = AudioImportProgressProbe()
+        let previewStartedAt = DispatchTime.now().uptimeNanoseconds
+        let result = try NativeAudioSparsePreviewBuilder.build(
+            sourceURL: sourceURL,
+            duration: assetInfo.duration ?? 0,
+            progress: probe.record
+        )
+        let previewMilliseconds = elapsedMilliseconds(since: previewStartedAt)
+        let snapshot = probe.snapshot()
+
+        try require(assetInfo.duration ?? 0 > 0, "large compressed asset has no duration")
+        try require(
+            snapshot.firstWaveformBinCount == NativeAudioSparsePreviewBuilder.coarseBinCount,
+            "large compressed asset did not publish the coarse full-file preview first"
+        )
+        try require(snapshot.firstWaveformHadSignal, "large compressed preview contained no signal")
+        try require(
+            result.refinedOverview.bins.count == NativeAudioSparsePreviewBuilder.refinedBinCount,
+            "large compressed asset did not refine to the screen-resolution preview"
+        )
+        try require(
+            abs(result.refinedOverview.duration - (assetInfo.duration ?? 0)) < 0.001,
+            "large compressed preview duration diverged from source duration"
+        )
+        try require(
+            snapshot.firstWaveformMilliseconds ?? .infinity <=
+                AudioImportPerformanceContract.firstLargeCompressedWaveformMilliseconds,
+            String(
+                format: "large compressed first waveform took %.1f ms (budget %.1f ms)",
+                snapshot.firstWaveformMilliseconds ?? .infinity,
+                AudioImportPerformanceContract.firstLargeCompressedWaveformMilliseconds
+            )
+        )
+        try require(
+            previewMilliseconds <= AudioImportPerformanceContract.largeCompressedRefinedWaveformMilliseconds,
+            String(
+                format: "large compressed refined waveform took %.1f ms (budget %.1f ms)",
+                previewMilliseconds,
+                AudioImportPerformanceContract.largeCompressedRefinedWaveformMilliseconds
+            )
+        )
+
+        var fullImportDescription = "not requested"
+        if arguments.contains("--full") {
+            let fingerprint = try AudioImportFingerprint(url: sourceURL, assetInfo: assetInfo)
+            AudioImportCacheStore.shared.removeCache(for: fingerprint)
+            let fullStartedAt = DispatchTime.now().uptimeNanoseconds
+            let imported = try awaitValue {
+                try await AudioAssetImporter.importEditableAsset(at: sourceURL) { progress in
+                    if progress.previewOverview != nil || progress.stage != .proxying {
+                        print(
+                            "  full import stage: \(progress.stage.rawValue) " +
+                            "\(progress.completedFrames)/\(progress.totalFrames)"
+                        )
+                    }
+                }
+            }
+            defer {
+                AudioImportCacheStore.shared.removeCache(for: imported.fingerprint)
+            }
+            let fullMilliseconds = elapsedMilliseconds(since: fullStartedAt)
+            try require(
+                FileManager.default.fileExists(atPath: imported.proxyURL.path),
+                "large compressed import did not produce an editable proxy"
+            )
+            try require(
+                abs(imported.proxyFileInfo.duration - (assetInfo.duration ?? 0)) <= 0.1,
+                "large compressed editable proxy duration diverged from its source"
+            )
+            try require(
+                imported.waveformOverview.bins.count == StreamingAudioProxyBuilder.waveformBinCount,
+                "large compressed import did not retain its final waveform detail"
+            )
+            fullImportDescription = String(format: "%.1f sec", fullMilliseconds / 1_000)
+        }
+
+        print("Soundtime large compressed import smoke passed")
+        print("  file: \(sourceURL.lastPathComponent)")
+        print(String(format: "  duration: %.1f sec", assetInfo.duration ?? 0))
+        print(String(format: "  admission: %.1f ms", admissionMilliseconds))
+        print(String(format: "  first waveform: %.1f ms", snapshot.firstWaveformMilliseconds ?? 0))
+        print(String(format: "  refined waveform: %.1f ms", previewMilliseconds))
+        print("  full editable proxy: \(fullImportDescription)")
+    }
+
+    private static func verifyLargeCompressedSamplingContract() throws {
+        let twoHourStereoMP3Frames: Int64 = 327_967_488
+        let plan = NativeAudioSparsePreviewBuilder.makeSamplingPlan(
+            frameLength: twoHourStereoMP3Frames
+        )
+        try require(
+            plan.refinedBinCount == NativeAudioSparsePreviewBuilder.refinedBinCount,
+            "large compressed preview scaled its bin count with source duration"
+        )
+        try require(
+            plan.coarseRefinedIndices.count == NativeAudioSparsePreviewBuilder.coarseBinCount,
+            "large compressed preview did not retain its fixed first-frame bin budget"
+        )
+        try require(
+            Set(plan.coarseRefinedIndices).count == plan.coarseRefinedIndices.count,
+            "large compressed coarse sampling plan contains duplicate windows"
+        )
+        try require(
+            plan.coarseRefinedIndices.first == 2 &&
+                plan.coarseRefinedIndices.last == NativeAudioSparsePreviewBuilder.refinedBinCount - 2,
+            "large compressed coarse sampling plan does not cover the full source duration"
+        )
+        try require(
+            plan.coarseRefinedIndices.count + plan.refinementIndices.count ==
+                NativeAudioSparsePreviewBuilder.refinedBinCount,
+            "large compressed refinement plan does not cover every output bin exactly once"
+        )
+
+        let frameLength: AVAudioFramePosition = twoHourStereoMP3Frames
+        try require(
+            StreamingAudioProxyBuilder.isTolerableDecoderTail(
+                framePosition: frameLength - 2_176,
+                frameLength: frameLength,
+                sampleRate: 44_100
+            ),
+            "valid compressed encoder padding was not accepted as end-of-stream"
+        )
+        try require(
+            !StreamingAudioProxyBuilder.isTolerableDecoderTail(
+                framePosition: frameLength - 4_411,
+                frameLength: frameLength,
+                sampleRate: 44_100
+            ),
+            "compressed decoder failure beyond the 100 ms tail tolerance was hidden"
+        )
+    }
+
     private static func verifyCommonFormatRecognition() throws {
         let expectedFormats: [(String, AudioAssetFormat)] = [
             ("voice.wav", .wav),
@@ -246,6 +400,65 @@ enum AudioAssetImporterSmokeHarness {
         let unknownURL = URL(fileURLWithPath: "/tmp/not-audio.xyz")
         try require(AudioAssetFormat.inferred(from: unknownURL) == .unknown, "unknown format inference failed")
         try require(!AudioAssetImporter.canImport(unknownURL), "unknown format should not be importable")
+    }
+
+    private static func verifyCompressedDurationAndPromotionContracts() throws {
+        let sampleRate = 48_000.0
+        let decodedDuration = 7_436.855
+        let decodedFrames = Int((sampleRate * decodedDuration).rounded())
+        let canonicalFrames = AudioAssetImporter.canonicalNativeFrameCount(
+            sampleRate: sampleRate,
+            duration: AudioAssetImporter.preferredNativeDuration(
+                containerDuration: 6_352.25,
+                decoderDuration: decodedDuration
+            ),
+            decoderFrameCount: decodedFrames
+        )
+        try require(
+            canonicalFrames == decodedFrames,
+            "compressed admission trusted an estimated container duration over decoded PCM"
+        )
+        try require(
+            AudioAssetImporter.preferredNativeDuration(
+                containerDuration: decodedDuration,
+                decoderDuration: nil
+            ) == decodedDuration,
+            "compressed admission did not fall back to container duration without a decoder length"
+        )
+
+        let provisionalFrames = Int(sampleRate * 4.25)
+        let provisional = AudioFileEditTimeline(
+            sourceFrameCount: provisionalFrames,
+            sourceSampleRate: sampleRate
+        )
+        let proxyFrameCount = canonicalFrames ?? 0
+        let blockAlign = 2 * MemoryLayout<Float>.size
+        let proxyInfo = WAVFileInfo(
+            url: URL(fileURLWithPath: "/tmp/authoritative-import-proxy.wav"),
+            formatTag: 3,
+            channelCount: 2,
+            sampleRate: sampleRate,
+            blockAlign: blockAlign,
+            bitsPerSample: 32,
+            dataRange: 44..<(44 + proxyFrameCount * blockAlign)
+        )
+        let promoted = provisional.promotedToEditableProxy(fileInfo: proxyInfo)
+        try require(
+            promoted.frameCount == proxyInfo.frameCount,
+            "untouched compressed import preserved a short provisional clip after proxy promotion"
+        )
+
+        var edited = AudioFileEditTimeline(
+            sourceFrameCount: provisionalFrames,
+            sourceSampleRate: sampleRate
+        )
+        _ = edited.delete(TimelineSelection(startProgress: 0.25, endProgress: 0.5))
+        let editedDuration = edited.duration
+        let promotedEdit = edited.promotedToEditableProxy(fileInfo: proxyInfo)
+        try require(
+            abs(promotedEdit.duration - editedDuration) <= (2 / sampleRate),
+            "proxy promotion discarded edits made while compressed audio was preparing"
+        )
     }
 
     private static func verifyWAVImmediatePreviewContract() throws {
@@ -466,6 +679,7 @@ enum AudioAssetImporterSmokeHarness {
     }
 
     private struct CompressedPreparationPair: Sendable {
+        let admission: AudioImportAdmission
         let first: AudioAssetProxyResult
         let replayed: AudioAssetProxyResult
     }
@@ -514,7 +728,11 @@ enum AudioAssetImporterSmokeHarness {
                 )
                 let replayed = try await replayedTask.value
                 await coordinator.forget(sessionID: admission.sessionID)
-                return CompressedPreparationPair(first: result, replayed: replayed)
+                return CompressedPreparationPair(
+                    admission: admission,
+                    first: result,
+                    replayed: replayed
+                )
             } catch {
                 await coordinator.forget(sessionID: admission.sessionID)
                 throw error
@@ -539,8 +757,8 @@ enum AudioAssetImporterSmokeHarness {
             )
         )
         try require(
-            progress.firstWaveformBinCount == StreamingAudioProxyBuilder.progressWaveformBinCount,
-            "compressed progressive waveform did not use the screen-detail bin budget"
+            progress.firstWaveformBinCount == NativeAudioSparsePreviewBuilder.coarseBinCount,
+            "compressed import did not publish the coarse full-file waveform first"
         )
         try require(
             progress.firstWaveformHadSignal,
@@ -580,6 +798,17 @@ enum AudioAssetImporterSmokeHarness {
             abs(result.waveformOverview.duration - result.proxyFileInfo.duration) <=
                 (2 / result.proxyFileInfo.sampleRate),
             "compressed waveform duration diverged from its editable proxy"
+        )
+        guard let admissionDuration = completed.admission.assetInfo.duration else {
+            throw SmokeError.failed("compressed admission did not publish a duration")
+        }
+        try require(
+            abs(admissionDuration - result.proxyFileInfo.duration) <= 0.05,
+            String(
+                format: "compressed admission duration %.6f diverged from proxy duration %.6f",
+                admissionDuration,
+                result.proxyFileInfo.duration
+            )
         )
         try require(
             result.peakWorkingSetBytes <= AudioImportPerformanceContract.maximumWorkingSetBytes,
