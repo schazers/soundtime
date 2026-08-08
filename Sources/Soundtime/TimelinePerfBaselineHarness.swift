@@ -1,6 +1,7 @@
 import Foundation
 @preconcurrency import Metal
 import QuartzCore
+import Darwin
 
 enum TimelinePerfBaselineHarness {
     private static let maximumVisualEffectVerticesPerFrame = 10_000
@@ -25,22 +26,41 @@ enum TimelinePerfBaselineHarness {
         let deletionBurstInterval: Int?
         var waveformRefreshInterval: Int? = nil
         var transientBurstInterval: Int? = nil
+        var syntheticDuration: TimeInterval = 360
+        var clipCountPerTrack: Int = 0
+        var waveformLayerCount: Int = 1
+        var automationPointCountPerTrack: Int = 0
+        var transcriptWordCount: Int = 0
+        var transcriptTrackStride: Int = 0
+        var measuresTranscriptLayout: Bool = false
+        var measuresFullFrameWork: Bool = false
+        var requiresZeroDropped144HzFrames: Bool = false
     }
 
     private struct TrackCacheKey: Hashable {
         let trackCount: Int
         let waveformBinCount: Int
+        let syntheticDurationMilliseconds: Int
+        let clipCountPerTrack: Int
+        let waveformLayerCount: Int
+        let automationPointCountPerTrack: Int
+        let transcriptWordCount: Int
+        let transcriptTrackStride: Int
     }
 
     private struct ScenarioResult {
         let scenario: Scenario
         let cpuFrameMilliseconds: [Double]
         let gpuFrameMilliseconds: [Double]
+        let stateUpdateMilliseconds: [Double]
+        let transcriptLayoutMilliseconds: [Double]
+        let renderSubmissionMilliseconds: [Double]
         let rendererStats: TimelineFrameStats
         let rendererStatsSamples: [TimelineFrameStats]
         let deletionEffectCounts: [Int]
         let visibleLaneCounts: [Int]
         let visibleLaneBudget: Int
+        var attemptCount: Int = 1
 
         var frameCount: Int {
             cpuFrameMilliseconds.count
@@ -149,7 +169,15 @@ enum TimelinePerfBaselineHarness {
     }
 
     static func runFromCommandLine(arguments: [String]) throws {
+        let previousQoS = qos_class_self()
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)
+        defer {
+            pthread_set_qos_class_self_np(previousQoS, 0)
+        }
+
         let startedAtNanoseconds = DispatchTime.now().uptimeNanoseconds
+        let isExtreme = arguments.contains("--extreme") ||
+            arguments.contains("--extreme-timeline-performance")
         let isQuick = arguments.contains("--quick") || arguments.contains("--timeline-perf-baseline-quick")
         let enforcesBudgets = arguments.contains("--ci") || arguments.contains("--timeline-perf-baseline-ci")
         let pixelFormat: MTLPixelFormat = .bgra8Unorm
@@ -184,14 +212,13 @@ enum TimelinePerfBaselineHarness {
         }
         texture.label = "Soundtime timeline perf baseline target"
 
-        let scenarios = makeScenarios(
-            isQuick: isQuick,
-            frames: scenarioFrames,
-            warmupFrames: warmupFrames
-        )
+        let scenarios = isExtreme ?
+            makeExtremeScenarios(frames: scenarioFrames, warmupFrames: warmupFrames) :
+            makeScenarios(isQuick: isQuick, frames: scenarioFrames, warmupFrames: warmupFrames)
 
         print("Soundtime timeline perf baseline")
-        print("device=\(device.name) mode=\(isQuick ? "quick" : "full") viewport=\(Int(viewportSize.width))x\(Int(viewportSize.height)) scale=\(backingScale) bins=\(syntheticBinCount)")
+        let modeName = isExtreme ? "extreme" : (isQuick ? "quick" : "full")
+        print("device=\(device.name) mode=\(modeName) viewport=\(Int(viewportSize.width))x\(Int(viewportSize.height)) scale=\(backingScale) bins=\(syntheticBinCount)")
 
         var trackCache: [TrackCacheKey: [TimelineRenderState.Track]] = [:]
         var budgetFailures: [String] = []
@@ -200,7 +227,13 @@ enum TimelinePerfBaselineHarness {
             let scenarioBinCount = scenario.waveformBinCount ?? syntheticBinCount
             let cacheKey = TrackCacheKey(
                 trackCount: scenario.trackCount,
-                waveformBinCount: scenarioBinCount
+                waveformBinCount: scenarioBinCount,
+                syntheticDurationMilliseconds: Int((scenario.syntheticDuration * 1_000).rounded()),
+                clipCountPerTrack: scenario.clipCountPerTrack,
+                waveformLayerCount: scenario.waveformLayerCount,
+                automationPointCountPerTrack: scenario.automationPointCountPerTrack,
+                transcriptWordCount: scenario.transcriptWordCount,
+                transcriptTrackStride: scenario.transcriptTrackStride
             )
             let tracks: [TimelineRenderState.Track]
             if let cachedTracks = trackCache[cacheKey] {
@@ -208,8 +241,13 @@ enum TimelinePerfBaselineHarness {
             } else {
                 tracks = makeSyntheticTracks(
                     count: scenario.trackCount,
-                    duration: 360,
-                    binCount: scenarioBinCount
+                    duration: scenario.syntheticDuration,
+                    binCount: scenarioBinCount,
+                    clipCountPerTrack: scenario.clipCountPerTrack,
+                    waveformLayerCount: scenario.waveformLayerCount,
+                    automationPointCountPerTrack: scenario.automationPointCountPerTrack,
+                    transcriptWordCount: scenario.transcriptWordCount,
+                    transcriptTrackStride: scenario.transcriptTrackStride
                 )
                 trackCache[cacheKey] = tracks
             }
@@ -240,13 +278,13 @@ enum TimelinePerfBaselineHarness {
         }
 
         if let reportURL = StabilityReportWriter.writeSuite(
-            name: "timeline-perf-baseline",
+            name: isExtreme ? "extreme-timeline-performance" : "timeline-perf-baseline",
             status: budgetFailures.isEmpty ? "passed" : "failed",
             startedAtNanoseconds: startedAtNanoseconds,
             checks: reportChecks,
             metadata: [
                 "device": device.name,
-                "mode": isQuick ? "quick" : "full",
+                "mode": modeName,
                 "enforcesBudgets": enforcesBudgets ? "true" : "false",
                 "viewportWidth": "\(textureWidth)",
                 "viewportHeight": "\(textureHeight)",
@@ -262,6 +300,39 @@ enum TimelinePerfBaselineHarness {
         if !budgetFailures.isEmpty {
             throw HarnessError.budgetExceeded(budgetFailures)
         }
+    }
+
+    private static func makeExtremeScenarios(
+        frames: Int,
+        warmupFrames: Int
+    ) -> [Scenario] {
+        [
+            Scenario(
+                name: "extreme clips text automation pan zoom",
+                trackCount: 1_000,
+                waveformBinCount: 131_072,
+                frames: max(frames, 360),
+                warmupFrames: max(warmupFrames, 120),
+                viewportDuration: 0.035,
+                isPlaybackActive: true,
+                pansDuringRun: true,
+                zoomsDuringRun: true,
+                scrollsTracksDuringRun: true,
+                showsSelection: true,
+                showsGainPreview: false,
+                targetsVisibleTrack: true,
+                deletionBurstInterval: nil,
+                syntheticDuration: 7_200,
+                clipCountPerTrack: 128,
+                waveformLayerCount: 4,
+                automationPointCountPerTrack: 256,
+                transcriptWordCount: 384,
+                transcriptTrackStride: 4,
+                measuresTranscriptLayout: true,
+                measuresFullFrameWork: true,
+                requiresZeroDropped144HzFrames: true
+            ),
+        ]
     }
 
     private static func makeScenarios(
@@ -529,6 +600,11 @@ enum TimelinePerfBaselineHarness {
     ) -> ScenarioResult {
         renderer.displayTracks(tracks)
         renderer.displayPlaybackActive(scenario.isPlaybackActive)
+        renderer.displayAutomationParameter(
+            scenario.automationPointCountPerTrack > 0 &&
+                ProcessInfo.processInfo.environment["SOUNDTIME_PERF_DISABLE_AUTOMATION"] != "1" ?
+                TimelineAutomationParameterID.volume.rawValue : nil
+        )
 
         var bestResult = run(
             scenario: scenario,
@@ -540,12 +616,15 @@ enum TimelinePerfBaselineHarness {
             rendererStats: rendererStats
         )
         var bestFailures = budgetFailuresFor(bestResult)
-        guard enforcesBudgets, isRetryableTimingOnlyFailure(bestFailures) else {
+        guard
+            enforcesBudgets,
+            isRetryableTimingOnlyFailure(bestFailures)
+        else {
             return bestResult
         }
 
-        for _ in 0..<2 {
-            let retryResult = run(
+        for retryIndex in 0..<2 {
+            var retryResult = run(
                 scenario: scenario,
                 tracks: tracks,
                 renderer: renderer,
@@ -554,6 +633,7 @@ enum TimelinePerfBaselineHarness {
                 backingScale: backingScale,
                 rendererStats: rendererStats
             )
+            retryResult.attemptCount = retryIndex + 2
             let retryFailures = budgetFailuresFor(retryResult)
             let retryIsTimingOnly = retryFailures.isEmpty || isRetryableTimingOnlyFailure(retryFailures)
             if
@@ -585,12 +665,18 @@ enum TimelinePerfBaselineHarness {
     ) -> ScenarioResult {
         var cpuMilliseconds: [Double] = []
         var gpuMilliseconds: [Double] = []
+        var stateUpdateMilliseconds: [Double] = []
+        var transcriptLayoutMilliseconds: [Double] = []
+        var renderSubmissionMilliseconds: [Double] = []
         var rendererStatsSamples: [TimelineFrameStats] = []
         var deletionEffectCounts: [Int] = []
         var visibleLaneCounts: [Int] = []
         var activeTracks = tracks
         cpuMilliseconds.reserveCapacity(scenario.frames)
         gpuMilliseconds.reserveCapacity(scenario.frames)
+        stateUpdateMilliseconds.reserveCapacity(scenario.frames)
+        transcriptLayoutMilliseconds.reserveCapacity(scenario.frames)
+        renderSubmissionMilliseconds.reserveCapacity(scenario.frames)
         rendererStatsSamples.reserveCapacity(scenario.frames)
         deletionEffectCounts.reserveCapacity(scenario.frames)
         visibleLaneCounts.reserveCapacity(scenario.frames)
@@ -599,9 +685,18 @@ enum TimelinePerfBaselineHarness {
         let totalFrames = scenario.warmupFrames + scenario.frames
         let maximumSettleFrames = 240
         let requiredSettledResidencyFrames = 12
-        let minimumSettleFrame = scenario.scrollsTracksDuringRun ?
-            max(scenario.warmupFrames, totalFrames * 2) :
-            scenario.warmupFrames
+        let minimumSettleFrame: Int
+        if scenario.requiresZeroDropped144HzFrames {
+            // The extreme scenario intentionally shares a small source-residency
+            // set across a huge clip graph. Start measuring as soon as those
+            // sources are demonstrably resident so the timed window includes
+            // sustained horizontal and vertical navigation.
+            minimumSettleFrame = scenario.warmupFrames
+        } else {
+            minimumSettleFrame = scenario.scrollsTracksDuringRun ?
+                max(scenario.warmupFrames, totalFrames * 2) :
+                scenario.warmupFrames
+        }
         let baseTimestamp = CACurrentMediaTime()
         var frame = 0
         var hasSettledRendererResidency = false
@@ -609,6 +704,7 @@ enum TimelinePerfBaselineHarness {
         var postSettleDiscardFrameCount = 0
         while cpuMilliseconds.count < scenario.frames {
             autoreleasepool {
+                let fullFrameStartTime = CACurrentMediaTime()
                 let displayTimestamp = baseTimestamp + Double(frame) / 144.0
                 let viewport = viewport(for: scenario, frame: frame, totalFrames: totalFrames)
                 let playheadProgress = playheadProgress(for: scenario, frame: frame, totalFrames: totalFrames)
@@ -653,9 +749,28 @@ enum TimelinePerfBaselineHarness {
                     playheadProgress: playheadProgress,
                     displayTimestamp: displayTimestamp
                 )
+                let stateUpdateEndTime = CACurrentMediaTime()
+                if scenario.measuresTranscriptLayout {
+                    let transcriptLayout = TranscriptLayoutEngine.makeLayout(
+                        TranscriptTimelineLayoutInput(
+                            tracks: activeTracks,
+                            viewport: viewport,
+                            trackLayout: trackLayout,
+                            timelineDuration: scenario.syntheticDuration,
+                            bounds: viewportSize,
+                            displayMode: .waveformOverlay
+                        )
+                    )
+                    precondition(
+                        transcriptLayout.backgrounds.count + transcriptLayout.runs.count >= 0,
+                        "transcript layout must be consumable"
+                    )
+                }
+                let transcriptLayoutEndTime = CACurrentMediaTime()
 
                 let renderPassDescriptor = makeRenderPassDescriptor(texture: texture)
-                let startTime = CACurrentMediaTime()
+                let startTime = scenario.measuresFullFrameWork ? fullFrameStartTime : CACurrentMediaTime()
+                let renderSubmissionStartTime = CACurrentMediaTime()
                 let commandBuffer = renderer.renderOffscreen(
                     renderPassDescriptor: renderPassDescriptor,
                     viewportSize: viewportSize,
@@ -663,7 +778,8 @@ enum TimelinePerfBaselineHarness {
                     displayTimestamp: displayTimestamp,
                     waitUntilCompleted: false
                 )
-                let elapsedMilliseconds = (CACurrentMediaTime() - startTime) * 1_000
+                let renderSubmissionEndTime = CACurrentMediaTime()
+                let elapsedMilliseconds = (renderSubmissionEndTime - startTime) * 1_000
                 commandBuffer?.waitUntilCompleted()
 
                 let statsAfterFrame = rendererStats()
@@ -691,6 +807,13 @@ enum TimelinePerfBaselineHarness {
                     }
 
                     cpuMilliseconds.append(elapsedMilliseconds)
+                    stateUpdateMilliseconds.append((stateUpdateEndTime - fullFrameStartTime) * 1_000)
+                    transcriptLayoutMilliseconds.append(
+                        (transcriptLayoutEndTime - stateUpdateEndTime) * 1_000
+                    )
+                    renderSubmissionMilliseconds.append(
+                        (renderSubmissionEndTime - renderSubmissionStartTime) * 1_000
+                    )
                     if let gpuMillisecondsForFrame = commandBufferGPUMilliseconds(from: commandBuffer) {
                         gpuMilliseconds.append(gpuMillisecondsForFrame)
                     }
@@ -710,6 +833,9 @@ enum TimelinePerfBaselineHarness {
             scenario: scenario,
             cpuFrameMilliseconds: cpuMilliseconds,
             gpuFrameMilliseconds: gpuMilliseconds,
+            stateUpdateMilliseconds: stateUpdateMilliseconds,
+            transcriptLayoutMilliseconds: transcriptLayoutMilliseconds,
+            renderSubmissionMilliseconds: renderSubmissionMilliseconds,
             rendererStats: rendererStats(),
             rendererStatsSamples: rendererStatsSamples,
             deletionEffectCounts: deletionEffectCounts,
@@ -785,13 +911,19 @@ enum TimelinePerfBaselineHarness {
         frame: Int,
         totalFrames: Int
     ) -> TimelineViewport {
+        let navigationFrame = scenario.requiresZeroDropped144HzFrames ?
+            frame % max(totalFrames, 1) :
+            frame
         let duration = scenario.zoomsDuringRun ?
-            scenario.viewportDuration * (0.62 + 0.38 * pulse(frame: frame, period: 96)) :
+            scenario.viewportDuration * (0.62 + 0.38 * pulse(frame: navigationFrame, period: 96)) :
             scenario.viewportDuration
         let maximumStart = max(1 - duration, 0)
         let panProgress: Float
         if scenario.pansDuringRun {
-            panProgress = min(maximumStart, maximumStart * Float(frame) / Float(max(totalFrames - 1, 1)))
+            panProgress = min(
+                maximumStart,
+                maximumStart * Float(navigationFrame) / Float(max(totalFrames - 1, 1))
+            )
         } else if duration < 1 {
             panProgress = min(maximumStart, 0.32)
         } else {
@@ -999,20 +1131,207 @@ enum TimelinePerfBaselineHarness {
     private static func makeSyntheticTracks(
         count: Int,
         duration: TimeInterval,
-        binCount: Int
+        binCount: Int,
+        clipCountPerTrack: Int = 0,
+        waveformLayerCount: Int = 1,
+        automationPointCountPerTrack: Int = 0,
+        transcriptWordCount: Int = 0,
+        transcriptTrackStride: Int = 0
     ) -> [TimelineRenderState.Track] {
         let overview = makeSyntheticWaveform(duration: duration, binCount: binCount)
         return (0..<count).map { index in
-            TimelineRenderState.Track(
-                id: UUID(),
+            let trackID = deterministicUUID(namespace: 1, index: index)
+            let clipRanges = makeSyntheticClipRanges(
+                trackIndex: index,
+                count: clipCountPerTrack
+            )
+            let waveformLayers = makeSyntheticWaveformLayers(
+                trackIndex: index,
+                overview: overview,
+                clipRanges: clipRanges,
+                layerCount: waveformLayerCount
+            )
+            let automationLanes = makeSyntheticAutomationLanes(
+                trackIndex: index,
+                pointCount: automationPointCountPerTrack
+            )
+            let transcript = transcriptTrackStride > 0 && index.isMultiple(of: transcriptTrackStride) ?
+                makeSyntheticTranscript(
+                    trackID: trackID,
+                    duration: duration,
+                    wordCount: transcriptWordCount,
+                    trackIndex: index
+                ) : nil
+            return TimelineRenderState.Track(
+                id: trackID,
                 waveformVersion: 1,
                 waveformOverview: overview,
                 durationHint: duration,
                 volume: 0.72 + Float(index % 5) * 0.07,
                 isMuted: false,
-                isSoloed: false
+                isSoloed: false,
+                clipRanges: clipRanges,
+                usesSourceWaveformLayers: waveformLayers.isEmpty == false,
+                waveformLayers: waveformLayers,
+                transcript: transcript,
+                automationLanes: automationLanes
             )
         }
+    }
+
+    private static func makeSyntheticClipRanges(
+        trackIndex: Int,
+        count: Int
+    ) -> [TimelineRenderState.ClipRange] {
+        guard count > 0 else { return [] }
+        let spacing = 1.0 / Double(count)
+        return (0..<count).map { clipIndex in
+            let start = Double(clipIndex) * spacing
+            let width = spacing * (0.60 + Double((trackIndex + clipIndex) % 4) * 0.07)
+            return TimelineRenderState.ClipRange(
+                id: AudioTimelineClipID(
+                    rawValue: deterministicUUID(namespace: 2 + trackIndex, index: clipIndex)
+                ),
+                startProgress: start,
+                endProgress: min(start + width, 1),
+                name: "Extreme Clip \(trackIndex + 1).\(clipIndex + 1)",
+                isSelected: clipIndex == (trackIndex % count),
+                gain: 0.72 + Float(clipIndex % 6) * 0.045,
+                fadeInProgress: clipIndex.isMultiple(of: 5) ? 0.08 : 0,
+                fadeOutProgress: clipIndex.isMultiple(of: 7) ? 0.06 : 0
+            )
+        }
+    }
+
+    private static func makeSyntheticWaveformLayers(
+        trackIndex: Int,
+        overview: WaveformOverview,
+        clipRanges: [TimelineRenderState.ClipRange],
+        layerCount: Int
+    ) -> [TimelineRenderState.Track.WaveformLayer] {
+        guard layerCount > 0, !clipRanges.isEmpty else { return [] }
+        return (0..<layerCount).map { layerIndex in
+            let segments: [TimelineRenderState.Track.WaveformSegment] = clipRanges.enumerated().compactMap { clipIndex, clip in
+                guard clipIndex % layerCount == layerIndex else { return nil }
+                let sourceStart = Float((clipIndex * 37 + trackIndex * 11) % 800) / 1_000
+                let sourceWidth = min(Float(clip.durationProgress * 12), 0.18)
+                return TimelineRenderState.Track.WaveformSegment(
+                    outputStartProgress: Float(clip.startProgress),
+                    outputEndProgress: Float(clip.endProgress),
+                    sourceStartProgress: sourceStart,
+                    sourceEndProgress: min(sourceStart + max(sourceWidth, 0.01), 1),
+                    gainStart: clip.gain,
+                    gainEnd: clip.gain
+                )
+            }
+            return TimelineRenderState.Track.WaveformLayer(
+                // Source identity is intentionally shared across every destination
+                // lane. An extreme edit graph must not multiply GPU residency by
+                // clip or track count when the underlying media is the same.
+                id: deterministicUUID(namespace: 40_000, index: layerIndex),
+                sourceID: TimelineMediaSourceID(
+                    rawValue: "extreme-source-\(layerIndex)"
+                ),
+                waveformVersion: 1,
+                waveformOverview: overview,
+                waveformSegments: segments
+            )
+        }
+    }
+
+    private static func makeSyntheticAutomationLanes(
+        trackIndex: Int,
+        pointCount: Int
+    ) -> [TimelineRenderState.Track.AutomationLane] {
+        guard pointCount > 0 else { return [] }
+        let points = (0..<pointCount).map { pointIndex in
+            let progress = Double(pointIndex) / Double(max(pointCount - 1, 1))
+            let phase = Float(progress * .pi * 2 * Double(3 + trackIndex % 9))
+            return TimelineRenderState.Track.AutomationPoint(
+                id: deterministicUUID(namespace: 80_000 + trackIndex, index: pointIndex),
+                projectProgress: progress,
+                normalizedValue: 0.52 + sin(phase) * 0.36,
+                curveToNext: Float((pointIndex % 7) - 3) / 3
+            )
+        }
+        return [TimelineRenderState.Track.AutomationLane(
+            parameterID: TimelineAutomationParameterID.volume.rawValue,
+            defaultNormalizedValue: 0.8,
+            points: points,
+            isEnabled: true
+        )]
+    }
+
+    private static func makeSyntheticTranscript(
+        trackID: UUID,
+        duration: TimeInterval,
+        wordCount: Int,
+        trackIndex: Int
+    ) -> TranscriptDocument? {
+        guard wordCount > 0 else { return nil }
+        let wordsPerSegment = 12
+        var segments: [TranscriptSegment] = []
+        for segmentStartIndex in stride(from: 0, to: wordCount, by: wordsPerSegment) {
+            let segmentIndex = segmentStartIndex / wordsPerSegment
+            let segmentWordCount = min(wordsPerSegment, wordCount - segmentStartIndex)
+            let sourceStart = Double(segmentStartIndex) / Double(wordCount) * duration
+            let sourceEnd = Double(segmentStartIndex + segmentWordCount) / Double(wordCount) * duration
+            let words = (0..<segmentWordCount).map { localIndex in
+                let wordIndex = segmentStartIndex + localIndex
+                let start = sourceStart + Double(localIndex) / Double(segmentWordCount) * (sourceEnd - sourceStart)
+                let end = min(start + max((sourceEnd - sourceStart) / Double(segmentWordCount) * 0.72, 0.05), duration)
+                return TranscriptWord(
+                    id: deterministicUUID(namespace: 120_000 + trackIndex, index: wordIndex),
+                    text: "word\(wordIndex)",
+                    rawText: "word\(wordIndex)",
+                    punctuatedText: "word\(wordIndex)",
+                    startTime: start,
+                    endTime: end,
+                    confidence: 0.96,
+                    speakerID: "speaker-\(trackIndex % 8)",
+                    channelIndex: 0
+                )
+            }
+            segments.append(TranscriptSegment(
+                id: deterministicUUID(namespace: 160_000 + trackIndex, index: segmentIndex),
+                speakerID: "speaker-\(trackIndex % 8)",
+                speakerLabel: "Speaker \(trackIndex % 8 + 1)",
+                startTime: sourceStart,
+                endTime: sourceEnd,
+                text: words.map(\.text).joined(separator: " "),
+                words: words,
+                confidence: 0.95,
+                channelIndex: 0
+            ))
+        }
+        return TranscriptDocument(
+            id: deterministicUUID(namespace: 200_000, index: trackIndex),
+            sourceKind: .track,
+            trackID: trackID,
+            sourceRevision: 1,
+            sourceDuration: duration,
+            sourceFingerprint: "extreme-transcript-\(trackIndex)",
+            languageCode: "en-US",
+            providerIdentifier: "soundtime-extreme-fixture",
+            providerDisplayName: "Soundtime Extreme Fixture",
+            providerModelName: "deterministic-v1",
+            validity: .valid,
+            segments: segments
+        )
+    }
+
+    private static func deterministicUUID(namespace: Int, index: Int) -> UUID {
+        let high = UInt64(bitPattern: Int64(namespace))
+        let low = UInt64(bitPattern: Int64(index))
+        let text = String(
+            format: "%08X-%04X-%04X-%04X-%012llX",
+            UInt32(truncatingIfNeeded: high),
+            UInt16(truncatingIfNeeded: high >> 32),
+            UInt16(truncatingIfNeeded: high >> 48),
+            UInt16(truncatingIfNeeded: low >> 48),
+            low & 0x0000_FFFF_FFFF_FFFF
+        )
+        return UUID(uuidString: text)!
     }
 
     private static func makeSyntheticWaveform(
@@ -1061,11 +1380,22 @@ enum TimelinePerfBaselineHarness {
             "device": deviceName,
             "tracks": result.scenario.trackCount,
             "waveform_bins": result.scenario.waveformBinCount ?? 0,
+            "clips": result.scenario.trackCount * result.scenario.clipCountPerTrack,
+            "waveform_layers_per_track": result.scenario.waveformLayerCount,
+            "automation_points": result.scenario.trackCount * result.scenario.automationPointCountPerTrack,
+            "transcript_words_per_transcribed_track": result.scenario.transcriptWordCount,
             "frames": result.frameCount,
+            "attempts": result.attemptCount,
             "cpu_submit_p50_ms": rounded(percentile(cpu, 0.50)),
             "cpu_submit_p95_ms": rounded(percentile(cpu, 0.95)),
             "cpu_submit_p99_ms": rounded(percentile(cpu, 0.99)),
             "cpu_submit_max_ms": rounded(cpu.max() ?? 0),
+            "state_update_p95_ms": rounded(percentile(result.stateUpdateMilliseconds, 0.95)),
+            "state_update_max_ms": rounded(result.stateUpdateMilliseconds.max() ?? 0),
+            "transcript_layout_p95_ms": rounded(percentile(result.transcriptLayoutMilliseconds, 0.95)),
+            "transcript_layout_max_ms": rounded(result.transcriptLayoutMilliseconds.max() ?? 0),
+            "render_submission_p95_ms": rounded(percentile(result.renderSubmissionMilliseconds, 0.95)),
+            "render_submission_max_ms": rounded(result.renderSubmissionMilliseconds.max() ?? 0),
             "gpu_p50_ms": rounded(percentile(gpu, 0.50)),
             "gpu_p95_ms": rounded(percentile(gpu, 0.95)),
             "gpu_max_ms": rounded(gpu.max() ?? 0),
@@ -1106,7 +1436,7 @@ enum TimelinePerfBaselineHarness {
     }
 
     private static func budgetFailuresFor(_ result: ScenarioResult) -> [String] {
-        let budget = budget(for: result.scenario.trackCount)
+        let budget = budget(for: result.scenario)
         let trackCount = result.scenario.trackCount
         let cpuP95 = percentile(result.cpuFrameMilliseconds, 0.95)
         let cpuMax = result.cpuFrameMilliseconds.max() ?? 0
@@ -1149,9 +1479,10 @@ enum TimelinePerfBaselineHarness {
                 "budget \(result.visibleLaneBudget)"
             )
         }
-        let waveformDrawBudget = result.scenario.waveformBinCount == nil ?
-            max(result.visibleLaneBudget, 1) :
-            max(result.visibleLaneBudget, 2)
+        let waveformDrawBudget = max(
+            result.visibleLaneBudget * max(result.scenario.waveformLayerCount, 1),
+            1
+        )
         if result.maximumGPUWaveformDrawCount > waveformDrawBudget {
             failures.append(
                 "\(label) issued \(result.maximumGPUWaveformDrawCount) waveform draw calls, " +
@@ -1234,7 +1565,19 @@ enum TimelinePerfBaselineHarness {
             Double(dropped60) * 12.0
     }
 
-    private static func budget(for trackCount: Int) -> ScenarioBudget {
+    private static func budget(for scenario: Scenario) -> ScenarioBudget {
+        if scenario.requiresZeroDropped144HzFrames {
+            let frameBudget = 1_000.0 / 144.0
+            return ScenarioBudget(
+                cpuP95Milliseconds: frameBudget * 0.90,
+                cpuMaxMilliseconds: frameBudget,
+                gpuP95Milliseconds: frameBudget * 0.90,
+                gpuMaxMilliseconds: frameBudget,
+                allowedDropped144HzFrames: 0
+            )
+        }
+
+        let trackCount = scenario.trackCount
         switch trackCount {
         case ..<50:
             return ScenarioBudget(

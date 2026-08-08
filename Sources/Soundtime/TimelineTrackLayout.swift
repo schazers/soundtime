@@ -2,8 +2,8 @@ import Foundation
 
 struct TimelineTrackLayout: Sendable, Equatable {
     static let `default` = TimelineTrackLayout()
-    static let defaultPreferredTrackHeight: Float = 148
-    static let defaultRulerLaneHeight: Float = 32
+    static let defaultPreferredTrackHeight: Float = 200
+    static let defaultRulerLaneHeight: Float = 40
     fileprivate static let maximumAutoFitTrackCount = 4
 
     var scrollOffset: Float
@@ -17,7 +17,7 @@ struct TimelineTrackLayout: Sendable, Equatable {
     init(
         scrollOffset: Float = 0,
         preferredTrackHeight: Float = Self.defaultPreferredTrackHeight,
-        automaticallyFitsTrackHeight: Bool = true,
+        automaticallyFitsTrackHeight: Bool = false,
         rulerLaneHeight: Float = Self.defaultRulerLaneHeight,
         insertionTrackIndex: Int? = nil,
         insertionProgress: Float = 1,
@@ -145,6 +145,14 @@ struct TimelineTrackLayout: Sendable, Equatable {
     }
 }
 
+enum TimelineRulerLaneGeometry {
+    static let loopBandFraction: Float = 0.5
+
+    static func loopBandHeight(for rulerHeight: Float) -> Float {
+        max(rulerHeight, 0) * loopBandFraction
+    }
+}
+
 struct ResolvedTimelineTrackLayout: Sendable, Equatable {
     let totalTrackCount: Int
     let viewportHeight: Float
@@ -162,7 +170,7 @@ struct ResolvedTimelineTrackLayout: Sendable, Equatable {
         totalTrackCount: Int,
         viewportHeight: Float,
         preferredTrackHeight: Float,
-        automaticallyFitsTrackHeight: Bool = true,
+        automaticallyFitsTrackHeight: Bool = false,
         requestedScrollOffset: Float,
         rulerLaneHeight: Float = TimelineTrackLayout.defaultRulerLaneHeight,
         insertionTrackIndex: Int? = nil,
@@ -341,6 +349,20 @@ struct ResolvedTimelineTrackLayout: Sendable, Equatable {
         return TimelineTrackLaneFrame(top: top, bottom: bottom)
     }
 
+    func lanePixelFrame(forTrackIndex trackIndex: Int) -> TimelineTrackLanePixelFrame? {
+        guard let laneFrame = laneFrame(forTrackIndex: trackIndex) else {
+            return nil
+        }
+        return pixelFrame(for: laneFrame)
+    }
+
+    func pixelFrame(for laneFrame: TimelineTrackLaneFrame) -> TimelineTrackLanePixelFrame {
+        TimelineTrackLanePixelFrame(
+            top: laneFrame.top * viewportHeight,
+            bottom: laneFrame.bottom * viewportHeight
+        )
+    }
+
     func trackIndex(atYFromTop yFromTop: Float) -> Int? {
         guard totalTrackCount > 0 else {
             return nil
@@ -394,5 +416,30 @@ struct TimelineTrackLaneFrame: Sendable, Equatable {
 
     var clampedBottom: Float {
         min(max(bottom, 0), 1)
+    }
+}
+
+struct TimelineTrackLanePixelFrame: Sendable, Equatable {
+    let top: Float
+    let bottom: Float
+
+    var height: Float {
+        bottom - top
+    }
+
+    func intersectsViewport(height viewportHeight: CGFloat) -> Bool {
+        bottom > 0 && top < Float(max(viewportHeight, 0))
+    }
+
+    /// Projects the complete top-down lane into AppKit's bottom-up coordinate
+    /// space. The frame intentionally extends outside the viewport when a lane
+    /// is partially visible; the owning viewport is responsible for clipping.
+    func appKitFrame(viewportWidth: CGFloat, viewportHeight: CGFloat) -> CGRect {
+        CGRect(
+            x: 0,
+            y: viewportHeight - CGFloat(bottom),
+            width: viewportWidth,
+            height: max(CGFloat(height), 0)
+        )
     }
 }

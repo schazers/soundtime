@@ -1,15 +1,85 @@
 import Foundation
 
+/// Converts canonical timeline frames into the track-local progress consumed by
+/// the renderer. Clip and waveform geometry in a render track must use this
+/// domain; the renderer converts it to project progress exactly once by applying
+/// the track-duration/project-duration ratio.
+enum TimelineRenderTrackProgress {
+    static func normalized(frame: Int, trackEndFrame: Int) -> Double {
+        Double(frame) / Double(max(trackEndFrame, 1))
+    }
+
+    static func projectProgress(
+        trackProgress: Double,
+        trackEndFrame: Int,
+        projectEndFrame: Int
+    ) -> Double {
+        trackProgress * Double(max(trackEndFrame, 0)) / Double(max(projectEndFrame, 1))
+    }
+}
+
+struct TimelineAutomationHover: Equatable, Sendable {
+    let trackID: UUID
+    let pointID: UUID?
+    let segmentLeadingPointID: UUID?
+    let isLineHovered: Bool
+}
+
+struct TimelineAutomationPreview: Equatable, Sendable {
+    let trackID: UUID
+    let parameterID: String
+    let points: [TimelineRenderState.Track.AutomationPoint]
+}
+
+struct TimelineAutomationSelectionPresentation: Equatable, Sendable {
+    let trackID: UUID
+    let parameterID: String
+    let pointIDs: Set<UUID>
+}
+
 struct TimelineRenderState: Sendable {
     struct ClipRange: Equatable, Sendable {
+        let id: AudioTimelineClipID
+        /// Progress within this track's duration, not the whole project.
         let startProgress: Double
         let endProgress: Double
+        let name: String?
+        let isSelected: Bool
+        let isSilent: Bool
+        let isMissingMedia: Bool
+        /// True only for the temporary clip that is growing while input is recorded.
+        /// Its visual end is projected from the display-frame transport clock.
+        let isLiveRecordingPreview: Bool
+        let gain: Float
+        let fadeInProgress: Double
+        let fadeOutProgress: Double
 
-        init(startProgress: Double, endProgress: Double) {
+        init(
+            id: AudioTimelineClipID = AudioTimelineClipID(),
+            startProgress: Double,
+            endProgress: Double,
+            name: String? = nil,
+            isSelected: Bool = false,
+            isSilent: Bool = false,
+            isMissingMedia: Bool = false,
+            isLiveRecordingPreview: Bool = false,
+            gain: Float = 1,
+            fadeInProgress: Double = 0,
+            fadeOutProgress: Double = 0
+        ) {
+            self.id = id
             let clampedStart = min(max(startProgress, 0), 1)
             let clampedEnd = min(max(endProgress, 0), 1)
             self.startProgress = min(clampedStart, clampedEnd)
             self.endProgress = max(clampedStart, clampedEnd)
+            self.name = name
+            self.isSelected = isSelected
+            self.isSilent = isSilent
+            self.isMissingMedia = isMissingMedia
+            self.isLiveRecordingPreview = isLiveRecordingPreview
+            self.gain = max(gain, 0)
+            self.fadeInProgress = min(max(fadeInProgress, 0), 1)
+            self.fadeOutProgress = min(max(fadeOutProgress, 0), 1)
         }
 
         var durationProgress: Double {
@@ -18,7 +88,37 @@ struct TimelineRenderState: Sendable {
     }
 
     struct Track: Sendable {
+        struct AutomationPoint: Equatable, Sendable {
+            let id: UUID
+            let projectProgress: Double
+            let normalizedValue: Float
+            let curveToNext: Float
+        }
+
+        struct AutomationLane: Equatable, Sendable {
+            let revision: UInt64
+            let parameterID: String
+            let defaultNormalizedValue: Float
+            let points: [AutomationPoint]
+            let isEnabled: Bool
+
+            init(
+                revision: UInt64 = 1,
+                parameterID: String,
+                defaultNormalizedValue: Float,
+                points: [AutomationPoint],
+                isEnabled: Bool
+            ) {
+                self.revision = revision
+                self.parameterID = parameterID
+                self.defaultNormalizedValue = defaultNormalizedValue
+                self.points = points
+                self.isEnabled = isEnabled
+            }
+        }
+
         struct WaveformSegment: Sendable, Hashable {
+            /// Output progress within the destination track's duration.
             let outputStartProgress: Float
             let outputEndProgress: Float
             let sourceStartProgress: Float
@@ -43,6 +143,41 @@ struct TimelineRenderState: Sendable {
             }
         }
 
+        /// A source-resident waveform projected into this logical track lane.
+        ///
+        /// A track can contain clips from several media sources. Keeping each
+        /// source in its own layer lets the renderer reuse resident GPU data
+        /// while clip segments provide the timeline mapping.
+        struct WaveformLayer: Sendable {
+            let id: UUID
+            let sourceID: TimelineMediaSourceID?
+            let waveformVersion: Int
+            let waveformOverview: WaveformOverview?
+            let waveformSegments: [WaveformSegment]
+            let waveformTileSource: WaveformTileBuildSource?
+            let isLiveRecordingPreview: Bool
+
+            init(
+                id: UUID,
+                sourceID: TimelineMediaSourceID? = nil,
+                waveformVersion: Int,
+                waveformOverview: WaveformOverview?,
+                waveformSegments: [WaveformSegment],
+                waveformTileSource: WaveformTileBuildSource? = nil,
+                isLiveRecordingPreview: Bool = false
+            ) {
+                self.id = id
+                self.sourceID = sourceID
+                self.waveformVersion = waveformVersion
+                self.waveformOverview = waveformOverview
+                self.waveformSegments = waveformSegments.filter {
+                    $0.outputEndProgress > $0.outputStartProgress
+                }
+                self.waveformTileSource = waveformTileSource
+                self.isLiveRecordingPreview = isLiveRecordingPreview
+            }
+        }
+
         let id: UUID
         let waveformVersion: Int
         let waveformOverview: WaveformOverview?
@@ -54,7 +189,10 @@ struct TimelineRenderState: Sendable {
         let clipRanges: [ClipRange]
         let waveformSegments: [WaveformSegment]
         let waveformTileSource: WaveformTileBuildSource?
+        let usesSourceWaveformLayers: Bool
+        let waveformLayers: [WaveformLayer]
         let transcript: TranscriptDocument?
+        let automationLanes: [AutomationLane]
 
         init(
             id: UUID,
@@ -68,7 +206,10 @@ struct TimelineRenderState: Sendable {
             clipRanges: [ClipRange] = [],
             waveformSegments: [WaveformSegment] = [],
             waveformTileSource: WaveformTileBuildSource? = nil,
-            transcript: TranscriptDocument? = nil
+            usesSourceWaveformLayers: Bool = false,
+            waveformLayers: [WaveformLayer] = [],
+            transcript: TranscriptDocument? = nil,
+            automationLanes: [AutomationLane] = []
         ) {
             self.id = id
             self.waveformVersion = waveformVersion
@@ -77,11 +218,112 @@ struct TimelineRenderState: Sendable {
             self.volume = volume
             self.isMuted = isMuted
             self.isSoloed = isSoloed
-            self.hasWaveform = hasWaveform ?? (waveformOverview?.isEmpty == false)
+            self.hasWaveform = hasWaveform ?? (
+                waveformOverview?.isEmpty == false ||
+                waveformLayers.contains { $0.waveformOverview?.isEmpty == false }
+            )
             self.clipRanges = clipRanges.filter { $0.durationProgress > 0 }
             self.waveformSegments = waveformSegments.filter { $0.outputEndProgress > $0.outputStartProgress }
             self.waveformTileSource = waveformTileSource
+            self.usesSourceWaveformLayers = usesSourceWaveformLayers || !waveformLayers.isEmpty
+            self.waveformLayers = waveformLayers
             self.transcript = transcript
+            self.automationLanes = automationLanes
+        }
+
+        var resolvedWaveformLayers: [WaveformLayer] {
+            if usesSourceWaveformLayers {
+                return waveformLayers
+            }
+            guard waveformOverview?.isEmpty == false else {
+                return []
+            }
+            return [WaveformLayer(
+                id: id,
+                waveformVersion: waveformVersion,
+                waveformOverview: waveformOverview,
+                waveformSegments: waveformSegments,
+                waveformTileSource: waveformTileSource
+            )]
+        }
+
+        /// Keeps a source's last drawable payload while a newer presentation
+        /// update is still resolving that source. The incoming clip segments
+        /// remain authoritative so moved, trimmed, and removed clips never
+        /// retain stale timeline geometry.
+        func resolvingWaveformLayers(using lastGoodTrack: Track?) -> [WaveformLayer] {
+            guard usesSourceWaveformLayers else {
+                return waveformLayers
+            }
+
+            let lastGoodLayers = lastGoodTrack?.waveformLayers ?? []
+            let legacySingleSourceFallback: WaveformLayer? = {
+                guard
+                    waveformLayers.count == 1,
+                    lastGoodTrack?.usesSourceWaveformLayers == false,
+                    let overview = lastGoodTrack?.waveformOverview,
+                    !overview.isEmpty
+                else {
+                    return nil
+                }
+
+                return WaveformLayer(
+                    id: waveformLayers[0].id,
+                    sourceID: waveformLayers[0].sourceID,
+                    waveformVersion: lastGoodTrack?.waveformVersion ?? 0,
+                    waveformOverview: overview,
+                    waveformSegments: waveformLayers[0].waveformSegments,
+                    waveformTileSource: lastGoodTrack?.waveformTileSource,
+                    isLiveRecordingPreview: waveformLayers[0].isLiveRecordingPreview
+                )
+            }()
+            return waveformLayers.map { incomingLayer in
+                guard incomingLayer.waveformOverview?.isEmpty != false else {
+                    return incomingLayer
+                }
+                let lastGoodLayer = lastGoodLayers.first(where: { candidate in
+                    if let sourceID = incomingLayer.sourceID {
+                        return candidate.sourceID == sourceID
+                    }
+                    return candidate.id == incomingLayer.id
+                }) ?? legacySingleSourceFallback
+                guard let lastGoodLayer, lastGoodLayer.waveformOverview?.isEmpty == false else {
+                    return incomingLayer
+                }
+
+                return WaveformLayer(
+                    id: incomingLayer.id,
+                    sourceID: incomingLayer.sourceID,
+                    waveformVersion: lastGoodLayer.waveformVersion,
+                    waveformOverview: lastGoodLayer.waveformOverview,
+                    waveformSegments: incomingLayer.waveformSegments,
+                    waveformTileSource: lastGoodLayer.waveformTileSource,
+                    isLiveRecordingPreview: incomingLayer.isLiveRecordingPreview
+                )
+            }
+        }
+
+        func sourceTrack(for layer: WaveformLayer) -> Track {
+            // This is a source-residency view used only by waveform selection,
+            // promotion, and drawing. Destination-lane clip chrome, transcript,
+            // and automation data are deliberately not copied into it. Keeping
+            // this projection lightweight matters when a visible lane contains
+            // hundreds of clip instances backed by several shared sources.
+            Track(
+                id: layer.id,
+                waveformVersion: layer.waveformVersion,
+                waveformOverview: layer.waveformOverview,
+                durationHint: durationHint,
+                volume: volume,
+                isMuted: isMuted,
+                isSoloed: isSoloed,
+                hasWaveform: layer.waveformOverview?.isEmpty == false,
+                clipRanges: [],
+                waveformSegments: layer.waveformSegments,
+                waveformTileSource: layer.waveformTileSource,
+                transcript: nil,
+                automationLanes: []
+            )
         }
 
         func applying(_ mix: ProjectPlaybackTrackMix) -> Track {
@@ -100,7 +342,30 @@ struct TimelineRenderState: Sendable {
                 clipRanges: clipRanges,
                 waveformSegments: waveformSegments,
                 waveformTileSource: waveformTileSource,
-                transcript: transcript
+                usesSourceWaveformLayers: usesSourceWaveformLayers,
+                waveformLayers: waveformLayers,
+                transcript: transcript,
+                automationLanes: automationLanes
+            )
+        }
+
+        func replacingAutomationLanes(_ automationLanes: [AutomationLane]) -> Track {
+            Track(
+                id: id,
+                waveformVersion: waveformVersion,
+                waveformOverview: waveformOverview,
+                durationHint: durationHint,
+                volume: volume,
+                isMuted: isMuted,
+                isSoloed: isSoloed,
+                hasWaveform: hasWaveform,
+                clipRanges: clipRanges,
+                waveformSegments: waveformSegments,
+                waveformTileSource: waveformTileSource,
+                usesSourceWaveformLayers: usesSourceWaveformLayers,
+                waveformLayers: waveformLayers,
+                transcript: transcript,
+                automationLanes: automationLanes
             )
         }
     }
@@ -238,7 +503,7 @@ struct TimelineRenderState: Sendable {
         return withTracks(tracks)
     }
 
-    func withTracks(_ tracks: [Track]) -> TimelineRenderState {
+    func withTracks(_ tracks: [Track], duration: TimeInterval? = nil) -> TimelineRenderState {
         TimelineRenderState(
             tracks: tracks,
             viewport: viewport,
@@ -255,7 +520,32 @@ struct TimelineRenderState: Sendable {
             candidateRegions: candidateRegions,
             processingTrackHighlight: processingTrackHighlight,
             trimPreview: trimPreview,
-            gainPreview: nil
+            gainPreview: nil,
+            duration: duration
+        )
+    }
+
+    func withDuration(_ duration: TimeInterval?) -> TimelineRenderState {
+        TimelineRenderState(
+            tracks: tracks,
+            viewport: viewport,
+            trackLayout: trackLayout,
+            playheadProgress: playheadProgress,
+            playheadAnchorTimestamp: playheadAnchorTimestamp,
+            isPlaybackActive: isPlaybackActive,
+            isRecordingActive: isRecordingActive,
+            hoverProgress: hoverProgress,
+            isHoverGuideArmed: isHoverGuideArmed,
+            selection: selection,
+            selectedTrackID: selectedTrackID,
+            selectedTrackIDs: selectedTrackIDs,
+            candidateRegions: candidateRegions,
+            processingTrackHighlight: processingTrackHighlight,
+            trimPreview: trimPreview,
+            gainPreview: gainPreview,
+            duration: duration,
+            hasWaveforms: hasWaveforms,
+            hasSoloedTrack: hasSoloedTrack
         )
     }
 

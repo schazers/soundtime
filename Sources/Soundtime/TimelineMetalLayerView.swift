@@ -156,6 +156,20 @@ class TimelineMetalLayerView: NSView {
             return nil
         }
 
+        // A display-link frame may already own a drawable when live resize
+        // changes CAMetalLayer.drawableSize. Presenting that old-size texture
+        // with the new viewport briefly stretches every lane vertically.
+        // Drop it and let the next display tick acquire the correctly sized
+        // drawable instead.
+        guard Self.drawablePixelSizeMatches(
+            viewportSize: drawableState.viewportSize,
+            backingScale: drawableState.backingScale,
+            textureWidth: drawable.texture.width,
+            textureHeight: drawable.texture.height
+        ) else {
+            return nil
+        }
+
         let renderPassDescriptor = MTLRenderPassDescriptor()
         renderPassDescriptor.colorAttachments[0].texture = drawable.texture
         renderPassDescriptor.colorAttachments[0].loadAction = .clear
@@ -170,6 +184,19 @@ class TimelineMetalLayerView: NSView {
             displayTimestamp: displayTimestamp,
             publishesFrameStats: true
         )
+    }
+
+    nonisolated static func drawablePixelSizeMatches(
+        viewportSize: CGSize,
+        backingScale: CGFloat,
+        textureWidth: Int,
+        textureHeight: Int
+    ) -> Bool {
+        let expectedWidth = Int((viewportSize.width * backingScale).rounded())
+        let expectedHeight = Int((viewportSize.height * backingScale).rounded())
+        return
+            abs(textureWidth - expectedWidth) <= 1 &&
+            abs(textureHeight - expectedHeight) <= 1
     }
 
     private func updateDrawableSize() {
