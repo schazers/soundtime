@@ -18,16 +18,23 @@ enum DiagnosticsSmokeHarness {
         diagnostics.resetForSmokeTesting()
 
         try verifyBasicEventAccounting(diagnostics)
+        try verifyOperationCorrelation(diagnostics)
         try verifyFrameStatsEscalation(diagnostics)
         try verifyAudioSnapshotEscalation(diagnostics)
+        try verifyMixerSnapshotEscalation(diagnostics)
         try verifyTraceWriting(diagnostics)
         try verifyEventRetentionLimit(diagnostics)
+        try verifyMainThreadWatchdog(diagnostics)
 
         diagnostics.resetForSmokeTesting()
         let checks = [
             "basic event accounting",
+            "stable operation correlation",
+            "main queue watchdog timing",
+            "main queue watchdog reset isolation",
             "frame stats warning/severe escalation",
             "audio snapshot escalation",
+            "mixer packet and render-budget escalation",
             "diagnostics trace writing",
             "event retention limit",
         ]
@@ -41,6 +48,55 @@ enum DiagnosticsSmokeHarness {
             print("wrote stability report: \(reportURL.path)")
         }
         print("Soundtime diagnostics smoke passed")
+    }
+
+    private static func verifyMixerSnapshotEscalation(_ diagnostics: SoundtimeDiagnostics) throws {
+        let baseline = diagnostics.snapshot(limit: 64)
+        diagnostics.recordMixerSnapshot(MixerDiagnosticsSnapshot(
+            packetAgeMilliseconds: 12,
+            droppedPacketCount: 0,
+            stalePacketCount: 0,
+            realtimeWorkNanoseconds: 18_000,
+            visibleChannelCount: 10,
+            renderedMeterCount: 18,
+            gpuDrawCount: 1,
+            drawDurationMilliseconds: 0.35,
+            maximumDrawDurationMilliseconds: 0.62
+        ), isPlaying: true)
+        var snapshot = diagnostics.snapshot(limit: 64)
+        try require(
+            snapshot.events.last?.name == "mixer-performance-snapshot" &&
+                snapshot.events.last?.severity == .info,
+            "healthy mixer diagnostics did not record an informational baseline"
+        )
+        try require(
+            snapshot.warningEventCount == baseline.warningEventCount,
+            "healthy mixer diagnostics unexpectedly raised a warning"
+        )
+
+        diagnostics.recordMixerSnapshot(MixerDiagnosticsSnapshot(
+            packetAgeMilliseconds: 140,
+            droppedPacketCount: 2,
+            stalePacketCount: 1,
+            realtimeWorkNanoseconds: 42_000,
+            visibleChannelCount: 10,
+            renderedMeterCount: 18,
+            gpuDrawCount: 1,
+            drawDurationMilliseconds: 2.4,
+            maximumDrawDurationMilliseconds: 2.4
+        ), isPlaying: true)
+        snapshot = diagnostics.snapshot(limit: 64)
+        guard let event = snapshot.events.last else {
+            throw SmokeError.failed("mixer diagnostics did not emit a budget event")
+        }
+        try require(event.name == "mixer-performance-snapshot", "mixer diagnostics used an unexpected event name")
+        try require(event.severity == .warning, "mixer diagnostics did not escalate a delivery/render failure")
+        try require(event.fields["droppedPacketDelta"] == "2", "mixer diagnostics lost dropped-packet context")
+        try require(event.fields["stalePacketDelta"] == "1", "mixer diagnostics lost stale-packet context")
+        try require(
+            snapshot.warningEventCount == baseline.warningEventCount + 1,
+            "mixer budget violation did not increment warning accounting exactly once"
+        )
     }
 
     private static func verifyBasicEventAccounting(_ diagnostics: SoundtimeDiagnostics) throws {
@@ -65,6 +121,66 @@ enum DiagnosticsSmokeHarness {
         try require(snapshot.severeEventCount == 0, "diagnostics severe count should still be zero")
         try require(snapshot.mainThreadStallCount == 1, "main thread stall count mismatch")
         try require(abs(snapshot.lastMainThreadStallMilliseconds - 66.5) < 0.001, "main thread stall latency mismatch")
+    }
+
+    private static func verifyOperationCorrelation(_ diagnostics: SoundtimeDiagnostics) throws {
+        diagnostics.resetForSmokeTesting()
+        diagnostics.record(
+            category: .import,
+            severity: .info,
+            name: "import-started",
+            message: "Import started.",
+            fields: ["graphRevision": "41"]
+        )
+        diagnostics.record(
+            category: .import,
+            severity: .info,
+            name: "import-progress",
+            message: "Import progressed."
+        )
+        diagnostics.record(
+            category: .import,
+            severity: .info,
+            name: "import-finished",
+            message: "Import finished."
+        )
+        let events = diagnostics.snapshot(limit: 3).events
+        let operationIDs = events.compactMap { $0.correlation?.operationID }
+        try require(operationIDs.count == 3, "import operation events did not receive operation IDs")
+        try require(Set(operationIDs).count == 1, "import operation events did not share one operation ID")
+        try require(
+            events.allSatisfy { $0.correlation?.graphRevision == 41 },
+            "import operation did not retain its graph revision"
+        )
+        diagnostics.resetForSmokeTesting()
+    }
+
+    private static func verifyMainThreadWatchdog(_ diagnostics: SoundtimeDiagnostics) throws {
+        diagnostics.resetForSmokeTesting()
+        let monitor = SoundtimeMainThreadStallMonitor.shared
+        monitor.start()
+        monitor.resetForSmokeTesting()
+        monitor.enqueueHeartbeatForSmokeTesting()
+
+        Thread.sleep(forTimeInterval: 0.080)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.020))
+
+        let snapshot = diagnostics.snapshot(limit: 16)
+        try require(snapshot.mainThreadStallCount == 1, "main queue watchdog did not record a blocked heartbeat")
+        try require(
+            snapshot.lastMainThreadStallMilliseconds >= 70,
+            "main queue watchdog underreported the blocked heartbeat"
+        )
+
+        diagnostics.resetForSmokeTesting()
+        monitor.publishStaleSampleForSmokeTesting(milliseconds: 80)
+        let staleSnapshot = diagnostics.snapshot(limit: 16)
+        monitor.stop()
+        try require(
+            staleSnapshot.mainThreadStallCount == 0,
+            "main queue watchdog published a stale sample after reset"
+        )
+        diagnostics.resetForSmokeTesting()
     }
 
     private static func verifyFrameStatsEscalation(_ diagnostics: SoundtimeDiagnostics) throws {
@@ -247,8 +363,19 @@ enum DiagnosticsSmokeHarness {
 
         let data = try Data(contentsOf: traceURL)
         let events = try JSONDecoder().decode([SoundtimeDiagnosticEvent].self, from: data)
-        try require(events.count >= 8, "diagnostics trace did not include recent events")
-        try require(events.contains { $0.name == "audio-underrun" }, "diagnostics trace did not include audio event")
+        let expectedNames: Set<String> = [
+            "timeline-frame-drop",
+            "audio-underrun",
+            "audio-dropped-command",
+            "audio-callback-deadline-miss",
+            "audio-render-work-deadline-miss",
+            "audio-callback-scheduling-late",
+        ]
+        let names = Set(events.map(\.name))
+        try require(
+            expectedNames.isSubset(of: names),
+            "diagnostics trace omitted required events: \(expectedNames.subtracting(names).sorted())"
+        )
     }
 
     private static func verifyEventRetentionLimit(_ diagnostics: SoundtimeDiagnostics) throws {

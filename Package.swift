@@ -9,6 +9,8 @@ let package = Package(
     ],
     products: [
         .executable(name: "Soundtime", targets: ["Soundtime"]),
+        .library(name: "SoundtimeDiagnosticsCore", targets: ["SoundtimeDiagnosticsCore"]),
+        .executable(name: "SoundtimeLog", targets: ["SoundtimeLog"]),
     ],
     dependencies: [
         .package(
@@ -24,11 +26,17 @@ let package = Package(
         .target(
             name: "SoundtimeEditing"
         ),
+        .target(name: "SoundtimeDiagnosticsCore"),
+        .executableTarget(
+            name: "SoundtimeLog",
+            dependencies: ["SoundtimeDiagnosticsCore"]
+        ),
         .executableTarget(
             name: "Soundtime",
             dependencies: [
                 "SoundtimeAudioCore",
                 "SoundtimeEditing",
+                "SoundtimeDiagnosticsCore",
                 .product(name: "Sparkle", package: "Sparkle"),
             ],
             resources: [
@@ -56,7 +64,14 @@ let package = Package(
             name: "SoundtimeEditingTests",
             dependencies: [
                 "SoundtimeEditing",
+            ],
+            resources: [
+                .process("Fixtures"),
             ]
+        ),
+        .testTarget(
+            name: "SoundtimeDiagnosticsCoreTests",
+            dependencies: ["SoundtimeDiagnosticsCore"]
         ),
     ],
     cxxLanguageStandard: .cxx20

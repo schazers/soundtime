@@ -2,6 +2,7 @@ import AppKit
 import Darwin
 import Metal
 import QuartzCore
+import SoundtimeDiagnosticsCore
 
 struct PerformanceDashboardDiagnosticsSnapshot: Codable, Sendable {
     var frameStatsDisplayCount: Int
@@ -339,7 +340,7 @@ private final class PerformanceDashboardView: NSView {
     private let threadCard = PerformanceInfoCardView(title: "Threading")
     private let traceCard = PerformanceInfoCardView(title: "Trace Capture")
     private let eventsView = PerformanceEventLogView()
-    private let exportButton = PerformanceActionButton(title: "Export Trace")
+    private let exportButton = PerformanceActionButton(title: "Export Bundle")
     private let dashboardRefreshInterval: TimeInterval = 0.75
     private let dashboardRefreshCoalesceInterval: TimeInterval = 0.25
     private var timer: Timer?
@@ -652,26 +653,27 @@ private final class PerformanceDashboardView: NSView {
         ])
 
         traceCard.update(lines: [
-            "Ring buffer   2048 events",
+            "Memory ring   2048 events",
             "Shown events  \(diagnostics.events.count)",
-            "Auto export   severe events",
+            "Durable log   JSONL sessions",
             "BG complete   \(importBudget.completedWorkCount)",
             String(format: "BG defer sec  %.2f", importBudget.totalDeferredSeconds),
-            "Format        JSON",
-            "Location      /tmp",
+            "Format        schema-v2 JSONL",
+            "Location      ~/Library/Logs/Soundtime",
         ])
 
         eventsView.update(events: diagnostics.events)
     }
 
     private func exportTrace() {
-        if let url = SoundtimeDiagnostics.shared.writeTrace(reason: "manual") {
+        if let url = SoundtimeDiagnostics.shared.exportDiagnosticBundle() {
             traceCard.update(lines: [
-                "Trace saved",
+                "Bundle saved",
                 url.lastPathComponent,
-                "Format        JSON",
+                "Format        ZIP",
                 "Location      \(url.deletingLastPathComponent().path)",
             ])
+            NSWorkspace.shared.activateFileViewerSelecting([url])
         }
     }
 }
@@ -839,7 +841,7 @@ private final class PerformanceInfoCardView: NSView {
     }
 }
 
-private final class PerformanceEventLogView: NSView {
+private final class PerformanceEventLogView: NSView, NSTextViewDelegate {
     private static let eventTextColor = NSColor(white: 0.82, alpha: 1)
     private static let eventTextFont = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .regular)
 
@@ -847,6 +849,21 @@ private final class PerformanceEventLogView: NSView {
     private let textView = NSTextView()
     private let scrollView = NSScrollView()
     private let jumpToLatestButton = PerformanceEventJumpButton()
+    private let searchField = NSSearchField()
+    private let categoryPopup = NSPopUpButton()
+    private let severityPopup = NSPopUpButton()
+    private let pauseButton = NSButton(title: "Pause", target: nil, action: nil)
+    private let clearButton = NSButton(title: "Clear View", target: nil, action: nil)
+    private let markButton = NSButton(title: "Mark Incident", target: nil, action: nil)
+    private let revealButton = NSButton(title: "Reveal Logs", target: nil, action: nil)
+    private let copyQueryButton = NSButton(title: "Copy Query", target: nil, action: nil)
+    private let copyEventButton = NSButton(title: "Copy Event", target: nil, action: nil)
+    private let detailLabel = NSTextField(wrappingLabelWithString: "Select or search events. Queries support category:, severity:, name:, field.<key>:, text:, and after:-30s.")
+    private var sourceEvents: [SoundtimeDiagnosticEvent] = []
+    private var isPaused = false
+    private var clearBeforeSequence: UInt64 = 0
+    private var displayedEvents: [SoundtimeDiagnosticEvent] = []
+    private var selectedEvent: SoundtimeDiagnosticEvent?
     private var displayedEventFingerprint = ""
     private var displayedEventCount = -1
     private var hasUnseenBottomEvents = false
@@ -877,6 +894,22 @@ private final class PerformanceEventLogView: NSView {
     }
 
     func update(events: [SoundtimeDiagnosticEvent]) {
+        sourceEvents = events
+        guard !isPaused else { return }
+        applyCurrentQuery()
+    }
+
+    private func applyCurrentQuery() {
+        let category = categoryPopup.titleOfSelectedItem ?? "All"
+        let severity = severityPopup.titleOfSelectedItem ?? "All"
+        let query = DiagnosticQuery(searchField.stringValue)
+        let events = sourceEvents.filter {
+            $0.sequence > clearBeforeSequence &&
+            (category == "All" || $0.category.rawValue == category) &&
+            (severity == "All" || $0.severity.rawValue == severity) &&
+            query.matches($0)
+        }
+        displayedEvents = Array(events.suffix(160))
         let shouldFollowTail = isFollowingTail || isPinnedToBottom()
         let previousFingerprint = displayedEventFingerprint
         let nextFingerprint = eventFingerprint(for: events.last)
@@ -889,7 +922,7 @@ private final class PerformanceEventLogView: NSView {
         displayedEventCount = eventCount
 
         titleLabel.stringValue = "Recent Events (\(eventCount))"
-        let lines = events.suffix(160).map { event -> String in
+        let lines = displayedEvents.map { event -> String in
             let severity = event.severity.rawValue.uppercased()
             let fields = event.fields
                 .sorted { $0.key < $1.key }
@@ -919,6 +952,7 @@ private final class PerformanceEventLogView: NSView {
             hasUnseenBottomEvents = true
         }
         updateJumpButtonVisibility()
+        showDetails(for: selectedEvent ?? displayedEvents.last)
     }
 
     var displayedText: String {
@@ -935,6 +969,25 @@ private final class PerformanceEventLogView: NSView {
         titleLabel.font = .systemFont(ofSize: 11, weight: .semibold)
         titleLabel.textColor = NSColor(white: 0.70, alpha: 1)
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        searchField.placeholderString = "Search events or use category:edit severity:severe field.graphRevision:42 after:-30s"
+        searchField.target = self; searchField.action = #selector(filtersChanged(_:))
+        searchField.translatesAutoresizingMaskIntoConstraints = false
+        categoryPopup.addItems(withTitles: ["All"] + DiagnosticCategory.allCases.map(\.rawValue))
+        severityPopup.addItems(withTitles: ["All"] + DiagnosticSeverity.allCases.map(\.rawValue))
+        for popup in [categoryPopup, severityPopup] { popup.target = self; popup.action = #selector(filtersChanged(_:)); popup.translatesAutoresizingMaskIntoConstraints = false }
+        for button in [pauseButton, clearButton, markButton, revealButton, copyQueryButton, copyEventButton] {
+            button.bezelStyle = .rounded; button.controlSize = .small; button.translatesAutoresizingMaskIntoConstraints = false
+        }
+        pauseButton.target = self; pauseButton.action = #selector(togglePause(_:))
+        clearButton.target = self; clearButton.action = #selector(clearView(_:))
+        markButton.target = self; markButton.action = #selector(markIncident(_:))
+        revealButton.target = self; revealButton.action = #selector(revealLogs(_:))
+        copyQueryButton.target = self; copyQueryButton.action = #selector(copyQuery(_:))
+        copyEventButton.target = self; copyEventButton.action = #selector(copyEvent(_:))
+        detailLabel.font = .monospacedSystemFont(ofSize: 9.5, weight: .regular)
+        detailLabel.textColor = NSColor(white: 0.58, alpha: 1); detailLabel.maximumNumberOfLines = 2
+        detailLabel.translatesAutoresizingMaskIntoConstraints = false
 
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = false
@@ -959,6 +1012,7 @@ private final class PerformanceEventLogView: NSView {
         textView.isHorizontallyResizable = false
         textView.isVerticallyResizable = true
         textView.autoresizingMask = [.width]
+        textView.delegate = self
         scrollView.documentView = textView
 
         jumpToLatestButton.translatesAutoresizingMaskIntoConstraints = false
@@ -970,17 +1024,45 @@ private final class PerformanceEventLogView: NSView {
         }
 
         addSubview(titleLabel)
+        addSubview(searchField); addSubview(categoryPopup); addSubview(severityPopup)
+        addSubview(pauseButton); addSubview(clearButton); addSubview(markButton); addSubview(revealButton); addSubview(copyQueryButton); addSubview(copyEventButton)
         addSubview(scrollView)
         addSubview(jumpToLatestButton)
+        addSubview(detailLabel)
 
         NSLayoutConstraint.activate([
             titleLabel.topAnchor.constraint(equalTo: topAnchor, constant: 12),
             titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
 
-            scrollView.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 8),
+            searchField.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 7),
+            searchField.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 240),
+            categoryPopup.leadingAnchor.constraint(equalTo: searchField.trailingAnchor, constant: 6),
+            categoryPopup.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
+            severityPopup.leadingAnchor.constraint(equalTo: categoryPopup.trailingAnchor, constant: 4),
+            severityPopup.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
+            pauseButton.leadingAnchor.constraint(equalTo: severityPopup.trailingAnchor, constant: 6),
+            pauseButton.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
+            clearButton.leadingAnchor.constraint(equalTo: pauseButton.trailingAnchor, constant: 4),
+            clearButton.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
+            markButton.leadingAnchor.constraint(equalTo: clearButton.trailingAnchor, constant: 4),
+            markButton.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
+            revealButton.leadingAnchor.constraint(equalTo: markButton.trailingAnchor, constant: 4),
+            revealButton.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
+            copyQueryButton.leadingAnchor.constraint(equalTo: revealButton.trailingAnchor, constant: 4),
+            copyQueryButton.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
+            copyEventButton.leadingAnchor.constraint(equalTo: copyQueryButton.trailingAnchor, constant: 4),
+            copyEventButton.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -12),
+            copyEventButton.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
+
+            scrollView.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 7),
             scrollView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
             scrollView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
-            scrollView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -6),
+            scrollView.bottomAnchor.constraint(equalTo: detailLabel.topAnchor, constant: -5),
+
+            detailLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            detailLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            detailLabel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
 
             jumpToLatestButton.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
             jumpToLatestButton.bottomAnchor.constraint(equalTo: scrollView.bottomAnchor, constant: -14),
@@ -994,6 +1076,34 @@ private final class PerformanceEventLogView: NSView {
             name: NSView.boundsDidChangeNotification,
             object: scrollView.contentView
         )
+    }
+
+    @objc private func filtersChanged(_ sender: Any?) { displayedEventFingerprint = ""; displayedEventCount = -1; applyCurrentQuery() }
+    @objc private func togglePause(_ sender: Any?) { isPaused.toggle(); pauseButton.title = isPaused ? "Resume" : "Pause"; if !isPaused { applyCurrentQuery() } }
+    @objc private func clearView(_ sender: Any?) { clearBeforeSequence = sourceEvents.last?.sequence ?? 0; displayedEventFingerprint = ""; displayedEventCount = -1; applyCurrentQuery() }
+    @objc private func markIncident(_ sender: Any?) { _ = SoundtimeDiagnostics.shared.markIncident(); markButton.title = "Marked" }
+    @objc private func revealLogs(_ sender: Any?) { NSWorkspace.shared.open(SoundtimeDiagnostics.shared.logsDirectoryURL) }
+    @objc private func copyQuery(_ sender: Any?) { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(searchField.stringValue, forType: .string) }
+    @objc private func copyEvent(_ sender: Any?) {
+        guard let event = selectedEvent ?? displayedEvents.last else { return }
+        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601; encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(event), let text = String(data: data, encoding: .utf8) else { return }
+        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    func textViewDidChangeSelection(_ notification: Notification) {
+        guard !isApplyingEventText, !displayedEvents.isEmpty else { return }
+        let location = min(textView.selectedRange().location, (textView.string as NSString).length)
+        let prefix = (textView.string as NSString).substring(to: location)
+        let line = min(prefix.reduce(0) { $1 == "\n" ? $0 + 1 : $0 }, displayedEvents.count - 1)
+        selectedEvent = displayedEvents[line]
+        showDetails(for: selectedEvent)
+    }
+
+    private func showDetails(for event: SoundtimeDiagnosticEvent?) {
+        guard let event else { detailLabel.stringValue = "No matching events."; return }
+        let related = event.correlation?.operationID.map { id in sourceEvents.filter { $0.correlation?.operationID == id }.count } ?? 0
+        detailLabel.stringValue = "#\(event.sequence)  \(event.eventID.uuidString)  wall \(ISO8601DateFormatter().string(from: event.wallTime))  session \(event.sessionID.uuidString)  operation \(event.correlation?.operationID?.uuidString ?? "-")  graph \(event.correlation?.graphRevision.map(String.init) ?? "-")  related \(related)"
     }
 
     private func eventTextAttributes() -> [NSAttributedString.Key: Any] {

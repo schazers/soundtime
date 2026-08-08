@@ -194,8 +194,9 @@ final class PerformanceSampler: @unchecked Sendable {
             targetFPS - mainThreadStallPenalties.reduce(0) { $0 + $1.missedDisplayFrames },
             0
         )
-        let renderHealthFPS = Self.effectiveFrameHealthFramesPerSecond(
-            measuredFramesPerSecond: presentedFPS,
+        let renderHealthFPS = Self.effectiveRenderHealthFramesPerSecond(
+            submittedFramesPerSecond: presentedFPS,
+            completedFramesPerSecond: completedFPS,
             targetFramesPerSecond: targetFPS,
             renderDemand: demand,
             activeDemandAge: demandAge
@@ -244,6 +245,32 @@ final class PerformanceSampler: @unchecked Sendable {
         // It takes two presentation timestamps to establish a cadence. Do not
         // report a false zero during that short measurement warm-up.
         return activeDemandAge <= 0.10 ? target : 0
+    }
+
+    static func effectiveRenderHealthFramesPerSecond(
+        submittedFramesPerSecond: Double,
+        completedFramesPerSecond: Double,
+        targetFramesPerSecond: Double,
+        renderDemand: PerformanceRenderDemand,
+        activeDemandAge: CFTimeInterval
+    ) -> Double {
+        let submittedHealth = effectiveFrameHealthFramesPerSecond(
+            measuredFramesPerSecond: submittedFramesPerSecond,
+            targetFramesPerSecond: targetFramesPerSecond,
+            renderDemand: renderDemand,
+            activeDemandAge: activeDemandAge
+        )
+        guard renderDemand != .idle else {
+            return submittedHealth
+        }
+
+        let completedHealth = effectiveFrameHealthFramesPerSecond(
+            measuredFramesPerSecond: completedFramesPerSecond,
+            targetFramesPerSecond: targetFramesPerSecond,
+            renderDemand: renderDemand,
+            activeDemandAge: activeDemandAge
+        )
+        return min(submittedHealth, completedHealth)
     }
 
     static func effectiveGraphFramesPerSecond(
