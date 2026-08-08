@@ -1569,6 +1569,8 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
     private var denseClipChromePlacementScratch: [DenseClipChromePlacement] = []
     private var highlightedClipEdge: (trackID: UUID, clipID: AudioTimelineClipID, edge: TimelineClipEdge)?
     private var clipDragPreviews: [TimelineClipDragPreview] = []
+    private var clipDragPreviewsByClip: [TimelineClipSelectionKey: TimelineClipDragPreview] = [:]
+    private var renderTrackIndicesByID: [UUID: Int] = [:]
     private var isClipDragPlacementAllowed = true
     private var clipPropertyPreview: TimelineClipPropertyPreview?
     private var clipPropertyHover: TimelineClipPropertyHover?
@@ -2077,6 +2079,9 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
         let previousTracks = renderState.tracks
         let currentTracksByID = Dictionary(uniqueKeysWithValues: previousTracks.map { ($0.id, $0) })
         let renderTracks = tracks.map { lightweightRenderTrack(from: $0, currentTrack: currentTracksByID[$0.id]) }
+        renderTrackIndicesByID = Dictionary(
+            uniqueKeysWithValues: renderTracks.enumerated().map { ($0.element.id, $0.offset) }
+        )
         let sourcePublicationTracks = zip(tracks, renderTracks).map { incomingTrack, renderTrack in
             incomingTrack.usesSourceWaveformLayers ? renderTrack : incomingTrack
         }
@@ -3161,8 +3166,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             return
         }
         clipDragPreviews = previews
+        clipDragPreviewsByClip = Dictionary(
+            uniqueKeysWithValues: previews.map {
+                (TimelineClipSelectionKey(trackID: $0.trackID, clipID: $0.clipID), $0)
+            }
+        )
         isClipDragPlacementAllowed = placementAllowed
-        invalidateClipChromeCache()
         if !previews.isEmpty {
             markWaveformHotInteraction()
         }
@@ -3776,7 +3785,7 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             playheadProgress: renderedPlayheadProgress,
             deletionEffects: deletionEffectsForFrame,
             displayTimestamp: displayTimestamp,
-            forceInstances: animatesClipDeletion || renderState.isRecordingActive
+            forceInstances: animatesClipDeletion || renderState.isRecordingActive || !clipDragPreviews.isEmpty
         )
         let clipBoundaryVertices: CachedVertexBuffer? = usesDenseClipChrome ? nil : cachedClipChromeVertices(
             drawableSize: viewportSize,
@@ -11072,15 +11081,13 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             guard trackDurationProgress > 0 else { continue }
 
             for clipRange in track.clipRanges where !clipRange.isSilent {
-                let preview = clipDragPreviews.first {
-                    $0.trackID == track.id && $0.clipID == clipRange.id
-                }
+                let preview = clipDragPreviewsByClip[
+                    TimelineClipSelectionKey(trackID: track.id, clipID: clipRange.id)
+                ]
                 let presentedLaneFrame = preview.flatMap { preview in
                     guard
                         preview.destinationTrackID != track.id,
-                        let destinationIndex = renderState.tracks.firstIndex(where: {
-                            $0.id == preview.destinationTrackID
-                        })
+                        let destinationIndex = renderTrackIndicesByID[preview.destinationTrackID]
                     else { return laneFrame }
                     return trackLayout.laneFrame(forTrackIndex: destinationIndex)
                 } ?? laneFrame
@@ -11376,12 +11383,12 @@ final class TimelineRenderer: NSObject, @unchecked Sendable {
             }
 
             for clipRange in track.clipRanges where !clipRange.isSilent {
-                let preview = clipDragPreviews.first {
-                    $0.trackID == track.id && $0.clipID == clipRange.id
-                }
+                let preview = clipDragPreviewsByClip[
+                    TimelineClipSelectionKey(trackID: track.id, clipID: clipRange.id)
+                ]
                 let presentedLaneFrame = preview.flatMap { preview in
                     guard preview.destinationTrackID != track.id,
-                          let destinationIndex = renderState.tracks.firstIndex(where: { $0.id == preview.destinationTrackID })
+                          let destinationIndex = renderTrackIndicesByID[preview.destinationTrackID]
                     else { return laneFrame }
                     return trackLayout.laneFrame(forTrackIndex: destinationIndex)
                 } ?? laneFrame

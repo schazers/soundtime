@@ -360,6 +360,11 @@ enum TimelineUXSmokeHarness {
         )
         complete("fixed ruler occludes vertically scrolled track content")
 
+        try MainActor.assumeIsolated {
+            try verifyClipDragFloodPublishesAtDisplayCadence(track: track)
+        }
+        complete("raw clip-drag floods collapse to display-paced preview publication")
+
         try verifyFadeMappingRendersOnFirstFrame(
             renderer: renderer,
             track: track,
@@ -6845,6 +6850,132 @@ enum TimelineUXSmokeHarness {
             "full-timeline clip changed duration while moving"
         )
         try require(!duplicates, "ordinary full-timeline clip drag unexpectedly duplicated the clip")
+    }
+
+    @MainActor
+    private static func verifyClipDragFloodPublishesAtDisplayCadence(
+        track: TimelineRenderState.Track
+    ) throws {
+        let clipID = AudioTimelineClipID(
+            rawValue: UUID(uuidString: "AC1D0000-0000-0000-0000-000000000005") ?? UUID()
+        )
+        let clipTrack = TimelineRenderState.Track(
+            id: track.id,
+            waveformVersion: track.waveformVersion,
+            waveformOverview: track.waveformOverview,
+            durationHint: track.durationHint,
+            volume: track.volume,
+            isMuted: track.isMuted,
+            isSoloed: track.isSoloed,
+            hasWaveform: track.hasWaveform,
+            clipRanges: [TimelineRenderState.ClipRange(
+                id: clipID,
+                startProgress: 0.1,
+                endProgress: 0.3,
+                name: "Display-paced drag",
+                isSelected: true
+            )],
+            waveformSegments: track.waveformSegments,
+            waveformTileSource: track.waveformTileSource,
+            transcript: track.transcript
+        )
+        let timeline = TimelineView()
+        timeline.frame = NSRect(x: 0, y: 0, width: 960, height: 360)
+        timeline.displayTracks(
+            [clipTrack],
+            animateWaveformTransition: false,
+            allowImmediateWaveformPrewarm: false,
+            allowImmediateInteractiveWaveformPrewarm: false
+        )
+
+        let layout = TimelineTrackLayout.default.resolved(
+            totalTrackCount: 1,
+            viewportHeight: Float(timeline.bounds.height)
+        )
+        let lane = try requireValue(
+            layout.laneFrame(forTrackIndex: 0),
+            "display-paced clip drag test did not resolve its lane"
+        )
+        let y = timeline.bounds.height * CGFloat(1 - lane.center)
+        let start = NSPoint(x: timeline.bounds.width * 0.2, y: y)
+        let destination = NSPoint(x: timeline.bounds.width * 0.7, y: y)
+        var validationCount = 0
+        var committedPreviews: [TimelineClipDragPreview] = []
+        timeline.onValidateClipDragPreviews = { previews in
+            validationCount += 1
+            return !previews.isEmpty
+        }
+        timeline.onClipDragCommitted = { previews, _ in
+            committedPreviews = previews
+        }
+
+        let down = try requireValue(
+            NSEvent.mouseEvent(
+                with: .leftMouseDown,
+                location: start,
+                modifierFlags: [],
+                timestamp: 11,
+                windowNumber: 0,
+                context: nil,
+                eventNumber: 1,
+                clickCount: 1,
+                pressure: 1
+            ),
+            "could not create display-paced clip mouse-down event"
+        )
+        timeline.mouseDown(with: down)
+        for index in 1...500 {
+            let fraction = CGFloat(index) / 500
+            let point = NSPoint(
+                x: start.x + (destination.x - start.x) * fraction,
+                y: y
+            )
+            let dragged = try requireValue(
+                NSEvent.mouseEvent(
+                    with: .leftMouseDragged,
+                    location: point,
+                    modifierFlags: [],
+                    timestamp: 11 + Double(index) * 0.000_2,
+                    windowNumber: 0,
+                    context: nil,
+                    eventNumber: index + 1,
+                    clickCount: 1,
+                    pressure: 1
+                ),
+                "could not create display-paced clip drag event"
+            )
+            timeline.mouseDragged(with: dragged)
+        }
+        try require(
+            validationCount == 0,
+            "raw clip drag events performed \(validationCount) synchronous validations before presentation"
+        )
+
+        let up = try requireValue(
+            NSEvent.mouseEvent(
+                with: .leftMouseUp,
+                location: destination,
+                modifierFlags: [],
+                timestamp: 11.2,
+                windowNumber: 0,
+                context: nil,
+                eventNumber: 502,
+                clickCount: 1,
+                pressure: 0
+            ),
+            "could not create display-paced clip mouse-up event"
+        )
+        timeline.mouseUp(with: up)
+
+        try require(validationCount == 1, "clip mouse-up did not perform exactly one final validation")
+        let preview = try requireValue(
+            committedPreviews.first,
+            "display-paced clip drag did not commit its exact final preview"
+        )
+        try require(
+            abs(preview.presentedStartProjectProgress - 0.6) < 0.01,
+            "display-paced clip drag committed at \(preview.presentedStartProjectProgress), expected 0.6"
+        )
     }
 
     @MainActor

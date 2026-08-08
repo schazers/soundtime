@@ -410,6 +410,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
     private var activeClipPropertyControl: TimelineClipPropertyControl?
     private var activeClipDragDuplicates = false
     private var activeClipSnapGuideProgress: Float?
+    private var activeClipSnapCandidates: [Float]?
+    private var activeClipTrackIndices: [UUID: Int] = [:]
     private var hoveredClipRequest: TimelineClipFocusRequest?
     private var hoveredClipEdge: TimelineClipEdge?
     private var hoveredClipProperty: TimelineClipPropertyHover?
@@ -1738,9 +1740,13 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                 requests: requests
             )
             let destinationTrackID = trackID(at: point) ?? request.trackID
-            let anchorSourceIndex = currentTrackIDs.firstIndex(of: request.trackID) ?? 0
-            let requestedDestinationIndex = currentTrackIDs.firstIndex(of: destinationTrackID) ?? anchorSourceIndex
-            let selectedSourceIndices = requests.compactMap { currentTrackIDs.firstIndex(of: $0.trackID) }
+            let anchorSourceIndex = activeClipTrackIndices[request.trackID] ??
+                currentTrackIDs.firstIndex(of: request.trackID) ?? 0
+            let requestedDestinationIndex = activeClipTrackIndices[destinationTrackID] ??
+                currentTrackIDs.firstIndex(of: destinationTrackID) ?? anchorSourceIndex
+            let selectedSourceIndices = requests.compactMap {
+                activeClipTrackIndices[$0.trackID] ?? currentTrackIDs.firstIndex(of: $0.trackID)
+            }
             let minimumSourceIndex = selectedSourceIndices.min() ?? anchorSourceIndex
             let maximumSourceIndex = selectedSourceIndices.max() ?? anchorSourceIndex
             let trackDelta = min(
@@ -1748,7 +1754,8 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                 max(currentTrackIDs.count - 1 - maximumSourceIndex, 0)
             )
             previews = requests.map { item in
-                let sourceIndex = currentTrackIDs.firstIndex(of: item.trackID) ?? anchorSourceIndex
+                let sourceIndex = activeClipTrackIndices[item.trackID] ??
+                    currentTrackIDs.firstIndex(of: item.trackID) ?? anchorSourceIndex
                 let destinationIndex = min(max(sourceIndex + trackDelta, 0), currentTrackIDs.count - 1)
                 return TimelineClipDragPreview(
                     trackID: item.trackID,
@@ -1835,53 +1842,88 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         _ progress: Float,
         request: TimelineClipFocusRequest
     ) -> Float {
-        snapProgress(progress, candidates: clipSnapCandidates(excluding: request))
+        snapProgress(
+            progress,
+            candidates: activeClipSnapCandidates ?? clipSnapCandidates(excluding: request)
+        )
     }
 
     private func snappedClipGroupDelta(
         _ delta: Float,
         requests: [TimelineClipFocusRequest]
     ) -> Float {
-        let keys = Set(requests.map(TimelineClipSelectionKey.init))
-        let candidates = clipSnapCandidates(excluding: keys)
+        let candidates: [Float]
+        if let activeClipSnapCandidates {
+            candidates = activeClipSnapCandidates
+        } else {
+            let keys = Set(requests.map(TimelineClipSelectionKey.init))
+            candidates = clipSnapCandidates(excluding: keys)
+        }
         var bestDelta: Float?
+        var bestGuide: Float?
+        let threshold = Float(8 / max(bounds.width, 1)) * viewport.durationProgress
         for request in requests {
             for edge in [request.projectStartProgress + delta, request.projectEndProgress + delta] {
                 for candidate in candidates {
                     let snapDelta = candidate - edge
-                    let threshold = Float(8 / max(bounds.width, 1)) * viewport.durationProgress
                     guard isClipSnappingEnabled, abs(snapDelta) <= threshold else {
                         continue
                     }
                     if bestDelta == nil || abs(snapDelta) < abs(bestDelta!) {
                         bestDelta = snapDelta
+                        bestGuide = candidate
                     }
                 }
             }
         }
         let minimumStart = requests.map(\.projectStartProgress).min() ?? 0
         let result = max(delta + (bestDelta ?? 0), -minimumStart)
-        activeClipSnapGuideProgress = bestDelta == nil ? nil : requests
-            .flatMap { [$0.projectStartProgress + result, $0.projectEndProgress + result] }
-            .first { edge in candidates.contains { abs($0 - edge) < 0.000_01 } }
+        activeClipSnapGuideProgress = bestGuide
         return result
     }
 
     private func snapProgress(_ progress: Float, candidates: [Float]) -> Float {
-        let scale = 1_000_000
         let thresholdProgress = Float(8 / max(bounds.width, 1)) * viewport.durationProgress
-        let result = TimelineClipSnapEngine.snap(
-            frame: Int((progress * Float(scale)).rounded()),
-            targets: candidates.map {
-                TimelineClipSnapTarget(frame: Int(($0 * Float(scale)).rounded()), kind: .clipEdge)
-            },
-            configuration: TimelineClipSnapConfiguration(
-                isEnabled: isClipSnappingEnabled,
-                toleranceFrames: Int((thresholdProgress * Float(scale)).rounded())
-            )
+        guard isClipSnappingEnabled else {
+            activeClipSnapGuideProgress = nil
+            return progress
+        }
+        var nearest: Float?
+        var nearestDistance = Float.greatestFiniteMagnitude
+        for candidate in candidates {
+            let distance = abs(candidate - progress)
+            if distance <= thresholdProgress, distance < nearestDistance {
+                nearest = candidate
+                nearestDistance = distance
+            }
+        }
+        activeClipSnapGuideProgress = nearest
+        return nearest ?? progress
+    }
+
+    private func prepareClipDragInteractionContext() {
+        let requests: [TimelineClipFocusRequest]
+        if let activeClipRequest {
+            requests = activeClipRequests.isEmpty ? [activeClipRequest] : activeClipRequests
+        } else {
+            requests = []
+        }
+        activeClipTrackIndices = Dictionary(
+            uniqueKeysWithValues: currentTrackIDs.enumerated().map { ($0.element, $0.offset) }
         )
-        activeClipSnapGuideProgress = result.target == nil ? nil : Float(result.frame) / Float(scale)
-        return Float(result.frame) / Float(scale)
+        guard !requests.isEmpty else {
+            activeClipSnapCandidates = nil
+            return
+        }
+        activeClipSnapCandidates = clipSnapCandidates(
+            excluding: Set(requests.map(TimelineClipSelectionKey.init))
+        )
+    }
+
+    private func clearClipDragInteractionContext() {
+        activeClipSnapCandidates = nil
+        activeClipTrackIndices.removeAll(keepingCapacity: true)
+        activeClipSnapGuideProgress = nil
     }
 
     private func displayHighlightedLoopRegion(
@@ -2579,8 +2621,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         let didAdvanceScrollbarHover = stepScrollbarHover(sampledAt: sampledAt)
         let didRefreshSelection = refreshLiveSelectionFromCurrentMouse(sampledAt: sampledAt)
         let didRefreshLoop = refreshLiveLoopFromCurrentMouse()
+        let didRefreshClipDrag = refreshLiveClipDragFromCurrentMouse()
         let didRefreshAutomation = refreshLiveAutomationFromCurrentMouse()
-        if didRefreshSelection || didRefreshLoop || didRefreshAutomation {
+        if didRefreshSelection || didRefreshLoop || didRefreshClipDrag || didRefreshAutomation {
             PerformanceSampler.shared.recordTimelineInputEvent(
                 kind: "display-paced-drag-sample",
                 at: sampledAt
@@ -2603,6 +2646,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             didAdvanceScrollbarHover ||
             didRefreshSelection ||
             didRefreshLoop ||
+            didRefreshClipDrag ||
             didRefreshAutomation ||
             isHotPathContractSmokeFrameStatsActive
 
@@ -2615,7 +2659,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             return
         }
 
-        if didRefreshSelection || didRefreshLoop || didRefreshAutomation {
+        if didRefreshSelection || didRefreshLoop || didRefreshClipDrag || didRefreshAutomation {
             needsTimelineRender = true
         }
 
@@ -2897,6 +2941,21 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         )
     }
 
+    private func refreshLiveClipDragFromCurrentMouse() -> Bool {
+        guard
+            isDraggingSelection,
+            activeDragMode == .moveClip ||
+                activeDragMode == .trimClipStart ||
+                activeDragMode == .trimClipEnd,
+            let point = currentMousePointInTimeline()
+        else {
+            return false
+        }
+
+        updateClipDragPreview(to: point, renderCadence: .none)
+        return true
+    }
+
     private var isEdgeAutoPanDragActive: Bool {
         guard isSelectionEnabled, !viewport.isFull else {
             return false
@@ -2987,7 +3046,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
             // would publish the same state twice in one display interval during edge auto-pan.
             break
         case .moveClip, .trimClipStart, .trimClipEnd:
-            updateClipDragPreview(to: point, renderCadence: .coalescedInteraction)
+            // Clip geometry is sampled immediately after auto-pan by the display-link owner.
+            // Publishing here as well would validate and render the same pointer twice per frame.
+            break
         case .clipFadeIn, .clipFadeOut:
             updateClipPropertyPreview(to: point)
         case
@@ -4888,6 +4949,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                 activeDragMode = .moveClip
                 NSCursor.closedHand.set()
             }
+            prepareClipDragInteractionContext()
             displayHoverProgress(nil)
             return
         }
@@ -4986,8 +5048,14 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                 activeDragMode == .trimClipEnd
         {
             if didMovePastSelectionThreshold(to: point) {
-                isDraggingSelection = true
-                updateClipDragPreview(to: point)
+                if !isDraggingSelection {
+                    isDraggingSelection = true
+                    edgeAutoPanLastTimestamp = nil
+                    startTimelineDisplayLink()
+                }
+                // Raw pointer events only keep the display-paced sampler awake. The sampler owns
+                // the one validation and preview publication for each frame that can be shown.
+                wakeDisplayPacedInteractionSampler()
                 if activeDragMode == .moveClip {
                     (activeClipPlacementIsAllowed ? NSCursor.closedHand : NSCursor.operationNotAllowed).set()
                 } else {
@@ -5144,6 +5212,9 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
                 activeDragMode == .trimClipEnd)
         {
             if isDraggingSelection {
+                // Mouse-up can arrive between display ticks. Sample its exact position once before
+                // committing so display pacing never trades away drop accuracy.
+                updateClipDragPreview(to: point, renderCadence: .none)
                 if activeDragMode == .moveClip, activeClipPlacementIsAllowed {
                     onClipDragCommitted?(activeClipDragPreviews, activeClipDragDuplicates)
                 } else {
@@ -5283,6 +5354,7 @@ final class TimelineView: TimelineMetalLayerView, NSMenuItemValidation {
         activeClipRequests = []
         activeClipDragOffsetProgress = 0
         activeClipDragDuplicates = false
+        clearClipDragInteractionContext()
         activeClipPropertyControl = nil
         activeClipPropertyPreview = nil
         displayClipMarquee(from: nil, to: nil)

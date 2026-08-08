@@ -3,6 +3,11 @@ import SoundtimeEditing
 
 @MainActor
 final class TimelineClipLabelOverlayView: NSView {
+    private struct LabelBinding {
+        let key: TimelineClipSelectionKey
+        let isDragPreview: Bool
+    }
+
     private var tracks: [TimelineRenderState.Track] = []
     private var timelineDuration: TimeInterval = 0
     private var viewport = TimelineViewport.full
@@ -11,6 +16,7 @@ final class TimelineClipLabelOverlayView: NSView {
     private var deletionEffects: [TimelineDeletionEffectRequest] = []
     private var deletionEffectStartTimestamp: CFTimeInterval?
     private var labelPool: [NSTextField] = []
+    private var labelBindings: [LabelBinding?] = []
 
     override var isFlipped: Bool { true }
 
@@ -52,8 +58,65 @@ final class TimelineClipLabelOverlayView: NSView {
         guard dragPreviews != previews else {
             return
         }
+        let previousPreviews = dragPreviews
         dragPreviews = previews
+        if applyHorizontalDragTranslation(from: previousPreviews, to: previews) {
+            return
+        }
         updateVisibleLabels()
+    }
+
+    private func applyHorizontalDragTranslation(
+        from previousPreviews: [TimelineClipDragPreview],
+        to previews: [TimelineClipDragPreview]
+    ) -> Bool {
+        guard
+            !previousPreviews.isEmpty,
+            previousPreviews.count == previews.count,
+            viewport.durationProgress > 0,
+            bounds.width > 0
+        else {
+            return false
+        }
+        let previousByKey = Dictionary(
+            uniqueKeysWithValues: previousPreviews.map {
+                (TimelineClipSelectionKey(trackID: $0.trackID, clipID: $0.clipID), $0)
+            }
+        )
+        var translationsByKey: [TimelineClipSelectionKey: CGFloat] = [:]
+        translationsByKey.reserveCapacity(previews.count)
+        for preview in previews {
+            let key = TimelineClipSelectionKey(trackID: preview.trackID, clipID: preview.clipID)
+            guard
+                let previous = previousByKey[key],
+                previous.kind == preview.kind,
+                previous.destinationTrackID == preview.destinationTrackID,
+                previous.presentedStartProjectProgress >= viewport.startProgress,
+                previous.presentedEndProjectProgress <= viewport.endProgress,
+                preview.presentedStartProjectProgress >= viewport.startProgress,
+                preview.presentedEndProjectProgress <= viewport.endProgress
+            else {
+                return false
+            }
+            translationsByKey[key] = CGFloat(
+                (preview.presentedStartProjectProgress - previous.presentedStartProjectProgress) /
+                    viewport.durationProgress
+            ) * bounds.width
+        }
+        var movedLabelCount = 0
+        for index in labelPool.indices {
+            guard
+                labelBindings.indices.contains(index),
+                let binding = labelBindings[index],
+                binding.isDragPreview,
+                let translation = translationsByKey[binding.key]
+            else {
+                continue
+            }
+            labelPool[index].frame.origin.x += translation
+            movedLabelCount += 1
+        }
+        return movedLabelCount > 0
     }
 
     func displayDeletionEffects(
@@ -137,14 +200,20 @@ final class TimelineClipLabelOverlayView: NSView {
                 }
                 let originalStart = Float(clip.startProgress * trackProjectScale)
                 let originalEnd = Float(clip.endProgress * trackProjectScale)
-                var presentations: [(lane: TimelineTrackLaneFrame, start: Float, end: Float)] = []
+                var presentations: [(
+                    lane: TimelineTrackLaneFrame,
+                    start: Float,
+                    end: Float,
+                    isDragPreview: Bool
+                )] = []
                 if preview?.kind == .duplicate {
-                    presentations.append((lane, originalStart, originalEnd))
+                    presentations.append((lane, originalStart, originalEnd, false))
                 }
                 presentations.append((
                     destinationLane,
                     preview?.presentedStartProjectProgress ?? originalStart,
-                    preview?.presentedEndProjectProgress ?? originalEnd
+                    preview?.presentedEndProjectProgress ?? originalEnd,
+                    preview != nil
                 ))
 
                 for var presentation in presentations {
@@ -188,6 +257,10 @@ final class TimelineClipLabelOverlayView: NSView {
                     else { continue }
 
                     let label = reusableLabel(at: nextLabelIndex)
+                    labelBindings[nextLabelIndex] = LabelBinding(
+                        key: TimelineClipSelectionKey(trackID: track.id, clipID: clip.id),
+                        isDragPreview: presentation.isDragPreview
+                    )
                     nextLabelIndex += 1
                     label.stringValue = name
                     label.textColor = clip.isMissingMedia ?
@@ -253,13 +326,15 @@ final class TimelineClipLabelOverlayView: NSView {
         label.isSelectable = false
         addSubview(label)
         labelPool.append(label)
+        labelBindings.append(nil)
         return label
     }
 
     private func hideLabels(startingAt index: Int) {
         guard index < labelPool.count else { return }
-        for label in labelPool[index...] {
-            label.isHidden = true
+        for hiddenIndex in index..<labelPool.count {
+            labelPool[hiddenIndex].isHidden = true
+            labelBindings[hiddenIndex] = nil
         }
     }
 }

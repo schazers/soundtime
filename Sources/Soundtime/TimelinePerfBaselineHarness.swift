@@ -35,6 +35,7 @@ enum TimelinePerfBaselineHarness {
         var measuresTranscriptLayout: Bool = false
         var measuresFullFrameWork: Bool = false
         var requiresZeroDropped144HzFrames: Bool = false
+        var dragsClipDuringRun: Bool = false
     }
 
     private struct TrackCacheKey: Hashable {
@@ -331,6 +332,32 @@ enum TimelinePerfBaselineHarness {
                 measuresTranscriptLayout: true,
                 measuresFullFrameWork: true,
                 requiresZeroDropped144HzFrames: true
+            ),
+            Scenario(
+                name: "extreme stable clip drag",
+                trackCount: 1_000,
+                waveformBinCount: 131_072,
+                frames: max(frames, 360),
+                warmupFrames: max(warmupFrames, 120),
+                viewportDuration: 0.035,
+                isPlaybackActive: true,
+                pansDuringRun: true,
+                zoomsDuringRun: true,
+                scrollsTracksDuringRun: false,
+                showsSelection: false,
+                showsGainPreview: false,
+                targetsVisibleTrack: true,
+                deletionBurstInterval: nil,
+                syntheticDuration: 7_200,
+                clipCountPerTrack: 128,
+                waveformLayerCount: 4,
+                automationPointCountPerTrack: 256,
+                transcriptWordCount: 384,
+                transcriptTrackStride: 4,
+                measuresTranscriptLayout: true,
+                measuresFullFrameWork: true,
+                requiresZeroDropped144HzFrames: true,
+                dragsClipDuringRun: true
             ),
         ]
     }
@@ -742,6 +769,12 @@ enum TimelinePerfBaselineHarness {
                     trackLayout: trackLayout,
                     viewportHeight: Float(viewportSize.height)
                 )
+                displayClipDragPreview(
+                    scenario: scenario,
+                    renderer: renderer,
+                    tracks: activeTracks,
+                    viewport: viewport
+                )
                 displayTransientBursts(
                     scenario: scenario,
                     renderer: renderer,
@@ -845,6 +878,38 @@ enum TimelinePerfBaselineHarness {
                 viewportHeight: Float(viewportSize.height)
             )
         )
+    }
+
+    private static func displayClipDragPreview(
+        scenario: Scenario,
+        renderer: TimelineRenderer,
+        tracks: [TimelineRenderState.Track],
+        viewport: TimelineViewport
+    ) {
+        guard
+            scenario.dragsClipDuringRun,
+            let track = tracks.first,
+            let clip = track.clipRanges.first
+        else {
+            renderer.displayClipDragPreviews([])
+            return
+        }
+
+        let originalStart = Float(clip.startProgress)
+        let originalEnd = Float(clip.endProgress)
+        let width = originalEnd - originalStart
+        let presentedStart = viewport.startProgress + viewport.durationProgress * 0.5 - width * 0.5
+        renderer.displayClipDragPreviews([
+            TimelineClipDragPreview(
+                trackID: track.id,
+                clipID: clip.id,
+                originalStartProjectProgress: originalStart,
+                originalEndProjectProgress: originalEnd,
+                presentedStartProjectProgress: presentedStart,
+                presentedEndProjectProgress: presentedStart + width,
+                kind: .move
+            ),
+        ])
     }
 
     private static func refreshWaveformSnapshotIfNeeded(

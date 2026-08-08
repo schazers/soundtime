@@ -102,6 +102,87 @@ private struct WAVZeroCrossingProbeCacheKey: Hashable {
     let sampleRate: Double
 }
 
+/// A read-only collision index for live clip placement previews.
+///
+/// The canonical validator remains the authority at commit time. During a
+/// drag, however, the graph and moving clip set are stable, so rebuilding
+/// conflict arrays and rescanning the graph on every display frame only adds
+/// pointer latency. This index is rebuilt when either graph revision or the
+/// moving set changes and answers preview collision checks with binary search.
+private struct ClipDragPlacementValidationIndex {
+    private struct OccupiedRange {
+        let range: TimelineFrameRange
+    }
+
+    let graphRevision: UInt64
+    let movingClipIDs: Set<AudioTimelineClipID>
+    private let knownClipIDs: Set<AudioTimelineClipID>
+    private let occupiedRangesByTrackID: [UUID: [OccupiedRange]]
+
+    init(graph: TimelineClipGraph, movingClipIDs: Set<AudioTimelineClipID>) {
+        self.graphRevision = graph.revision
+        self.movingClipIDs = movingClipIDs
+        var knownClipIDs = Set<AudioTimelineClipID>()
+        var occupiedRangesByTrackID: [UUID: [OccupiedRange]] = [:]
+        occupiedRangesByTrackID.reserveCapacity(graph.tracks.count)
+        for track in graph.tracks {
+            knownClipIDs.formUnion(track.clips.map(\.id))
+            occupiedRangesByTrackID[track.id] = track.clips.compactMap { clip in
+                guard !movingClipIDs.contains(clip.id) else { return nil }
+                return OccupiedRange(range: clip.timelineRange)
+            }
+        }
+        self.knownClipIDs = knownClipIDs
+        self.occupiedRangesByTrackID = occupiedRangesByTrackID
+    }
+
+    func allows(_ placements: [TimelineClipPlacement]) -> Bool {
+        guard Set(placements.map(\.clipID)).count == placements.count else {
+            return false
+        }
+        for placement in placements {
+            guard
+                knownClipIDs.contains(placement.clipID),
+                placement.timelineRange.startFrame >= 0,
+                placement.timelineRange.frameCount > 0,
+                let occupied = occupiedRangesByTrackID[placement.destinationTrackID],
+                !intersectsOccupiedRange(placement.timelineRange, in: occupied)
+            else {
+                return false
+            }
+        }
+        for leftIndex in placements.indices {
+            for rightIndex in placements.indices where rightIndex > leftIndex {
+                let left = placements[leftIndex]
+                let right = placements[rightIndex]
+                if left.destinationTrackID == right.destinationTrackID,
+                   left.timelineRange.intersects(right.timelineRange) {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+
+    private func intersectsOccupiedRange(
+        _ range: TimelineFrameRange,
+        in occupied: [OccupiedRange]
+    ) -> Bool {
+        var lower = 0
+        var upper = occupied.count
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2
+            if occupied[middle].range.endFrame <= range.startFrame {
+                lower = middle + 1
+            } else {
+                upper = middle
+            }
+        }
+        guard occupied.indices.contains(lower) else { return false }
+        return occupied[lower].range.startFrame < range.endFrame
+    }
+}
+
 struct WorkspaceVisualInvariantSmokeSnapshot: Codable, Sendable {
     struct Track: Codable, Sendable {
         var id: UUID
@@ -1314,6 +1395,7 @@ final class WorkspaceView: NSView, NSMenuItemValidation {
     }
 
     private let projectSession = ProjectSession()
+    private var clipDragPlacementValidationIndex: ClipDragPlacementValidationIndex?
     private var projectTracks: [ProjectTrack] {
         _read {
             yield projectSession.tracks
@@ -4579,8 +4661,7 @@ final class WorkspaceView: NSView, NSMenuItemValidation {
     ) -> Bool {
         guard !previews.isEmpty else { return true }
         let graph = projectSession.clipGraph
-        let placements = previews.compactMap { preview -> TimelineClipPlacement? in
-            guard graph.location(of: preview.clipID) != nil else { return nil }
+        let placements = previews.map { preview in
             let start = Int(
                 (Double(preview.presentedStartProjectProgress) * max(projectSelectionDuration, 0) *
                     graph.timelineSampleRate).rounded()
@@ -4598,9 +4679,15 @@ final class WorkspaceView: NSView, NSMenuItemValidation {
                 )
             )
         }
-        guard placements.count == previews.count else { return true }
-        return ((try? TimelineClipPlacementValidator.evaluate(placements, in: graph)) ?? .allowed)
-            .isAllowed
+        let movingClipIDs = Set(previews.map(\.clipID))
+        if clipDragPlacementValidationIndex?.graphRevision != graph.revision ||
+            clipDragPlacementValidationIndex?.movingClipIDs != movingClipIDs {
+            clipDragPlacementValidationIndex = ClipDragPlacementValidationIndex(
+                graph: graph,
+                movingClipIDs: movingClipIDs
+            )
+        }
+        return clipDragPlacementValidationIndex?.allows(placements) ?? false
     }
 
     private func commitTimelineClipDrag(
